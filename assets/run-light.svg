@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="284" viewBox="0 0 880 284" role="img" aria-label="a terminal running: supercomputer run --jobs jobs.json --out runs/x">
+<style>
+.d{font-family:'Funnel Display','Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif} .t{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif} .m{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace}
+.ink{fill:#060606} .t2{fill:#4d4d4d} .mu{fill:#767676} .ac{fill:#263fa9}
+.cur{animation:blink 1s steps(1) infinite} @keyframes blink{50%{opacity:0}}
+@keyframes type{0%{width:0}21.7%{width:399px}100%{width:399px}}
+.typed{animation:type 12.0s steps(47) infinite}
+@keyframes caret{0%{transform:translateX(-395px)}21.7%,100%{transform:translateX(0)}}
+.caret{animation:caret 12.0s steps(47) infinite}
+@keyframes l0{0%,25.8%{opacity:0}25.9%,96%{opacity:1}100%{opacity:0}} .l0{animation:l0 12.0s infinite}
+@keyframes l1{0%,30.4%{opacity:0}30.5%,96%{opacity:1}100%{opacity:0}} .l1{animation:l1 12.0s infinite}
+@keyframes l2{0%,35.0%{opacity:0}35.1%,96%{opacity:1}100%{opacity:0}} .l2{animation:l2 12.0s infinite}
+@keyframes l3{0%,39.6%{opacity:0}39.7%,96%{opacity:1}100%{opacity:0}} .l3{animation:l3 12.0s infinite}
+@keyframes l4{0%,44.2%{opacity:0}44.3%,96%{opacity:1}100%{opacity:0}} .l4{animation:l4 12.0s infinite}
+@keyframes l5{0%,48.8%{opacity:0}48.9%,96%{opacity:1}100%{opacity:0}} .l5{animation:l5 12.0s infinite}
+@keyframes l6{0%,53.3%{opacity:0}53.4%,96%{opacity:1}100%{opacity:0}} .l6{animation:l6 12.0s infinite}
+@media (prefers-reduced-motion: reduce){*{animation:none!important}}
+</style>
+<rect x="0.5" y="0.5" width="879" height="283" rx="14" fill="#fefefe" stroke="#e0e0e0"/>
+
+<rect x="0.5" y="0.5" width="879" height="38" rx="14" fill="#f2f2f2"/>
+<rect x="0.5" y="24" width="879" height="15" fill="#f2f2f2"/>
+<line x1="0" y1="38.5" x2="880" y2="38.5" stroke="#e0e0e0"/>
+<circle cx="24" cy="19.5" r="5" fill="#c4c4c4"/><circle cx="42" cy="19.5" r="5" fill="#c4c4c4"/><circle cx="60" cy="19.5" r="5" fill="#c4c4c4"/>
+<text class="m mu" x="440.0" y="24" font-size="12" text-anchor="middle">~/my-repo</text>
+<defs><clipPath id="typed"><rect class="typed" x="44" y="58" width="399" height="22"/></clipPath></defs>
+<text class="m ac" x="28" y="74" font-size="14">$</text>
+<text class="m ink" x="46" y="74" font-size="14" clip-path="url(#typed)" xml:space="preserve">supercomputer run --jobs jobs.json --out runs/x</text>
+<g class="caret"><rect class="cur" x="444" y="61" width="8" height="16" fill="#263fa9" opacity=".85"/></g>
+<text class="m mu l0" x="28" y="96" font-size="14" xml:space="preserve">[boat] batch 20261109-190534-9oib2o: demo, image demo-img-bced87332328, tree b838901c3100 (2 files)</text><text class="m mu l1" x="28" y="118" font-size="14" xml:space="preserve">[boat] 3 jobs to the scheduler (interactive) (times from the last run)</text><text class="m t2 l2" x="28" y="140" font-size="14" xml:space="preserve">hello                                    exit   0      0.03 s</text><text class="m t2 l3" x="28" y="162" font-size="14" xml:space="preserve">nproc                                    exit   0      0.01 s</text><text class="m t2 l4" x="28" y="184" font-size="14" xml:space="preserve">tests                                    exit   0      0.02 s</text><text class="m ac l5" x="28" y="206" font-size="14" xml:space="preserve">3 jobs, 0 failed, 11.7 s wall, 0.1 s of job time; 3 on boat</text><text class="m mu l6" x="28" y="228" font-size="14" xml:space="preserve">boat (the scheduler, class interactive): 1 VMs, 0 starts charged to this batch</text>
+
+</svg>

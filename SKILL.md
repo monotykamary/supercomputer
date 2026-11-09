@@ -1,7 +1,7 @@
 # supercomputer: run work on boat VMs (agents' guide; `supercomputer --skill` prints it, live values filled in)
 
 **Use it for everything but the extremely light** (tests, checks, Lean, bars, sweeps, timing claims). The laptop runs
-only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README for depth; state in ~/.local/share/supercomputer). Now: {live_now}
+only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README and docs/ for depth; state in ~/.local/share/supercomputer). Now: {live_now}
 
 **Run a jobs file** from any repo (its git root is the tree; `supercomputer.toml` says what it needs):
 - `supercomputer run --jobs jobs.json --out runs/x [--class C] [--timing] [--data DIR[:DEST]] [--env K=V]`
