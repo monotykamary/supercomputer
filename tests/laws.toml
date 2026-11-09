@@ -1,0 +1,8 @@
+# The law gate's batch on boat (tests/check_laws.sh): this checkout shipped as is, gdp-wired-cli by bunx on the pool's
+# image ($SUPERCOMPUTER_IMAGE, the one its VMs run: bun on it), nothing built.
+name = "supercomputer"
+
+[boat]
+vm_type = "large"
+path = ["~/.bun/bin"]
+ignore = ["**/__pycache__/**", "live/**", "**/runs/**"]

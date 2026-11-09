@@ -1,0 +1,4297 @@
+"""The scheduler: one queue for all of the pool's work, by priority class, and the only client that holds pool VMs for
+it. Every batch (`supercomputer run`, a bar's launches, a runner's calls, the treadmill's rounds) is a tenant: it
+submits its items and gets its rows back; the scheduler decides which VM runs what, when VMs come and go.
+
+    1 interactive  small checks: a free slot, else a filler's or a sweep's item killed (queued again) at once
+    2 gate         bars and suites: the same, then the VMs that finish the gate within GATE_HORIZON
+    3 submission   lane and terra experiments, the queue: slots as lower items end (a filler's after SUB_PREEMPT s);
+                   up to SUB_VMS VMs' worth per client at once
+    4 sweep        the treadmill's chains over unsolved tasks
+    5 filler       soundness fuzz and mutants: keeps held VMs busy, never a reason to start one
+
+Round-robin across clients within a class. Capacity comes from a warm slot, then a lower class's slot, then a free
+start, then a paid one (Modal only on boat's errors, a missing image or the cap). Growth is demand-driven (_plan): the
+queued slot-time against what the held pool clears within HORIZON, gates against GATE_HORIZON, each new VM with 3x its
+bring-up of work, at most BRINGUP_MAX coming up at once and MAX_VMS (a technical ceiling). No money caps: "no limits,
+but be smart with our money" (the user, 10-31). The pool shrinks damped: VMs
+above the floor (the treadmill's hint) run filler for HOLD s after their last real work, then go (stopped 60 s later).
+A circuit breaker stops every start when most recent starts don't come up (or boat's front fails most agents at once),
+and a watchdog pauses starts when the controller itself is loaded. README, "Scheduling policy".
+
+    supercomputer scheduler serve [--idle-exit 120]    (started by the first client that needs it; exits when idle)
+    supercomputer scheduler status
+
+It listens on 127.0.0.1 with a token (LIVE/scheduler/token, 0600): on the controller VM (controller.py), or on this
+machine as the fallback. Its queue (each batch, its rows, its placements, each item's output) and its accounts
+(LIVE/scheduler/metrics/) are on disk, so a restart loses no result.
+"""
+import base64
+import concurrent.futures
+import collections
+import contextlib
+import fcntl
+import hashlib
+import hmac
+import http.server
+import io
+import json
+import math
+import os
+import pathlib
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.request
+
+from . import blobcache, boat, canary, config, health, rules
+from .boat import AgentClient, AgentError, Registry
+from .rules.owned_lifecycle import OwnedLifecycle, retention_supported
+
+CLASSES = {"interactive": 1, "gate": 2, "submission": 3, "sweep": 4, "filler": 5}
+NAMES = {v: k for k, v in CLASSES.items()}
+DIR = config.LIVE / "scheduler"
+BLOBS = DIR / "blobs"
+PORT = int(os.environ.get("SUPERCOMPUTER_SCHEDULER_PORT", "8790"))
+ORPHAN_S = 21600  # a batch no client has polled for this long is closed (its client is gone; a laptop asleep comes back sooner)
+def _cpu_now() -> float:
+    """This thread's CPU seconds (0 where the clock has none: the simulator's)."""
+    f = getattr(time, "thread_time", None)
+    return f() if f else 0.0
+
+
+def _proc_cpu() -> float:
+    f = getattr(time, "process_time", None)
+    return f() if f else 0.0
+
+
+FULL_S = 5.0  # a full pass at most this often (a batch submitted or closed: at once); light passes between
+STRAY_S = 120  # a run no item owns counts as stray (health) only past this: a kill retried once (60 s) and the ticks' lag; sooner it's a kill landing
+CLIENT = "scheduler"
+
+
+class OwnedAgentRefused(RuntimeError):
+    pass
+
+
+class OwnedAgentClient:
+    """Same authenticated transport; distinct command legacy daemons must refuse."""
+    def __init__(self, client, version):
+        self.client, self.version = client, version
+
+    def rpc(self, command, *args, **kwargs):
+        nonce = secrets.token_hex(16)
+        request = {"protocol": 1, "version": self.version, "nonce": nonce,
+                   "command": command, "args": list(args)}
+        reply = self.client.rpc("owned_rpc", request, **kwargs)
+        if (not isinstance(reply, dict) or reply.get("ok") is not True
+                or type(reply.get("protocol")) is not int or reply["protocol"] != 1
+                or reply.get("version") != self.version or reply.get("nonce") != nonce
+                or not isinstance(reply.get("features"), dict)
+                or reply["features"].get("pidfd") is not True
+                or reply["features"] != {"pidfd": True, "private_pid_namespace": "verified-before-payload"}
+                or not isinstance(reply.get("result"), dict)):
+            raise OwnedAgentRefused("owned RPC source/nonce/features refused")
+        result = reply["result"]
+        if command == "vtick" and (result.get("err") or not isinstance(result.get("done"), list)
+                                    or not isinstance(result.get("running"), list)):
+            raise OwnedAgentRefused("owned tick result missing or refused; no legacy fallback")
+        return result
+
+    def put(self, route, data):
+        encoded = base64.b64encode(data).decode()
+        if route == "/put":
+            return self.rpc("put", encoded)
+        if route.startswith("/cache?"):
+            from urllib.parse import parse_qs, urlparse
+            query = parse_qs(urlparse(route).query)
+            return self.rpc("cacheput", query["name"][0], query["key"][0], encoded)
+        raise OwnedAgentRefused("unsupported owned upload")
+
+def log(*a):
+    print(f"[scheduler {time.strftime('%H:%M:%S')}]", *a, file=sys.stderr, flush=True)
+
+
+def klass(name: str | int | None, default: str = "submission") -> int:
+    if isinstance(name, int):
+        return name
+    return CLASSES.get((name or os.environ.get("SUPERCOMPUTER_CLASS") or default).lower(), CLASSES[default])
+
+
+def _env(k: str, d):
+    return type(d)(os.environ.get(f"SUPERCOMPUTER_{k}") or d)
+
+
+# The policy's knobs (README, "Scheduling policy"); $SUPERCOMPUTER_<KNOB> overrides each.
+BRINGUP_MAX = _env("BRINGUP", 10)  # VMs being brought up at once (the scheduler's own load guard); the rest wait their turn
+HORIZON = _env("HORIZON", 3600.0)  # work the warm pool clears within this needs no start
+GATE_HORIZON = _env("GATE_HORIZON", 900.0)  # a gate gets the VMs that finish it within this (its items' last times)
+MAX_VMS = int(os.environ.get("SUPERCOMPUTER_MAX_VMS") or 0) or 10 ** 9  # none by default (the user: "no limit"); set, a technical ceiling
+HOLD = _env("HOLD", 2700.0)  # a VM above the floor runs filler this long after its last real work, then goes (45 min: a paid start's
+# break-even for a large VM is about 42-58 min, and a start is never free: the allowance is shared with other projects)
+SUB_VMS = _env("SUB_VMS", 8)  # a submission client's VMs' worth of slots at once
+BOAT_TRIES = _env("BOAT_TRIES", 3)  # boat failures (a VM lost, a row missing, no VM ready) before an item goes to Modal
+DRAIN_STEP = _env("DRAIN_STEP", 0.25)  # past their hold, the VMs above the floor shed by at most this share (rounded up) a window
+DRAIN_EVERY = _env("DRAIN_EVERY", 300.0)  # the staged drain's window: until this long after its last shed
+FLOOR_ALWAYS = _env("FLOOR_ALWAYS", 0) not in (0, "0", "")  # the floor held with no treadmill alive too
+FLOOR_DEFAULT = int(_env("FLOOR_DEFAULT", 1))  # an image without a treadmill keeps this many VMs between bursts (no churn)...
+FLOOR_IDLE = float(_env("FLOOR_IDLE", 2700.0))  # ...while it had real work within this; past it none (a project that stopped)
+FLOOR_BY_IMAGE: dict = {}  # an image's own floor, replacing either (the policy's floor_by_image)
+DISK_MIN_MB = int(_env("DISK_MIN_MB", 10240))  # a VM with less free disk (or a tenth of a smaller disk) takes nothing (rules.disk_ok)
+DISK_GRACE_S = 120  # its agent's cleaning's time to free it; past it, a VM still low is deleted once empty (rules.disk_replaced)
+SUB_PREEMPT = _env("SUB_PREEMPT", 90.0)  # a submission item waiting this long takes a filler's slot (else at item ends)
+PREP_MAX = _env("PREP_MAX", 2)  # trees and caches the controller itself sends at once (VMs pull from peers first)
+BREAK_READY = _env("BREAK_READY", 480.0)  # a start not ready within this counts as failed
+BREAK_WINDOW, BREAK_MIN, BREAK_RATIO = 1200.0, 4, 0.5  # over 50% of at least 4 recent starts failed: no starts
+BREAK_BACKOFF, BREAK_MAX = 300.0, 3600.0  # the first pause, doubled at each trip in a row
+SHED_LOAD = _env("SHED_LOAD", 1.5)  # load per CPU past which the controller sheds (no starts, one preparation at a time)
+WATCHDOG = os.environ.get("SUPERCOMPUTER_WATCHDOG", "1" if sys.platform.startswith("linux") else "0") not in ("0", "")
+
+# ---------------------------------------------------------------------------------------------------- the policy
+# One source of policy: LIVE/policy.json, with a generation. The scheduler reads it every tick (by its mtime), so a
+# change applies to VMs already up and items already running within one tick, with no restart; the knobs above are
+# only its defaults ($SUPERCOMPUTER_<KNOB> at the first run). `supercomputer policy [set k=v ...]`.
+POLICY = config.LIVE / "policy.json"
+
+
+def policy_defaults() -> dict:
+    return {"floor": _env("FLOOR", 8), "max_vms": 0 if MAX_VMS >= 10 ** 9 else MAX_VMS, "hold_s": HOLD, "gate_horizon_s": GATE_HORIZON, "horizon_s": HORIZON, "idle_s": boat.IDLE,
+            "ttl_s": boat.BACKSTOP, "bringup": BRINGUP_MAX, "sub_vms": SUB_VMS, "sub_preempt_s": SUB_PREEMPT, "boat_tries": BOAT_TRIES, "classes": list(CLASSES),
+            "drain_step": DRAIN_STEP, "drain_every_s": DRAIN_EVERY, "floor_always": bool(FLOOR_ALWAYS),
+            "floor_default": FLOOR_DEFAULT, "floor_idle_s": FLOOR_IDLE, "floor_by_image": dict(FLOOR_BY_IMAGE),
+            "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400}
+
+
+def read_policy() -> dict:
+    with contextlib.suppress(Exception):
+        p = json.loads(POLICY.read_text())
+        return {**policy_defaults(), **p}
+    return {**policy_defaults(), "generation": 0}
+
+
+def write_policy(changes: dict) -> dict:
+    """The policy with `changes`, its generation one more; written whole, then renamed in (never half a file)."""
+    p = read_policy()
+    pol = rules.Policy(max(0, int(p.get("generation", 0))))  # (rules.Policy.write: a knob it doesn't have refused)
+    unknown = [k for k in changes if k not in policy_defaults()]
+    if not pol.write(not unknown):
+        raise SystemExit(f"no policy knob {unknown[0]} (knobs: {', '.join(policy_defaults())})")
+    for k, v in changes.items():
+        d = policy_defaults()[k]
+        if isinstance(d, dict):  # (floor_by_image={"img": 0}, or img=n,img2=m)
+            v = v if isinstance(v, dict) else json.loads(v) if str(v).strip().startswith("{") else {a: int(b) for a, b in (x.split("=", 1) for x in str(v).split(",") if x)}
+            p[k] = {str(a): int(b) for a, b in v.items()}
+            continue
+        p[k] = (str(v).lower() in ("1", "true", "yes")) if isinstance(d, bool) else type(d)(v) if not isinstance(d, list) else v
+    if p["blob_cache_bytes"] < 0 or p["blob_cache_grace_s"] < 60 or p["blob_cache_max_age_s"] < p["blob_cache_grace_s"]:
+        raise SystemExit("blob cache requires bytes >= 0, grace >= 60s, and max age >= grace")
+    p["generation"] = pol.generation
+    p["t"] = round(time.time(), 1)
+    POLICY.parent.mkdir(parents=True, exist_ok=True)
+    tmp = POLICY.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(p, indent=1))
+    tmp.rename(POLICY)
+    return p
+
+
+def apply_policy(p: dict):
+    global MAX_VMS, HOLD, GATE_HORIZON, HORIZON, BRINGUP_MAX, SUB_VMS, SUB_PREEMPT, BOAT_TRIES, DRAIN_STEP, DRAIN_EVERY, FLOOR_ALWAYS, FLOOR_DEFAULT, FLOOR_IDLE, FLOOR_BY_IMAGE
+    MAX_VMS = rules.max_vms_of(int(p.get("max_vms") or 0))  # (0 or unset: no limit)
+    HOLD, GATE_HORIZON, HORIZON = float(p["hold_s"]), float(p["gate_horizon_s"]), float(p["horizon_s"])
+    BRINGUP_MAX, SUB_VMS, SUB_PREEMPT, BOAT_TRIES = int(p["bringup"]), int(p["sub_vms"]), float(p["sub_preempt_s"]), int(p["boat_tries"])
+    boat.IDLE, boat.LONG, boat.BACKSTOP = int(p["idle_s"]), int(p["idle_s"]), int(p["ttl_s"])
+    DRAIN_STEP, DRAIN_EVERY = min(1.0, max(0.01, float(p.get("drain_step", 0.25)))), max(1.0, float(p.get("drain_every_s", 300.0)))
+    FLOOR_ALWAYS = p.get("floor_always") in (True, 1, "1", "true", "True")
+    FLOOR_DEFAULT, FLOOR_IDLE = max(0, int(p.get("floor_default", 1))), max(0.0, float(p.get("floor_idle_s", 2700.0)))
+    FLOOR_BY_IMAGE = {str(a): int(b) for a, b in (p.get("floor_by_image") or {}).items()}
+
+
+_code_cache: dict = {}
+
+
+def code_hash(pkg: pathlib.Path | None = None) -> str:
+    """The installed tool's code (config.SRC's, whatever this process runs: a hand-back runs a kept copy): a hash of
+    its modules (by their mtimes, rehashed only when one changed)."""
+    files = sorted((pkg or config.SRC / "supercomputer").glob("*.py"))
+    key = tuple((f.name, f.stat().st_mtime_ns) for f in files)
+    if _code_cache.get(str(pkg)) != key:
+        h = hashlib.sha256()
+        for f in files:
+            h.update(f.name.encode() + b"\0" + f.read_bytes() + b"\0")
+        _code_cache[str(pkg)], _code_cache[f"{pkg}#"] = key, h.hexdigest()[:12]
+    return _code_cache[f"{pkg}#"]
+
+
+def own_code() -> str:
+    """The code this process runs (its own package's files, read once: they may be replaced under it)."""
+    if "own" not in _code_cache:
+        _code_cache["own"] = code_hash(pathlib.Path(__file__).parent)
+    return _code_cache["own"]
+
+
+def jlines(p: pathlib.Path) -> list[dict]:
+    """A JSON-lines file, its lines that parse (a crash mid-append leaves at most a torn last line, skipped)."""
+    out = []
+    for l in (p.read_text().splitlines() if p.exists() else []):
+        with contextlib.suppress(Exception):
+            out.append(json.loads(l))
+    return out
+
+
+def vm_slots(vm_type: str) -> int:
+    return max(1, boat.TYPES[vm_type][0] // boat.SLOT_CPU)
+
+
+def vm_mult(vm_type: str) -> float:
+    return boat.TYPES[vm_type][0] / boat.TYPES["default"][0]
+
+
+def pct(xs: list, q: float):
+    if not xs:
+        return None
+    s = sorted(xs)
+    return round(s[min(len(s) - 1, int(q * len(s)))], 1)
+
+
+# ------------------------------------------------------------------------------------------------------ the state
+class Item:
+    def __init__(self, batch, spec: dict):
+        self.batch, self.spec = batch, spec
+        self.name = spec["name"]
+        named = rules.placement_type(getattr(batch, "vm_named", False), batch.vm_type, spec.get("vm_type") or "")
+        if named and not spec.get("vm_type"):  # (a type its batch named: its placement constraint, starts and reuse within it)
+            spec = self.spec = {**spec, "vm_type": named}
+        self.weight = int(spec.get("weight", 1))
+        self.memory = int(spec.get("memory") or 0)  # (MB it asks, as its job said (job_items: 4096 by default); none said: its slots, no more)
+        self.est = float(spec.get("est", 60))
+        self.owned = OwnedLifecycle(batch.strict_once)
+        self.start_done = threading.Event()
+        self.start_done.set()
+        self.launch_identity = None
+        self.last_placement = None
+        self.state = "queued"  # queued | starting | running | preempting | done | cancel_pending
+        self.vm = None
+        self.tries = 0
+        self.t_created = time.time()
+        self.t_queued = time.time()
+        self.head = False  # (preempted: back at the head of its class)
+        self.t_start = None
+        self.run_name = self.name  # (the name on the VM: a retry has a name of its own there)
+        # a timing item: nothing else on its VM while it runs (its own CPUs pinned as asked, the rest of the VM idle)
+        self.timing = bool(spec.get("timing")) or batch.timing
+        # (a timing item takes the smallest free VM that fits it, any type, warm first; only when none is free is one
+        # made, of the smallest type that fits it: rules.timing_vcpus. 06:50-07:02: 43 small VMs created for timing
+        # items while large ones of the image were free, churn 40)
+        self.need_type = None
+        if not self.timing and not spec.get("vm_type") and not boat.R.fits_memory(self.memory, boat.TYPES.get(batch.vm_type, (0, 1 << 30))[1], boat.MEM_OVERHEAD):
+            # (its batch's type can't hold its memory: the smallest that can, with its slots; the plan starts those)
+            self.need_type = next((t for t, (c, m) in sorted(boat.TYPES.items(), key=lambda x: x[1]) if c // boat.SLOT_CPU >= self.weight and boat.R.fits_memory(self.memory, m, boat.MEM_OVERHEAD)), batch.vm_type)
+        if self.timing and not spec.get("vm_type"):
+            v = rules.timing_vcpus(self.weight * boat.SLOT_CPU)
+            # (the smallest type with its vCPUs whose usable memory holds it: rules.boat.fits_memory; a 4 GB VM's 2 GB
+            # usable doesn't hold a slot's 4 GB, lane Y's OOM kills)
+            self.need_type = next((t for t, (c, m) in sorted(boat.TYPES.items(), key=lambda x: x[1]) if c >= v and boat.R.fits_memory(self.memory, m, boat.MEM_OVERHEAD)), batch.vm_type)
+        self.peers = 0  # the most other items that ran on its VM beside it
+        # its fate (rules.ItemFate): placed, done, boat's failures of it (infrastructure, not its own exit code, one per
+        # VM, the VMs in its avoid set), BOAT_TRIES of them, then Modal; the policy generation it follows
+        self.fate = rules.ItemFate(BOAT_TRIES)
+        self.not_before = 0.0  # (queued again in an outage: not before this)
+
+    fails = property(lambda self: self.fate.fails)
+    avoid = property(lambda self: self.fate.avoid)
+    gen = property(lambda self: self.fate.gen)
+
+
+class Batch:
+    def __init__(self, msg: dict):
+        self.id = msg["batch"]
+        self.strict_once = bool(msg.get("strict_once", False))
+        self.retain_journals = bool(msg.get("retain_journals", False))
+        if not retention_supported(self.strict_once, self.retain_journals):
+            raise ValueError("retain_journals requires strict_once ownership")
+        self.admission_closed = bool(msg.get("admission_closed", False))
+        self.cache_generation = msg.get("cache_generation")
+        self.klass = int(msg["klass"])
+        self.client, self.label = msg.get("client", "?"), msg.get("label", "")
+        self.image, self.vm_type = msg["image"], msg.get("vm_type", boat.VM_TYPE)
+        self.tree = msg["tree"]  # {id, files, links}; a tree the controller keeps: its id alone
+        if "files" not in self.tree:
+            self.tree = json.loads((DIR / "trees" / f"{self.tree['id']}.json").read_text())
+        self.ctx_b64 = msg["ctx_b64"]
+        self.caches = [{**c, "local": str(config.LIVE / c["name"] / c["key"])} for c in msg.get("caches", [])]  # (this host's copies)
+        self.on_lost = bool(msg.get("on_lost")) and not self.strict_once
+        self.max_wait = float(msg.get("max_wait", 0) or 0)
+        self.warm_only = bool(msg.get("warm_only"))
+        self.timing = bool(msg.get("timing"))
+        self.vm_named = bool(msg.get("vm_type_named"))  # (its type named by its client: each item's placement constraint)
+        self.items = {s["name"]: Item(self, s) for s in msg["items"]}
+        self.rows: list[dict] = []
+        self.t0 = float(msg.get("t0") or time.time())
+        self.t_first = None  # its first item placed
+        self.t_placed = None  # its last item placed (nothing of it queued any more)
+        self.vms_used: set[str] = set()
+        self.starts = 0
+        self.preempted = 0
+        self.slot_s = 0.0
+        self.closed = bool(msg.get("cancellation_complete", False))
+        self.cv = threading.Condition()
+
+    def deliver(self, row: dict):
+        with self.cv:
+            self.rows.append(row)
+            with contextlib.suppress(Exception):
+                with open(DIR / "queue" / f"{self.id}.rows", "a") as f:
+                    f.write(json.dumps(row) + "\n")
+            self.cv.notify_all()
+
+    def left(self) -> int:
+        return sum(1 for it in self.items.values() if it.state != "done")
+
+    def scale(self) -> float:
+        """What its items took against their estimates, once 3 finished (never below 1: estimates aren't trusted
+        to be generous, a slow batch grows the pool)."""
+        return max(1.0, self.obs_s / self.obs_est) if getattr(self, "obs_n", 0) >= 3 and self.obs_est > 0 else 1.0
+
+
+def mem_fits(it, vm_type: str) -> bool:
+    """The item's memory within the VM type's usable memory (rules.boat.fits_memory: nominal less MEM_OVERHEAD)."""
+    return boat.R.fits_memory(getattr(it, "memory", 0), boat.TYPES.get(vm_type, (0, 1 << 30))[1], boat.MEM_OVERHEAD)
+
+
+def fit_shape(it) -> tuple:
+    """All a VM's fit for the item reads (rules.vm_fits): its image, class, timing, weight, VM type, avoid set, memory.
+    Items of one shape fit the same VMs: a pass's memo, preemption's and health's waste group by it."""
+    return (it.batch.image, it.batch.klass, it.timing, it.weight, it.spec.get("vm_type") or "", frozenset(it.avoid) if it.avoid else None, getattr(it, "memory", 0))
+
+
+def vm_fits(shape: tuple, vm, retired: set) -> bool:
+    """rules.vm_fits for an item of `shape` on the VM: the one test of placement, preemption and waste."""
+    image, _k, _t, _w, vtype, avoid, mem = shape
+    return rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
+                         bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
+
+
+class VMState:
+    def __init__(self, id: str, image: str, vm_type: str, how: str):
+        self.id, self.image, self.type, self.how = id, image, vm_type, how
+        self.slots = vm_slots(vm_type)
+        self.client: AgentClient | None = None
+        self.ready = False
+        self.dead = False
+        self.prepared: set[str] = set()
+        self.preparing: dict[str, threading.Event] = {}
+        self.trees: set[str] = set()  # tree ids on it (a peer for other VMs' pulls)
+        self.caches: set[tuple] = set()  # (name, key) of build caches it has whole
+        self.running: dict[tuple, Item] = {}
+        self.model = ""
+        self.starts: list[dict] = []
+        self.acks: list[dict] = []
+        self.idle_since = time.time()
+        self.t_lease = time.time()
+        self.t_ready = None
+        self.t_real = time.time()  # its last real (non-filler) work: a VM above the floor goes HOLD s after it
+        self.draining = False  # (past its hold: no new filler; released once empty)
+        self.failing = 0  # ticks failed in a row
+        self.disk: dict = {}  # its agent's last word on its disk ({free_mb, total_mb}), with each tick
+        self.disk_low = False  # (below rules.disk_ok's threshold: nothing placed there)
+        self.t_disk = time.time()  # (that word's time; an empty VM first asked 5 min after it came, its ticks telling before)
+        self.t_low = 0.0  # (low since)
+        self.gen = 0  # (the policy generation it last followed)
+        self.agent = ""  # its agent's code hash
+        self.t_agent = 0.0
+        self.busy_s = 0.0
+        self.lock = threading.Lock()
+
+    def used(self) -> int:
+        """Slots taken: a timing item takes them all; runs the agent reports that this scheduler doesn't hold (an older
+        run of a re-placed item, a run a handoff didn't take back) take theirs too, until they end (B11)."""
+        return min(self.slots, (self.slots if any(it.timing for it in self.running.values()) else sum(it.weight for it in self.running.values())) + getattr(self, "foreign", 0))
+
+
+class Scheduler:
+    def __init__(self, idle_exit: float = 120):
+        DIR.mkdir(parents=True, exist_ok=True)
+        BLOBS.mkdir(parents=True, exist_ok=True)
+        (DIR / "metrics").mkdir(parents=True, exist_ok=True)
+        self.batches: dict[str, Batch] = {}
+        self.vms: dict[str, VMState] = {}
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.stop = threading.Event()
+        self.idle_exit = idle_exit
+        self.t_idle = self.t_up = time.time()
+        self.hints: dict[str, dict] = {}  # client -> {image, base_vms, until, pid}
+        self._hints_saved: dict = {}
+        self.gate = boat.StartGate()
+        self.creating: dict[tuple[str, str], int] = {}  # (image, type) -> VMs asked of boat, not yet in self.vms
+        self.backoff: dict[str, float] = {}
+        self.asking: set[str] = set()
+        self.prep_sem = threading.BoundedSemaphore(PREP_MAX)
+        self.token = secrets.token_urlsafe(24)
+        self.agent_b64 = base64.b64encode((pathlib.Path(boat.__file__).parent / "agent.py").read_bytes()).decode()
+        from . import agent as agent_mod
+        self.agent_version = agent_mod.VERSION
+        # the circuit breaker, the watchdog, the plan, the day's metrics (all kept across restarts)
+        self.starts_log: list[dict] = []  # {t, vm, ok (None while coming up)}
+        self.br = {"open_until": 0.0, "backoff": BREAK_BACKOFF, "half": False, "t_trip": 0.0, "reason": "", "trips": 0}
+        self.shed = False
+        self.load = {}
+        self.alerts: list[dict] = []
+        self.target: dict[str, dict] = {}  # image -> the plan's last numbers
+        self.bring_up = float(boat.BRING_UP)  # measured, an average
+        self.wave = {"on": False, "t": 0.0, "t_end": 0.0}
+        self.held_before: dict = {}  # (the VMs the previous scheduler held, their hold clocks: all taken back)
+        self.est_hist: dict = {}  # (seconds an item of a (label, function) took, an average kept across batches)
+        self.class_obs: dict = {}  # (the last seconds items of each class took)
+        self.m = self._metrics_load()
+        self.hints.update(self._hints_saved)
+        self.health = health.Health(DIR / "metrics" / "health.json")  # (the targets' records: health.py; they outlive a handoff)
+        self.code = own_code()
+        self.canary = canary.Canary(DIR)  # (canary.py: this code kept for a hand-back; a handoff to it watched 10 min)
+        self.canary.snapshot(self.code, pathlib.Path(__file__).parent)
+        self.pol = read_policy()
+        if not POLICY.exists():
+            self.pol = write_policy({})
+        apply_policy(self.pol)
+        self.pol_mtime = POLICY.stat().st_mtime_ns if POLICY.exists() else 0
+        log(f"code {self.code}, policy generation {self.pol['generation']}")
+        self.reload()
+        if not self.batches and not self.recovery_blocked:  # no adoption while ownership is uncertain
+            self.adopting = True
+            threading.Thread(target=lambda: (time.sleep(5), self._adopt()), daemon=True).start()
+
+    # -- the day's metrics
+    def _metrics_new(self, day: str) -> dict:
+        return {"day": day, "vmh": 0.0, "vmh_filler_hold": 0.0, "vmh_by_class": {}, "starts": {n: {"free": 0, "paid": 0} for n in CLASSES}, "preempted": {n: 0 for n in CLASSES},
+                "placed": {n: 0 for n in CLASSES}, "placed_warm": 0, "waits": {n: [] for n in CLASSES}, "hold_ends": 0, "max_binds": 0, "breaker_trips": 0,
+                "gaps": [], "waves": 0, "peak_vms": 0, "not_ready": 0, "batches": [], "boat_fails": {n: 0 for n in CLASSES}, "to_modal": {n: 0 for n in CLASSES}}
+
+    def _metrics_load(self) -> dict:
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        with contextlib.suppress(Exception):
+            st = json.loads((DIR / "metrics" / "state.json").read_text())
+            self.br.update(st.get("breaker", {}))
+            self.bring_up = float(st.get("bring_up", self.bring_up))
+            self.wave.update(st.get("wave", {}))
+            self.starts_log = [s for s in st.get("starts_log", []) if time.time() - s["t"] < BREAK_WINDOW]
+            self.held_before = st.get("held", {})
+            self.est_hist = st.get("est", {})
+            self.class_obs = {int(k): v for k, v in st.get("class_obs", {}).items()}
+            self._drains_saved = st.get("drains", {})  # (the staged drain's window outlives a handoff: B4)
+            self._hints_saved = {k: h for k, h in st.get("hints", {}).items() if h.get("until", 0) > time.time()}  # (the treadmill's hint too: a new scheduler's floor at once, not at its next hint)
+        with contextlib.suppress(Exception):
+            m = json.loads((DIR / "metrics" / f"{day}.json").read_text())
+            base = self._metrics_new(day)
+            for k, v in base.items():
+                m.setdefault(k, v)
+            return m
+        return self._metrics_new(day)
+
+    def _h(self):
+        return getattr(self, "health", None) or health.Null()
+
+    def health_check(self, minutes: float = 30) -> dict:
+        """The targets over the last `minutes` (health.py), from this scheduler's records."""
+        return self._h().check(time.time(), minutes) or {}
+
+    def _metrics_save(self):
+        self._h().save()
+        with contextlib.suppress(Exception):
+            p = DIR / "metrics" / f"{self.m['day']}.json"
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.m))
+            tmp.rename(p)
+            st = {"breaker": self.br, "bring_up": self.bring_up, "wave": self.wave, "starts_log": self.starts_log[-200:],
+                  "held": {v.id: {"t_real": v.t_real, "draining": v.draining} for v in list(self.vms.values()) if not v.dead},
+                  "est": self.est_hist, "class_obs": {str(k): v[-200:] for k, v in self.class_obs.items()},
+                  "hints": {k: h for k, h in self.hints.items() if h.get("until", 0) > time.time()},
+                  "drains": {img: {"open": d.open, "t_last": d.t_last, "share": d.share, "quota": d.quota, "released": d.released}
+                             for img, d in self.__dict__.get("_drains", {}).items()}}
+            tmp = DIR / "metrics" / "state.tmp"
+            tmp.write_text(json.dumps(st))
+            tmp.rename(DIR / "metrics" / "state.json")
+
+    def alert(self, msg: str):
+        a = {"t": round(time.time(), 1), "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "msg": msg}
+        self.alerts = (self.alerts + [a])[-20:]
+        log(f"ALERT: {msg}")
+        with contextlib.suppress(Exception):
+            with open(DIR / "alerts.jsonl", "a") as f:
+                f.write(json.dumps(a) + "\n")
+
+    @staticmethod
+    def _read_client_closes() -> set[str]:
+        """Only scheduler close receipts, not completion guesses or canary state."""
+        closed = set()
+        if boat.LEDGER.exists():
+            with boat.LEDGER.open() as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                        if isinstance(r, dict) and r.get("scheduled") is True and "wall_s" in r and "slot_s" in r and isinstance(r.get("batch"), str):
+                            # close removes the admission before writing this receipt.
+                            # An existing file wins over an older close of a reused ID.
+                            bid = Scheduler._valid_batch(r["batch"])
+                            if not (DIR / "queue" / f"{bid}.json").exists():
+                                closed.add(bid)
+                    except (ValueError, TypeError):
+                        continue  # another process may still be appending the tail
+        return closed
+
+    def _unclassified(self, bid: str) -> bool:
+        if bid in getattr(self, "recovery_errors", {}):
+            return True
+        if bid in self.batches or bid in getattr(self, "_client_closed", set()):
+            return False
+        try:
+            self._valid_batch(bid)
+        except ValueError:
+            return True
+        return (DIR / "queue" / f"{bid}.json").exists()
+
+    # -- tenants
+    def reload(self):
+        """The queue as it was before a restart (the controller's service restarted, its VM recovered): every batch
+        still open, its delivered rows kept, the rest queued again (what ran on VMs this process no longer holds runs
+        again)."""
+        qd = DIR / "queue"
+        self.recovery_errors = {}
+        self.recovery_blocked = True
+        self._client_closed = self._read_client_closes()
+        for f in sorted(qd.glob("*.json")) if qd.exists() else []:
+            if f.stem in self._client_closed:
+                continue
+            b = None
+            try:
+                b = Batch(json.loads(f.read_text()))
+                if self._valid_batch(b.id) != f.stem:
+                    raise ValueError("admission id does not match its file")
+                enhanced = b.strict_once or b.retain_journals or b.admission_closed
+                rows = self._read_journal(qd / f"{b.id}.rows", enhanced)
+                for r in rows:
+                    if r.get("name") in b.items:
+                        b.items[r["name"]].state = "done"
+                        b.items[r["name"]].fate.delivered()
+                b.rows = rows
+                placed = self._read_journal(qd / f"{b.id}.placed", enhanced)
+                if enhanced:
+                    for pl in placed:
+                        if not all(k in pl for k in ("name", "run_name", "vm", "image")) or pl["name"] not in b.items:
+                            raise ValueError("invalid owned placement journal")
+                for pl in placed:  # cumulative admission survives even a crash before prepare
+                    prior = b.items.get(pl.get("name"))
+                    if prior:
+                        prior.owned.placements += 1
+                        prior.launch_identity = pl.get("identity")
+                        prior.last_placement = pl
+                        b.vms_used.add(pl["vm"])
+                for it in b.items.values():
+                    if b.strict_once and it.owned.placements > 1:
+                        raise ValueError("strict admission has multiple placements; quarantined")
+                    it.owned.closed = b.admission_closed
+                for receipt in self._read_journal(qd / f"{b.id}.cancel", enhanced):
+                    it = b.items.get(receipt.get("name"))
+                    if it and receipt.get("admission_closed") is True and receipt.get("identity") == it.launch_identity:
+                        it.owned.cancel()
+                        it.state = "cancel_pending"
+                    if (it and it.owned.closed and
+                            ((receipt.get("matched") is True and self._matching_receipt(
+                                receipt.get("receipt"), b.id, receipt.get("run_name"), it.launch_identity))
+                             or (it.owned.placements == 0 and receipt.get("unplaced") is True))):
+                        it.owned.confirm(True)
+                        it.state = "done"
+                        it.fate.delivered()
+                for pl in placed:  # (the last placement of each item not done: taken back below)
+                    it = b.items.get(pl["name"])
+                    if it and it.state != "done":
+                        it.reattach = pl
+                        it.fate.reloaded(pl["vm"])
+                        it.placed = int(pl["run_name"].rsplit("~s", 1)[1]) if "~s" in pl["run_name"] else 1
+                self.batches[b.id] = b  # Publish only a completely decoded admission.
+            except Exception as e:
+                # Keep the ID reservation, not partially decoded items. Never let a parser
+                # exception turn a durable admission into an unowned worker run.
+                self.recovery_errors[f.stem] = repr(e)
+                log(f"{f.stem}: recovery quarantined, ownership retained: {e!r}")
+        self.recovery_blocked = bool(self.recovery_errors)
+        if self.batches:
+            log(f"{len(self.batches)} batches back from before the restart")
+        # (every VM the previous scheduler held, taken in one write of the registry before this one serves: a handoff's
+        # (its snapshot, the old one waiting for this one's word) or a restart's (its leases, their holder gone);
+        # rules.take_over. Before, VM by VM: 14:33:45-14:36:54, 43 of 225 held at 14:33, 176 with no live owner)
+        self._take_pool()
+        if self.batches and not self.recovery_blocked:
+            self.reattaching, self.t_reattach = True, time.time()  # (no VM leased or started until the first pass took back what runs where: rules.plan_waits, one tick after a handoff, 60 s at most)
+            threading.Thread(target=self._reattach, daemon=True).start()
+
+    def _take_pool(self):
+        """At the start, before serving: every VM the previous scheduler held, in one write of the registry
+        (rules.take_over), each held here at once, ready, as the handoff's snapshot (or the registry and the hold
+        clocks) says; its items joined to it by re-attach's first pass at once (it holds the VM), then checked against
+        its agent's word (_reconcile_taken). A handoff's old scheduler is told what was taken (handoff.ack): it exits
+        only when this one holds every VM it held (rules.handoff_done)."""
+        now, me, host = time.time(), os.getpid(), socket.gethostname()
+        snap = {}
+        with contextlib.suppress(Exception):  # (a handoff's snapshot only while its writer lives, waiting for this one's word: an
+            sn = json.loads((DIR / "handoff.json").read_text())  # older one (15:16: a hand-back's, 9 min old) is not what runs now
+            fp = int(sn.get("from_pid", 0))
+            if now - float(sn.get("t", 0)) < 600 and fp and fp != me and boat.pid_alive(fp, socket.gethostname()):
+                snap = sn
+        with contextlib.suppress(Exception):
+            (DIR / "handoff.json").rename(DIR / "handoff.used.json")  # (read once: never taken for a later start's)
+        old = int(snap.get("from_pid") or 0)
+        info = {v["id"]: v for v in snap.get("vms", [])}
+        # Refresh closes at the handoff, not at an observer's earlier baseline.
+        closed = self._read_client_closes()
+        for bid in closed:
+            self.batches.pop(bid, None)
+            self.recovery_errors.pop(bid, None)
+        self._client_closed = closed
+        loaded = set(self.batches)
+        # Old snapshots have no batch manifest. Preserve compatibility while
+        # guarding at least all disk admissions and every batch with held runs.
+        expected = set(snap["batches"]) if "batches" in snap else {
+            f.stem for f in (DIR / "queue").glob("*.json")} | {
+            x["batch"] for v in info.values() for x in v.get("items", [])}
+        self.recovery, what, why = self.canary.admissions(self.code, expected, loaded, closed, self.recovery_errors)
+        self.recovery["manifest_complete"] = "batches" in snap
+        self.recovery_blocked = not self.recovery["ready"]
+        # A guard-aware parent owns the failed-ACK rollback. Starting a second
+        # hand-back here would race its recovery and spawn two replacements.
+        self._recovery_decision = ("alert", why) if what and snap.get("admission_guard") else (what, why)
+
+        taken, missing, reg, starting = [], [], {}, []
+        retired = self.retired()
+        with Registry().locked() as d:
+            for vid, v in d["vms"].items():
+                l = v.get("lease") or {}
+                if vid in self.vms or vid in retired:
+                    continue
+                pid = int(l.get("pid") or 0)
+                if not rules.take_over(l.get("batch") == "scheduler", l.get("host") == host, pid == me, boat.pid_alive(pid, l.get("host", "")) if pid else False, bool(old) and pid == old):
+                    continue
+                if vid not in info and v.get("state") not in boat.RUNNING:
+                    continue  # (a lease left on a VM boat had stopped: nothing to hold)
+                v["lease"] = {"pid": me, "host": host, "batch": "scheduler", "since": now, "label": "scheduler (taken over)"}
+                taken.append(vid)
+                reg[vid] = dict(v)
+            missing = [vid for vid in info if vid not in taken]
+        for vid in list(taken):
+            i, r = info.get(vid, {}), reg[vid]
+            cl = boat.agent_client(vid)
+            vm = VMState(vid, i.get("image") or r.get("snapshot"), i.get("type") or r.get("type") or boat.VM_TYPE, "warm")
+            if cl is None and not self.recovery_blocked:  # uncertain ownership keeps the lease even without an agent
+                taken.remove(vid)
+                missing.append(vid)
+                with Registry().locked() as d:
+                    if vid in d["vms"] and (d["vms"][vid].get("lease") or {}).get("pid") == me:
+                        d["vms"][vid]["lease"] = None
+                continue
+            hb = self.held_before.get(vid, {})
+            vm.client, vm.slots = cl, int(i.get("slots") or vm.slots)
+            vm.prepared, vm.trees = set(i.get("prepared", [])), set(i.get("trees", []))
+            vm.caches = {tuple(c) for c in i.get("caches", [])}
+            vm.t_real = float(i.get("t_real") or hb.get("t_real") or now)
+            vm.draining = bool(i.get("draining", hb.get("draining", False)))
+            vm.gen, vm.agent, vm.t_agent = int(i.get("gen", 0)), i.get("agent", ""), 0.0
+            vm.ready, vm.t_ready, vm.idle_since = True, now, now
+            if snap:  # (a handoff: its items exactly as the old one held them there, no record older than that)
+                for x in i.get("items", []):
+                    b = self.batches.get(x["batch"])
+                    it = b.items.get(x["name"]) if b else None
+                    if it is None or it.state == "done" or b.closed:
+                        continue
+                    it.state = rules.taken_item_state(x.get("state", "running"))
+                    it.vm, it.run_name, it.t_start, it.taken_over, it.reattach = vm, x["run_name"], now, True, None
+                    it.last_placement = x.get("placement") or it.last_placement
+                    it.launch_identity = x.get("launch_identity") or it.launch_identity
+                    suffix = it.run_name.rpartition("~s")[2]
+                    it.placed = max(it.placed, int(x.get("placed", 0)), int(suffix) if suffix.isdigit() else 1)
+                    it.fate.reloaded(vid)
+                    it.fate.reattached(vid)
+                    vm.running[(b.id, x["run_name"])] = it
+                    if it.state == "starting":
+                        if b.strict_once:
+                            it.state = "running"  # Observe only: never resend a strict start after restart.
+                        else:
+                            starting.append((it, vm))  # Legacy agents deduplicate the same run name.
+            self.vms[vid] = vm
+        if not self.recovery_blocked:
+            for vid in taken:
+                self._worker(self.vms[vid])
+        if snap:  # (what the records place on the VMs handed over but the old one no longer held there: queued, as it was)
+            for b in self.batches.values():
+                for it in b.items.values():
+                    if getattr(it, "reattach", None) and it.reattach.get("vm") in self.vms and it.state == "queued":
+                        it.reattach = None
+        if not self.recovery_blocked:
+            for it, vm in starting:
+                threading.Thread(target=self._start_on, args=(it, vm), daemon=True).start()
+        if taken:  # (their TTLs renewed now, as re-attach did each: the heartbeat's next is 5 min away, and a few handoffs
+            def extend(ids=list(taken)):  # in a row would let a TTL run out under running items)
+                with concurrent.futures.ThreadPoolExecutor(16) as ex:
+                    list(ex.map(lambda vid: boat.boat("extend", vid, "--ttl", str(boat.BACKSTOP), "--json", check=False), ids))
+            threading.Thread(target=extend, daemon=True).start()
+        self._handoff = {"t": now, "from_pid": old, "held": sorted(info), "taken": taken, "missing": missing, "snapshot": bool(snap), "checks": 0}
+        if snap:
+            with contextlib.suppress(Exception):
+                tmp = DIR / "handoff.ack.tmp"
+                tmp.write_text(json.dumps({"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing, "admissions": self.recovery}))
+                tmp.rename(DIR / "handoff.ack")
+        if taken or missing:
+            log(f"took over {len(taken)} VMs in one write of the registry ({'the handoff of pid ' + str(old) if snap else 'the previous scheduler gone'}); "
+                f"{len(missing)} not taken{': ' + str(missing[:6]) if missing else ''}")
+        self._h().record_handoff(now, len(info) if snap else len(taken), len(taken), len(missing) if snap else 0, 0, 0)
+
+    def _reconcile_taken(self, vms: list):
+        """The VMs taken over, each asked once what runs there: an item held as running there that its agent neither
+        runs nor has finished is queued again (no strike: it never ran, or its row is gone with the old scheduler)."""
+        def one(vm):
+            try:
+                r = vm.client.rpc("vtick", {"wait": 0}, timeout=30)
+            except Exception:
+                return 0  # (its ticks decide: failing, repaired, or lost by boat's word)
+            seen = {(x["batch"], x["name"]) for x in r.get("running", [])} | {(x["batch"], x["name"]) for x in r.get("done", [])}
+            if r.get("cpus"):
+                vm.slots = max(1, int(r["cpus"]) // boat.SLOT_CPU)
+            n = 0
+            with self.lock:
+                for key, it in list(vm.running.items()):
+                    if (not it.batch.admission_closed and not it.owned.closed and key not in seen
+                            and it.state in ("running", "preempting") and getattr(it, "taken_over", False)):
+                        vm.running.pop(key, None)
+                        it.fate.requeued()
+                        it.state, it.vm, it.t_queued, it.head = "queued", None, time.time(), True
+                        n += 1
+            return n
+        with concurrent.futures.ThreadPoolExecutor(32) as ex:
+            n = sum(ex.map(one, vms))
+        if n:
+            log(f"take-over: {n} items held as running on the VMs taken over that their agents don't know: queued again")
+        self.wake.set()
+
+    def _handoff_check(self, now: float):
+        """A tick and two after a take-over: the VMs of the handoff not held here, VMs of this machine's scheduler
+        leases with no live holder (orphans), and slots idle beside real work waiting past a tick; health's handoff
+        target, judged by the canary at once (any of them: handed back, before another tick)."""
+        decision = getattr(self, "_recovery_decision", None)
+        if decision and decision[0]:
+            self._recovery_decision = None
+            what, why = decision
+            self.alert(why)
+            if what == "handback":
+                self.handoff(back_to=self.canary.read().get("from"))
+            return
+        if getattr(self, "recovery_blocked", False):
+            return  # keep every lease and result until classification is safe
+        h = getattr(self, "_handoff", None)
+        if not h or h["checks"] >= 2 or now - h["t"] < 15 * (h["checks"] + 1):
+            return
+        h["checks"] += 1
+        held = {vid for vid, v in self.vms.items() if not v.dead}
+        missing = [vid for vid in h["held"] if vid not in held and self._boat_up(vid)]
+        me, host, orphans = os.getpid(), socket.gethostname(), 0
+        with contextlib.suppress(Exception):
+            for vid, v in Registry().read().get("vms", {}).items():
+                l = v.get("lease") or {}
+                pid = int(l.get("pid") or 0)
+                if l.get("batch") == "scheduler" and l.get("host") == host and pid and pid != me and not boat.pid_alive(pid, host) \
+                        and v.get("state") in boat.RUNNING:
+                    orphans += 1
+        with self.lock:
+            live = [v for v in self.vms.values() if not v.dead]
+            idle = sum(self._waste_held("handoff", now, live, grace=15.0, idle_only=True).values()) if h["checks"] >= 2 else 0  # (held a tick: the second check)
+            if h["checks"] < 2:
+                self._waste_held("handoff", now, live, grace=15.0, idle_only=True)
+        self._h().record_handoff(now, len(h["held"]) or len(h["taken"]), len(held), len(missing), orphans, idle)
+        log(f"handoff check {h['checks']}: {len(held)} VMs held, {len(missing)} of the handoff's not held, {orphans} orphans, {idle} slots idle beside real work waiting past a tick")
+        what, why = self.canary.handoff_verdict(self.code, len(missing) + orphans, idle, f"{len(missing)} VMs not taken, {orphans} orphans, {idle} slots idle beside waiting real work")
+        if what == "alert":
+            self.alert(why)
+        if what == "handback":
+            d = self.canary.read()
+            self.alert(why)
+            self.handoff(back_to=d.get("from"))
+
+    def _handoff_snapshot(self) -> dict:
+        """What the next scheduler takes at once: every VM held here and ready, with what it knows of it."""
+        vms = []
+        for v in list(self.vms.values()):
+            if v.dead or not v.ready:
+                continue
+            vms.append({"id": v.id, "image": v.image, "type": v.type, "slots": v.slots, "prepared": sorted(v.prepared), "trees": sorted(v.trees),
+                        "caches": sorted([list(c) for c in v.caches]), "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
+                        "items": [{"batch": it.batch.id, "name": it.name, "run_name": it.run_name, "state": it.state,
+                                   "placement": it.last_placement, "launch_identity": it.launch_identity, "placed": it.placed}
+                                  for it in list(v.running.values())]})
+        return {"from_pid": os.getpid(), "t": time.time(), "from": self.code, "vms": vms,
+                "batches": sorted(set(self.batches) | set(getattr(self, "recovery_errors", {}))),
+                "admission_guard": True}
+
+    def _reattach(self):
+        """Items placed before a restart and not done: their VMs leased again (their leases were this host's dead
+        process's) and their items taken back where they run, so each result comes back; an item whose VM can't be
+        had, or that no longer runs there, is queued again (under a name of its own, so a late finish of the old run
+        is never taken for it)."""
+        by_vm: dict[str, list] = {}
+        for b in list(self.batches.values()):
+            for it in b.items.values():
+                pl = getattr(it, "reattach", None)
+                if pl and it.state != "done":
+                    by_vm.setdefault(pl["vm"], []).append((it, pl))
+        n = 0
+        # (each VM's tries by rules.VMLife.reattach: a pass, and one more 30 s later; a VM boat reports stopped none
+        # more; then adoption decides)
+        pending = dict(by_vm)
+        lives = {vid: self._life(None, time.time(), lease="dead", items=len(its)) for vid, its in by_vm.items()}
+        self.reattach_pending = set(pending)
+        self.reattach_why, self.reattach_dead = {}, set()
+        while pending and not self.stop.is_set():
+            # (each VM's try at once, 16 at a time: 121 VMs one by one took 6.5 minutes at the 23:40 handoff, their
+            # VMs waiting unowned by adoption's count the while)
+            tries = [vid for vid in pending if lives[vid].pending]
+            with concurrent.futures.ThreadPoolExecutor(16) as ex:
+                n += sum(ex.map(lambda vid: self._reattach_vm(vid, pending[vid]), tries))
+            for vid in tries:
+                if vid in self.reattach_dead:
+                    lives[vid].boat_stopped()
+                if vid in getattr(self, "reattach_empty", set()):  # (nothing to take back there: its items queued again, no strike)
+                    pending.pop(vid, None)
+                    continue
+                lives[vid].reattach(agent_ok=vid in self.vms)
+                if not lives[vid].pending:
+                    if vid not in self.vms and vid not in self.reattach_dead:
+                        continue  # (its tries over: left to adoption, its items queued again below)
+                    gone = pending.pop(vid)
+                    if vid in self.reattach_dead:  # (its items back to the queue at once: one real boat failure each)
+                        with self.lock:
+                            for it, _ in gone:
+                                if it.state == "queued":
+                                    self._boat_failed(it, vid, f"its VM {vid} stopped across the restart")
+            self.reattaching = False
+            self.reattach_pending = {vid for vid in pending if lives[vid].pending}
+            if not self.reattach_pending:
+                break
+            log(f"re-attach: {len(pending)} VMs not taken back yet; again in 30 s: {dict(list(self.reattach_why.items())[:4])}")
+            self.stop.wait(30)
+        with self.lock:  # (VMs not taken back: their items queued again; a strike only for a VM boat reports gone, rules.prepare_failed)
+            for vid, its in pending.items():
+                what = rules.prepare_failed(vid in self.reattach_dead or not self._boat_up(vid), True, self._outage())
+                for it, _ in its:
+                    if it.state == "queued":
+                        if what == "lost":
+                            self._boat_failed(it, vid, f"its VM {vid} not reached after the restart")
+                        else:  # (its agent hung on a VM boat reports up: ours to repair, no strike; B2)
+                            it.head = True
+        self.reattach_pending = set()
+        if n or pending:
+            log(f"re-attached {n} items running on {len(by_vm) - len(pending)} VMs since before the restart; {len(pending)} VMs left to adoption, their items queued again")
+        taken = [self.vms[vid] for vid in getattr(self, "_handoff", {}).get("taken", []) if vid in self.vms]
+        if taken:  # (the VMs taken at once hold their items as their records say; each agent's word corrects that, in the background)
+            threading.Thread(target=self._reconcile_taken, args=(taken,), daemon=True).start()
+        if not getattr(self, "adopting", False):
+            self.adopting = True
+            threading.Thread(target=self._adopt, daemon=True).start()
+        self.wake.set()
+
+    def _life(self, vm: "VMState | None", now: float, lease: str = "ours", items: int = 0, hold: float | None = None) -> rules.VMLife:
+        """A VM as rules.VMLife sees it, for one of its decisions (hold, release, re-attach, adoption): a VM held here
+        from its VMState, else one up whose holder is `lease`. `hold`: how long a floor VM may idle (HOLD's, or for an
+        image without a treadmill floor_idle_s: its default floor's VM waits between bursts)."""
+        life = rules.VMLife(int(HOLD if hold is None else hold), int(boat.IDLE), int(boat.BACKSTOP))
+        life.leased(now)
+        if vm is not None:
+            life.t_real, life.draining, life.running, life.gen = vm.t_real, vm.draining, len(vm.running), vm.gen
+        elif lease == "dead":
+            life.holder_died(items)
+        else:
+            life.lease = lease
+        return life
+
+    def _reattach_vm(self, vid: str, its: list) -> int:
+        n = 0
+        held = self.vms.get(vid)
+        if held is not None and held.ready and not held.dead:  # (in hand already: its items joined to it)
+            with self.lock:
+                for it, pl in its:
+                    if it.state in ("queued", "cancel_pending"):
+                        it.taken_over = vid in getattr(self, "_handoff", {}).get("taken", [])  # (its agent's word checked after: _reconcile_taken)
+                        it.state, it.vm, it.run_name, it.t_start = "running", held, pl["run_name"], time.time()
+                        it.fate.reattached(vid)
+                        held.running[(it.batch.id, pl["run_name"])] = it
+                        held.prepared.add(it.batch.id)
+                        n += 1
+            return n
+        if True:
+            cl = boat.agent_client(vid)
+            ok, why = False, "no agent recorded"
+            try:
+                ok = cl is not None and cl.ping().get("version") is not None
+            except Exception as e:
+                why = str(e)[:120]
+            if not ok and cl is not None and "is stopped" not in why and self._boat_up(vid):
+                # (boat reports it up, its agent doesn't answer: repaired in place with its token, so its items, still
+                # running in sessions of their own, are taken back rather than run again)
+                with contextlib.suppress(Exception):
+                    boat.bootstrap_agent(vid, self.agent_b64, cl.token, 60, 2)
+                    ok = cl.ping(timeout=15).get("version") is not None
+                    if ok:
+                        log(f"{vid}: its agent didn't answer after the restart: repaired in place")
+            if not ok:
+                self.reattach_why[vid] = why
+                if "is stopped" in why or "not found" in why.lower():
+                    self.reattach_dead.add(vid)  # (boat says it's stopped: it will never answer)
+            if ok:
+                with Registry().locked() as d:
+                    v = d["vms"].get(vid)
+                    if not (v and (boat.lease_free(v) or (v.get("lease") or {}).get("pid") == os.getpid())):
+                        self.reattach_why[vid] = f"its lease: {(v or {}).get('lease')}"
+                    if v and (boat.lease_free(v) or (v.get("lease") or {}).get("pid") == os.getpid()):
+                        v["lease"] = {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": time.time(), "label": "scheduler (re-attached)"}
+                    else:
+                        ok = False
+            if not ok:
+                return 0
+            threading.Thread(target=boat.boat, args=("extend", vid, "--ttl", str(boat.BACKSTOP), "--json"), kwargs={"check": False}, daemon=True).start()
+            pl0 = its[0][1]
+            vm = VMState(vid, pl0["image"], pl0.get("type", boat.VM_TYPE), "warm")
+            vm.client = cl
+            vm.t_agent = 0.0  # (its agent's code checked at its first tick)
+            running, finished, ticked = set(), set(), False
+            with contextlib.suppress(Exception):
+                r = cl.rpc("vtick", {"wait": 0}, timeout=30)
+                ticked = True
+                vm.slots = max(1, int(r.get("cpus") or boat.TYPES[vm.type][0]) // boat.SLOT_CPU)
+                vm.model = r.get("model", "")
+                running = {(x["batch"], x["name"]) for x in r.get("running", [])}
+                finished = {(x["batch"], x["name"]) for x in r.get("done", []) if not x.get("preempted")}  # (a preempted row: nothing to take back; B5)
+            with self.lock:
+                for it, pl in its:
+                    key = (it.batch.id, pl["run_name"])
+                    if it.state in ("queued", "cancel_pending") and (key in running or key in finished or it.owned.closed):
+                        it.state, it.vm, it.run_name, it.t_start = "running", vm, pl["run_name"], time.time()
+                        it.fate.reattached(vid)
+                        vm.running[key] = it
+                        vm.prepared.add(it.batch.id)
+                        n += 1
+                if ticked and not vm.running:  # (nothing of ours runs there any more, its filler preempted by a drain: left to adoption; B5)
+                    with Registry().locked() as d:
+                        v = d["vms"].get(vid)
+                        if v and (v.get("lease") or {}).get("pid") == os.getpid():
+                            v["lease"] = None
+                    self.reattach_empty = getattr(self, "reattach_empty", set()) | {vid}
+                    return 0
+                vm.ready = True
+                vm.t_ready = time.time()
+                vm.idle_since = time.time()
+                self.vms[vid] = vm
+            self._worker(vm)
+        return n
+
+    @staticmethod
+    def _read_journal(path, strict):
+        if not strict:
+            # Old takeovers could append JSON null for a starting legacy item.
+            # These are not placements. Strict journals still reject them below.
+            return [r for r in jlines(path) if r is not None]
+        if not path.exists():
+            return []
+        raw = path.read_text()
+        if raw and not raw.endswith("\n"):
+            raise ValueError("owned journal has a torn tail; admission quarantined")
+        records = [json.loads(line) for line in raw.splitlines()]
+        if any(not isinstance(record, dict) for record in records):
+            raise ValueError("invalid owned journal; admission quarantined")
+        return records
+
+    @staticmethod
+    def _valid_batch(bid):
+        if not isinstance(bid, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,159}", bid):
+            raise ValueError("invalid batch id")
+        return bid
+
+    @classmethod
+    def _validate_submission(cls, msg):
+        if not isinstance(msg, dict):
+            raise ValueError("submission must be an object")
+        enhanced = bool(msg.get("strict_once") or msg.get("retain_journals"))
+        if enhanced:
+            cls._valid_batch(msg.get("batch"))
+        for flag in ("strict_once", "retain_journals"):
+            if flag in msg and type(msg[flag]) is not bool:
+                raise ValueError(f"{flag} must be boolean")
+        if not retention_supported(bool(msg.get("strict_once")), bool(msg.get("retain_journals"))):
+            raise ValueError("retain_journals requires strict_once ownership")
+        names = []
+        for spec in msg.get("items", []):
+            if not isinstance(spec, dict):
+                raise ValueError("item must be an object")
+            name = spec.get("name")
+            if enhanced:
+                cls._valid_batch(name)
+            if "launch_identity" in spec or "strict_once" in spec:
+                raise ValueError("reserved scheduler ownership fields in item")
+            names.append(name)
+        if enhanced and len(names) != len(set(names)):
+            raise ValueError("duplicate item names")
+        if any(k in msg for k in ("admission_closed", "cancellation_complete", "launch_identity")):
+            raise ValueError("reserved scheduler ownership fields in submission")
+
+    @staticmethod
+    def _append_owned(bid, suffix, record):
+        qd = DIR / "queue"
+        qd.mkdir(parents=True, exist_ok=True)
+        with open(qd / f"{bid}.{suffix}", "a") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        fd = os.open(qd, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _persist_fence(self, b):
+        path = DIR / "queue" / f"{b.id}.json"
+        record = json.loads(path.read_text())
+        record["admission_closed"] = True
+        record["retain_journals"] = True
+        record["cancellation_complete"] = b.closed
+        tmp = path.with_suffix(".cancel.tmp")
+        with open(tmp, "w") as f:
+            json.dump(record, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _owned_failed(self, it, why):
+        if it.state == "done" and any(r.get("name") == it.name for r in it.batch.rows):
+            return
+        # Not 'lost': clients must not interpret an owned failure as a fallback request.
+        self._deliver_owned(it.batch, {"name": it.name, "code": -1, "seconds": -1,
+                          "error": why, "strict_once": it.batch.strict_once,
+                          "launch_identity": it.launch_identity})
+        it.state = "done"
+        it.fate.delivered()
+
+    def _deliver_owned(self, b, row):
+        # Callers hold self.lock: first terminal result wins without replacement.
+        with b.cv:
+            if any(r.get("name") == row.get("name") for r in b.rows):
+                return
+            self._append_owned(b.id, "rows", row)
+            b.rows.append(row)
+            b.cv.notify_all()
+
+    @staticmethod
+    def capabilities():
+        return {"scope": "isolated-proposed", "runtime_verified": False,
+                "submit_flags": ["strict_once", "retain_journals"],
+                "retention_requires_strict_once": True,
+                "paths": ["/cancel", "/snapshot", "/capabilities"],
+                "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
+
+    @classmethod
+    def _safe_snapshot(cls, value):
+        if isinstance(value, dict):
+            return {k: cls._safe_snapshot(v) for k, v in value.items()
+                    if not any(s in k.lower() for s in ("token", "secret", "password", "cookie", "authorization", "ctx_b64", "env"))}
+        if isinstance(value, list):
+            return [cls._safe_snapshot(v) for v in value]
+        return value
+
+    def snapshot(self, bid):
+        self._valid_batch(bid)
+        with self.lock:
+            b = self.batches.get(bid)
+            if bid in getattr(self, "recovery_errors", {}):
+                return {"ok": False, "batch": bid, "owned": True, "error": "admission quarantined; journals and ownership retained"}
+            if b is None:
+                exists = (DIR / "queue" / f"{bid}.json").exists()
+                return {"ok": False, "error": "admission quarantined; journals retained" if exists else "no such batch"}
+            return {"ok": True, "batch": bid, "strict_once": b.strict_once,
+                    "retain_journals": b.retain_journals, "admission_closed": b.admission_closed,
+                    "closed": b.closed,
+                    "placements": jlines(DIR / "queue" / f"{bid}.placed"),
+                    "cancellation_receipts": self._safe_snapshot(jlines(DIR / "queue" / f"{bid}.cancel")),
+                    "rows": [self._safe_snapshot(r) for r in b.rows],
+                    "items": [{"name": it.name, "state": it.state,
+                               "placements": it.owned.placements, "reaped": it.owned.reaped,
+                               "start_inflight": it.owned.inflight, "admission_closed": it.owned.closed,
+                               "result_error": getattr(it, "result_error", None)} for it in b.items.values()]}
+
+    @staticmethod
+    def _matching_receipt(receipt, bid, name, identity):
+        return (isinstance(receipt, dict) and receipt.get("ok") is True
+                and receipt.get("reaped") is True and receipt.get("namespace_absent") is True
+                and identity is not None and receipt.get("identity") == identity
+                and receipt.get("batch") == bid and receipt.get("name") == name)
+
+    def cancel(self, bid, wait_seconds=10):
+        self._valid_batch(bid)
+        if getattr(self, "recovery_blocked", False):
+            return {"ok": False, "complete": False, "error": "recovery quarantined; ownership held"}
+        if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (float, int)) or not math.isfinite(wait_seconds) or not 0 <= wait_seconds <= 60:
+            raise ValueError("wait_seconds must be between 0 and 60")
+        deadline = time.monotonic() + wait_seconds
+        with self.lock:
+            b = self.batches.get(bid)
+            if b is None:
+                return {"ok": False, "error": "no such batch"}
+            if not b.strict_once:
+                return {"ok": False, "complete": False, "batch": bid,
+                        "admission_closed": False,
+                        "error": "owned cancellation requires strict_once; legacy close remains available"}
+            # Set memory fence even on disk failure: fail closed in this process.
+            b.admission_closed = True
+            b.retain_journals = True
+            for it in b.items.values():
+                it.owned.cancel()
+            with blobcache.locked(BLOBS):
+                self._persist_fence(b)  # Serialize with completion-marker replacement too.
+            items = list(b.items.values())
+        for it in items:
+            remaining = max(0, deadline - time.monotonic())
+            if not it.start_done.wait(remaining):
+                continue
+            with self.lock:
+                if it.owned.reaped:
+                    continue
+                vm = it.vm
+                pl = it.last_placement
+                if vm is None and pl:
+                    vm = self.vms.get(pl["vm"])
+                name = pl["run_name"] if pl and it.vm is None else it.run_name
+                identity = it.launch_identity
+                placed = it.owned.placements > 0
+            receipt = None
+            if placed and vm is not None and identity:
+                try:
+                    remaining = max(0, deadline - time.monotonic())
+                    receipt = vm.client.rpc("cancelitem", bid, name, remaining, identity,
+                                            timeout=max(1, remaining + 2))
+                except Exception:
+                    receipt = {"ok": False, "error": "cancel RPC failed or timed out"}
+            matched = self._matching_receipt(receipt, bid, name, identity)
+            with self.lock:
+                # Persist evidence first; never acknowledge a reap whose journal failed.
+                self._append_owned(bid, "cancel", {"name": it.name, "run_name": name,
+                    "identity": identity, "matched": matched, "unplaced": not placed, "receipt": {
+                        k: receipt[k] for k in ("ok", "reaped", "namespace_absent", "identity", "batch", "name", "error") if k in receipt
+                    } if isinstance(receipt, dict) else None, "t": time.time()})
+                if it.owned.confirm(matched):
+                    if vm is not None:
+                        vm.running.pop((bid, name), None)
+                    if it.state != "done" or not any(r.get("name") == it.name for r in b.rows):
+                        it.state = "done"
+                        it.fate.delivered()
+                        self._deliver_owned(b, {"name": it.name, "code": -1, "seconds": -1,
+                                                "cancelled": True, "launch_identity": identity})
+                else:
+                    it.state = "cancel_pending"
+        with self.lock:
+            complete = all(it.owned.reaped for it in items)
+            if complete:
+                # Retention is not standing demand. Publish closed only after its
+                # durable marker succeeds; a pending cancellation keeps its holds.
+                b.closed = True
+                try:
+                    with blobcache.locked(BLOBS):
+                        self._persist_fence(b)
+                except Exception:
+                    b.closed = False
+                    raise
+            self.wake.set()
+            return {"ok": complete, "complete": complete, "admission_closed": True,
+                    "pending": [it.name for it in items if not it.owned.reaped], "batch": bid}
+
+    def submit(self, msg: dict) -> dict:
+        with self.lock:
+            return self._submit_locked(msg)
+
+    def _submit_locked(self, msg: dict) -> dict:
+        if getattr(self, "recovery_blocked", False):
+            return {"ok": False, "error": "recovery quarantined; ownership held"}
+        self._full_now = True
+        self._validate_submission(msg)
+        b = Batch(msg)
+        with self.lock:  # (rules.Submit: a batch with items queued or running is never replaced; the same submit again keeps it)
+            old = self.batches.get(b.id)
+            if old is None and (DIR / "queue" / f"{b.id}.json").exists():
+                return {"ok": False, "error": "persisted admission exists; reload or repair required"}
+            if old and (getattr(old, "strict_once", False) or getattr(old, "retain_journals", False) or getattr(old, "admission_closed", False)):
+                return {"ok": False, "error": "durable owned batch id cannot be reused"}
+            rule = rules.Submit()
+            rule.exists, rule.live = old is not None, old is not None and not old.closed and old.left() > 0
+            what = rule.admit(old is not None and set(old.items) == set(b.items))
+        if what == "keep":
+            return {"ok": True, "kept": True}
+        if what == "refuse":
+            log(f"{b.id} ({b.client}): a submit under the id of a batch with {old.left()} items live refused (never replaced)")
+            return {"ok": False, "error": f"batch {b.id} has items queued or running: a submit never replaces it"}
+        qd = DIR / "queue"
+        qd.mkdir(parents=True, exist_ok=True)
+        tmp = qd / f".{b.id}.json.tmp"  # (whole, then renamed in: a crash never leaves half a batch)
+        with blobcache.locked(BLOBS):
+            missing = [k for k in set(b.tree["files"].values()) if not (BLOBS / k).is_file()]
+            if missing:
+                return {"ok": False, "error": "tree blobs evicted before admission; upload again", "missing": missing}
+            b.cache_generation = secrets.token_hex(16)
+            admission = json.dumps({**msg, "t0": b.t0, "cache_generation": b.cache_generation,
+                                    "cache_completed_generation": None})
+            if getattr(b, "strict_once", False) or getattr(b, "retain_journals", False):
+                with open(tmp, "w") as f:
+                    f.write(admission)
+                    f.flush()
+                    os.fsync(f.fileno())
+            else:
+                tmp.write_text(admission)
+            tmp.rename(qd / f"{b.id}.json")
+            if getattr(b, "strict_once", False) or getattr(b, "retain_journals", False):
+                fd = os.open(qd, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        with self.lock:
+            self.batches[b.id] = b
+        log(f"{b.id} ({NAMES[b.klass]}, {b.client}): {len(b.items)} items on {b.image}")
+        self.wake.set()
+        return {"ok": True}
+
+    def poll(self, bid: str, since: int, wait: float) -> dict:
+        b = self.batches.get(bid)
+        if b is None:
+            if getattr(self, "recovery_blocked", False) or self._unclassified(bid):
+                # The client must keep waiting through quarantine/hand-back.
+                # done=True here loses every result without killing a worker.
+                self.stop.wait(min(max(wait, 0), 1.0))
+                return {"rows": [], "done": False, "running": 0, "queued": 0, "recovering": True}
+            return {"rows": [], "done": True, "err": "no such batch"}
+        b.t_poll = time.time()
+        with b.cv:
+            # (rules.Delivery: done to the client only once every item's row is in and it has read them all; it waits
+            # while a row may still come, an item done with its row not yet delivered among them)
+            names = {r.get("name") for r in b.rows} & set(b.items)
+            if len(b.rows) <= since and len(names) < len(b.items):
+                b.cv.wait(wait)
+                names = {r.get("name") for r in b.rows} & set(b.items)
+            rows = b.rows[since:]
+            d = rules.Delivery(len(b.items))
+            d.finished = len(b.items) - b.left()
+            d.rows = min(len(names), d.finished)
+            done = since <= len(b.rows) and d.poll(min(since, d.rows))  # (this poll gives the client every row there is)
+        running = sum(1 for it in b.items.values() if it.state in ("starting", "running"))
+        return {"rows": rows, "done": done, "running": running, "queued": sum(1 for it in b.items.values() if it.state == "queued")}
+
+    @staticmethod
+    def batch_of(m) -> str | None:
+        """The batch a request names: "batch", or "id" as an older record had it; None when it names none (an empty
+        or cut body: 09:50, three /close answered KeyError('batch'), 500s counted as our errors)."""
+        return (m.get("batch") or m.get("id")) if isinstance(m, dict) else None
+
+    def close(self, bid: str) -> dict:
+        self._valid_batch(bid)
+        if getattr(self, "recovery_blocked", False):
+            return {"ok": False, "error": "recovery quarantined; ownership held"}
+        with self.lock:
+            owned = self.batches.get(bid)
+            if owned and (owned.retain_journals or owned.strict_once or owned.admission_closed):
+                retain = True
+            else:
+                retain = False
+        if retain:
+            return self.cancel(bid)
+        self._full_now = True
+        b = self.batches.get(bid)
+        if b is None:
+            return {}
+        kill = []
+        with self.lock:
+            for it in b.items.values():  # (a client that gives up: what still runs is killed, what's queued goes)
+                if it.state in ("starting", "running") and it.vm:
+                    kill.append((it.vm, it.run_name))
+                it.state = "done"
+                it.fate.delivered()
+            b.closed = True
+            self.batches.pop(bid, None)
+        for vm, rn in kill:  # (the kills outside the lock, in the background: status never waits on them; one lost, the VM's tick kills it later)
+            threading.Thread(target=self._kill_run, args=(vm, b.id, rn), daemon=True).start()
+        for f in (DIR / "queue" / f"{bid}.json", DIR / "queue" / f"{bid}.rows", DIR / "queue" / f"{bid}.placed"):
+            f.unlink(missing_ok=True)
+        import shutil as _sh
+        _sh.rmtree(DIR / "queue" / f"{bid}.logs", ignore_errors=True)
+        s = {"vms": len(b.vms_used), "starts": b.starts, "preempted": b.preempted, "class": NAMES[b.klass], "wall_s": round(time.time() - b.t0, 1)}
+        first = round(b.t_first - b.t0, 1) if b.t_first else None
+        placed = round(b.t_placed - b.t0, 1) if b.t_placed else None
+        with self.lock:
+            self.m["batches"] = (self.m["batches"] + [{"id": b.id, "class": NAMES[b.klass], "client": b.client, "items": len(b.items), "starts": b.starts,
+                                                       "vms": len(b.vms_used), "first_s": first, "placed_s": placed, "wall_s": s["wall_s"], "t": round(time.time())}])[-2000:]
+        boat.ledger(batch=b.id, label=b.label, client=b.client, klass=NAMES[b.klass], starts=b.starts, vms=len(b.vms_used), slots=0, scheduled=True, slot_s=round(b.slot_s, 1),
+                    preempted=b.preempted, wall_s=s["wall_s"], first_s=first, placed_s=placed, items=len(b.items), acct=bool(b.starts))
+        self.wake.set()
+        return s
+
+    def logs(self, bid: str, vms: list[str]) -> bytes:
+        """The batch's logs: each item's, kept here as it finished (they outlive a restart), and the VMs' for any
+        not kept, merged (one tar.gz)."""
+        out = io.BytesIO()
+        kept = DIR / "queue" / f"{bid}.logs"
+        have = set()
+        # (an item's log is the log of the run that delivered its row: a VM's log of another run of a delivered item, a
+        # first try lost there, is left out; the client maps every run of an item to its name, the last one read won)
+        b = self.batches.get(bid)
+        rows = list(b.rows) if b else jlines(DIR / "queue" / f"{bid}.rows")
+        delivered = {r.get("name"): r.get("run_name") or r.get("name") for r in rows if r.get("name")}
+        with tarfile.open(fileobj=out, mode="w:gz") as tf:
+            for d in sorted(kept.iterdir()) if kept.exists() else []:
+                for f in ("out", "err"):
+                    if (d / f).exists():
+                        data = (d / f).read_bytes()
+                        ti = tarfile.TarInfo(f"{d.name}/{f}")
+                        ti.size = len(data)
+                        tf.addfile(ti, io.BytesIO(data))
+                have.add(d.name)
+            for v in vms:
+                vm = self.vms.get(v)
+                cl = vm.client if vm and vm.client else boat.agent_client(v)  # (a VM no longer held: its agent still answers)
+                if not cl:
+                    continue
+                with contextlib.suppress(Exception):
+                    data = cl.raw("logs", bid, timeout=120)
+                    with tarfile.open(fileobj=io.BytesIO(data)) as src:
+                        for m in src.getmembers():
+                            rn = m.name.split("/")[0]
+                            base = rn.rsplit("~s", 1)[0]
+                            if rn not in have and delivered.get(base, rn) == rn:
+                                tf.addfile(m, src.extractfile(m))
+        return out.getvalue()
+
+    def hint(self, msg: dict) -> dict:
+        """A tenant's standing demand (the treadmill: the pool's floor, while it lives)."""
+        self.hints[msg["client"]] = {**msg, "until": time.time() + float(msg.get("ttl", 300))}
+        self.wake.set()
+        return {"ok": True}
+
+    def floor(self, image: str) -> int:
+        """rules.image_floor: the policy's floor while a treadmill (a tenant's hint) keeps work coming for the image, or
+        floor_always; else the default floor (1) while the image had real work within floor_idle_s; floor_by_image's
+        number for an image instead of either."""
+        now = time.time()
+        tm = FLOOR_ALWAYS or self.treadmill_alive(image)
+        busy = any(b.image == image and b.klass <= 4 and not b.closed for b in list(self.batches.values()))
+        last = now if busy else max([v.t_real for v in list(self.vms.values()) if v.image == image and not v.dead] or [0.0])
+        return rules.image_floor(tm, int(self.pol["floor"]), FLOOR_DEFAULT, FLOOR_BY_IMAGE.get(image, -1), now - (last or 0.0), FLOOR_IDLE)
+
+    def treadmill_alive(self, image: str) -> bool:
+        """The treadmill registered for the image: its hint alive, or a batch of a sweep or filler of the image open."""
+        now = time.time()
+        return any(h["until"] > now and h.get("image") == image for h in self.hints.values()) or any(b.klass >= 4 and b.image == image and not b.closed for b in list(self.batches.values()))
+
+    def _drain(self, image: str) -> rules.Drain:
+        """The image's staged drain (rules.Drain), its step and window the policy's, re-read live."""
+        d = self.__dict__.setdefault("_drains", {}).get(image)
+        step, every = max(1, min(100, round(100 * DRAIN_STEP))), max(1, int(DRAIN_EVERY))
+        if d is None or (d.step_pct, d.every_s) != (step, every):
+            nd = rules.Drain(step, every)
+            saved = self.__dict__.get("_drains_saved", {}).pop(image, None) if d is None else None
+            if d is not None:
+                nd.open, nd.t_last, nd.share, nd.quota, nd.released = d.open, d.t_last, d.share, d.quota, d.released
+            elif saved:  # (the previous scheduler's window: a handoff opens none afresh)
+                nd.open, nd.t_last, nd.share, nd.quota, nd.released = bool(saved["open"]), float(saved["t_last"]), int(saved["share"]), int(saved["quota"]), int(saved["released"])
+            d = self._drains[image] = nd
+        return d
+
+    def status(self) -> dict:
+        """_status, timed from before its lock (the health target: under a second)."""
+        t0 = time.time()
+        r = self._status()
+        r["recovery"] = getattr(self, "recovery", {"errors": getattr(self, "recovery_errors", {})})
+        r["recovery_blocked"] = getattr(self, "recovery_blocked", False)
+        r["blob_cache"] = blobcache.last_report(BLOBS)
+        self._h().record_status(time.time(), time.time() - t0)
+        last = getattr(self._h(), "last", None) or {}
+        r["health"] = {"ok": last.get("ok"), "breached": sorted(k for k, v in last.get("targets", {}).items() if not v["ok"])}
+        return r
+
+    def _status(self) -> dict:
+        """The scheduler as status shows it, read without its lock (the loop holds it a while with a big queue: 02:49,
+        1.18 s under 26,000 queued items); a dict changing under the read is read again, under the lock the third time."""
+        for _ in range(3):
+            try:
+                return self._status_read()
+            except RuntimeError:  # (dictionary changed size during iteration)
+                continue
+        with self.lock:
+            return self._status_read()
+
+    def _status_read(self) -> dict:
+        now = time.time()
+        if True:
+            live = [v for v in self.vms.values() if not v.dead]
+            per, qk = {}, {}
+            for b in list(self.batches.values()):  # (the queue counted once, not once a class)
+                qk[b.klass] = qk.get(b.klass, 0) + sum(1 for it in b.items.values() if it.state == "queued")
+            for n, k in CLASSES.items():
+                q = qk.get(k, 0)
+                held = sum(1 for v in live if any(x.batch.klass == k for x in v.running.values()))
+                w = self.m["waits"].get(n, [])
+                per[n] = {"queued": q, "vms": held, "wait_p50": pct(w, 0.5), "wait_p95": pct(w, 0.95), "starts_free": self.m["starts"][n]["free"],
+                          "starts_paid": self.m["starts"][n]["paid"], "preempted": self.m["preempted"].get(n, 0), "placed": self.m["placed"].get(n, 0),
+                          "boat_fails": self.m["boat_fails"].get(n, 0), "to_modal": self.m["to_modal"].get(n, 0)}
+            starts = sum(s["free"] + s["paid"] for s in self.m["starts"].values())
+            items = sum(self.m["placed"].values())
+            return {"pid": os.getpid(), "batches": [{"id": b.id, "class": NAMES[b.klass], "client": b.client, "left": b.left(),
+                                                     "running": sum(1 for it in b.items.values() if it.state in ("starting", "running"))} for b in self.batches.values()],
+                    "vms": [{"id": v.id, "image": v.image, "type": v.type, "ready": v.ready, "used": v.used(), "slots": v.slots, "draining": v.draining, "real_ago": round(now - v.t_real), "gen": v.gen, "agent": v.agent,
+                             "classes": sorted({NAMES[it.batch.klass] for it in v.running.values()}), "foreign": getattr(v, "foreign", 0),
+                             "runs": [{"batch": it.batch.id, "name": it.run_name, "class": NAMES[it.batch.klass]} for it in v.running.values()]} for v in live],
+                    "classes": per,
+                    "pool": {"vms": len(live), "ready": sum(1 for v in live if v.ready), "coming": sum(self.creating.values()) + sum(1 for v in live if not v.ready),
+                             "target": {k: v for k, v in self.target.items()}, "max": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": {img: self.floor(img) for img in {v.image for v in live}}},
+                    "day": {"day": self.m["day"], "vmh": round(self.m["vmh"], 2), "vmh_filler_hold": round(self.m["vmh_filler_hold"], 2),
+                            "starts": starts, "items_placed": items, "starts_per_100_items": round(100 * starts / items, 1) if items else None,
+                            "items_placed_warm": self.m["placed_warm"], "max_binds": self.m.get("max_binds", 0), "hold_ends": self.m["hold_ends"], "peak_vms": self.m["peak_vms"],
+                            "breaker_trips": self.m["breaker_trips"], "not_ready": self.m["not_ready"]},
+                    "breaker": {**self.br, "open": now < self.br["open_until"], "open_for_s": max(0, round(self.br["open_until"] - now))},
+                    "shed": self.shed, "load": self.load, "bring_up_s": round(self.bring_up, 1), "alerts": self.alerts[-5:],
+                    "policy": self.pol, "code": self.code, "code_installed": code_hash(), "agent_code": self.agent_version, "stale": self.stale(),
+                    "agents": {v.id: v.agent for v in live},
+                    "knobs": {"bringup": BRINGUP_MAX, "horizon_s": HORIZON, "gate_horizon_s": GATE_HORIZON, "hold_s": HOLD, "sub_vms": SUB_VMS, "max_vms": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": self.pol["floor"]},
+                    # (the old keys, for older clients)
+                    "starts_by_class": {n: self.m["starts"][n]["free"] + self.m["starts"][n]["paid"] for n in CLASSES}, "preempted": sum(self.m["preempted"].values()),
+                    "hints": {k: {kk: vv for kk, vv in h.items() if kk != "pid"} for k, h in self.hints.items() if h["until"] > now}}
+
+    # -- the loop
+    def run(self):
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+        threading.Thread(target=self._sampler, daemon=True).start()
+        t_loop = time.time()
+        while not self.stop.is_set():
+            self.wake.wait(0.5)
+            self.wake.clear()
+            if getattr(self, "recovery_blocked", False):
+                self._handoff_check(time.time())
+                continue
+            if rules.woke(time.time() - t_loop, 60):  # (this machine slept: every VM checked, its TTL renewed, orphans adopted, now)
+                self.t_wake = time.time()
+                log(f"woke after {time.time() - t_loop:.0f} s asleep: TTLs renewed, adoption now, VMs boat stopped meanwhile let go with no strike to their items")
+                for v in list(self.vms.values()):
+                    if not v.dead:
+                        threading.Thread(target=boat.boat, args=("extend", v.id, "--ttl", str(boat.BACKSTOP), "--json"), kwargs={"check": False}, daemon=True).start()
+                if not getattr(self, "adopting", False):
+                    self.adopting = True
+                    threading.Thread(target=self._adopt, daemon=True).start()
+            t_loop = time.time()
+            c0 = _cpu_now()
+            with contextlib.suppress(Exception):
+                self._policy_tick()
+            self._blob_cache_tick()
+            t_s = time.time()
+            # (a full pass (the queue ordered, preemption, waits, the plan, the release) at most every FULL_S, or at once
+            # when a batch comes or goes; between them a light one places what's queued on the slots items freed, in the
+            # last full pass's order: 08:50, a full pass at every finished item, 3.2 s of a core each, held the lock the
+            # ticks need)
+            # (and never sooner than 4 times the last full pass took: its share of a core a fifth at most, however big the queue)
+            since = time.time() - getattr(self, "_t_full", 0.0)
+            light = getattr(self, "_q_full", None) is not None and (since < 4 * getattr(self, "_dt_full", 0.0) or (not getattr(self, "_full_now", True) and since < FULL_S))
+            try:
+                self.schedule(light=light)
+            except Exception as e:
+                log(f"schedule: {e!r}"[:400])
+            finally:
+                self._q_pass = None
+                self._cpu_add("pass light" if light else "pass", c0)
+                if not light:
+                    self._dt_full = _cpu_now() - c0 if _cpu_now() else time.time() - t_s
+            dt = time.time() - t_s
+            if dt > 0.02:  # (a long pass (a big queue) is followed by a pause 3 times as long: the passes at most a quarter of a core,
+                self.stop.wait(min(1.5, 3 * dt))  # its threads and status answered; 08:14, 59% of a core at 180 VMs and 8.8k items queued)
+            else:  # (passes at most 4 a second: the wakes of items finishing together are one pass; 09:19, 15 light passes a second)
+                self.stop.wait(max(0.0, 0.25 - dt))
+            # (a batch still running waits 6 hours for its client, a finished one a day: looked at once a minute)
+            if time.time() - getattr(self, "_t_abandon", 0) >= 60:
+                self._t_abandon = time.time()
+                for b in [b for b in list(self.batches.values()) if rules.abandoned(time.time(), getattr(b, "t_poll", b.t0), b.left(), ORPHAN_S)]:
+                    log(f"{b.id}: no client has asked for it in {ORPHAN_S} s: closed")  # (a client gone for good)
+                    self.close(b.id)
+            with self.lock:
+                busy = bool(self.batches) or any(v.running for v in self.vms.values())
+            if not busy:  # (a floor VM held: the scheduler stays to keep it; exiting releases every VM, the floor's too)
+                busy = any(self.floor(img) > 0 for img in {v.image for v in list(self.vms.values()) if not v.dead})
+            if busy:
+                self.t_idle = time.time()
+            elif self.idle_exit and time.time() - self.t_idle > self.idle_exit:
+                log(f"nothing queued for {self.idle_exit} s: exiting")
+                break
+        while getattr(self, "handing_off", False):  # (a handoff: its thread exits this process once the next one holds every VM;
+            time.sleep(1)  # never shutdown()'s let-go meanwhile: before, it raced the handoff's exit, VMs let go to adoption)
+        self.shutdown()
+
+    def _blob_cache_tick(self):
+        """One bounded maintenance worker, never on the placement thread or during handoff."""
+        if self.stop.is_set() or getattr(self, "handing_off", False) or getattr(self, "adopting", False):
+            return
+        if getattr(self, "_blob_cache_busy", False) or time.time() - getattr(self, "_blob_cache_at", 0) < 300:
+            return
+        self._blob_cache_at, self._blob_cache_busy = time.time(), True
+        policy = dict(self.pol)
+
+        def run():
+            try:
+                with self.lock:
+                    batches = list(self.batches.values())
+                for batch in batches:
+                    blobcache.completed(BLOBS, batch.id, getattr(batch, "cache_generation", None), batch.left())
+                report = blobcache.collect(BLOBS, int(policy["blob_cache_bytes"]), float(policy["blob_cache_grace_s"]),
+                                           float(policy["blob_cache_max_age_s"]),
+                                           cancelled=lambda: self.stop.is_set() or getattr(self, "handing_off", False))
+                if report.get("removed_files") or report.get("error"):
+                    log(f"blob cache: {report}")
+            except Exception as e:
+                log(f"blob cache: {e!r}")
+            finally:
+                self._blob_cache_busy = False
+        threading.Thread(target=run, daemon=True).start()
+
+    def _policy_tick(self):
+        """The policy file read again when it changed: its knobs in force at once, for every VM and item held (their
+        TTLs renewed to the new ttl_s, holds and growth by the new numbers); each VM and running item stamped with the
+        generation it now follows."""
+        mt = POLICY.stat().st_mtime_ns if POLICY.exists() else 0
+        if mt != self.pol_mtime:
+            self.pol_mtime = mt
+            new = read_policy()
+            if new.get("generation") != self.pol.get("generation"):
+                diff = {k: (self.pol.get(k), v) for k, v in new.items() if self.pol.get(k) != v and k not in ("t", "generation")}
+                self.pol = new
+                apply_policy(new)
+                log(f"policy generation {new['generation']} in force: {diff}")
+                if "ttl_s" in diff:
+                    for v in list(self.vms.values()):
+                        if not v.dead:
+                            threading.Thread(target=boat.boat, args=("extend", v.id, "--ttl", str(boat.BACKSTOP), "--json"), kwargs={"check": False}, daemon=True).start()
+        g = self.pol.get("generation", 0)
+        for v in list(self.vms.values()):
+            v.gen = g
+            for x in list(v.running.values()):
+                x.fate.follow(g)  # (rules.ItemFate.follow)
+
+    def stale(self) -> dict:
+        """What isn't on the policy generation or the code in force (zero one tick after a change)."""
+        g = self.pol.get("generation", 0)
+        live = [v for v in self.vms.values() if not v.dead]
+        return {"vms_old_policy": sum(1 for v in live if v.gen != g), "items_old_policy": sum(1 for v in live for x in v.running.values() if x.gen != g),
+                "agents_old_code": sorted(v.id for v in live if v.ready and v.agent and v.agent != self.agent_version)}
+
+    def queued(self) -> list[Item]:
+        """The queue in placement order: by class; within a class, round-robin across clients (each client's next item
+        ranked by what it already runs in that class), then by batch age, longest first."""
+        # (an item re-attach is still to take back where it runs isn't placed elsewhere meanwhile: B10, 02:24-02:55 a
+        # 10-min gate item placed again at each of 5 handovers, its runs left running beside new items)
+        pend = getattr(self, "reattach_pending", None) or set()
+        for b in list(self.batches.values()):
+            if b.admission_closed:
+                continue
+            for it in b.items.values():
+                if (b.strict_once and it.owned.placements and it.state == "queued"
+                        and not (getattr(it, "reattach", None) and it.reattach.get("vm") in pend)):
+                    self._owned_failed(it, "strict_once: prior placement could not be recovered")
+        q = [it for b in list(self.batches.values()) if not b.admission_closed for it in b.items.values() if it.state == "queued" and not it.owned.closed
+             and not (pend and getattr(it, "reattach", None) and it.reattach.get("vm") in pend)]
+        run: dict = {}
+        for v in list(self.vms.values()):
+            for x in list(v.running.values()):
+                run[(x.batch.klass, x.batch.client)] = run.get((x.batch.klass, x.batch.client), 0) + 1
+        groups: dict = {}
+        for it in q:
+            groups.setdefault((it.batch.klass, it.batch.client), []).append(it)
+        # (each client's items sorted, then the clients merged: n log(clients), not one sort of every item)
+        import heapq
+        lanes = []
+        for (k, c), its in groups.items():
+            its.sort(key=lambda it: (not it.head, it.batch.t0, -it.est))
+            base = run.get((k, c), 0)
+            lanes.append([((k, base + i, its[i].batch.t0, n), its[i]) for i in range(len(its)) for n in (len(lanes),)])
+        return [it for _, it in heapq.merge(*lanes, key=lambda x: x[0])]
+
+    def _pass_queue(self) -> list:
+        """The queue as this pass of schedule() ordered it, what's still queued of it (the plan and the release read
+        it again rather than sort 26,000 items three times a pass)."""
+        q = getattr(self, "_q_pass", None)
+        if q is None:
+            return self.queued()
+        return [it for it in q if it.state == "queued"]
+
+    def schedule(self, light: bool = False):
+        if getattr(self, "recovery_blocked", False):
+            return
+        now = time.time()
+        self._med = {}
+        with self.lock:
+            if light:
+                q = [it for it in self._q_full if it.state == "queued"]
+            else:
+                self._full_now, self._t_full = False, now
+                q = self.queued()
+                self._q_full = q
+            self._q_pass, self._any_queued = q, bool(q)
+            # 1. place queued items on free slots, highest class first (none while draining for a deploy); a submission
+            # client up to SUB_VMS VMs' worth of slots at once
+            sub_run: dict = {}
+            for v in self.vms.values():
+                for x in v.running.values():
+                    if x.batch.klass == 3:
+                        sub_run[x.batch.client] = sub_run.get(x.batch.client, 0) + x.weight
+            free = sum(max(0, v.slots - v.used()) for v in self.vms.values() if v.ready and not v.dead)
+            # (an item of a shape no VM took this pass is passed over: a pass only takes slots, so none takes the next of
+            # that shape either; 08:41, ~1 s a pass, each of 8.8k items looked for a VM among 181 while 3 slots nothing fit
+            # stayed free. An item a VM is set aside for, or one backing off, is its own shape)
+            mine = {id(r[0]) for v in self.vms.values() for r in (getattr(v, "reserved", None),) if r and self._held(v, None, now)}
+            no_vm: set = set()
+
+            def shape_of(it):  # (fit_shape: all a VM's fit reads, its memory too; 17:10-18:47 a memory-blind memo passed over items that fit)
+                return None if id(it) in mine or now < it.not_before else fit_shape(it)
+            # (a submission client's share binds only against a waiter that could take the slot (rules.contends): of its
+            # image, of a shape a VM took this pass (or not yet tried), not backing off; of a higher class, or another
+            # submission client under its own share. Past every share, the slots go to the submissions before sweeps and
+            # filler: 03:45, three weight-4 clients at 8 VMs each while most of 126 VMs ran sweeps; 11-01, any waiting
+            # gate of any image, placeable or not, held them at their share)
+            waiting = {}
+            for x in q:
+                if x.batch.klass <= 3:
+                    waiting.setdefault((x.batch.image, x.batch.klass, x.batch.client), x)
+            under = lambda c, x: rules.within_share(3, sub_run.get(c, 0), x.weight, SUB_VMS * vm_slots(x.batch.vm_type), True)
+            cont: dict = {}  # (each client's answer once until a submission's placement moves the shares, or a shape finds no VM)
+
+            def placeable(x):
+                if now < x.not_before:
+                    return False
+                sh = shape_of(x)
+                return sh is None or sh not in no_vm
+
+            def contended(it):
+                key = (it.batch.image, it.batch.client)
+                if key not in cont:
+                    cont[key] = any(rules.contends(img == it.batch.image, placeable(x), k, c != it.batch.client, k == 3 and under(c, x))
+                                    for (img, k, c), x in waiting.items())
+                return cont[key]
+            self._contended = contended  # (health's waste: a submission held by its share is not one placeable)
+            for it in ([] if getattr(self, "draining", False) else q):
+                if free <= 0:
+                    break
+                shape = shape_of(it)
+                if shape is not None and shape in no_vm:
+                    continue
+                if not rules.within_share(it.batch.klass, sub_run.get(it.batch.client, 0), it.weight, SUB_VMS * vm_slots(it.batch.vm_type), contended(it)):
+                    continue
+                vm = self._slot(it)
+                if vm is None and shape is not None:
+                    no_vm.add(shape)
+                    cont.clear()
+                if vm and self._place(it, vm):
+                    free -= vm.slots if it.timing else it.weight
+                    if it.batch.klass == 3:
+                        sub_run[it.batch.client] = sub_run.get(it.batch.client, 0) + it.weight
+                        cont.clear()
+            q = [it for it in q if it.state == "queued"]
+            if light:
+                return
+            for b in self.batches.values():
+                if b.t_first and not b.t_placed and not any(it.state == "queued" for it in b.items.values()):
+                    b.t_placed = now
+            # 2. preemption: interactive and gate items take fillers' and sweeps' slots at once; a submission's waiting
+            # past SUB_PREEMPT a filler's (else it gets slots as items end)
+            pp = rules.PreemptPass()  # (an item that finds nothing lower to take: those of its shape after it are passed over, no
+            for it in [it for it in q if it.batch.klass <= 4]:  # other; before, the first such item ended the pass for all)
+                if it.batch.klass == 3 and not rules.within_share(3, sub_run.get(it.batch.client, 0), 0, SUB_VMS * vm_slots(it.batch.vm_type) - 1, contended(it)):
+                    continue
+                shape = f"{rules.victims(it.batch.klass, now - it.t_created, SUB_PREEMPT)}|{fit_shape(it)}"
+                if not pp.admit(shape):
+                    continue
+                back = now < it.not_before  # (backing off: it doesn't try, nor passes its shape over for the rest, rules.PreemptPass.after)
+                pp.after(shape, back, not back and self._preempt_for(it, now))
+            # 3. items that waited past their batch's max_wait with no VM ready: one of boat's failures of the item only
+            # when boat failed a start of its image during that wait (refused, or not ready within BREAK_READY); a wait
+            # the scheduler made itself (the breaker, a backoff, the bring-up cap) is not boat failing it, and the item
+            # keeps its place. BOAT_TRIES of boat's failures, then back to its client for Modal
+            for it in q:
+                b = it.batch
+                if b.on_lost and b.max_wait and now - it.t_queued > b.max_wait and not any(v.ready and v.image == b.image for v in self.vms.values()):
+                    strike = it.fate.waited(self._start_failed(b.image, it.t_queued, now))  # (rules.ItemFate.waited)
+                    if strike != "none":
+                        it.t_queued = now
+                        self._boat_failed(it, None, f"no boat VM ready within {int(b.max_wait)} s, a start of {b.image} failed in it", strike)
+            # 4. capacity: the plan (demand-driven), within the bring-up cap, the breaker and the watchdog
+            want = self._plan(now)
+        for (image, vm_type), (n, k, b, allow) in want.items():
+            if n > 0 and time.time() > self.backoff.get(image, 0) and image not in self.asking:
+                # (boat's API off the loop: a slow `limits` never holds up placing or preempting)
+                self.asking.add(image)
+                threading.Thread(target=self._ask, args=(image, vm_type, n, k, b, allow), daemon=True).start()
+        self._release_idle()
+
+    def retired(self) -> set:
+        """VMs to retire (LIVE/scheduler/retire, one id a line): nothing new placed there, let go once empty, never
+        adopted nor leased again (an operator's: a VM whose tokens leaked, deleted once it's let go)."""
+        if time.time() - getattr(self, "_retire_t", 0) < 2:  # (the file looked at every 2 s, not at every VM of every pass:
+            return self._retire  # 94% of the scheduler's time at 200 VMs, a stat per VM per pass)
+        self._retire_t = time.time()
+        p = DIR / "retire"
+        mt = p.stat().st_mtime_ns if p.exists() else 0
+        if getattr(self, "_retire_mt", None) != mt:
+            self._retire_mt = mt
+            self._retire = set(p.read_text().split()) if p.exists() else set()
+        return self._retire
+
+    def _slot(self, it: Item) -> VMState | None:
+        best = None
+        now = time.time()
+        retired = self.retired()
+        shape = fit_shape(it)
+        if now < it.not_before:
+            return None
+        for vm in self.vms.values():
+            # (rules.vm_fits, the one test placement, preemption and waste read: its image and type, its memory, never a
+            # VM that failed it, one quarantined, retired or not answering; then rules.may_slot: it fits in the slots;
+            # a timing item only on an empty VM; no filler past a VM's hold; a VM set aside for another, its need)
+            if not vm_fits(shape, vm, retired):
+                continue
+            if not rules.may_slot(it.batch.klass, it.timing, it.weight, vm.slots - vm.used(), len(vm.running), vm.draining,
+                                  self._held(vm, it, now), True, getattr(vm, "prep_fails", 0)):
+                continue
+            # (a batch's VM, then the fullest: whole VMs stay free for timing items and for release)
+            score = (it.batch.id in vm.prepared, it.batch.tree["id"] in vm.trees, -(vm.slots - vm.used()))
+            if best is None or score > best[0]:
+                best = (score, vm)
+        return best[1] if best else None
+
+    def _place(self, it: Item, vm: VMState) -> bool:
+        with self.lock:
+            return self._place_locked(it, vm)
+
+    def _place_locked(self, it: Item, vm: VMState) -> bool:
+        """The item placed on the VM, where its fate allows it (rules.ItemFate.place: never a VM boat reports stopped
+        or one that failed it)."""
+        if it.batch.admission_closed or it.owned.closed:
+            return False
+        if it.batch.strict_once and it.owned.placements:
+            self._owned_failed(it, "strict_once: prior placement cannot be replaced")
+            return False
+        if not it.fate.place(vm.id, vm.dead or not vm.ready or getattr(vm, "stopped", False)):
+            if it.fate.state != "queued" and it.state == "queued" and not getattr(it, "_fate_alerted", False):
+                it._fate_alerted = True  # (every move of an item's state moves its fate too: this is a bug to report)
+                self.alert(f"{it.batch.id}: {it.name}: queued, its fate {it.fate.state}: not placed")
+            return False
+        if not it.owned.place():
+            return False
+        it.launch_identity = secrets.token_hex(24)
+        it.start_done.clear()
+        it.last_placement = {"name": it.name,
+            "run_name": it.name if not getattr(it, "placed", 0) else f"{it.name}~s{it.placed + 1}",
+            "vm": vm.id, "image": vm.image, "type": vm.type,
+            "identity": it.launch_identity, "t": time.time()}
+        # Write-ahead admission: never launch on failure to persist the placement.
+        try:
+            if it.batch.strict_once or it.batch.retain_journals:
+                self._append_owned(it.batch.id, "placed", it.last_placement)
+        except Exception:
+            it.owned.start_settled()
+            it.start_done.set()
+            self._owned_failed(it, "placement journal could not be persisted")
+            return False
+        now = time.time()
+        first = getattr(it, "placed", 0) == 0
+        it.state, it.vm, it.t_start = "starting", vm, now
+        it.tries += 1
+        it.placed = getattr(it, "placed", 0) + 1
+        it.head = False
+        it.fate.follow(self.pol.get("generation", 0))  # (placed under the policy in force)
+        for rv in {vm, getattr(it, "rsv_vm", None)}:  # (its reservation ends where it is placed, here or elsewhere)
+            if rv is not None and getattr(rv, "reserved", None) and rv.reserved[0] is it:
+                rv.reserved = None
+        it.rsv_vm = None
+        it.run_name = it.name if it.placed == 1 else f"{it.name}~s{it.placed}"  # (a name of its own on the VM each time: an agent ignores a start it has)
+        vm.running[(it.batch.id, it.run_name)] = it
+        it.batch.vms_used.add(vm.id)
+        it.batch.t_first = it.batch.t_first or now
+        if it.batch.klass <= 3:
+            vm.t_placed_real = now  # (health's waste: a VM real work goes on as its slots free is no waste of them)
+        if it.batch.klass <= 4:
+            if vm.t_real and now - vm.t_real >= 60 and not any(x.batch.klass <= 4 for x in vm.running.values() if x is not it):
+                self.m["vm_gaps"] = (self.m.get("vm_gaps", []) + [round(now - vm.t_real)])[-2000:]  # (a VM's gap between real work: the hold's test)
+            vm.t_real, vm.draining = now, False
+        if first:
+            n = NAMES[it.batch.klass]
+            self._h().record_placed(now)
+            self.m["placed"][n] = self.m["placed"].get(n, 0) + 1
+            self.m["waits"][n] = (self.m["waits"].get(n, []) + [round(now - it.t_created, 2)])[-1000:]
+            if vm.t_ready and vm.t_ready <= it.t_created:
+                self.m["placed_warm"] += 1
+        for x in vm.running.values():
+            x.peers = max(x.peers, len(vm.running) - 1)
+        threading.Thread(target=self._start_on, args=(it, vm), daemon=True).start()
+        return True
+
+    def _start_on(self, it: Item, vm: VMState):
+        try:
+            self._start_on_inner(it, vm)
+        finally:
+            with self.lock:
+                it.owned.start_settled()
+                it.start_done.set()
+
+    def _start_on_inner(self, it: Item, vm: VMState):
+        if getattr(self, "recovery_blocked", False):
+            return
+        b, rn = it.batch, it.run_name
+        try:
+            with self.lock:
+                if b.admission_closed or it.owned.closed:
+                    it.state = "cancel_pending"
+                    return
+            if b.strict_once:
+                OwnedAgentClient(vm.client, self.agent_version).rpc("capabilities")
+            self._prepare(b, vm)
+            vm.prep_fails = 0  # (prepared: a candidate again; rules.may_slot)
+            spec = {k: v for k, v in it.spec.items() if k not in ("est", "weight", "vm_type", "meta", "try", "orig", "timing")} | {"cpus": it.weight * boat.SLOT_CPU, "name": it.run_name, "launch_identity": it.launch_identity}
+            if b.strict_once:
+                spec["strict_once"] = True
+            if not (b.strict_once or b.retain_journals):
+                spec.pop("launch_identity", None)
+            with self.lock:  # (its batch closed, the item preempted or moved while the batch was prepared here: never started.
+                if it.state != "starting" or it.vm is not vm or it.run_name != rn or b.closed or b.admission_closed or it.owned.closed:  # Their kill found nothing to kill: a run
+                    if b.admission_closed or it.owned.closed:
+                        it.state = "cancel_pending"
+                        return  # Keep its placement held until a bound reap receipt.
+                    vm.running.pop((b.id, rn), None)  # stale preparation, never launch
+                    if it.state == "preempting" and it.vm is vm and not b.closed:
+                        it.state, it.vm, it.t_queued, it.head = "queued", None, time.time(), True
+                        it.fate.preempted()
+                        it.tries -= 1
+                    self.wake.set()
+                    return
+                it.state = "running"
+            if not (b.strict_once or b.retain_journals):
+                # Old handoff snapshots contain only batch/name/state. Rebuild
+                # a legacy placement from the actual held run, never write null.
+                if (not isinstance(it.last_placement, dict) or it.last_placement.get("run_name") != rn
+                        or it.last_placement.get("vm") != vm.id or it.last_placement.get("name") != it.name):
+                    it.last_placement = {"name": it.name, "run_name": rn, "vm": vm.id,
+                                         "image": vm.image, "type": vm.type,
+                                         "identity": it.launch_identity, "t": it.t_start or time.time()}
+                with contextlib.suppress(Exception):
+                    with open(DIR / "queue" / f"{b.id}.placed", "a") as f:
+                        f.write(json.dumps(it.last_placement) + "\n")
+            vm.fails = 0
+            # (the start goes at once, beside the worker's long poll: a placed item doesn't wait for that poll to end)
+            cl = OwnedAgentClient(vm.client, self.agent_version) if b.strict_once else vm.client
+            r = cl.rpc("vtick", {"start": [{"batch": b.id, "spec": spec}], "wait": 0}, timeout=60)
+            if b.strict_once and r.get("err"):
+                raise OwnedAgentRefused("owned preparation lost; placement held")
+            if r.get("err") and "isn't prepared here" in str(r["err"]):  # (its preparation gone from the VM: prepared again, no strike)
+                self._unprepare(vm, b.id)
+                with self.lock:
+                    if b.admission_closed or it.owned.closed:
+                        it.state = "cancel_pending"
+                        return
+                    vm.running.pop((b.id, it.run_name), None)
+                    if it.state != "done":
+                        it.fate.requeued()
+                        it.state, it.vm, it.head = "queued", None, True
+                self.wake.set()
+                return
+            if r.get("err"):
+                raise RuntimeError(r["err"])
+            for row in r.get("done", []):
+                self._accept_finished(vm, row)
+        except Exception as e:
+            if b.strict_once:
+                with self.lock:
+                    it.state = "owned_refused"
+                    it.result_error = "strict protocol/launch uncertain; placement quarantined: " + str(e)[:200]
+                self.wake.set()
+                return  # no preparation fallback, VM repair, provider probe, retry or replacement
+            with self.lock:
+                if b.admission_closed or it.owned.closed:
+                    it.state = "cancel_pending"
+                    return
+            log(f"{vm.id}: {b.id}: prepare failed ({str(e)[:200]})")
+            gone = "is stopped" in str(e) or not self._boat_up(vm.id)
+            unanswered = "didn't answer" in str(e) or "502" in str(e)
+            # (rules.prepare_failed: boat stopped it, the VM lost; an agent not answering on a VM boat reports up is our
+            # repair to make, no strike against the item, nor in an outage; a preparation that fails on an answering
+            # agent is one)
+            what = rules.prepare_failed(gone, unanswered, self._outage(), "lacked" in str(e) and "made again" in str(e))
+            if not str(e).startswith("its preparation failed") and "made again" not in str(e):  # (3 in a row: no more placements there, rules.may_slot; a preparation counted
+                vm.prep_fails = getattr(vm, "prep_fails", 0) + 1  # once, not once per item waiting on it: 4 waiters quarantined a VM for one 3-s outage, B9)
+            if what == "lost":  # (boat stopped it: nothing more is placed there)
+                self._lost_vm(vm)
+            elif unanswered:
+                threading.Thread(target=self._repair, args=(vm,), daemon=True).start()
+            with self.lock:
+                if b.admission_closed or it.owned.closed:
+                    it.state = "cancel_pending"
+                    return
+                vm.running.pop((b.id, it.run_name), None)
+                if it.state != "done":
+                    if what == "requeue":  # (no failure charged to the item: back off, no retry hot)
+                        it.state, it.vm, it.not_before = "queued", None, time.time() + 60
+                        it.fate.requeued()
+                    else:
+                        self._boat_failed(it, vm.id, f"prepare on {vm.id} failed: {str(e)[:120]}")
+            # (a VM boat reports up is never let go for failing: it is repaired in place; "lost" is boat's word only)
+        self.wake.set()
+
+    def _peer(self, vm: VMState, tree: str | None = None, cache: tuple | None = None) -> VMState | None:
+        """A ready VM (not this one) that has the tree or the cache whole: the one this VM pulls from."""
+        for v in list(self.vms.values()):
+            if v is vm or v.dead or not v.ready or not v.client or v.failing:
+                continue
+            if (tree and tree in v.trees) or (cache and cache in v.caches):
+                return v
+        return None
+
+    def _prepare(self, b: Batch, vm: VMState):
+        """The batch's directory on the VM: its tree synced by hash, pulled by the VM from a peer VM that has it (the
+        work on the VMs, not here), else sent from the blob store here (PREP_MAX at once); its caches the same way."""
+        # (rules.Preparation: a prepared batch is never prepared again; one being prepared waited for; a failed one not
+        # kept, so the next placement here prepares again)
+        prep = rules.Preparation()
+        for _ in range(3):
+            with vm.lock:
+                prep.state = "prepared" if b.id in vm.prepared else "preparing" if b.id in vm.preparing else "none"
+                what = prep.begin()
+                if what == "ready":
+                    return
+                first = what == "prepare"
+                ev = vm.preparing[b.id] = threading.Event() if first else vm.preparing[b.id]
+                if first:
+                    vm.__dict__.setdefault("prep_err", {}).pop(b.id, None)  # (this preparation's failure, not an older one's)
+            if first:
+                break
+            ev.wait(600)
+            # (rules.Preparation.waited: its failure's own words (an agent that didn't answer is no strike for the waiters
+            # either; B8); unprepared with no failure recorded (the VM dropped it, the wait ran out): prepared again, never
+            # a strike: 11-01 11:09-12:21, 5,748 strikes with no reason, 1,107 items to Modal)
+            err = getattr(vm, "prep_err", {}).get(b.id, "")
+            w = prep.waited(b.id in vm.prepared, bool(err))
+            if w == "ready":
+                return
+            if w == "fail":
+                raise RuntimeError(f"its preparation failed: {err}")
+        else:
+            raise AgentError(f"{vm.id}: the batch's preparation there never ended (3 waits)")
+        try:
+            cl = OwnedAgentClient(vm.client, self.agent_version) if b.strict_once else vm.client
+            t = b.tree
+            r = cl.rpc("begin", self.agent_version, b.id, t["id"], b.ctx_b64, timeout=60)
+            if r.get("ok"):
+                r = r["prep"]
+            else:
+                if b.strict_once and (r.get("version") != self.agent_version or r.get("need") != "manifest"):
+                    raise OwnedAgentRefused("strict begin refused: no fallback preparation")
+                r = cl.rpc("tree", t["id"], t["files"], t["links"], timeout=120)
+                if not r.get("ok") and r.get("missing"):
+                    peer, pulled = self._peer(vm, tree=t["id"]), False
+                    if peer:
+                        with contextlib.suppress(Exception):
+                            pr = cl.rpc("pull", peer.client.url, peer.client.token, r["missing"], timeout=900)
+                            pulled = pr.get("ok") and not pr.get("missing")
+                    if not pulled:
+                        with self.prep_sem:
+                            while self.shed and not self.stop.is_set():  # (the controller loaded: one send at a time, later)
+                                time.sleep(2)
+                            miss = cl.rpc("have", sorted(set(t["files"].values())), timeout=120).get("missing", r["missing"])
+                            for i in range(0, len(miss), 800):
+                                cl.put("/put", blob_tar(miss[i:i + 800]))
+                    r = cl.rpc("tree", t["id"], t["files"], t["links"], timeout=120)
+                if not r.get("ok"):
+                    raise AgentError(f"tree: {str(r)[:200]}")
+                r = cl.rpc("prep", b.id, f"tree:{t['id']}", b.ctx_b64, t["id"], "", "-", timeout=300)
+            if not r.get("ok"):
+                raise AgentError(f"prep: {str(r)[:200]}")
+            vm.trees.add(t["id"])
+            for c in b.caches:
+                local = pathlib.Path(c["local"])
+                names = sorted(f.name for f in local.iterdir() if f.name in set(c["outputs"])) if local.exists() else []
+                have = set(r.get("caches", {}).get(c["name"], []))
+                if set(names) - have:
+                    peer = self._peer(vm, cache=(c["name"], c["key"]))
+                    got = set()
+                    if peer:
+                        with contextlib.suppress(Exception):
+                            got = set(cl.rpc("pullcache", peer.client.url, peer.client.token, c["name"], c["key"], timeout=600).get("got", []))
+                    if set(names) - have - got:
+                        with self.prep_sem:
+                            buf = io.BytesIO()
+                            with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
+                                for n in sorted(set(names) - have - got):
+                                    tf.add(local / n, arcname=n)
+                            cl.put(f"/cache?name={c['name']}&key={c['key']}", buf.getvalue())
+                if names:
+                    vm.caches.add((c["name"], c["key"]))
+            self._verify_tree(vm, b, t)
+            vm.prepared.add(b.id)
+        except Exception as e:
+            vm.__dict__.setdefault("prep_err", {})[b.id] = str(e)[:200]
+            raise
+        finally:
+            with vm.lock:  # (a failed preparation isn't kept: the next item of the batch placed here tries again; one that
+                prep.done(b.id in vm.prepared)  # ended either way is no longer being made: never left marked running, for
+                if vm.preparing.get(b.id) is ev:  # a waiter to find finished and unprepared once the VM drops the batch)
+                    vm.preparing.pop(b.id, None)
+            ev.set()
+
+    def _verify_tree(self, vm: VMState, b, t: dict):
+        """The batch's tree on the VM, each file its client's manifest names a git blob for checked to be that blob
+        before any job of it runs there (agent.tree_verified): a mismatch is ours (a wrong key on the client's side),
+        never run (11-02: research/termination/lean-termination.ts shipped as main's old content)."""
+        gits = t.get("gits") or {}
+        if not gits:
+            return
+        try:
+            cl = OwnedAgentClient(vm.client, self.agent_version) if b.strict_once else vm.client
+            r = cl.rpc("verify", t["id"], gits, timeout=120)
+        except Exception as e:
+            if not b.strict_once and "no command verify" in str(e):  # (an agent from before: upgraded in place between items, checked then)
+                return
+            raise
+        if not r.get("ok"):
+            bad = r.get("bad") or []
+            with vm.lock:
+                vm.prepared.discard(b.id)
+            if r.get("partial"):  # (the VM's tree lacked files: dropped there, made again at the next preparation; no strike)
+                raise RuntimeError(f"its tree here lacked {len(bad)} files of its manifest ({bad[:2]}): dropped, made again")
+            raise RuntimeError(f"its tree isn't the commit's: {len(bad)} files aren't the git blobs named ({bad[:2]}): stale content, ours")
+
+    def _unprepare(self, vm: VMState, bid: str):
+        """The VM dropped the batch (rules.Preparation.dropped): the next placement there prepares it again; a finished
+        preparation's mark goes with it (a running one is left to end)."""
+        with vm.lock:
+            vm.prepared.discard(bid)
+            ev = vm.preparing.get(bid)
+            if ev is not None and ev.is_set():
+                vm.preparing.pop(bid, None)
+
+    def _victimize(self, v: VMState, x: Item, why: str):
+        if x.batch.admission_closed:
+            return
+        x.state = "preempting"
+        self.m["preempted"][NAMES[x.batch.klass]] = self.m["preempted"].get(NAMES[x.batch.klass], 0) + 1
+        x.batch.preempted += 1
+        threading.Thread(target=self._kill, args=(v, x), daemon=True).start()
+
+    def _preempt_for(self, it: Item, now: float) -> bool:
+        """A slot for a higher-class item, taken at once from a lower class: interactive checks and gates kill a
+        filler's or a sweep's item (queued again at the head of its class); a submission waits for items to end, and
+        after SUB_PREEMPT s takes a filler's. A timing item gets a whole VM of lower classes emptied. False when there
+        is nothing to take."""
+        if now - getattr(it, "claimed", 0) < 20:
+            return True
+        k = it.batch.klass
+        # (rules.victims: interactive checks and gates take a filler's or a sweep's slot, a submission a filler's after
+        # SUB_PREEMPT s, nobody a submission's)
+        victims = {"filler_sweep": (5, 4), "filler": (5,), "none": ()}[rules.victims(k, now - it.t_created, SUB_PREEMPT)]
+        if not victims:
+            return False
+        if (it.timing or it.weight > 1) and now < it.not_before:
+            return False  # (backing off: no VM set aside for an item that can't take it yet)
+        if it.timing or it.weight > 1:
+            # (an item that needs several slots or a whole VM (B15: weight-4 submissions behind filler and sweeps, none
+            # placed for an hour): slots on one VM set aside for it, the nearest to empty first (its lower-class items
+            # killed, what it may not take left to end; nothing new placed in the slots it needs, rules.reservation_holds),
+            # never a full VM drained while a nearly empty one waits; slots held so are exclusive work in health's busy.
+            # A VM running its own class or higher is a candidate too when the slots past those fit it
+            # (rules.may_set_aside; 11-01 13:25, a 2-slot gate item found none where gates ran beside filler everywhere)
+            rv = getattr(it, "rsv_vm", None)
+            if not (rv is not None and not rv.dead and rv.ready and getattr(rv, "reserved", None) and rv.reserved[0] is it and now < rv.reserved[1]):
+                rv = None
+            keep_of = lambda v: sum(x.weight for x in v.running.values() if x.batch.klass not in victims or x.state == "starting") + getattr(v, "foreign", 0)
+            if rv is not None and not keep_of(rv):
+                # (set aside already: one VM an item, never another every 20 s; a lower item that was starting there
+                # when it was set aside is killed once it runs)
+                self._make_room(rv, it, rv.reserved[2] if len(rv.reserved) > 2 else rv.slots, victims)
+                it.claimed = now
+                return True
+            best = None
+            retired, shape = self.retired(), fit_shape(it)
+            for v in self.vms.values():
+                if not vm_fits(shape, v, retired):  # (the one fit: rules.vm_fits)
+                    continue
+                if self._held(v, it, now):
+                    continue  # (set aside for another item still waiting)
+                need = max(v.slots, it.weight) if it.timing else it.weight  # (a timing item: the whole VM, and one it fits in:
+                xs = list(v.running.values())  # 10:35-14:25, a 2-slot timing sweep item set aside 1-slot VMs 100 times, never placed)
+                # (what it may not take, and lower items starting there (killed once they run), left to end; lower items
+                # being killed already are slots coming free)
+                keep = keep_of(v)
+                if not rules.may_set_aside(need, v.slots, keep, any(x.batch.klass <= k for x in xs)):
+                    continue
+                score = (keep, sum(x.weight for x in xs if x.batch.klass in victims))
+                if best is None or score < best[0]:
+                    best = (score, v, need)
+            if rv is not None and (best is None or best[1] is rv or not rules.reservation_moves(keep_of(rv), best[0][0])):
+                # (waiting there for what it may not take to end, and no VM nearer to empty: it stays)
+                self._make_room(rv, it, rv.reserved[2] if len(rv.reserved) > 2 else rv.slots, victims)
+                it.claimed = now
+                return True
+            if best is None:
+                return False
+            if rv is not None:  # (a VM nearer to empty came: the item moves there, its old one free to all)
+                rv.reserved = None
+            v, need = best[1], best[2]
+            it.claimed = now
+            v.reserved, it.rsv_vm = (it, now + (120 if not best[0][0] else 900), need), v
+            kill = self._make_room(v, it, need, victims)
+            log(f"{NAMES[k]} {it.batch.id}: {v.id} set aside for a{' timing' if it.timing else ' ' + str(it.weight) + '-slot'} item ({len(kill)} lower-class items queued again, {best[0][0]} slots to end)")
+            return True
+        for victim_class in victims:
+            retired, shape = self.retired(), fit_shape(it)
+            for v in [v for v in self.vms.values() if vm_fits(shape, v, retired)]:
+                held = self._held(v, it, now)  # (slots set aside for another waiting item: not this one's to take)
+                for x in list(v.running.values()):
+                    if x.batch.klass != victim_class or x.state != "running" or v.slots - v.used() + x.weight - held < it.weight:
+                        continue
+                    it.claimed = now
+                    self._victimize(v, x, NAMES[k])
+                    return True
+        return False
+
+    def _make_room(self, v: VMState, it: Item, need: int, victims: tuple) -> list:
+        """The lower items running on a VM set aside for `it` killed until its need is free (or coming free)."""
+        free_now = v.slots - v.used() + sum(x.weight for x in v.running.values() if x.state == "preempting")
+        kill = []
+        for x in sorted([x for x in v.running.values() if x.batch.klass in victims and x.state == "running"], key=lambda x: (-x.batch.klass, x.weight)):
+            if free_now >= need:
+                break
+            kill.append(x)
+            free_now += x.weight
+        for x in kill:
+            self._victimize(v, x, "timing" if it.timing else "wide")
+        return kill
+
+    def _held(self, vm: VMState, it, now: float) -> int:
+        """The slots of the VM a reservation holds against `it` (None: against anyone): its item's need while that item
+        is still queued, before its deadline (rules.reservation_holds); a reservation that holds nothing is dropped."""
+        r = getattr(vm, "reserved", None)
+        if not r:
+            return 0
+        other = r[0]
+        queued = other.state == "queued" and not other.batch.closed
+        n = rules.reservation_holds(other is it, queued, now, r[1], r[2] if len(r) > 2 else vm.slots, it is not None and it.batch.klass < other.batch.klass)
+        if not queued or now >= r[1]:
+            vm.reserved = None  # (its item ran elsewhere, is done or gone, or the deadline passed)
+        return n
+
+    def _cancel_strict_item(self, vm, it):
+        """Preemption is terminal for one strict item; uncertain reap holds its slot."""
+        b = it.batch
+        with self.lock:
+            if it.owned.reaped:
+                return
+            it.owned.cancel()
+            it.state = "cancel_pending"
+            self._append_owned(b.id, "cancel", {"name": it.name, "run_name": it.run_name,
+                "identity": it.launch_identity, "admission_closed": True, "t": time.time()})
+        if not it.start_done.wait(60):
+            return
+        receipt = None
+        try:
+            receipt = vm.client.rpc("cancelitem", b.id, it.run_name, 10,
+                                    it.launch_identity, timeout=12)
+        except Exception:
+            receipt = {"ok": False, "error": "strict preemption reap failed or timed out"}
+        matched = self._matching_receipt(receipt, b.id, it.run_name, it.launch_identity)
+        with self.lock:
+            self._append_owned(b.id, "cancel", {"name": it.name, "run_name": it.run_name,
+                "identity": it.launch_identity, "matched": matched, "receipt": self._safe_snapshot(receipt), "t": time.time()})
+            if it.owned.confirm(matched):
+                vm.running.pop((b.id, it.run_name), None)
+                self._owned_failed(it, "strict_once: preempted; matching namespace reap confirmed")
+        self.wake.set()
+
+    def _kill(self, vm: VMState, it: Item):
+        if it.batch.strict_once:
+            return self._cancel_strict_item(vm, it)
+        with contextlib.suppress(Exception):
+            vm.client.rpc("killitem", it.batch.id, it.run_name, timeout=30)
+        self.wake.set()
+
+    # -- the plan
+    @staticmethod
+    def est_key(it: Item) -> str:
+        sp = it.spec
+        return f"{it.batch.label.split(' ')[0]}|{sp.get('module', '')}|{sp.get('fn') or it.name.rstrip('0123456789-~s')}"
+
+    def est_of(self, it: Item) -> float:
+        """An item's expected seconds: its own estimate when it has one (scaled by what its batch's items took);
+        one of a second or less (a runner's call: `est` 1) from the history of its (label, function), kept across
+        batches and restarts, else the median of what its class's items took lately, else a minute."""
+        e = it.est
+        if e > 1:
+            return e * it.batch.scale()
+        h = self.est_hist.get(self.est_key(it))
+        if h:
+            return float(h)
+        med = self.__dict__.setdefault("_med", {})  # (a class's median, once a pass: a sort of 200 for each of 8.8k items was a pass's)
+        if it.batch.klass not in med:
+            obs = sorted(self.class_obs.get(it.batch.klass, []))
+            med[it.batch.klass] = float(obs[len(obs) // 2]) if obs else 60.0
+        return med[it.batch.klass]
+
+    def _learn(self, it: Item, seconds: float):
+        k = self.est_key(it)
+        self.est_hist[k] = round(seconds if k not in self.est_hist else 0.7 * self.est_hist[k] + 0.3 * seconds, 2)
+        self.class_obs[it.batch.klass] = (self.class_obs.get(it.batch.klass, []) + [round(seconds, 2)])[-200:]
+
+    def _in_flight(self) -> int:
+        return sum(self.creating.values()) + sum(1 for v in self.vms.values() if not v.dead and not v.ready)
+
+    def _plan(self, now: float) -> dict:
+        """VMs to start per image, demand-driven (README, "Scheduling policy"):
+        - the deficit: queued slot-time (every class but filler; a submission client's capped at SUB_VMS VMs) less
+          what the pool held (and coming) clears within HORIZON, its running real work deducted;
+        - a gate's (and an interactive check's) own need, exempt from that horizon: the VMs that finish what's queued
+          of them within GATE_HORIZON, after the slots free now or held by lower classes (fillers, sweeps);
+        - an interactive check alone starts at most one VM, and none while any VM of its image is held;
+        - each new VM needs 3x its bring-up time of queued work;
+        - bounded by the bring-up cap (in flight), MAX_VMS (counted when it binds), the breaker and the watchdog. No
+          VM-hour or dollar cap."""
+        out = {}
+        groups: dict = {}
+        for it in self._pass_queue():
+            groups.setdefault((it.batch.image, it.spec.get("vm_type") or getattr(it, "need_type", None) or it.batch.vm_type), []).append(it)
+        if rules.plan_waits(getattr(self, "reattaching", False), time.time() - getattr(self, "t_reattach", 0.0), bool(getattr(self, "_handoff", {}).get("taken")), 15.0):
+            return {}
+        live = [v for v in self.vms.values() if not v.dead]
+        # (the starts: rules.Pool.grow's, from the pool as it is: VMs held and ready, starts in flight (asked of boat or
+        # coming up), the breaker; within max_vms and the bring-up cap, none while the breaker is open but one probe)
+        pool, in_flight = rules.Pool(max(1, MAX_VMS), max(1, BRINGUP_MAX), int(BREAK_BACKOFF), int(BREAK_MAX)), self._in_flight()
+        pool.held, pool.coming = len(live) + sum(self.creating.values()) - in_flight, in_flight
+        pool.open_until, pool.half = float(self.br["open_until"]), bool(self.br["half"])
+        pool.probing = pool.half and any(s["ok"] is None for s in self.starts_log if s["t"] > self.br["t_trip"])
+        self.target = {}
+        for (image, vm_type), its in groups.items():
+            S, bu = vm_slots(vm_type), max(30.0, self.bring_up)
+            held = [v for v in live if v.image == image and v.type == vm_type]
+            coming = self.creating.get((image, vm_type), 0)
+            real = [it for it in its if it.batch.klass <= 4]
+            if not real:
+                continue
+            scale = {}
+
+            def sz(it, S=S):  # (an item's slot-time; its batch's scale read once a pass, not once an item)
+                e = it.est
+                if e > 1:
+                    b = it.batch
+                    if b not in scale:
+                        scale[b] = b.scale()
+                    e *= scale[b]
+                else:
+                    e = self.est_of(it)
+                return (S if it.timing else it.weight) * e
+            work, subs = 0.0, {}
+            for it in real:
+                if it.batch.klass == 3:
+                    subs[it.batch.client] = subs.get(it.batch.client, 0.0) + sz(it)
+                else:
+                    work += sz(it)
+            contended = getattr(self, "_contended", None)
+            first = {}
+            for it in real:
+                if it.batch.klass == 3:
+                    first.setdefault(it.batch.client, it)
+            for c, w in subs.items():  # (a client's work past its share is demand while its share doesn't bind: the same
+                held_c = sum(x.weight for v in held for x in v.running.values() if x.batch.klass == 3 and x.batch.client == c)
+                binds = contended(first[c]) if contended is not None and c in first else (len(subs) > 1 or any(it.batch.klass <= 2 for it in real))
+                work += rules.sub_demand(w, max(0, SUB_VMS * S - held_c) * HORIZON, binds)  # contention placement reads, rules.contends)
+            busy = sum(x.weight * min(HORIZON, max(0.0, self.est_of(x) - (now - (x.t_start or now)))) for v in held for x in v.running.values() if x.batch.klass <= 4)
+            cap = sum(rules.usable_slots(v.slots, getattr(v, "foreign", 0), False) * HORIZON for v in held) + coming * S * HORIZON - busy
+            n_def = math.ceil((work - cap) / (S * HORIZON)) if work > cap else 0
+            hi = [it for it in real if it.batch.klass <= 2]
+            n_hi = 0
+            if hi:
+                H = GATE_HORIZON
+                hw = sum(sz(it) for it in hi)
+                # the held VMs' slot-time within H a gate can have: free slots and lower classes' at once, the rest
+                # as their items (interactive, gate, submission) end; VMs still coming up, after their bring-up
+                cap_hi = 0.0
+                exclusive = any(it.timing for it in hi)
+                retired = self.retired()
+                for v in held:
+                    # The same shape/health exclusions as placement. Coming workers have no
+                    # agent inventory yet; ready workers' foreign runs have no known end.
+                    if v.ready and not any(vm_fits(fit_shape(it), v, retired) for it in hi):
+                        continue
+                    slots = rules.usable_slots(v.slots, getattr(v, "foreign", 0), exclusive)
+                    left = [min(H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
+                            for x in v.running.values() if x.batch.klass <= 3]
+                    if exclusive:
+                        taken = slots * max(left, default=0.0)  # one whole VM, not fragments on several
+                    else:
+                        taken = sum((v.slots if x.timing else x.weight) * min(H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
+                                    for x in v.running.values() if x.batch.klass <= 3)
+                    cap_hi += max(0.0, slots * (H if v.ready else max(0.0, H - bu)) - taken)
+                cap_hi += coming * S * max(0.0, H - bu)
+                n_hi = math.ceil((hw - cap_hi) / (S * max(60.0, H - bu))) if hw > cap_hi else 0
+                if all(it.batch.klass == 1 for it in hi):  # (a check alone: one VM, and only when none is held)
+                    n_hi = 0 if (held or coming) else 1
+            want = max(n_def, n_hi)
+            ready = [v for v in held if v.ready]
+            stuck = bool(ready) and any(all(v.id in it.avoid for v in ready) for it in real)  # (B3: every held VM failed it)
+            want = rules.stuck_wants(want, stuck, coming + sum(1 for v in held if not v.ready))
+            # each new VM: 3x its bring-up time of queued work
+            useful = math.floor(sum(sz(it) for it in real) / (S * 3 * bu))
+            # A guessed end is not a service lane for a new exclusive batch. Give
+            # each unserved timing batch a lane, reusing a free/preemptible worker
+            # first. Once it is running, the horizon sizes its remaining work.
+            timing = {it.batch: it for it in hi if it.timing}
+            unserved = [it for b, it in timing.items() if not any(x.batch is b for v in held for x in v.running.values())]
+            available = {}
+            for it in unserved:
+                available[it] = []
+                low = {"filler_sweep": (5, 4), "filler": (5,), "none": ()}[rules.victims(it.batch.klass, now - it.t_created, SUB_PREEMPT)]
+                for v in held:
+                    if (vm_fits(fit_shape(it), v, self.retired()) and not getattr(v, "foreign", 0)
+                            and not self._held(v, it, now) and all(x.batch.klass in low for x in v.running.values())):
+                        available[it].append(v.id)
+            # Match distinct lanes to actual placement shapes. Their union can
+            # hide a batch that cannot use any of another batch's free workers.
+            lanes = {}
+            def reuse(it, seen):
+                for vid in available[it]:
+                    if vid not in seen:
+                        seen.add(vid)
+                        if vid not in lanes or reuse(lanes[vid], seen):
+                            lanes[vid] = it
+                            return True
+                return False
+            reused = sum(reuse(it, set()) for it in unserved)
+            lane_need = rules.exclusive_lanes(len(unserved), reused, coming + sum(1 for v in held if not v.ready))
+            stranded = bool(hi) and cap_hi <= 0 and not coming
+            want = max(want, lane_need, int(stranded))
+            useful = max(useful, lane_need)
+            if (not held and not coming) or stuck or stranded:  # (work with nowhere to go: one VM, whatever it amounts to)
+                useful = max(useful, 1)
+            n = min(want, useful)
+            # (reuse before create, across types: a VM of the image of another type, empty or running only what this
+            # work may take (filler; a gate's, sweeps too), with the slots and the usable memory its items need, is one
+            # of its before any start, a larger one too (rules.starts_beside_free; 20:46, default VMs started for a wave))
+            loose = [it for it in real if not it.spec.get("vm_type") and not it.timing]
+            if loose and n > 0:
+                kmin = min(it.batch.klass for it in loose)
+                low = {"filler_sweep": (5, 4), "filler": (5,), "none": ()}[rules.victims(kmin, 10 ** 9, SUB_PREEMPT)]
+                w_max, mem_max = max(it.weight for it in loose), max(it.memory for it in loose)
+                retired = self.retired()
+                spare = 0  # (slots of other types' VMs this work may have: empty, or on what it may take; a larger VM's too)
+                for v in live:
+                    if v.image != image or v.type == vm_type or not v.ready or v.dead or v.id in retired or v.failing or getattr(v, "disk_low", False) or getattr(v, "prep_fails", 0) >= 3 \
+                            or v.slots < w_max or not boat.R.fits_memory(mem_max, boat.TYPES.get(v.type, (0, 0))[1], boat.MEM_OVERHEAD):
+                        continue
+                    spare += max(0, v.slots - sum(x.weight for x in v.running.values() if x.batch.klass not in low) - getattr(v, "foreign", 0))
+                free_any = spare // max(1, S)  # (in VMs of the group's type)
+                n = rules.starts_beside_free(n, free_any)
+            # (timing items: a free VM of any type that fits one is its, before any start; a start only for those left)
+            tim = [it for it in real if it.timing and not it.spec.get("vm_type")]
+            if tim:
+                need = vm_slots(vm_type)
+                kmin = min(it.batch.klass for it in tim)
+                low = {"filler_sweep": (5, 4), "filler": (5,), "none": ()}[rules.victims(kmin, 10 ** 9, SUB_PREEMPT)]
+                # (a VM of the image that fits one and runs only what a timing item may take (filler, sweeps) is one it
+                # gets by emptying it, never a reason to start one)
+                free_fit = sum(1 for v in live if v.image == image and v.ready and not getattr(v, "foreign", 0) and not getattr(v, "disk_low", False) and v.slots >= need and all(mem_fits(it, v.type) for it in tim[:1])
+                               and v.type != vm_type and all(x.batch.klass in low for x in v.running.values())
+                               and (not self._held(v, None, now) or v.reserved[0] in tim))  # (set aside for one of them: theirs)
+                # (the starts this work earns: the VMs its other items fill, and one per timing item no free VM takes;
+                # a start past those, with such a VM free, is needless: 08:17, a submission's own starts were counted)
+                earned = math.ceil(sum(sz(it) for it in real if it not in tim) / (S * HORIZON)) + max(0, len(tim) - free_fit) if len(tim) < len(real) else max(0, len(tim) - free_fit)
+                if len(tim) == len(real):
+                    n = min(n, earned)
+                if n > earned and free_fit:
+                    self._h().record_needless(now, n - earned, image, vm_type)
+            tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "why": ""}
+            if n > 0:
+                tgt["why"] = "breaker" if now < pool.open_until else "probe" if pool.half else ""
+                if self.shed:
+                    n, tgt["why"] = 0, "shed"
+                else:
+                    at_max = pool.max_vms - pool.held - pool.coming < n
+                    got = pool.grow(n, now)
+                    if got < n and not tgt["why"]:
+                        if at_max and now - getattr(self, "_max_t", 0) > 300:
+                            self._max_t = now
+                            self.m["max_binds"] = self.m.get("max_binds", 0) + 1
+                            log(f"growth held at the ceiling of {MAX_VMS} VMs ({n} wanted)")
+                        tgt["why"] = "max VMs" if at_max else "bring-up cap"
+                    n = got
+            self.target[f"{image}/{vm_type}"] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
+            if n <= 0:
+                continue
+            first = min(real, key=lambda it: (it.batch.klass, it.batch.t0)).batch
+            out[(image, vm_type)] = (n, first.klass, first, not first.warm_only)
+        return out
+
+    # -- VMs
+    def _ask(self, image, vm_type, n, k, b, allow):
+        try:
+            if not self._acquire(image, vm_type, n, k, b, allow):
+                self.backoff[image] = time.time() + 15  # (nothing to be had now: ask boat again in a while, not every loop)
+        except Exception as e:
+            log(f"acquire: {str(e)[:200]}")
+            self.backoff[image] = time.time() + 15
+        finally:
+            self.asking.discard(image)
+            self.wake.set()
+
+    def _acquire(self, image: str, vm_type: str, n: int, k: int, b: Batch, allow: bool = True) -> int:
+        """n VMs: warm free ones of the pool first (no start), then resumed or created, free starts before paid ones
+        (every class may pay: the user, 10-31, a paid start and prepaid VM-hours beat Modal past about 2 minutes of
+        work), paced by the StartGate (a sixth of what's left a minute, boat's minute limit), each with its warm
+        agent. Modal only on boat's API errors, a missing image, or the extra starts' cap. How many are coming."""
+        try:
+            lim = boat.limits() if allow else None
+            starts = max(0, boat.starts_left(lim)) if allow else 0
+        except Exception:
+            starts = 0
+        budget = min(starts, boat.budget(starts))
+        mine = []
+        with Registry().locked() as d:
+            with contextlib.suppress(Exception):
+                boat.reconcile(d, boat.sandboxes())
+            now = time.time()
+            free = [i for i, v in d["vms"].items() if v["snapshot"] == image and v["type"] == vm_type and boat.lease_free(v) and i not in self.vms and i not in self.retired()]
+            up = [i for i in free if d["vms"][i].get("state") in boat.RUNNING and d["vms"][i].get("until", 0) > now + boat.WARM_MARGIN]
+            stopped = [i for i in free if i not in up and d["vms"][i].get("state") == "stopped"]
+            acq = rules.Acquire()  # (rules.Acquire: warm ones first, then resumes and creations within the budget)
+            acq.plan(max(0, n), len(up), len(stopped), max(0, budget))
+            pick = up[:acq.warm] + stopped[:acq.resumes]
+            for i in pick:
+                d["vms"][i]["lease"] = {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": now, "label": f"scheduler ({NAMES[k]})"}
+                d["vms"][i].pop("released", None)
+                mine.append((i, i in up))
+        create = acq.creates
+        for i, warm in mine:
+            self._bring(i, image, vm_type, "warm" if warm else "resumed", k, b)
+        if create > 0:
+            with self.lock:
+                self.creating[(image, vm_type)] = self.creating.get((image, vm_type), 0) + create
+            threading.Thread(target=self._create, args=(image, vm_type, create, k, b), daemon=True).start()
+        return len(mine) + max(0, create)
+
+    def _bring(self, i: str, image: str, vm_type: str, how: str, k: int, b: Batch):
+        vm = VMState(i, image, vm_type, how)
+        with self.lock:
+            if i in self.vms:  # (a VM is brought up once at a time: a second bring-up would replace its agent's token)
+                return
+            self.vms[i] = vm
+        threading.Thread(target=self._up, args=(vm, k, b), daemon=True).start()
+
+    def _count_start(self, k: int, b: Batch, got: int, paid: int, ids: list[str], vm_type: str = ""):
+        with self.lock:
+            n = NAMES[k]
+            self.m["starts"][n]["paid"] += paid
+            self.m["starts"][n]["free"] += got - paid
+            b.starts += got
+            for i in ids:
+                self.starts_log.append({"t": time.time(), "vm": i, "ok": None, "image": b.image})
+                self._h().record_start(time.time(), b.image, i, vm_type or (self.vms[i].type if i in self.vms else ""))
+            self.starts_log = [s for s in self.starts_log if time.time() - s["t"] < 2 * BREAK_WINDOW]
+
+    def _start_failed(self, image: str, since: float, now: float) -> bool:
+        """Whether boat failed a start of this image since then: refused, or not ready within BREAK_READY."""
+        return any(s.get("image") == image and s["t"] >= since and (s["ok"] is False or (s["ok"] is None and now - s["t"] > BREAK_READY))
+                   for s in self.starts_log)
+
+    def _start_done(self, vm_id: str, ok: bool):
+        with self.lock:
+            for s in self.starts_log:
+                if s["vm"] == vm_id and s["ok"] is None:
+                    s["ok"] = ok
+            if not ok:
+                self.m["not_ready"] += 1
+
+    def _up(self, vm: VMState, k: int, b: Batch):
+        started = False
+        try:
+            if vm.how == "resumed":
+                got, paid = self.gate.take_split(1, self.stop)
+                if not got:
+                    raise RuntimeError("no start left")
+                out = boat.boat("resume", vm.id, "--json", check=False, timeout=300)
+                if boat.R.resume_replaces(boat.resume_missing(out), False):
+                    boat.note_starts(-1)
+                    boat.forget_missing(vm.id, "scheduler")
+                    vm.dead = True
+                    log(f"{vm.id}: boat no longer has it; replanning on fresh capacity")
+                    return
+                self._count_start(k, b, 1, paid, [vm.id])
+                started = True
+                if "rate_limited" in out:
+                    boat.note_starts(-1)
+                    raise RuntimeError("boat refused the resume")
+            started = started or vm.how == "created"
+            threading.Thread(target=boat.boat, args=("extend", vm.id, "--ttl", str(boat.BACKSTOP), "--json"), kwargs={"check": False}, daemon=True).start()
+            cl = boat.agent_client(vm.id) if vm.how in ("warm", "adopt") else None
+            ok = False
+            if cl:
+                with contextlib.suppress(Exception):
+                    ok = cl.ping().get("version") == self.agent_version
+            if not ok:
+                if not boat.wait_running([vm.id], int(BREAK_READY)):
+                    raise RuntimeError("never came up")
+                tok = secrets.token_urlsafe(24)
+                r = boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90)
+                if not r.get("ok"):
+                    raise RuntimeError(f"agent: {r}")
+                old = boat.read_agent(vm.id) or {}
+                url = old.get("url") or boat.bj("host", vm.id, str(boat.AGENT_PORT), "--localhost", "--private")["url"]
+                cl = AgentClient(vm.id, url, tok)
+                try:
+                    cl.ping()
+                except AgentError:
+                    url = boat.bj("host", vm.id, str(boat.AGENT_PORT), "--localhost", "--private")["url"]
+                    cl = AgentClient(vm.id, url, tok)
+                    cl.ping()
+                boat.write_agent(vm.id, {"url": url, "token": tok, "t": time.time(), "version": self.agent_version})
+            vm.client = cl
+            vm.agent, vm.t_agent = self.agent_version, time.time()
+            r = cl.rpc("vtick", {"wait": 0}, timeout=30)
+            vm.slots = max(1, int(r.get("cpus") or boat.TYPES[vm.type][0]) // boat.SLOT_CPU)
+            vm.model = r.get("model", "")
+            self._foreign(vm, r)  # (inventory before advertising this worker as usable)
+            vm.ready = True
+            vm.t_ready = vm.idle_since = vm.t_real = time.time()
+            if vm.id in self.held_before:
+                vm.t_real = float(self.held_before[vm.id].get("t_real", vm.t_real))
+            if started:
+                self._start_done(vm.id, True)
+                self.bring_up = 0.8 * self.bring_up + 0.2 * (vm.t_ready - vm.t_lease)
+            self._worker(vm)
+            log(f"{vm.id} ({vm.how}) ready for {NAMES[k]} in {vm.t_ready - vm.t_lease:.0f} s" if vm.how != "adopt" else f"{vm.id} adopted (agent {vm.agent})")
+        except Exception as e:
+            log(f"{vm.id}: {str(e)[:200]}")
+            if started:
+                self._start_done(vm.id, False)
+            vm.dead = True
+            self._let_go(vm, stop=True)
+        finally:
+            self.wake.set()
+
+    def _create(self, image: str, vm_type: str, n: int, k: int, b: Batch):
+        try:
+            got, paid = self.gate.take_split(n, self.stop)
+            if got <= 0:
+                return
+            try:
+                out = boat.boat("new", "--from", image, "--type", vm_type, "--count", str(got), "--ttl", str(boat.BACKSTOP), "--no-env", "--no-monitoring", "--json", timeout=600, check=False)
+            except Exception as e:  # (boat new that never answered (06:5x: a 600 s timeout for a small VM): no VM, the starts given back,
+                log(f"boat new --from {image} --type {vm_type}: {str(e)[:160]}; backing off 120 s")  # its image's starts backed off; a VM
+                out = ""  # made all the same is up with no owner: adoption takes it in (work queued) or stops it)
+                self.backoff[image] = time.time() + 120
+            ids = []
+            for line in out.splitlines():
+                with contextlib.suppress(Exception):
+                    e = json.loads(line)
+                    if e.get("id") and e["id"] not in ids and e.get("event") != "error":
+                        ids.append(e["id"])
+            if len(ids) < got:
+                boat.note_starts(-(got - len(ids)))
+                if not ids:
+                    self.alert(f"boat new --from {image} made no VM ({out.strip()[-200:]})")
+            self._count_start(k, b, len(ids), min(paid, len(ids)), ids, vm_type)
+            with Registry().locked() as d:
+                for i in ids:
+                    d["vms"][i] = {"type": vm_type, "snapshot": image, "created": time.time(), "last_used": time.time(), "state": "starting",
+                                   "lease": {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": time.time(), "label": f"scheduler ({NAMES[k]})"}}
+            for i in ids:
+                self._bring(i, image, vm_type, "created", k, b)
+        finally:
+            with self.lock:
+                self.creating[(image, vm_type)] = max(0, self.creating.get((image, vm_type), 0) - n)
+            self.wake.set()
+
+    def _boat_up(self, vm_id: str) -> bool:
+        """boat's own word on a VM: up (a VM boat reports up is never called lost by us)."""
+        with contextlib.suppress(Exception):
+            return boat.states(10).get(vm_id, {}).get("state") in boat.RUNNING
+        return True  # (boat's list not to be had: no verdict, so not lost)
+
+    def _repair(self, vm: VMState) -> bool:
+        """A VM whose agent doesn't answer, repaired in place: its agent restarted through boat exec with its token
+        (its items, in sessions of their own, run on), then asked again. True once it answers."""
+        if any(it.batch.strict_once for it in vm.running.values()):
+            return False  # unresolved owned supervisors may not be detached by repair
+        if time.time() - getattr(vm, "t_repair", 0) < 30:
+            return False
+        vm.t_repair = time.time()
+        with contextlib.suppress(Exception):
+            boat.bootstrap_agent(vm.id, self.agent_b64, vm.client.token, 60, 2)
+            if vm.client.ping(timeout=15).get("ok"):
+                log(f"{vm.id}: its agent didn't answer: repaired in place ({len(vm.running)} items running on)")
+                vm.failing, vm.fails = 0, 0
+                return True
+        return False
+
+    def _outage(self) -> bool:
+        """boat's front failing most VMs' agents at once (the 2026-10-31 incident: every tick 502): no VM is at fault,
+        none is let go, and no start is made until it passes."""
+        rv = [v for v in self.vms.values() if v.ready and not v.dead]
+        return rules.outage(len(rv), sum(1 for v in rv if v.failing))
+
+    # -- the VMs' ticks: a fixed pool of pollers over every VM (POLLERS threads whatever the pool's size), each VM due
+    # at its next tick in a heap; never a thread per VM (07:02: 356 threads, 82-94% of a core at 181 VMs, every idle
+    # VM's thread waking 5 times a second)
+    POLLERS = 32  # (a tick waits for nothing: at 200 VMs about 100 calls a second; a hung agent holds one poller TICK_S at most)
+    TICK_S = 20
+
+    def _cpu_add(self, part: str, c0: float):
+        """This thread's CPU since c0 charged to a part of the scheduler (status: load.cpu_s, load.cpu_n)."""
+        c = self.__dict__.setdefault("_cpu", {})
+        n = self.__dict__.setdefault("_cpu_n", {})
+        c[part] = c.get(part, 0.0) + _cpu_now() - c0
+        n[part] = n.get(part, 0) + 1
+
+    def _poll_add(self, vm: VMState, delay: float = 0.0):
+        import heapq
+        with self._pcv():
+            heapq.heappush(self._pheap, (time.time() + delay, next(self._pseq), vm))
+            self._pcond.notify()
+
+    def _pcv(self):
+        if not hasattr(self, "_pcond"):
+            import itertools
+            self._pcond, self._pheap, self._pseq = threading.Condition(), [], itertools.count()
+            self._pollers = [threading.Thread(target=self._poller, name=f"poller-{k}", daemon=True) for k in range(self.POLLERS)]
+            for t in self._pollers:
+                t.start()
+        return self._pcond
+
+    def _poller(self):
+        import heapq
+        while not self.stop.is_set():
+            with self._pcond:
+                while not self.stop.is_set():
+                    if self._pheap and self._pheap[0][0] <= time.time():
+                        _, _, vm = heapq.heappop(self._pheap)
+                        break
+                    self._pcond.wait(min(1.0, max(0.01, self._pheap[0][0] - time.time())) if self._pheap else 1.0)
+                else:
+                    return
+            if vm.dead or self.vms.get(vm.id) is not vm and not vm.running:
+                continue
+            c0 = _cpu_now()
+            try:
+                delay = self._tick(vm)
+            except Exception as e:
+                log(f"{vm.id}: tick: {e!r}"[:300])
+                delay = 5.0
+            self._cpu_add("tick", c0)
+            if delay is not None and not vm.dead:
+                self._poll_add(vm, delay)
+
+    def _worker(self, vm: VMState):
+        """The VM taken into the pollers' heap (its ticks: its starts and acks out, every batch's finished items back)."""
+        vm._fails = 0
+        self._poll_add(vm)
+
+    def _tick(self, vm: VMState) -> float | None:
+        """One tick of the VM (a call that waits for nothing): the seconds until its next, None when it's done."""
+        with vm.lock:
+            starts, acks = vm.starts, vm.acks
+            vm.starts, vm.acks = [], []
+        if not vm.running and not starts and not acks and not getattr(vm, "foreign", 0) and time.time() - getattr(vm, "t_inventory", 0) < 30:
+            if vm.ready is False:
+                return None
+            if vm.client and time.time() - vm.t_disk >= (30 if vm.disk_low else 300):  # (its disk asked by ping every 5 min, 30 s while low:
+                vm.t_disk = time.time()  # a vtick of an empty VM would read its runs mid-handoff)
+                with contextlib.suppress(Exception):
+                    self._disk(vm, vm.client.ping().get("disk") or {})
+            return 1.0  # (nothing of ours there: no call, looked at again in a second)
+        busy_queue = getattr(self, "_any_queued", True)  # (the last pass's word: no scan of every item at every tick of every VM)
+        if time.time() - vm.t_agent > 600 and not vm.running:  # (an agent's code checked, and upgraded, between items only)
+            vm.t_agent = time.time()
+            with contextlib.suppress(Exception):
+                self._check_agent(vm)
+        strict_starts = [st for st in starts if st.get("spec", {}).get("strict_once") is True]
+        strict_acks = [ack for ack in acks if "launch_identity" in ack]
+        starts = [st for st in starts if st not in strict_starts]
+        acks = [ack for ack in acks if ack not in strict_acks]
+        owned_done = []
+        if strict_starts or strict_acks:
+            try:
+                strict_result = OwnedAgentClient(vm.client, self.agent_version).rpc(
+                    "vtick", {"start": strict_starts, "acks": strict_acks, "wait": 0}, timeout=self.TICK_S)
+                owned_done = strict_result.get("done", [])
+            except Exception as error:
+                with self.lock:
+                    for st in strict_starts:
+                        item = vm.running.get((st["batch"], st["spec"]["name"]))
+                        if item:
+                            item.state, item.result_error = "owned_refused", str(error)
+                with vm.lock:
+                    vm.acks = strict_acks + vm.acks  # unknown reply never discards acknowledgements
+        try:
+            r = vm.client.rpc("vtick", {"start": starts, "acks": acks, "wait": 0}, timeout=self.TICK_S)
+            r["done"] = owned_done + r.get("done", [])
+            vm._fails, vm.failing = 0, 0
+        except Exception as e:
+            fails = vm._fails = getattr(vm, "_fails", 0) + 1
+            vm.failing = fails
+            outage = self._outage()
+            if "is stopped" in str(e) and rules.vm_lost(fails, outage, False, True):  # (boat stopped it: let go at once, its items to other VMs)
+                log(f"{vm.id}: boat reports it stopped")
+                self._lost_vm(vm)
+                return None
+            if fails >= 2 and fails % 4 == 2:  # (its agent repaired in place, its items running on)
+                if self._repair(vm):
+                    vm._fails = 0
+                    return 0.0
+            with vm.lock:
+                vm.starts = starts + vm.starts
+                vm.acks = acks + vm.acks
+            if outage and time.time() >= self.br["open_until"]:
+                self.trip(f"boat's front: the agents of {sum(1 for v in self.vms.values() if v.failing)} of {sum(1 for v in self.vms.values() if v.ready and not v.dead)} VMs don't answer ({str(e)[:80]})")
+            if fails <= 3 or fails % 10 == 0:
+                log(f"{vm.id}: tick failed ({fails}{', an outage' if outage else ''}): {str(e)[:160]}")
+            # ("lost": rules.vm_lost, boat reports it stopped or gone; boat asked only past the failures' threshold)
+            if rules.vm_lost(fails, outage, fails < (90 if outage else 12) or self._boat_up(vm.id), False):
+                self._lost_vm(vm)
+                return None
+            return float(min(20, 2 * fails))
+        if r.get("err"):  # (a batch's directory gone from the VM: prepared again)
+            self._unprepare(vm, r.get("batch"))
+            with self.lock:
+                for key, it in list(vm.running.items()):
+                    if not it.batch.admission_closed and not it.owned.closed and it.batch.id == r.get("batch") and it.state == "running":
+                        vm.running.pop(key)
+                        it.state, it.vm = "queued", None
+                        it.fate.requeued()
+            self.wake.set()
+            return 0.5
+        self._disk(vm, r.get("disk") or {})
+        self._foreign(vm, r)
+        for row in r.get("done", []):
+            self._accept_finished(vm, row)
+        if r.get("done") or vm.acks:
+            return 0.5  # (its acks out soon)
+        return 2.0 if (busy_queue or not vm.running) and not self.shed else 10.0
+
+    def _disk(self, vm: VMState, d: dict):
+        """The agent's word on its disk with each tick (an agent before 11-02 says nothing: as fit as before): below
+        rules.disk_ok's threshold nothing is placed there; its agent cleans its scratch meanwhile (agent.clean_disk)."""
+        if "free_mb" not in d:
+            return
+        now = time.time()
+        low = not rules.disk_ok(int(d["free_mb"]), int(d.get("total_mb", 0)), DISK_MIN_MB)
+        if low != vm.disk_low:
+            log(f"{vm.id}: disk {'low' if low else 'free again'}: {d['free_mb'] / 1024:.1f} GB free of {d.get('total_mb', 0) / 1024:.0f}"
+                + (": nothing placed there while its agent cleans its scratch" if low else ""))
+            vm.t_low = now if low else 0.0
+        vm.disk, vm.disk_low, vm.t_disk = d, low, now
+
+    def _foreign(self, vm: VMState, r: dict):
+        """Runs the agent reports on the VM that this scheduler doesn't hold there: their slots counted taken (B11);
+        one of an item done, or now running under another name, killed (a run nobody will read)."""
+        with self.lock:
+            mine = set(vm.running)
+            n, stale, stray, now = 0, [], 0, time.time()
+            first, seen = getattr(vm, "_unowned", {}), {}  # (each unowned run's first sighting: stray only past STRAY_S)
+            for x in r.get("running", []):
+                key = (x.get("batch"), x.get("name"))
+                if key in mine:
+                    if vm.running[key].batch.closed:  # (its client closed the batch, its kill lost: killed again, its slot ours till then)
+                        stale.append(key)
+                    continue
+                if self._unclassified(key[0]):
+                    n += vm.slots  # unknown shape: reserve the whole VM, never kill it
+                    continue
+                b = self.batches.get(key[0])
+                it = b.items.get(str(key[1]).rsplit("~s", 1)[0]) if b else None
+                if it is not None and it.state == "queued" and it.run_name == key[1] and it.fate.place(vm.id, False):
+                    it.state, it.vm = "running", vm  # (its own last run, there: taken back, not run again)
+                    it.t_start = it.t_start or time.time()
+                    vm.running[key] = it
+                    vm.prepared.add(b.id)
+                    log(f"{vm.id}: {b.id}: {key[1]}: its run found there: taken back")
+                    continue
+                n += it.weight if it else 1
+                seen[key] = first.get(key, now)
+                if now - seen[key] > STRAY_S:
+                    stray += it.weight if it else 1
+                if b is None or it is None or it.state == "done" or (it.state in ("starting", "running") and it.run_name != key[1]):
+                    stale.append(key)  # (a run nobody reads: of a batch closed, of an item done or running under another name)
+            changed = n != getattr(vm, "foreign", 0)
+            vm.foreign, vm.stray, vm._unowned = n, stray, seen
+            vm.t_inventory = now
+            if changed:
+                log(f"{vm.id}: foreign inventory {n} slots: {sorted(seen)}")
+                self.wake.set()
+        killed = self.__dict__.setdefault("_killed_stale", {})
+        for bid, name in stale:
+            if time.time() - killed.get((vm.id, bid, name), 0) > 60:  # (a kill lost (its agent hung) asked again a minute later)
+                if (vm.id, bid, name) not in killed:
+                    log(f"{vm.id}: {bid}: {name}: a run no item owns (its batch closed, its item done or running elsewhere): killed")
+                killed[(vm.id, bid, name)] = time.time()
+                threading.Thread(target=self._kill_run, args=(vm, bid, name), daemon=True).start()
+
+    def _kill_run(self, vm: VMState, bid: str, name: str):
+        if getattr(self, "recovery_blocked", False) or self._unclassified(bid):
+            return
+        with self.lock:
+            b = self.batches.get(bid)
+            if b and b.strict_once:
+                it = next((x for x in b.items.values() if x.run_name == name), None)
+                strict = True
+            else:
+                strict = False
+        if strict:
+            if it is not None:
+                self._cancel_strict_item(vm, it)
+            return  # Unknown strict identity: never fall back to a legacy kill.
+        with contextlib.suppress(Exception):
+            vm.client.rpc("killitem", bid, name, timeout=20)
+
+    def _accept_finished(self, vm, row):
+        if getattr(self, "recovery_blocked", False) or self._unclassified(row["batch"]):
+            return False  # leave results on the agent until their admission is decoded
+        ack = {"batch": row["batch"], "name": row["name"]}
+        if "launch_identity" in row:
+            ack["launch_identity"] = row["launch_identity"]
+        b = self.batches.get(row["batch"])
+        if b is None:
+            held = vm.running.get((row["batch"], row["name"]))
+            b = held.batch if held is not None else None
+        if b is not None and not b.strict_once:
+            if getattr(self, "handing_off", False):
+                return False
+            # Legacy ticks/preparation queued the ACK before _finished in 40.
+            # A concurrent tick may send it during optional log I/O. Do not
+            # impose the owned durable-commit barrier on this protocol.
+            with vm.lock:
+                vm.acks.append(ack)
+            return self._finished_legacy(vm, row)
+        if not self._finished(vm, row):
+            return False
+        with vm.lock:
+            vm.acks.append(ack)
+        return True
+
+    def _result_identity_matches(self, it, row):
+        if not it.batch.strict_once:
+            return True
+        if it.launch_identity is not None and row.get("launch_identity") == it.launch_identity:
+            it.result_error = None
+            return True
+        # An old done.json is not evidence about the admitted launch. Keep its
+        # actual placement held, never replace it or acknowledge the stale row.
+        it.result_error = "strict result launch_identity missing or mismatched; placement held"
+        return False
+
+    def _finished_logs(self, vm, bid, run_name):
+        with contextlib.suppress(Exception):
+            lg = vm.client.rpc("itemlogs", bid, run_name, timeout=60)
+            d = DIR / "queue" / f"{bid}.logs" / run_name
+            d.mkdir(parents=True, exist_ok=True)
+            for f in ("out", "err"):
+                (d / f).write_text(lg.get(f, ""))
+
+    def _finished_legacy(self, vm: VMState, row: dict):
+        if getattr(self, "handing_off", False):
+            return False  # (handing off: the row is the next scheduler's, its agent sends it again, unacked)
+        with self.lock:
+            it = vm.running.pop((row["batch"], row["name"]), None)
+            if it is None:
+                return True
+            if it.t_start:
+                vm.busy_s += time.time() - it.t_start
+            vm.idle_since = time.time()
+            b = it.batch
+            if b.closed:
+                return True
+            if row.get("preempted"):
+                it.state, it.vm, it.t_queued, it.head = "queued", None, time.time(), True  # (back at the head of its class)
+                it.fate.preempted()
+                it.tries -= 1
+            elif row.get("lost"):
+                # (rules.lost_row: the VM dropped the batch's tree, its preparation here is gone, our doing: prepared
+                # again, the item queued with no strike; any other loss a strike, its agent's err said)
+                err = str(row.get("err", ""))[:160]
+                what = rules.lost_row("tree isn't on" in err, it.state == "preempting")
+                if what == "preempted":  # (its kill raced its report: the preemption it is, no strike)
+                    it.state, it.vm, it.t_queued, it.head = "queued", None, time.time(), True
+                    it.fate.preempted()
+                    it.tries -= 1
+                elif what == "reprepare":
+                    self._unprepare(vm, b.id)
+                    it.fate.requeued()
+                    it.state, it.vm, it.t_queued, it.head = "queued", None, time.time(), True
+                    log(f"{vm.id}: {b.id}: {it.name}: its row lost ({err}): the batch prepared again there, no strike")
+                else:
+                    self._boat_failed(it, vm.id, f"its row lost on {vm.id}: {err or 'no reason given'}")
+            else:
+                it.state = "done"
+                it.fate.finished()
+                b.slot_s += max(0.0, float(row.get("seconds", 0) or 0)) * it.weight
+                if float(row.get("seconds", -1) or -1) > 0:
+                    self._learn(it, float(row["seconds"]))
+                    b.obs_s, b.obs_est, b.obs_n = getattr(b, "obs_s", 0.0) + float(row["seconds"]), getattr(b, "obs_est", 0.0) + it.est, getattr(b, "obs_n", 0) + 1
+                done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
+                        "placement": {"vm": vm.id, "type": vm.type, "cpu": vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
+                                      "exclusive": it.timing, "co_tenants": it.peers}}
+        if row.get("preempted") or row.get("lost") or b.closed or it.state != "done":
+            self.wake.set()
+            return True
+        # (its output kept here before its row goes out: a restart of the scheduler loses neither)
+        self._finished_logs(vm, b.id, it.run_name)
+        b.deliver(done)
+        self.wake.set()
+        return True
+
+    def _finished(self, vm: VMState, row: dict):
+        """Return True only when the row may be acknowledged to this worker."""
+        b = self.batches.get(row["batch"])
+        if b is None:
+            held = vm.running.get((row["batch"], row["name"]))
+            b = held.batch if held is not None else None
+        if b is not None and not b.strict_once:
+            return self._finished_legacy(vm, row)
+        if getattr(self, "handing_off", False):
+            return False
+        key = (row["batch"], row["name"])
+        with self.lock:
+            it = vm.running.get(key)
+            if it is None:
+                b = self.batches.get(key[0])
+                if b and b.strict_once:
+                    prior = next((x for x in b.items.values() if x.run_name == key[1]), None)
+                    return bool(prior and prior.last_placement
+                                and prior.last_placement.get("vm") == vm.id
+                                and self._result_identity_matches(prior, row)
+                                and any(r.get("name") == prior.name for r in b.rows))
+                return True
+            if not self._result_identity_matches(it, row):
+                return False
+            b = it.batch
+            if b.admission_closed or it.owned.closed:
+                return False  # only a bound cancelitem receipt can release this hold
+        # Owned cancellation may win during output I/O: its placement/state
+        # stays held until the identity/fence-checked atomic terminal commit.
+        if not row.get("preempted") and not row.get("lost"):
+            self._finished_logs(vm, b.id, key[1])
+        with self.lock:
+            if (b.closed or b.admission_closed or it.owned.closed
+                    or vm.running.get(key) is not it):
+                return False
+            if not self._result_identity_matches(it, row):
+                return False
+            if row.get("preempted") or row.get("lost"):
+                self._owned_failed(it, "strict_once: preempted or lost placement")
+            else:
+                done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
+                        "placement": {"vm": vm.id, "type": vm.type, "cpu": vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
+                                      "exclusive": it.timing, "co_tenants": it.peers}}
+                # Journal before releasing the placement, and under the same lock
+                # as cancellation. Never expose a done-without-row window.
+                self._deliver_owned(b, done)
+                it.state = "done"
+                it.fate.finished()
+                b.slot_s += max(0.0, float(row.get("seconds", 0) or 0)) * it.weight
+                if float(row.get("seconds", -1) or -1) > 0:
+                    self._learn(it, float(row["seconds"]))
+                    b.obs_s, b.obs_est, b.obs_n = getattr(b, "obs_s", 0.0) + float(row["seconds"]), getattr(b, "obs_est", 0.0) + it.est, getattr(b, "obs_n", 0) + 1
+            vm.running.pop(key, None)
+            if it.t_start:
+                vm.busy_s += time.time() - it.t_start
+            vm.idle_since = time.time()
+        self.wake.set()
+        return True
+
+    def _boat_failed(self, it: Item, vm_id: str | None, why: str, strike: str | None = None):
+        """One of boat's failures of an item (a VM lost or stopped, its row missing, its preparation failed, its VM not
+        reached after a restart; or, as `strike`, a wait in which boat failed a start of its image): queued again, never
+        on a VM that failed it, until boat has failed it BOAT_TRIES times; then its row says lost (its client runs it
+        once on Modal, or reports it failed). The decision is rules.ItemFate's (one strike per VM, charged only to an
+        item last placed on that VM). Under self.lock."""
+        if it.batch.admission_closed or it.owned.closed:
+            it.state = "cancel_pending"
+            return
+        if it.batch.strict_once:
+            self._owned_failed(it, why)
+            return
+        n = NAMES[it.batch.klass]
+        if strike is None:
+            strike = it.fate.boat_failed(vm_id) if vm_id else "none"
+        if strike == "none":  # (one VM's trouble is one strike for an item, however many ways it shows)
+            if it.state != "done" and it.fate.state == "queued":  # (its fate the word: a stale report of a VM it has left
+                it.state, it.vm, it.head = "queued", None, True  # leaves it where it is now; B13: queued, its fate placed, never placed)
+            return
+        self.m["boat_fails"][n] = self.m["boat_fails"].get(n, 0) + 1
+        self._h().record_strike(time.time(), f"{it.batch.id}/{it.name}", vm_id, why)
+        if strike == "again":
+            it.state, it.vm, it.t_queued, it.head = "queued", None, time.time(), True
+            log(f"{it.batch.id}: {it.name}: boat failed it ({it.fails} of {BOAT_TRIES}): {why}; again on boat")
+            return
+        it.state = "done"
+        self.m["to_modal"][n] = self.m["to_modal"].get(n, 0) + 1
+        self._h().record_modal(time.time(), f"{it.batch.id}/{it.name}", it.fails, len(it.avoid), BOAT_TRIES)
+        log(f"{it.batch.id}: {it.name}: boat failed it {it.fails} times ({why}): back to its client" + (" for Modal" if it.batch.on_lost else ""))
+        threading.Thread(target=it.batch.deliver, args=({"name": it.name, "code": -1, "seconds": -1, "lost": True, "boat_fails": it.fails,
+                                                         "error": f"boat failed it {it.fails} times (last: {why})"},), daemon=True).start()
+
+    def _lost_vm(self, vm: VMState):
+        log(f"{vm.id}: lost")
+        with self.lock:
+            vm.dead = True
+            # (rules.slept_through, ItemFate.vm_lost: a VM boat stopped while this machine slept is no strike)
+            slept = rules.slept_through(time.time(), getattr(self, "t_wake", 0), 900)
+            for key, it in list(vm.running.items()):
+                if it.batch.admission_closed or it.owned.closed:
+                    it.state = "cancel_pending"
+                    continue
+                vm.running.pop(key)
+                strike = it.fate.vm_lost(vm.id, slept)
+                if slept:
+                    it.state, it.vm, it.head = "queued", None, True
+                else:
+                    self._boat_failed(it, vm.id, f"boat VM {vm.id} lost", strike)
+        self._let_go(vm, stop=True)
+        self.wake.set()
+
+    def _release_idle(self):
+        """The pool shrinks, damped: the floor (the treadmill's hint) stays while there's work for it; a VM above it
+        runs filler for HOLD s after its last real work (real work takes its slots at once), then drains (its filler
+        killed and queued again, no new filler) and is released. A VM with nothing to run is released at once: busy,
+        never parked (boat's TOS-6). Released VMs stop IDLE (60) s later unless another batch leases them first.
+        During this candidate's pending canary, voluntary holds/drains wait for its verdict; explicit retirement and
+        disk replacement still run, and real-work preemption is unaffected."""
+        if getattr(self, "recovery_blocked", False):
+            return
+        c = getattr(self, "canary", None)
+        verdict = c.read() if c is not None else {}
+        allow_retirement = rules.voluntary_retirement_allowed(verdict.get("state") == "watching",
+                                                               verdict.get("to") == getattr(self, "code", None))
+        now = time.time()
+        with self.lock:
+            q = self._pass_queue()
+            q_classes: dict = {}
+            for it in q:
+                q_classes.setdefault(it.batch.image, set()).add(it.batch.klass)
+            for image in {v.image for v in self.vms.values()}:
+                vs = [v for v in self.vms.values() if v.image == image and v.ready and not v.dead]
+                for v in vs:
+                    if any(x.batch.klass <= 4 for x in v.running.values()):
+                        v.t_real = now
+                vs.sort(key=lambda v: -v.t_real)
+                above = vs[self.floor(image):]
+                drains = self._drain(image)
+                for v in vs:  # (each VM's hold: rules.VMLife.hold_tick; past it, its drain on its turn: rules.Drain.turn)
+                    life = self._life(v, now)
+                    real = any(x.batch.klass <= 4 for x in v.running.values())
+                    rq = bool(q_classes.get(image, set()) - {5})  # (real work of the image queued: no drain)
+                    ripe = allow_retirement and v in above and not v.draining and not real and not rq and now - v.t_real > HOLD
+                    drain = life.hold_tick(now, int(self.pol.get("generation", 0)), real, v in above, ripe and drains.turn(now, len(above)), rq)
+                    v.t_real, v.draining, v.gen = life.t_real, life.draining, life.gen
+                    if drain:
+                        self.m["hold_ends"] += 1
+                        fill = [x for x in v.running.values() if x.batch.klass == 5 and x.state == "running"]
+                        log(f"{v.id}: {HOLD / 60:.0f} min on filler only, above the floor of {self.floor(image)}: released ({len(fill)} filler items queued again)")
+                        for x in fill:
+                            x.state = "preempting"
+                            threading.Thread(target=self._kill, args=(v, x), daemon=True).start()
+            # (released: rules.VMLife.release, nothing running on it and nothing of its image queued, or draining with
+            # only filler queued; within the floor not while the treadmill is alive (but idle for HOLD s); above it on
+            # its turn of the staged drain)
+            retired = self.retired()
+            go = [v for v in self.vms.values() if v.id in retired and v.ready and not v.dead and not v.running and not getattr(v, "foreign", 0)]  # (retired, empty: nothing of ours nor anyone's runs there)
+            for v in go:
+                v.why_go = "retired, empty"
+            full = [v for v in self.vms.values() if v not in go and v.ready and not v.dead and not v.starts
+                    and rules.disk_replaced(v.disk_low, not v.running and not getattr(v, "foreign", 0), int(now - v.t_low) if v.disk_low else 0, DISK_GRACE_S)]
+            for v in full:  # (rules.disk_replaced: its disk still low past its agent's cleaning, empty: deleted, the next start a new VM)
+                v.why_go, v.replace = f"its disk stays full ({v.disk.get('free_mb', 0) / 1024:.1f} GB free of {v.disk.get('total_mb', 0) / 1024:.0f}): deleted, replaced by a new VM", True
+            go += full
+            if go:
+                log(f"retired, empty: let go {[v.id for v in go]}")
+            for image in {v.image for v in self.vms.values()}:
+                vs = sorted([v for v in self.vms.values() if v.image == image and v.ready and not v.dead], key=lambda v: -v.t_real)
+                tm = FLOOR_ALWAYS or self.treadmill_alive(image)
+                n_floor = self.floor(image)
+                held = n_floor > 0  # (a treadmill's floor, or the default floor of an image with recent work)
+                for i, v in enumerate(vs):
+                    if not allow_retirement or v.starts or now - v.idle_since <= 3 or v in go:
+                        continue
+                    life, within = self._life(v, now, hold=None if tm else max(HOLD, FLOOR_IDLE)), i < n_floor
+                    rq = bool(q_classes.get(image, set()) - {5})
+                    fq = rules.filler_coming(5 in q_classes.get(image, set()), tm, now - v.t_real, HOLD)  # (a live treadmill's filler is seconds away)
+                    if not life.releasable(rq, fq, within, held, now - v.idle_since):
+                        continue
+                    turn = within or v.draining or self._drain(image).turn(now, len(vs) - n_floor)
+                    if life.release(now, rq, fq, within, held, now - v.idle_since, turn):
+                        go.append(v)
+                        v.why_go = (f"{'within the floor' if within else 'above the floor'} of {n_floor}, {'draining past its hold' if v.draining else 'nothing to run'}"
+                                    f" (idle {now - v.idle_since:.0f} s, last real work {now - v.t_real:.0f} s ago; {'filler' if fq else 'nothing'} queued, treadmill {'alive' if tm else 'none'})")
+            for v in go:
+                v.ready = False
+                # Adoption must not revive our old lease while release I/O is in flight.
+                # Keep it out of self.vms so it is not promised as incoming capacity.
+                self.__dict__.setdefault("_releasing", set()).add(v.id)
+                self.vms.pop(v.id, None)
+        def finish_release(v):
+            try:
+                self._let_go(v)
+            finally:
+                with self.lock:
+                    self._releasing.discard(v.id)
+        for v in go:
+            threading.Thread(target=finish_release, args=(v,), daemon=True).start()
+
+    def _let_go(self, vm: VMState, stop: bool = False, keep: bool = False):
+        if getattr(self, "recovery_blocked", False):
+            return  # uncertain ownership keeps even apparently idle leases
+        ttl = boat.BACKSTOP if keep else boat.IDLE
+        if not keep and not vm.dead:  # (a release: a start of its image within 25 min after it is churn; each logged with its reason)
+            if getattr(vm, "why_go", "") != "retired, empty" and not getattr(vm, "replace", False):  # (a VM retired by an operator, or deleted for its full disk, isn't capacity let go: no churn after it)
+                self._h().record_release(time.time(), vm.image, vm.id, vm.type)
+            log(f"{vm.id}: released{' and stopped' if stop else ''}: {getattr(vm, 'why_go', 'shutdown' if self.stop.is_set() else '?')}")
+        if getattr(vm, "replace", False):  # (its disk full past its cleaning: deleted, never back in the pool where a resume would find it full)
+            boat.boat("delete", vm.id, "--yes", "--json", check=False, timeout=180)
+            with Registry().locked() as d:
+                if ((d["vms"].get(vm.id) or {}).get("lease") or {}).get("pid") == os.getpid():
+                    d["vms"].pop(vm.id, None)
+            with self.lock:
+                if self.vms.get(vm.id) is vm:
+                    self.vms.pop(vm.id, None)
+            return
+        if stop:
+            boat.stop_vm(vm.id)
+        else:
+            boat.boat("extend", vm.id, "--ttl", str(ttl), "--json", check=False)
+        now = time.time()
+        with Registry().locked() as d:
+            v = d["vms"].get(vm.id)
+            if v and (v.get("lease") or {}).get("pid") == os.getpid():
+                v["lease"], v["last_used"] = None, now
+                v["until"] = 0 if stop else now + ttl
+                v["released"] = now  # (let go on purpose: adoption doesn't take it back for its hold, only for real work; B5)
+                v["owner"] = None
+                if not stop:
+                    v["state"] = "running"
+        with self.lock:
+            if self.vms.get(vm.id) is vm:
+                self.vms.pop(vm.id, None)
+
+    # -- the breaker, the watchdog, the day's accounts
+    def trip(self, reason: str):
+        """The circuit breaker opens: no start (free or paid) for its backoff, doubled at each trip in a row; then one
+        start as a probe, and starts again only once a probe came up."""
+        now = time.time()
+        with self.lock:
+            b = self._breaker()
+            pause = b.backoff
+            if b.trip(now) != "tripped":  # (rules.Breaker.trip: none while open)
+                return
+            self.br.update(open_until=b.open_until, t_trip=now, half=b.half, reason=reason, trips=b.trips, backoff=b.backoff, last_reason=reason,
+                           history=(self.br.get("history", []) + [{"t": round(now, 1), "reason": reason}])[-20:])  # (every trip's why, kept past its close)
+            self.m["breaker_trips"] += 1
+        self.alert(f"circuit breaker open for {pause / 60:.0f} min: {reason}")
+        self._metrics_save()
+
+    def _breaker_eval(self, now: float):
+        recent = [s for s in self.starts_log if s["t"] > self.br["t_trip"] and now - s["t"] < BREAK_WINDOW]
+        judged = [s for s in recent if s["ok"] is not None or now - s["t"] > BREAK_READY]
+        bad = [s for s in judged if not s["ok"]]
+        b = self._breaker()
+        what = b.judge(now, len(judged), len(bad), any(s["ok"] for s in recent))  # (rules.Breaker.judge: over half of enough starts)
+        if what == "closed":
+            with self.lock:
+                self.br.update(half=b.half, backoff=b.backoff, reason="")
+            log("circuit breaker closed: a probe start came up")
+        elif what == "tripped":
+            self.trip(f"{len(bad)} of the last {len(judged)} starts not ready within {BREAK_READY / 60:.0f} min")
+
+    def _breaker(self) -> rules.Breaker:
+        """The breaker as rules.Breaker holds it (its state kept in self.br, across restarts)."""
+        b = rules.Breaker(int(BREAK_BACKOFF), int(BREAK_MAX), BREAK_MIN)
+        b.open_until, b.half = float(self.br["open_until"]), bool(self.br["half"])
+        b.backoff, b.trips = min(int(BREAK_MAX), max(int(BREAK_BACKOFF), int(self.br["backoff"]))), int(self.br.get("trips", 0))
+        return b
+
+    def _watch(self):
+        """The controller's own load: past SHED_LOAD per CPU, or under 15% of its memory free, it sheds (no starts,
+        the controller's own sends one at a time, slower ticks) until the load is back under one per CPU."""
+        ncpu = os.cpu_count() or 1
+        l1 = os.getloadavg()[0]
+        mem = None
+        with contextlib.suppress(Exception):
+            mi = {l.split(":")[0]: int(l.split()[1]) for l in open("/proc/meminfo")}
+            mem = mi["MemAvailable"] / mi["MemTotal"]
+        rss = None
+        with contextlib.suppress(Exception):
+            rss = next(int(l.split()[1]) // 1024 for l in open("/proc/self/status") if l.startswith("VmRSS"))
+        self.load = {"load1": round(l1, 2), "cpus": ncpu, "mem_free": round(mem, 2) if mem is not None else None, "rss_mb": rss, "threads": threading.active_count(),
+                     "threads_by": dict(collections.Counter(re.sub(r"^Thread-\d+ \((.*)\)$", r"\1", re.sub(r"-\d+$", "", t.name)) for t in threading.enumerate()).most_common(12)),
+                     "cpu_s": {k: round(v, 2) for k, v in sorted(self.__dict__.get("_cpu", {}).items(), key=lambda kv: -kv[1])[:16]},
+                     "cpu_n": dict(self.__dict__.get("_cpu_n", {})), "cpu_total_s": round(_proc_cpu(), 2), "up_s": round(time.time() - getattr(self, "t_up", time.time()), 1)}
+        if not WATCHDOG:
+            return
+        wd = rules.Watchdog(int(SHED_LOAD * 1000))  # (rules.Watchdog: past SHED_LOAD per CPU or 15% memory; back under 1 and 25%)
+        wd.shed = self.shed
+        shed = wd.sample(int(1000 * l1 / ncpu), int(100 * mem) if mem is not None else 100)
+        if shed and not self.shed:
+            self.shed = True
+            self.alert(f"the controller is loaded (load {l1:.1f} on {ncpu} CPUs, {100 * (mem or 0):.0f}% memory free, {threading.active_count()} threads): starts paused")
+        elif not shed and self.shed:
+            self.shed = False
+            log(f"the controller's load is back (load {l1:.1f}): starts again")
+
+    def _waste(self, now: float, live: list, grace: float | None = None, idle_only: bool = False, by_vm: dict | None = None) -> dict:
+        """Per image, the slots held by filler (or a sweep, against a gate) or idle while real work (interactive, gate,
+        submission, sweep) that could take them has waited past SUB_PREEMPT (health's waste: want 0). A waiter counts when it
+        isn't backing off, a submission within its share (or uncontended), and the slots fit it on a VM it may take:
+        its image and type, a VM that hasn't failed it, not quarantined nor retired, past the slots set aside for
+        another waiting item, a timing item's VM with nothing of its class or higher. Each such slot is counted once,
+        given to the waiters in class order (11-01 13:25-13:40: 60 slots idle on VMs set aside for items that had run
+        elsewhere, counted busy, while 1,500 gate items waited)."""
+        retired = self.retired()
+        cap: dict = {}  # vm id -> [idle, filler, sweep] slots it could give
+        for v in live:
+            if not v.ready or v.dead or v.id in retired or getattr(v, "prep_fails", 0) >= 3 or v.failing or getattr(v, "_fails", 0):
+                continue  # (a VM whose agent doesn't answer: nothing can be placed there till it does)
+            held = self._held(v, None, now)  # (slots set aside for a waiting item: its idle ones first, then the filler
+            free = max(0, v.slots - v.used())  # and sweeps it is emptying for that item: none of them another's to have;
+            idle = max(0, free - held)  # 00:50:39, an xlarge's filler counted beside a submission, set aside for a gate)
+            over = max(0, held - free)
+            fil = 0 if idle_only else sum(x.weight for x in v.running.values() if x.batch.klass == 5 and x.state == "running")
+            swp = 0 if idle_only else sum(x.weight for x in v.running.values() if x.batch.klass == 4 and x.state == "running")
+            fil, over = max(0, fil - over), max(0, over - fil)
+            swp = max(0, swp - over)
+            cap[v.id] = [idle, fil, swp]
+        groups: dict = {}
+        contended = getattr(self, "_contended", None)
+        sub_run: dict = {}
+        for v in live:
+            for x in v.running.values():
+                if x.batch.klass == 3:
+                    sub_run[x.batch.client] = sub_run.get(x.batch.client, 0) + x.weight
+        pend = getattr(self, "reattach_pending", None) or set()
+        for b in self.batches.values():
+            if b.klass > 4 or b.closed:  # (sweeps too: real work above filler, the treadmill's frontier; the coordinator, 11-01 20:20)
+                continue
+            for it in b.items.values():
+                if it.state != "queued" or now - it.t_queued < (SUB_PREEMPT if grace is None else grace) or now < it.not_before:
+                    continue
+                if pend and getattr(it, "reattach", None) and it.reattach.get("vm") in pend:
+                    continue  # (re-attach is still to take it back where it runs: not a waiter, B10)
+                if b.klass == 3 and contended is not None and not rules.within_share(3, sub_run.get(b.client, 0), it.weight, SUB_VMS * vm_slots(b.vm_type), contended(it)):
+                    continue
+                key = fit_shape(it)
+                groups[key] = groups.get(key, 0) + 1
+        out: dict = {}
+        by_id = {v.id: v for v in live}
+        for shape, n in sorted(groups.items(), key=lambda g: g[0][1]):
+            image, k, timing, weight, vtype, avoid, mem = shape
+            for vid, c in cap.items():
+                if n <= 0:
+                    break
+                v = by_id[vid]
+                if not vm_fits(shape, v, retired) or v.slots < weight:  # (the one fit, as placement reads it; and its slots:
+                    continue  # 00:36:10, a 1-slot VM counted beside a 2-slot timing item)
+                if timing:
+                    if any(x.batch.klass <= k for x in v.running.values()) or self._held(v, None, now) or sum(c) < v.slots:
+                        continue
+                    took = [c[0], c[1], c[2] if k <= 2 else 0]
+                    if sum(took) < v.slots:
+                        continue
+                    out[image] = out.get(image, 0) + v.slots
+                    if by_vm is not None:
+                        by_vm[vid] = (image, by_vm.get(vid, (image, 0, ""))[1] + v.slots, f"{NAMES[k]}/timing w{weight}" + (f" {mem} MB" if mem else ""))
+                    cap[vid] = [0, 0, 0]
+                    n -= 1
+                    continue
+                avail = c[0] + c[1] + (c[2] if k <= 2 else 0)
+                m = min(n, avail // weight)
+                if m <= 0:
+                    continue
+                need = m * weight
+                out[image] = out.get(image, 0) + need
+                if by_vm is not None:
+                    by_vm[vid] = (image, by_vm.get(vid, (image, 0, ""))[1] + need, f"{NAMES[k]} w{weight}" + (f" {mem} MB" if mem else ""))
+                for i in (0, 1, 2) if k <= 2 else (0, 1):
+                    d = min(c[i], need)
+                    c[i] -= d
+                    need -= d
+                n -= m
+        return out
+
+    def _waste_held(self, key: str, now: float, live: list, **kw) -> dict:
+        """Per image, the slots _waste counts on a VM now and at the last measure under `key` too (the lesser of the
+        two): a slot held on filler or idle for a measure's interval beside waiting real work, not one an item freed
+        an instant before the next pass fills it (16:06-16:10: 1-2 slots freed between passes, ~40 items a second
+        ending on 600 slots, counted as waste and a handoff's idle, the canary handing back for 2 of them)."""
+        cur: dict = {}
+        self._waste(now, live, by_vm=cur, **kw)
+        prev = self.__dict__.setdefault("_waste_prev", {}).get(key, {})
+        t_prev = self.__dict__.setdefault("_waste_t", {}).get(key, now)
+        self._waste_prev[key], self._waste_t[key] = cur, now
+        out: dict = {}
+        for vid, (image, n, why) in cur.items():
+            if vid in prev:
+                v0 = self.vms.get(vid)
+                k = rules.waste_held(n, prev[vid][1], bool(v0) and getattr(v0, "t_placed_real", 0) > t_prev)
+                out[image] = out.get(image, 0) + k
+                if k and now - getattr(self, "_t_waste_log", 0) > 300:  # (what waited and where: once in 5 min)
+                    self._t_waste_log = now
+                    v = self.vms.get(vid)
+                    log(f"waste: {k} slots of {vid} ({v.type if v else '?'}, {[NAMES[x.batch.klass] for x in v.running.values()] if v else []}) on filler or idle a measure long beside {why} waiting")
+        return out
+
+    def _sampler(self):
+        """Every 5 s: the watchdog and the breaker; every 15 s the day's accounts (VM-hours, those on filler above the
+        floor, waves of real work and the gaps between them), saved every minute."""
+        t_acc, t_save, t_adopt = time.time(), time.time(), 0.0
+        while not self.stop.wait(5):
+            now = time.time()
+            with contextlib.suppress(Exception):
+                # (a new install, unchanged for 60 s, that imports: rules.Install; no handoff while files are being
+                # written, none of a broken install)
+                h = code_hash()
+                inst = self.__dict__.setdefault("_install", rules.Install(self.code, 60))
+                ripe = h != self.code and inst.seen == h and now - inst.t_seen >= inst.stable_s and not self.canary.rejected(h)
+                if inst.tick(now, h, ripe and self._imports(h)) == "handoff":
+                    self.handoff()
+            if now - t_adopt > 60 and not getattr(self, "adopting", False):
+                t_adopt = now
+                self.adopting = True
+                threading.Thread(target=self._adopt, daemon=True).start()
+            with contextlib.suppress(Exception):
+                self._watch()
+            try:  # (a tick and two after a take-over: what it held, orphans, idle slots; the canary's word at once)
+                self._handoff_check(now)
+            except Exception as e:
+                self._h().record_error(now, f"handoff check: {e!r}")
+            with contextlib.suppress(Exception):
+                self._breaker_eval(now)
+            if now - t_acc < 15:
+                continue
+            dt, t_acc = now - t_acc, now
+            with contextlib.suppress(Exception):
+                day = time.strftime("%Y-%m-%d", time.gmtime())
+                with self.lock:
+                    if day != self.m["day"]:
+                        self._metrics_save()
+                        self.m = self._metrics_new(day)
+                        self.m["waves"] = int(self.wave["on"])  # (a wave going on at midnight is the new day's too: 0 waves all day under one)
+                    live = [v for v in self.vms.values() if not v.dead]
+                    self.m["peak_vms"] = max(self.m["peak_vms"], len(live))
+                    for v in live:
+                        h = vm_mult(v.type) * dt / 3600
+                        self.m["vmh"] += h
+                        cls = min([x.batch.klass for x in v.running.values()] or [0])
+                        key = NAMES.get(cls, "idle")
+                        self.m["vmh_by_class"][key] = self.m["vmh_by_class"].get(key, 0.0) + h
+                    for image in {v.image for v in live}:
+                        vs = sorted([v for v in live if v.image == image], key=lambda v: -v.t_real)
+                        for v in vs[self.floor(image):]:
+                            if v.running and all(x.batch.klass == 5 for x in v.running.values()):
+                                self.m["vmh_filler_hold"] += vm_mult(v.type) * dt / 3600
+                    per = {}
+                    for v in live:
+                        if v.ready:
+                            p = per.setdefault(v.image, {"slots": 0, "busy": 0, "queued": 0, "stray": 0})
+                            p["slots"] += v.slots
+                            p["stray"] += min(v.slots, getattr(v, "stray", 0))  # (slots held by runs no item owns past a kill's retry: a leak, not the lag of a kill landing)
+                            if getattr(v, "disk_low", False):  # (health's disk: VMs held below rules.disk_ok's threshold)
+                                p.setdefault("disk_low", []).append([v.id, round(v.disk.get("free_mb", 0) / 1024, 1)])
+                            p["busy"] += v.slots if any(x.timing and x.batch.klass <= 4 for x in v.running.values()) else sum(x.weight for x in v.running.values() if x.batch.klass <= 4)
+                            held = min(self._held(v, None, now), max(0, v.slots - v.used()))  # (slots held empty for a waiting
+                            if held:  # wide or timing item: busy by design, only while that item waits, only its need)
+                                p["busy"] += held
+                                p["exclusive"] = p.get("exclusive", 0) + held
+                    contended, sub_held = getattr(self, "_contended", None), {}
+                    for v in live:
+                        for x in v.running.values():
+                            if x.batch.klass == 3:
+                                sub_held[x.batch.client] = sub_held.get(x.batch.client, 0) + x.weight
+                    for b in self.batches.values():
+                        if b.klass <= 4 and b.image in per:
+                            for it in b.items.values():
+                                if it.state == "queued":
+                                    per[b.image]["queued"] += 1  # (and the slots it needs: busy's demand, health)
+                                    share_ok = b.klass != 3 or contended is None or rules.within_share(3, sub_held.get(b.client, 0), it.weight, SUB_VMS * vm_slots(b.vm_type), contended(it))
+                                    per[b.image]["qslots"] = per[b.image].get("qslots", 0) + rules.busy_demand(b.klass, now - it.t_queued, SUB_PREEMPT, vm_slots(b.vm_type) if it.timing else it.weight, share_ok)
+                                    qb = per[b.image].setdefault("q_by", {})  # (the queue's make-up by class: busy's demand read)
+                                    qb[NAMES[b.klass]] = qb.get(NAMES[b.klass], 0) + (vm_slots(b.vm_type) if it.timing else it.weight)
+                    try:  # (a fault in the measure never costs the sample)
+                        for image, w in self._waste_held("sample", now, live).items():
+                            if image in per:
+                                per[image]["waste"] = w
+                    except Exception as e:
+                        self._h().record_error(now, f"waste: {e!r}")
+                    self._h().record_sample(now, per)
+                    real = any(it.state != "done" and b.klass <= 3 for b in self.batches.values() for it in b.items.values())
+                    if real and not self.wave["on"]:
+                        if self.wave.get("t_end"):
+                            self.m["gaps"] = (self.m["gaps"] + [round(now - self.wave["t_end"])])[-500:]
+                        self.wave.update(on=True, t=now)
+                        self.m["waves"] += 1
+                    elif not real and self.wave["on"]:
+                        self.wave.update(on=False, t_end=now)
+            if now - t_save > 60:
+                t_save = now
+                with contextlib.suppress(Exception):  # (the targets checked every minute: an alert after 2 checks in a row breached)
+                    self._h().prune(now)
+                    for a in self._h().tick(now, 30) or []:
+                        self.alert(a)
+                threading.Thread(target=self._billing, daemon=True).start()  # (boat's billing, read once a minute: health's billing target)
+                with contextlib.suppress(Exception):  # (a canary: new code that breaks a target goes back to the previous)
+                    what, why = self.canary.tick(self.code, now, self._h())
+                    if what == "passed":
+                        log(f"canary: {why}")
+                    elif what == "handback":
+                        self.alert(f"canary: {why}")
+                        self.handoff(back_to=self.canary.read().get("from"))
+                self._metrics_save()
+
+    def rollback(self, code: str | None = None) -> dict:
+        """supercomputer rollback: the canary's own hand-back, asked for (to `code`, else the newest whose canary passed);
+        every VM and item kept; the install left as it is, this code rejected until another install."""
+        to, why = self.canary.rollback_to(self.code, code)
+        if not to:
+            return {"ok": False, "error": why}
+        self.alert(f"rollback: code {self.code} -> {to} (asked for): handing the pool back")
+        threading.Thread(target=lambda: (time.sleep(1), self.handoff(back_to=to)), daemon=True).start()
+        return {"ok": True, "from": self.code, "to": to}
+
+    def _billing(self):
+        with contextlib.suppress(Exception):
+            self._h().record_billing(time.time(), health.billing_problems(boat.limits()))
+
+    def handoff(self, back_to: str | None = None):
+        """A new code version installed: this scheduler hands the pool to it and exits only once the new one holds every
+        VM it held (rules.handoff_done). Nothing is let go: each VM keeps its TTL and its items run on; the queue,
+        placements, outputs and accounts are on disk; this one's VMs, as it knows them, in handoff.json; the next
+        scheduler (systemd restarts it on the controller; here this one starts it) takes them all in one write of the
+        registry before it serves and says so (handoff.ack). Should it not take them all, this one keeps them (its
+        leases its own throughout) and hands them to its own code's kept copy instead, the new code rejected. Only once
+        the new code imports: a broken install keeps this one running."""
+        new = back_to or code_hash()
+        home, src = str(config.HOME), str(config.SRC)
+        if not back_to and not self._imports(new):
+            return
+        log(f"code {self.code} -> {new} {'(the canary handing back)' if back_to else 'installed'}: handing the pool over (VMs and items stay; the next scheduler takes them all at once)")
+        if getattr(self, "handing_off", False):
+            return  # (one handoff at a time)
+        self.handing_off = True
+        if not back_to:
+            self.canary.handing_off(self.code, new, time.time())
+        self.stop.set()
+        self._metrics_save()
+        time.sleep(rules.switch_wait(sum(len(v.running) for v in list(self.vms.values())), 15.0))  # (no wait for what's in flight:
+        with self.lock:  # this one keeps no row from here (_finished) and acks none, the next one takes its items as they are)
+            snap = self._handoff_snapshot()
+        tmp = DIR / "handoff.json.tmp"
+        tmp.write_text(json.dumps(snap))
+        tmp.rename(DIR / "handoff.json")
+        (DIR / "handoff.ack").unlink(missing_ok=True)
+        self.released_lock = True  # (the port and the lock to the next one; this process alive, its leases its own, till its word)
+        with contextlib.suppress(Exception):
+            self._srv.shutdown()
+            self._srv.server_close()
+        with contextlib.suppress(Exception):
+            fcntl.flock(self._lockf, fcntl.LOCK_UN)
+        held = {v["id"] for v in snap["vms"]}
+        for attempt, to in enumerate([back_to or None, self.code] if not back_to else [back_to]):
+            path = str(DIR / "code" / to) if to else src  # (a hand-back: a kept copy, config.SRC still the install)
+            proc = None
+            if not os.environ.get("INVOCATION_ID") or to:  # (not under systemd: the next scheduler started here, waiting for the lock)
+                with open(DIR / "log", "a") as lf:
+                    proc = subprocess.Popen([sys.executable, "-P", "-m", "supercomputer", "scheduler", "serve", "--idle-exit", str(self.idle_exit), "--takeover"],
+                                            stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True, close_fds=True,
+                                            env={**os.environ, "PYTHONPATH": path, "SUPERCOMPUTER_HOME": home, "SUPERCOMPUTER_SRC": src}, cwd=home)
+            src = pathlib.Path(path) / "supercomputer" / "scheduler.py"
+            with contextlib.suppress(Exception):
+                if "def _take_pool" not in src.read_text():  # (a code from before the atomic handoff (a hand-back to one):
+                    log(f"handoff: code {to or new} takes the pool by re-attach, not by this handoff: exiting")  # it never answers;
+                    os._exit(0)  # waiting on it would leave two schedulers, the old way's the only one it knows)
+            ack, t0 = None, time.time()
+            while time.time() - t0 < 120:
+                with contextlib.suppress(Exception):
+                    a = json.loads((DIR / "handoff.ack").read_text())
+                    if float(a.get("of", 0)) == float(snap["t"]):
+                        ack = a
+                        break
+                time.sleep(0.5)
+            taken = held & set(ack.get("taken", [])) if ack else set()
+            died = {vid for vid in held - taken if not self._boat_up(vid)} if ack else set()
+            if rules.handoff_done(len(held), len(taken), len(died), ack is not None) == "exit" and ack.get("admissions", {}).get("ready", True):
+                log(f"handoff: the new scheduler (pid {ack.get('pid')}) holds {len(taken)} of the {len(held)} VMs held here ({len(died)} gone): exiting")
+                os._exit(0)
+            why = f"handoff to {to or new} failed: {'no word from the new scheduler in 120 s' if ack is None else f'it took {len(taken)} of {len(held)} VMs'}"
+            if ack and not ack.get("admissions", {}).get("ready", True):
+                why += "; admission check failed: " + json.dumps(ack["admissions"], sort_keys=True)
+            self.alert(why + ("; the pool to this code's kept copy" if attempt == 0 and not back_to else ""))
+            if proc is not None and proc.pid:  # (the new one, by its exact pid: it lets go of what it took, its leases ours again below)
+                with contextlib.suppress(Exception):
+                    os.kill(proc.pid, 15)
+            if not back_to and attempt == 0:
+                d = self.canary.read()
+                d.update({"state": "rejected", "rejected": sorted(set(d.get("rejected", [])) | {new}), "why": why})
+                self.canary.write(d)
+            with Registry().locked() as d:  # (whatever it took back to this process, for the next try's take-over)
+                for vid in held:
+                    v = d["vms"].get(vid)
+                    if v is not None and (v.get("lease") or {}).get("batch") == "scheduler":
+                        v["lease"] = {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": time.time(), "label": "scheduler (handoff kept)"}
+            snap["t"] = time.time()
+            tmp.write_text(json.dumps(snap))
+            tmp.rename(DIR / "handoff.json")
+            (DIR / "handoff.ack").unlink(missing_ok=True)
+        os._exit(0)
+
+    def _imports(self, new: str) -> bool:
+        """Whether the installed code imports (a broken install is never handed the pool: an alert, once)."""
+        r = subprocess.run([sys.executable, "-c", "import supercomputer.scheduler"], cwd=str(config.SRC), capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "PYTHONPATH": str(config.SRC)})
+        if r.returncode != 0 and getattr(self, "_bad_code", "") != new:
+            self._bad_code = new
+            self.alert(f"code {new} installed but doesn't import: no handoff ({r.stderr.strip()[-200:]})")
+        return r.returncode == 0
+
+    def _adopt(self):
+        """No VM of the pool up without a live owner, ever: every up VM of the pool's images (in the registry or not)
+        that no live client holds and this scheduler doesn't hold is adopted (its agent reached, repaired by boat exec
+        if need be) while its image has queued work or it's within its hold; stopped only with its image's queue empty
+        and its hold over (or when it can't be brought up at all).
+        At the start (after a restart, a handoff, a kill -9) and every 2 minutes."""
+        try:
+            if getattr(self, "recovery_blocked", False):
+                return
+            live = boat.sandboxes()
+            now = time.time()
+            with self.lock:
+                q_images = {it.batch.image for it in self.queued() if it.batch.klass <= 4}  # (real work: filler never a reason to keep a VM; B5)
+            took, stop, orphans = [], [], []  # (no cap on how many: every one of them is ours to keep or stop now)
+            with Registry().locked() as d:
+                images = {v.get("snapshot") for v in d["vms"].values()} | {b.image for b in self.batches.values()}
+                for i, sb in live.items():
+                    if (sb.get("state") not in boat.RUNNING or sb.get("name") not in images or i in self.vms
+                            or i in getattr(self, "_releasing", ()) or i in self.retired()):
+                        continue
+                    v = d["vms"].get(i)
+                    if v is None:  # (up, of our image, in no registry: e.g. a scheduler on another host stopped)
+                        v = d["vms"][i] = {"type": sb.get("type", boat.VM_TYPE), "snapshot": sb["name"], "created": now, "last_used": now, "state": sb["state"], "lease": None}
+                    # (its decision: rules.VMLife.adopt_tick. Its owner: a live client (a batch holding its own VMs, or
+                    # this scheduler's own lease, new: being brought up), nobody (released a moment ago: it stops by
+                    # itself at its `until`, or a batch leases it), or a holder that died (this scheduler's own lease
+                    # older than 5 minutes on a VM it doesn't hold is one): an orphan whatever its `until`)
+                    l = v.get("lease") or {}
+                    mine = l.get("pid") == os.getpid() and l.get("host") == socket.gethostname() and now - l.get("since", now) > 300
+                    life = self._life(None, now, lease="client" if not mine and not boat.lease_free(v) else "none" if not l else "dead")
+                    life.until, life.last_used = float(v.get("until", 0) or 0), 0.0 if v.get("released") and not l else float(v.get("last_used", 0) or 0)
+                    life.pending = i in getattr(self, "reattach_pending", set())  # (re-attach is taking it back with its items)
+                    was_held = i in self.held_before or (l.get("batch") == "scheduler" and not mine)
+                    if life.lease == "dead" or (life.lease == "none" and life.until < now):  # (no live owner: health's orphans while it lasts)
+                        orphans.append(i)
+                    what = life.adopt_tick(now, sb["name"] in q_images, was_held)  # (held before, queued work, or within its hold)
+                    if what == "keep":
+                        continue
+                    if what == "adopt":
+                        v["lease"] = {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": now, "label": "scheduler (adopted)"}
+                        took.append((i, sb["name"], v["type"]))
+                    else:
+                        v["lease"], v["until"] = None, 0
+                        stop.append(i)
+            for i, img, t in took:
+                self._bring(i, img, t, "adopt", 5, None)
+                hb = self.held_before.get(i)
+                if hb and i in self.vms:  # (its hold clock as the previous scheduler left it)
+                    self.vms[i].t_real = float(hb.get("t_real", now))
+            self._h().record_orphans(now, [i for i in orphans if i not in [t[0] for t in took] and i not in stop])
+            for i in stop:
+                self._h().record_release(now, live.get(i, {}).get("name", ""), i)
+                threading.Thread(target=boat.stop_vm, args=(i,), daemon=True).start()
+            if took or stop:
+                log(f"adoption: {len(took)} VMs with no live owner taken in, {len(stop)} stopped (nothing for them): {[i for i, *_ in took] + stop}")
+        except Exception as e:
+            log(f"adoption: {str(e)[:200]}")
+        finally:
+            self.adopting = False
+            self.wake.set()
+
+    def _check_agent(self, vm: VMState):
+        """Agents follow the code: one whose hash isn't this scheduler's agent.py is upgraded in place (its items, in
+        sessions of their own, run on), through itself, else by boat exec."""
+        if any(it.batch.strict_once for it in vm.running.values()):
+            return  # no upgrade/repair may discard a live or quarantined strict owner
+        r = vm.client.ping()
+        vm.agent, vm.t_agent = str(r.get("version")), time.time()
+        if vm.agent == self.agent_version:
+            return
+        tok = vm.client.token
+        try:
+            vm.client.rpc("upgrade", self.agent_b64, str(boat.AGENT_PORT), tok, timeout=30)
+        except Exception:
+            boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90)
+        for _ in range(30):
+            time.sleep(1)
+            with contextlib.suppress(Exception):
+                if str(vm.client.ping().get("version")) == self.agent_version:
+                    old, vm.agent = vm.agent, self.agent_version
+                    log(f"{vm.id}: agent {old} -> {vm.agent} (upgraded in place, {len(vm.running)} items running on)")
+                    boat.write_agent(vm.id, {**(boat.read_agent(vm.id) or {}), "version": self.agent_version})
+                    return
+
+    def _heartbeat(self):
+        while not self.stop.wait(300):
+            for v in list(self.vms.values()):
+                if not v.dead:
+                    with contextlib.suppress(Exception):
+                        boat.boat("extend", v.id, "--ttl", str(boat.BACKSTOP), "--json", check=False)
+
+    def shutdown(self):
+        """A restart (a deploy, the service restarted): VMs running items keep them (their TTL renewed, their leases
+        let go for the next process to take back with their items); the others are released."""
+        self.stop.set()
+        self._metrics_save()
+        for v in list(self.vms.values()):
+            self._let_go(v, keep=rules.keep_across_restart(len(v.running), v.dead))
+
+
+# --------------------------------------------------------------------------------------------- the blob store
+def blob_tar(keys: list[str]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tf:
+        for k in keys:
+            data = blobcache.read(BLOBS, k)
+            ti = tarfile.TarInfo(k)
+            ti.size = len(data)
+            ti.mode = 0o755 if k.endswith("x") else 0o644
+            tf.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def store_blobs(tree) -> int:
+    """A tree's files into the blob store by key (the ones it lacks), so the scheduler ships what the client saw."""
+    BLOBS.mkdir(parents=True, exist_ok=True)
+    by = {}
+    for f, k in tree.files.items():
+        by.setdefault(k, f)
+    n = 0
+    missing = set(blobcache.have(BLOBS, list(by)))
+    for k, f in by.items():
+        if k not in missing:
+            continue
+        data = tree.read(f)
+        if data is None:
+            raise RuntimeError(f"{f} changed while the batch shipped it: run again")
+        blobcache.put(BLOBS, k, data)
+        n += 1
+    return n
+
+
+
+# --------------------------------------------------------------------------------------- a remote client's uploads
+def raw_post(path: str, body: bytes):
+    """The controller's uploads: blobs (a tar named by key), a cache's files, a queue submission, the repos' git."""
+    from urllib.parse import parse_qs, urlparse
+    q = {k: v[0] for k, v in parse_qs(urlparse(path).query).items()}
+    p = path.split("?")[0]
+    if p == "/blobs/put":
+        n = 0
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as tf:
+            for m in tf.getmembers():
+                data = tf.extractfile(m).read()
+                blobcache.put(BLOBS, m.name, data)
+                n += 1
+        return ({"stored": n},)
+    if p == "/cache/put":
+        d = config.LIVE / q["name"] / q["key"]
+        d.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as tf:
+            tf.extractall(d, filter="data")
+        return ({"ok": True},)
+    if p == "/queue/add":  # (a jobs file and its tree, for the treadmill here: as `supercomputer queue add` writes)
+        from . import treadmill
+        tm = treadmill.use()
+        meta = json.loads(q["meta"])
+        d = tm / "subs" / meta["name"]
+        if d.exists():
+            raise ValueError(f"{meta['name']} exists: another --name")
+        d.mkdir(parents=True)
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as tf:
+            (d / "tree.tar.gz").write_bytes(tf.extractfile("tree.tar.gz").read())
+            (d / "jobs.json").write_bytes(tf.extractfile("jobs.json").read())
+        (d / "meta.json").write_text(json.dumps(meta, indent=1))
+        return ({"queued": meta["name"]},)
+    if p == "/git":  # (bundles of the repos the treadmill follows: main, and the submodules' commits)
+        repo = pathlib.Path(q["repo"]).expanduser()
+        b = DIR / f"in-{os.getpid()}-{threading.get_ident()}.bundle"
+        b.write_bytes(body)
+        try:
+            r = subprocess.run(["git", "-C", str(repo), "fetch", "-q", str(b), q.get("refspec", "+main:main")], capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr[-400:])
+            if q.get("checkout"):
+                subprocess.run(["git", "-C", str(repo), "reset", "-q", "--hard", q["checkout"]], capture_output=True, timeout=120)
+        finally:
+            b.unlink(missing_ok=True)
+        return ({"ok": True},)
+    if p == "/state":  # (a copy of the durable state for the client to keep: no secrets, no blobs)
+        from . import treadmill
+        tm = treadmill.use()
+        buf = io.BytesIO()
+        skip = ("agents", "keys", "blobs", "index", "token", "boat-key")
+        with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tf:
+            for f in sorted(config.LIVE.rglob("*")):
+                rel = f.relative_to(config.LIVE)
+                if f.is_file() and not any(part in skip for part in rel.parts) and not f.name.endswith(".lock") and f.stat().st_size < 50 << 20:
+                    tf.add(f, arcname=f"live/{rel}")
+            for f in sorted(tm.rglob("*")) if tm.exists() else []:
+                rel = f.relative_to(tm)
+                if f.is_file() and rel.parts[0] not in ("trees", "unpacked") and not f.name.endswith(".tar.gz"):
+                    tf.add(f, arcname=f"treadmill/{rel}")
+        return (None, buf.getvalue())
+    raise ValueError(p)
+
+
+def queue_ls() -> dict:
+    from . import treadmill
+    tm = treadmill.use()
+    subs = sorted((json.loads(p.read_text()) for p in (tm / "subs").glob("*/meta.json")), key=lambda m: m["t"]) if (tm / "subs").exists() else []
+    st = json.loads((tm / "status.json").read_text()) if (tm / "status.json").exists() else {}
+    return {"subs": subs[-40:], "status": st}
+
+
+def queue_results(name: str) -> dict:
+    from . import treadmill
+    d = treadmill.use() / "subs" / name
+    meta = json.loads((d / "meta.json").read_text())
+    out = {"meta": meta, "summary": (d / "out" / "summary.tsv").read_text() if (d / "out" / "summary.tsv").exists() else ""}
+    out["logs"] = {f.stem: f.read_text()[-20000:] for f in sorted((d / "out").glob("*.log"))} if (d / "out").exists() else {}
+    return out
+
+
+# --------------------------------------------------------------------------------------------- the server
+def serve(idle_exit: float = 120, takeover: bool = False):
+    DIR.mkdir(parents=True, exist_ok=True)
+    lockf = open(DIR / "serve.lock", "a")
+    for k in range(120 if takeover else 1):  # (one scheduler per pool: the lock; a takeover waits for the old one to go)
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if k == (119 if takeover else 0):
+                print("the scheduler is running already", file=sys.stderr)
+                return
+            time.sleep(0.5)
+    os.environ["SUPERCOMPUTER_CLIENT"] = CLIENT
+    s = Scheduler(idle_exit)
+    if (DIR / "token").exists() and (DIR / "token").read_text().strip():  # (the same token across restarts: clients keep theirs)
+        s.token = (DIR / "token").read_text().strip()
+    with config.private_umask():
+        (DIR / "token").write_text(s.token)
+    (DIR / "pid").write_text(str(os.getpid()))
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, obj=None, raw=None):
+            if isinstance(obj, (bytes, bytearray)):
+                obj, raw = None, bytes(obj)
+            body = raw if raw is not None else json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._send(200, {"ok": True, "pid": os.getpid()})
+
+        def do_POST(self):
+            c0 = _cpu_now()
+            try:
+                return self._post()
+            finally:
+                s._cpu_add("http " + self.path.split("?")[0], c0)
+
+        def _post(self):
+            n = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(n)
+            if not hmac.compare_digest(self.headers.get("X-SC-Token", ""), s.token):
+                return self._send(403, {"error": "token"})
+            raw_paths = {"/blobs/put", "/cache/put", "/queue/add", "/git", "/state"}
+            if self.path.split("?")[0] in raw_paths:
+                try:
+                    return self._send(200, *raw_post(self.path, body))
+                except Exception as e:
+                    return self._send(500, {"error": repr(e)[-800:]})
+            try:
+                m = json.loads(body or b"{}")
+                p = self.path
+                if p == "/capabilities":
+                    return self._send(200, s.capabilities())
+                if p in ("/cancel", "/snapshot"):
+                    bid = s.batch_of(m)
+                    try:
+                        s._valid_batch(bid)
+                        result = s.snapshot(bid) if p == "/snapshot" else s.cancel(bid, m.get("wait_seconds", 10))
+                    except (ValueError, TypeError) as e:
+                        return self._send(400, {"error": str(e)})
+                    return self._send(200, result)
+                if p == "/submit":
+                    return self._send(200, s.submit(m))
+                if p in ("/poll", "/close", "/logs") and s.batch_of(m) is None:  # (a request naming no batch: the client's, cut or old; answered, not ours)
+                    log(f"{p}: a request naming no batch ({len(body)} of {n} bytes, keys {sorted(m)[:6] if isinstance(m, dict) else type(m).__name__}): nothing done")
+                    return self._send(400, {"error": "no batch named"})
+                if p == "/poll":
+                    return self._send(200, s.poll(s.batch_of(m), int(m.get("since", 0)), float(m.get("wait", 15))))
+                if p == "/close":
+                    return self._send(200, s.close(s.batch_of(m)))
+                if p == "/logs":
+                    return self._send(200, raw=s.logs(s.batch_of(m), m.get("vms", [])))
+                if p == "/hint":
+                    return self._send(200, s.hint(m))
+                if p == "/status":
+                    return self._send(200, s.status())
+                if p == "/health":
+                    return self._send(200, s.health_check(float(m.get("minutes", 30))))
+                if p == "/rollback":
+                    return self._send(200, s.rollback(m.get("code") or None))
+                if p == "/blobs/have":  # (a remote client: which of its tree's files the controller lacks)
+                    return self._send(200, {"missing": blobcache.have(BLOBS, m["keys"])})
+                if p == "/drain":  # (a deploy: no new item placed; what runs goes on, and comes back after the restart)
+                    s.draining = bool(m.get("on", True))
+                    running = sum(len(v.running) for v in s.vms.values())
+                    return self._send(200, {"draining": s.draining, "running": running})
+                if p == "/tree/put":  # (a tree's manifest, kept by id: later batches of it send the id alone)
+                    (DIR / "trees").mkdir(parents=True, exist_ok=True)
+                    with blobcache.locked(BLOBS):
+                        dest = DIR / "trees" / f"{m['tree']['id']}.json"
+                        tmp = dest.with_suffix(f".{threading.get_ident()}.tmp")
+                        tmp.write_text(json.dumps(m["tree"]))
+                        os.replace(tmp, dest)
+                    return self._send(200, {"ok": True})
+                if p == "/cache/have":
+                    d = config.LIVE / m["name"] / m["key"]
+                    return self._send(200, {"names": sorted(f.name for f in d.iterdir()) if d.exists() else []})
+                if p == "/queue/ls":
+                    return self._send(200, queue_ls())
+                if p == "/queue/results":
+                    return self._send(200, queue_results(m["name"]))
+                if p == "/ledger":
+                    lp = config.LIVE / "boat-starts.jsonl"
+                    lines = lp.read_text().splitlines()[-int(m.get("n", 2000)):] if lp.exists() else []
+                    return self._send(200, {"lines": lines})
+                if p == "/can":  # can an interactive batch of this image start now, with no start? (a VM held or warm)
+                    held = any(v.ready and not v.dead and v.image == m["image"] for v in s.vms.values())
+                    return self._send(200, {"held": held})
+                return self._send(404, {"error": p})
+            except Exception as e:
+                if health.client_gone(e):  # (its client gone mid-answer: nothing to answer, no error of ours; 02:38 a canary handed back for one)
+                    return
+                s._h().record_error(time.time(), f"{self.path}: {e!r}")
+                return self._send(500, {"error": repr(e)[-800:]})
+
+    class Srv(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        request_queue_size = 128
+
+        def handle_error(self, request, client_address):  # (a client gone mid-answer, a poll cut by a restart: quiet)
+            if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, TimeoutError)):
+                super().handle_error(request, client_address)
+
+    for k in range(60):  # (the old scheduler's port, freed as it exits)
+        try:
+            srv = Srv(("127.0.0.1", PORT), H)
+            break
+        except OSError:
+            if k == 59:
+                raise
+            time.sleep(0.5)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    s._srv, s._lockf = srv, lockf  # (a handoff gives both to the next scheduler before it exits)
+    hook = threading.excepthook
+
+    def died(a):  # (a thread of the scheduler dead of an exception: health's errors; a client gone isn't one)
+        if not health.client_gone(a.exc_value):
+            s._h().record_error(time.time(), f"thread {getattr(a.thread, 'name', '?')}: {a.exc_type.__name__}: {a.exc_value}")
+        hook(a)
+    threading.excepthook = died
+    log(f"serving on 127.0.0.1:{PORT} (pid {os.getpid()})")
+    with boat.signals_as_interrupt():
+        try:
+            s.run()
+        except KeyboardInterrupt:
+            s.shutdown()
+    srv.shutdown()
+    (DIR / "pid").unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------------------------- the client
+class Client:
+    """The scheduler: this machine's (127.0.0.1), or the controller's on boat (LIVE/controller.json: its boat URL,
+    boat's cookie and our token, 0600) when it answers."""
+
+    def __init__(self, remote: dict | None = None):
+        self.remote, self.port = None, PORT
+        if remote:
+            self.token = remote["token"]
+            if remote.get("transport", "forward") == "forward":  # (boat forward: TCP over boat's ssh)
+                self.port = persistent_forward(remote["vm"]) or forward(remote["vm"])
+                self.remote = "forward"
+            else:
+                self.remote = AgentClient(remote["vm"], remote["url"], remote["token"], remote.get("cookie", ""))
+        else:
+            self.token = (DIR / "token").read_text().strip()
+
+    def req(self, path: str, msg, timeout: float = 60, raw: bool = False, body: bytes | None = None):
+        data_in = body if body is not None else json.dumps(msg).encode()
+        if isinstance(self.remote, AgentClient):
+            code, data, _ = self.remote._req("POST", path, data_in, timeout, "application/octet-stream" if body is not None else "application/json")
+            if code != 200:
+                raise RuntimeError(f"the controller: {path}: {code} {data[:300]!r}")
+        else:
+            data = self._local(path, data_in, timeout)
+        return data if raw else json.loads(data)
+
+    def _local(self, path: str, body: bytes, timeout: float) -> bytes:
+        """A request over a kept-alive connection (to this machine's scheduler, or through the forward: a new
+        connection through boat's ssh costs a round trip of its own)."""
+        import http.client
+        last = None
+        for k in range(3):
+            c = getattr(self, "_conns", None)
+            if c is None:
+                self._conns = c = []
+            conn = c.pop() if c else http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+            conn.timeout = timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            try:
+                conn.request("POST", path, body=body, headers={"X-SC-Token": self.token, "Content-Type": "application/json"})
+                r = conn.getresponse()
+                data = r.read()
+                c.append(conn)
+                if r.status != 200:
+                    raise RuntimeError(f"the scheduler: {path}: {r.status} {data[:300]!r}")
+                return data
+            except (OSError, http.client.HTTPException) as e:
+                last = e
+                with contextlib.suppress(Exception):
+                    conn.close()
+                time.sleep(0.2 * (k + 1))
+        raise RuntimeError(f"the scheduler didn't answer ({last})")
+
+    def _known(self) -> dict:
+        p = FWD_DIR / "known.json"
+        with contextlib.suppress(Exception):
+            return json.loads(p.read_text())
+        return {"trees": [], "caches": []}
+
+    def _know(self, kind: str, key: str):
+        with contextlib.suppress(Exception):
+            k = self._known()
+            k[kind] = (k.get(kind, []) + [key])[-50:]
+            FWD_DIR.mkdir(parents=True, exist_ok=True)
+            (FWD_DIR / "known.json").write_text(json.dumps(k))
+
+    def push_tree(self, tree) -> int:
+        """Revalidate cached tree contents: a known manifest is not a blob-retention promise."""
+        if not self.remote:
+            return store_blobs(tree)
+        keys = sorted(set(tree.files.values()))
+        missing = self.req("/blobs/have", {"keys": keys}, timeout=120)["missing"]
+        by = {}
+        for f, k in tree.files.items():
+            by.setdefault(k, f)
+        for i in range(0, len(missing), 400):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tf:
+                for k in missing[i:i + 400]:
+                    data = tree.read(by[k])
+                    if data is None or hashlib.sha256(data).hexdigest() != k.rstrip("x"):
+                        raise RuntimeError(f"{by[k]} changed while the batch shipped it: run again")
+                    ti = tarfile.TarInfo(k)
+                    ti.size = len(data)
+                    tf.addfile(ti, io.BytesIO(data))
+            self.req("/blobs/put", None, timeout=600, body=buf.getvalue())
+        self.req("/tree/put", {"tree": {"id": tree.id, "files": tree.files, "links": tree.links}}, timeout=300)
+        self._know("trees", tree.id)
+        return len(missing)
+
+    def push_caches(self, caches: list[dict], outputs) -> None:
+        """A build cache's files here that the controller lacks for their key."""
+        if not self.remote:
+            return
+        for c in caches:
+            local = config.LIVE / c["name"] / c["key"]
+            names = sorted(f.name for f in local.iterdir() if f.name in set(outputs(c))) if local.exists() else []
+            tag = f"{c['name']}/{c['key']}/{len(names)}"
+            if tag in self._known().get("caches", []):
+                continue
+            have = set(self.req("/cache/have", {"name": c["name"], "key": c["key"]}).get("names", []))
+            if not set(names) - have:
+                self._know("caches", tag)
+            if set(names) - have:
+                buf = io.BytesIO()
+                with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
+                    for n in sorted(set(names) - have):
+                        tf.add(local / n, arcname=n)
+                self.req(f"/cache/put?name={c['name']}&key={c['key']}", None, timeout=600, body=buf.getvalue())
+
+    def keep(self):
+        if isinstance(self.remote, AgentClient):
+            with contextlib.suppress(Exception):
+                c = json.loads((config.LIVE / "controller.json").read_text())
+                if self.remote.cookie and c.get("cookie") != self.remote.cookie:
+                    c["cookie"] = self.remote.cookie
+                    write_private(config.LIVE / "controller.json", c)
+
+
+FWD_DIR = config.LIVE / "forward"
+FWD_PORT = int(os.environ.get("SUPERCOMPUTER_FORWARD_PORT", "8791"))
+FWD_IDLE = float(os.environ.get("SUPERCOMPUTER_FORWARD_IDLE", "1200"))  # the supervisor exits after this long unused
+
+
+def _healthy(port: int, timeout: float = 3) -> bool:
+    with contextlib.suppress(Exception):
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout).read()
+        return True
+    return False
+
+
+def persistent_forward(vm: str) -> int | None:
+    """The long-lived forward to the controller (one for every command on this machine, started by the first that
+    needs it): its port, or None when it can't be had (the caller forwards for itself). Each use touches its clock."""
+    FWD_DIR.mkdir(parents=True, exist_ok=True)
+    (FWD_DIR / "last-use").touch()
+    if _healthy(FWD_PORT, 2):
+        return FWD_PORT
+    with contextlib.suppress(Exception):
+        pid = int((FWD_DIR / "pid").read_text())
+        os.kill(pid, 0)
+        for _ in range(40):  # (a supervisor starting or reconnecting: a moment)
+            if _healthy(FWD_PORT, 2):
+                return FWD_PORT
+            time.sleep(0.25)
+        return None
+    home = str(pathlib.Path(boat.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": home}
+    with open(FWD_DIR / "log", "a") as lf:
+        subprocess.Popen([sys.executable, "-P", "-m", "supercomputer", "scheduler", "forward", vm], stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,
+                         start_new_session=True, close_fds=True, env=env, cwd=home)
+    for _ in range(60):
+        if _healthy(FWD_PORT, 2):
+            return FWD_PORT
+        time.sleep(0.25)
+    return None
+
+
+def forward_supervisor(vm: str):
+    """The supervisor: `boat forward` to the controller's scheduler on FWD_PORT, kept up (started again when it drops
+    or stops answering), exiting once no command has used it for FWD_IDLE seconds. One at a time (a lock)."""
+    lockf = open(FWD_DIR / "lock", "a")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    (FWD_DIR / "pid").write_text(str(os.getpid()))
+    p = None
+    stop = threading.Event()
+
+    def bye(*a):
+        stop.set()
+    import signal as _sig
+    _sig.signal(_sig.SIGTERM, bye)
+    _sig.signal(_sig.SIGHUP, bye)
+    try:
+        fails = 0
+        while not stop.is_set():
+            if p is None or p.poll() is not None:
+                p = subprocess.Popen([boat.BOAT, "forward", vm, "--remote", str(PORT), "--local", str(FWD_PORT)], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=boat.ENV)
+                log(f"forward to {vm} on 127.0.0.1:{FWD_PORT} (pid {p.pid})")
+                for _ in range(60):
+                    if _healthy(FWD_PORT, 2) or p.poll() is not None:
+                        break
+                    time.sleep(0.25)
+            if stop.wait(10):
+                break
+            if not _healthy(FWD_PORT, 5):
+                fails += 1
+                if fails >= 2:  # (dropped: a new one)
+                    log("the forward stopped answering: again")
+                    p.terminate()
+                    with contextlib.suppress(Exception):
+                        p.wait(5)
+                    p, fails = None, 0
+            else:
+                fails = 0
+            with contextlib.suppress(Exception):
+                if time.time() - (FWD_DIR / "last-use").stat().st_mtime > FWD_IDLE:
+                    log(f"unused for {int(FWD_IDLE)} s: exiting")
+                    break
+    finally:
+        if p is not None and p.poll() is None:
+            p.terminate()
+            with contextlib.suppress(Exception):
+                p.wait(5)
+        (FWD_DIR / "pid").unlink(missing_ok=True)
+
+
+_fwd: dict = {}
+
+
+def forward(vm: str) -> int:
+    """A local port forwarded to the controller's scheduler (`boat forward`, TCP over boat's ssh), for the life of
+    this process: stopped at its exit by the Popen we hold."""
+    if vm in _fwd:
+        return _fwd[vm][1]
+    import atexit
+    import socket as so
+    with so.socket() as t:
+        t.bind(("127.0.0.1", 0))
+        port = t.getsockname()[1]
+    # (through a watchdog that ends the forward when this process is gone, however it ends: no forward outlives its client)
+    watch = ("import os,signal,subprocess,sys,time\np=subprocess.Popen(sys.argv[2:])\n"
+             "signal.signal(signal.SIGTERM, lambda *a: (p.terminate(), sys.exit(0)))\n"
+             "while p.poll() is None:\n  try: os.kill(int(sys.argv[1]),0)\n  except OSError: p.terminate(); break\n  time.sleep(2)\n")
+    p = subprocess.Popen([sys.executable, "-c", watch, str(os.getpid()), boat.BOAT, "forward", vm, "--remote", str(PORT), "--local", str(port)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=boat.ENV, start_new_session=True)
+    atexit.register(lambda: (p.terminate(), p.wait(5)))
+    _fwd[vm] = (p, port)
+    for _ in range(150):
+        with contextlib.suppress(Exception):
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2).read()
+            return port
+        if p.poll() is not None:
+            break
+        time.sleep(0.2)
+    raise RuntimeError("boat forward to the controller didn't come up")
+
+
+def write_private(path: pathlib.Path, obj: dict):
+    with config.private_umask():
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(obj))
+        tmp.rename(path)
+
+
+_remote_ok: dict = {}
+
+
+def controller() -> dict | None:
+    """The controller on boat (LIVE/controller.json with its URL and token), if one is set up and not turned off."""
+    if os.environ.get("SUPERCOMPUTER_CONTROLLER", "0") in ("0", ""):  # (off by default: this machine's scheduler owns the pool)
+        return None
+    with contextlib.suppress(Exception):
+        c = json.loads((config.LIVE / "controller.json").read_text())
+        if c.get("url") and c.get("token"):
+            return c
+    return None
+
+
+def connect() -> "Client":
+    """The scheduler a batch goes to: the controller on boat when it answers (checked once a process), else this
+    machine's, started if need be (the local fallback)."""
+    return _remote() or ensure_running()
+
+
+def _remote() -> "Client | None":
+    c = controller()
+    if not c:
+        return None
+    if "ok" not in _remote_ok:
+        try:
+            cl = Client(c)
+            if not _healthy(cl.port, 3):  # (the forward answers: the scheduler behind it does)
+                cl.req("/status", {}, timeout=15)
+            _remote_ok["ok"] = cl
+            cl.keep()
+        except Exception as e:
+            print(f"[scheduler] the controller on boat doesn't answer ({str(e)[:120]}): this machine's scheduler", file=sys.stderr, flush=True)
+            _remote_ok["ok"] = None
+    return _remote_ok["ok"]
+
+
+def running() -> bool:
+    if _remote():
+        return True
+    try:
+        pid = int((DIR / "pid").read_text())
+        os.kill(pid, 0)
+        urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=2).read()
+        return True
+    except Exception:
+        return False
+
+
+def current() -> "Client | None":
+    """The scheduler if one runs (the controller's, else this machine's), started by no one."""
+    r = _remote()
+    if r:
+        return r
+    return Client() if running() else None
+
+
+def ensure_running() -> Client:
+    """The scheduler, started (detached, its log in LIVE/scheduler/log) if no client started it yet."""
+    if not running():
+        DIR.mkdir(parents=True, exist_ok=True)
+        home = str(pathlib.Path(boat.__file__).resolve().parent.parent)
+        env = {**os.environ, "PYTHONPATH": home + (":" + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
+        env.pop("SUPERCOMPUTER_CONFIG", None)
+        with open(DIR / "log", "a") as lf:
+            subprocess.Popen([sys.executable, "-P", "-m", "supercomputer", "scheduler", "serve"], stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,
+                             start_new_session=True, close_fds=True, env=env, cwd=home)
+        for _ in range(100):
+            if running():
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(f"the scheduler didn't start: {DIR / 'log'}")
+    return Client()
+
+
+def enabled() -> bool:
+    return os.environ.get("SUPERCOMPUTER_SCHEDULER", "1") not in ("0", "")
+
+
+def main(argv: list[str]):
+    import argparse
+    ap = argparse.ArgumentParser(prog="supercomputer scheduler")
+    ap.add_argument("cmd", choices=["serve", "status", "stop", "forward", "unforward"])
+    ap.add_argument("vm", nargs="?", default="")
+    ap.add_argument("--idle-exit", type=float, default=120, help="seconds idle before it exits (0: never, the controller's)")
+    ap.add_argument("--takeover", action="store_true", help="(a handoff: wait for the old scheduler's lock)")
+    a = ap.parse_args(argv)
+    if a.cmd == "serve":
+        serve(a.idle_exit, a.takeover)
+    elif a.cmd == "status":
+        c = controller()
+        if c:
+            print(f"the controller on boat: {c['vm']}")
+        print(json.dumps(connect().req("/status", {}), indent=1) if (c or running()) else "not running")
+    elif a.cmd == "forward":
+        forward_supervisor(a.vm or (controller() or {}).get("vm"))
+    elif a.cmd == "unforward":
+        with contextlib.suppress(Exception):
+            os.kill(int((FWD_DIR / "pid").read_text()), 15)
+            print("the forward supervisor stops")
+    elif a.cmd == "stop":
+        if (DIR / "pid").exists():
+            os.kill(int((DIR / "pid").read_text()), 15)
+            print("stopping")

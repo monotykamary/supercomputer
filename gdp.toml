@@ -1,0 +1,14 @@
+# gdp-wired's options for the laws of supercomputer/rules.py and tests/broken_rules.py (tests/check_laws.sh).
+# from = "any": the scheduler steps its rules from states it is handed (the queue read back after a restart, a handoff,
+# adoption's registry), so every law is proven from every state the laws allow, not only from the start.
+from = "any"
+
+# Episodes of VMLife, for its laws of "eventually": the requests that can happen in them.
+[rules.VMQuiet]
+methods = ["ended", "release", "boat_stopped"]
+
+[rules.Reattaching]
+methods = ["reattach", "boat_stopped"]
+
+[rules.Draining]
+methods = ["turn"]
