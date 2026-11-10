@@ -1,6 +1,7 @@
 live/
 repos/
 verification/
+runs/hotreload*/
 .pi/
 __pycache__/
 *.pyc

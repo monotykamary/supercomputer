@@ -94,7 +94,7 @@ class BootstrapTransport(unittest.TestCase):
 
     def test_exact_candidate_agent_crosses_linux_argument_boundary(self):
         data = (Path(boat.__file__).parent / 'agent.py').read_bytes()
-        self.assertEqual(len(data), 103173)
+        self.assertGreater(len(data), 100_000)  # source evolves; transport must still cross MAX_ARG_STRLEN
         self.assertGreater(len(base64.b64encode(data)), 131072)
         result = self.install(data)
         self.assertTrue(result['ok'])
@@ -235,7 +235,7 @@ class SchedulerBootstrapWiring(unittest.TestCase):
             bootstrap.assert_called_once_with('fake-vm', 'EXACT_SOURCE', 'same-token', 60, 2)
         self.assertEqual((vm.failing, vm.fails), (0, 0))
 
-    def test_check_agent_fallback_preserves_source_port_token_identity(self):
+    def test_ambiguous_upgrade_never_bootstraps_over_running_agent(self):
         instance = object.__new__(scheduler.Scheduler)
         instance.agent_b64, instance.agent_version = 'EXACT_SOURCE', 'new-hash'
         replies = iter([{'version': 'old-hash'}, {'version': 'new-hash'}])
@@ -243,8 +243,9 @@ class SchedulerBootstrapWiring(unittest.TestCase):
         vm = types.SimpleNamespace(id='fake-vm', running={}, client=client)
         with patch.object(boat, 'bootstrap_agent', return_value={'ok': True}) as bootstrap, patch.object(boat, 'read_agent', return_value={}), patch.object(boat, 'write_agent') as write, patch.object(scheduler.time, 'sleep'):
             instance._check_agent(vm)
-            bootstrap.assert_called_once_with('fake-vm', 'EXACT_SOURCE', 'same-token', 90)
-            self.assertEqual(write.call_args.args[1]['version'], 'new-hash')
+            bootstrap.assert_not_called()
+            write.assert_not_called()
+            self.assertEqual(vm.t_agent, 0)
 
 
 if __name__ == '__main__': unittest.main()

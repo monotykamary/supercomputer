@@ -179,6 +179,26 @@ def setup(vm: str, vms: int = 40, floor: int = 8, only: str = ""):
     print(f"controller {vm}: up; this machine's commands go there (LIVE/controller.json)")
 
 
+def stage(vm: str):
+    """Ship code only, then publish its install pointer; no service/pool changes."""
+    current = scheduler.Client(info()).req("/status", {}, timeout=10)
+    if current.get("hot_handoff") != 1:
+        raise RuntimeError("controller has no hot-handoff protocol; refusing a mixed-version rollout")
+    target = scheduler.code_hash(pathlib.Path(__file__).parent)
+    release = f"{SC}/releases/{target}"
+    command = (f"set -e; mkdir -p {release}; tar xzf - -C {release}; "
+               f"cd {release}; PYTHONPATH={release} SUPERCOMPUTER_SRC={release} "
+               f"SUPERCOMPUTER_HOME={SC}/tool SUPERCOMPUTER_LIVE={SC}/live "
+               "SUPERCOMPUTER_CONTROLLER=0 python3 -P -m supercomputer scheduler stage")
+    code, out = ssh(vm, command, tool_tar())
+    if code:
+        raise RuntimeError(f"controller staging failed: {out[-400:]}")
+    receipts = [json.loads(line) for line in out.splitlines() if line.startswith('{"active"')]
+    if not receipts or receipts[-1].get("staged") != target:
+        raise RuntimeError("controller did not attest the staged source hash")
+    print(json.dumps({"machine": vm, **receipts[-1]}, sort_keys=True))
+
+
 def handover(vm: str, n: int):
     """n of this registry's free, stopped VMs of the repo's image move to the controller's (this registry forgets
     them, so no client here leases one the controller holds)."""
@@ -346,7 +366,7 @@ def maybe_sync():
 def main(argv: list[str]):
     import argparse
     ap = argparse.ArgumentParser(prog="supercomputer controller")
-    ap.add_argument("cmd", choices=["setup", "status", "sync", "logs", "restart", "stop", "handover", "rekey"])
+    ap.add_argument("cmd", choices=["setup", "stage", "status", "sync", "logs", "restart", "stop", "handover", "rekey"])
     ap.add_argument("what", nargs="?", default="scheduler")
     ap.add_argument("--vm", default="")
     ap.add_argument("--vms", type=int, default=40, help="pool VMs the controller gets from this registry")
@@ -358,6 +378,8 @@ def main(argv: list[str]):
         raise SystemExit("no controller VM: supercomputer controller setup --vm <id>")
     if a.cmd == "setup":
         setup(vm, a.vms, a.floor, a.only)
+    elif a.cmd == "stage":
+        stage(vm)
     elif a.cmd == "rekey":
         print(f"rotated key {rekey(vm)}; its new secret is in the controller's memory only")
     elif a.cmd == "handover":

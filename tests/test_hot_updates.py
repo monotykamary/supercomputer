@@ -56,6 +56,32 @@ class Guards(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'fenced'):
                 agent.start(job.parents[1], {'name': 'another'})
 
+    def test_stage_install_publishes_source_without_starting_scheduler(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            source = root / 'new-install' / 'supercomputer'
+            source.mkdir(parents=True)
+            (source / 'scheduler.py').write_text('# candidate\n')
+            with mock.patch.object(scheduler, 'DIR', root / 'live'), \
+                 mock.patch.object(scheduler, '__file__', str(source / 'scheduler.py')), \
+                 mock.patch.object(scheduler, 'Client', side_effect=ConnectionRefusedError), \
+                 mock.patch.object(scheduler.subprocess, 'Popen') as spawn:
+                receipt = scheduler.stage_install()
+                self.assertEqual(scheduler.installed_source(), source.parent)
+                self.assertEqual(receipt['staged'], scheduler.code_hash(source))
+                self.assertIsNone(receipt['active'])
+                self.assertTrue((root / 'live/code' / receipt['staged'] / 'supercomputer/scheduler.py').exists())
+                spawn.assert_not_called()
+
+    def test_controller_stage_refuses_pre_handoff_runtime(self):
+        client = mock.Mock()
+        client.req.return_value = {'code': 'legacy'}
+        with mock.patch.object(controller.scheduler, 'Client', return_value=client), \
+             mock.patch.object(controller, 'ssh') as ssh:
+            with self.assertRaisesRegex(RuntimeError, 'no hot-handoff protocol'):
+                controller.stage('controller-fixture')
+            ssh.assert_not_called()
+
     def test_service_tracks_handoff_child(self):
         text = controller.unit('scheduler', 'python3 -m supercomputer scheduler serve', '/tmp/tool', {})
         self.assertIn('NotifyAccess=all', text)

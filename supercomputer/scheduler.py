@@ -221,12 +221,43 @@ def apply_policy(p: dict):
 _code_cache: dict = {}
 
 
+def installed_source() -> pathlib.Path:
+    """Explicit install handoff, including processes running a different checkout."""
+    try:
+        source = pathlib.Path(json.loads((DIR / "install.json").read_text())["source"])
+        if source.is_absolute() and (source / "supercomputer" / "scheduler.py").is_file():
+            return source
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return config.SRC
+
+
+def stage_install() -> dict:
+    """Publish immutable installed code for the next safe point; starts no service."""
+    DIR.mkdir(parents=True, exist_ok=True)
+    source = pathlib.Path(__file__).resolve().parent
+    target = code_hash(source)
+    saved = canary.Canary(DIR).snapshot(target, source)
+    if saved is None:
+        raise RuntimeError("cannot snapshot staged code")
+    manifest = {"source": str(source.parent), "snapshot": str(saved.parent), "code": target}
+    tmp = DIR / f"install.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(manifest))
+    tmp.replace(DIR / "install.json")
+    active = None
+    try:
+        active = Client().req("/status", {}, timeout=3).get("code")
+    except Exception:
+        pass  # stage must never create a scheduler just to report a hash
+    return {"staged": target, "active": active, "pending": active is not None and active != target}
+
+
 def code_hash(pkg: pathlib.Path | None = None) -> str:
     """The installed tool's code (config.SRC's, whatever this process runs: a hand-back runs a kept copy): a hash of
     its modules (by their mtimes, rehashed only when one changed)."""
-    root = pkg or config.SRC / "supercomputer"
+    root = pkg or installed_source() / "supercomputer"
     files = sorted(root.rglob("*.py"))
-    key = tuple((str(f.relative_to(root)), f.stat().st_mtime_ns, f.stat().st_size) for f in files)
+    key = (str(root), tuple((str(f.relative_to(root)), f.stat().st_mtime_ns, f.stat().st_size) for f in files))
     if _code_cache.get(str(pkg)) != key:
         h = hashlib.sha256()
         for f in files:
@@ -1490,7 +1521,7 @@ class Scheduler:
                             "breaker_trips": self.m["breaker_trips"], "not_ready": self.m["not_ready"]},
                     "breaker": {**self.br, "open": now < self.br["open_until"], "open_for_s": max(0, round(self.br["open_until"] - now))},
                     "shed": self.shed, "load": self.load, "bring_up_s": round(self.bring_up, 1), "alerts": self.alerts[-5:],
-                    "policy": self.pol, "code": self.code, "code_installed": code_hash(), "agent_code": self.agent_version, "stale": self.stale(),
+                    "policy": self.pol, "hot_handoff": 1, "code": self.code, "code_installed": code_hash(), "agent_code": self.agent_version, "stale": self.stale(),
                     "agents": {v.id: v.agent for v in live},
                     "knobs": {"bringup": BRINGUP_MAX, "break_even_override_s": BREAK_EVEN_OVERRIDE_S or None, "start_dollars": START_DOLLARS, "vm_hour_dollars": VM_HOUR_DOLLARS, "gate_horizon_s": GATE_HORIZON, "hold_s": HOLD, "sub_vms": SUB_VMS, "max_vms": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": self.pol["floor"]},
                     # (the old keys, for older clients)
@@ -2662,6 +2693,8 @@ class Scheduler:
         (its items, in sessions of their own, run on), then asked again. True once it answers."""
         if any(it.batch.strict_once for it in vm.running.values()):
             return False  # unresolved owned supervisors may not be detached by repair
+        if vm.running and getattr(vm, "agent", "") != self.agent_version:
+            return False  # repair is not permission to upgrade underneath legacy work
         if time.time() - getattr(vm, "t_repair", 0) < 30:
             return False
         vm.t_repair = time.time()
@@ -3524,7 +3557,7 @@ class Scheduler:
             if not back_to:
                 if not self._imports(new):
                     return
-                if self.canary.snapshot(new, config.SRC / "supercomputer") is None:
+                if self.canary.snapshot(new, installed_source() / "supercomputer") is None:
                     self.alert("handoff refused: cannot preserve candidate source")
                     return
             candidates = [new, self.code] if new != self.code else [new]
@@ -3555,7 +3588,7 @@ class Scheduler:
                 (DIR / "handoff.ack").unlink(missing_ok=True)
                 path = str(DIR / "code" / target)
                 env = {**os.environ, "PYTHONPATH": path, "SUPERCOMPUTER_HOME": str(config.HOME),
-                       "SUPERCOMPUTER_SRC": str(config.SRC)}
+                       "SUPERCOMPUTER_SRC": str(installed_source())}
                 if inherited:
                     env["SUPERCOMPUTER_HANDOFF_FDS"] = ",".join(map(str, fds))
                 with open(DIR / "log", "a") as lf:
@@ -3608,8 +3641,8 @@ class Scheduler:
 
     def _imports(self, new: str) -> bool:
         """Whether the installed code imports (a broken install is never handed the pool: an alert, once)."""
-        r = subprocess.run([sys.executable, "-c", "import supercomputer.scheduler"], cwd=str(config.SRC), capture_output=True, text=True, timeout=60,
-                           env={**os.environ, "PYTHONPATH": str(config.SRC)})
+        r = subprocess.run([sys.executable, "-c", "import supercomputer.scheduler"], cwd=str(installed_source()), capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "PYTHONPATH": str(installed_source())})
         if r.returncode != 0 and getattr(self, "_bad_code", "") != new:
             self._bad_code = new
             self.alert(f"code {new} installed but doesn't import: no handoff ({r.stderr.strip()[-200:]})")
@@ -3679,7 +3712,7 @@ class Scheduler:
     def _check_agent(self, vm: VMState):
         """Agents follow the code: one whose hash isn't this scheduler's agent.py is upgraded in place (its items, in
         sessions of their own, run on), through itself, else by boat exec."""
-        if vm.running or vm.starts:
+        if vm.running or getattr(vm, "starts", []):
             return  # Never replace an agent beneath any live or starting item.
         r = vm.client.ping()
         vm.agent, vm.t_agent = str(r.get("version")), time.time()
@@ -3692,7 +3725,8 @@ class Scheduler:
                 vm.t_agent = 0  # retry at the next empty safe point, never bootstrap around a refusal
                 return
         except Exception:
-            boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90)
+            vm.t_agent = 0
+            return  # an ambiguous upgrade reply never authorizes a bootstrap overwrite
         for _ in range(30):
             time.sleep(1)
             with contextlib.suppress(Exception):
@@ -4376,13 +4410,15 @@ def enabled() -> bool:
 def main(argv: list[str]):
     import argparse
     ap = argparse.ArgumentParser(prog="supercomputer scheduler")
-    ap.add_argument("cmd", choices=["serve", "status", "stop", "forward", "unforward"])
+    ap.add_argument("cmd", choices=["serve", "status", "stage", "stop", "forward", "unforward"])
     ap.add_argument("vm", nargs="?", default="")
     ap.add_argument("--idle-exit", type=float, default=120, help="seconds idle before it exits (0: never, the controller's)")
     ap.add_argument("--takeover", action="store_true", help="(a handoff: wait for the old scheduler's lock)")
     a = ap.parse_args(argv)
     if a.cmd == "serve":
         serve(a.idle_exit, a.takeover)
+    elif a.cmd == "stage":
+        print(json.dumps(stage_install(), sort_keys=True))
     elif a.cmd == "status":
         c = controller()
         if c:
