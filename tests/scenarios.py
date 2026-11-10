@@ -1924,13 +1924,16 @@ def run_one(name: str, code: str) -> dict:
 
 
 def on_boat(names: list[str], code: str) -> dict:
-    """Every scenario a job of one interactive batch on boat, on the pool's image (python3 there): the checkout shipped
-    as tests/laws.toml says, each job's last line its result (08:25: 4 scenarios at once here held the laptop's load at 65)."""
+    """Every scenario a job of one gate batch on boat, on the pool's image (python3 there).
+    SC_SCENARIOS_OUT retains the jobs, raw logs and summary for missing-worker diagnosis and targeted retries.
+    """
     import tempfile
     sc = os.path.expanduser("~/.local/bin/supercomputer")
-    out = pathlib.Path(tempfile.mkdtemp(prefix="sc-scen-"))
+    keep = os.environ.get("SC_SCENARIOS_OUT")
+    out = pathlib.Path(keep) if keep else pathlib.Path(tempfile.mkdtemp(prefix="sc-scen-"))
+    out.mkdir(parents=True, exist_ok=True)
     try:
-        jobs = [{"name": n, "cmd": f"PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3 -P tests/scenarios.py --one {n} --code . 2>/dev/null | tail -1", "timeout": 900, "cpu": 2}
+        jobs = [{"name": n, "cmd": f"set -o pipefail; PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3 -P tests/scenarios.py --one {n} --code . | tail -1", "timeout": 900, "cpu": 2}
                 for n in names]
         (out / "jobs.json").write_text(json.dumps(jobs))
         img = os.environ.get("SC_LAWS_IMAGE", "")
@@ -1938,7 +1941,7 @@ def on_boat(names: list[str], code: str) -> dict:
             with contextlib.suppress(Exception):
                 t = subprocess.run([sc, "scheduler", "status"], capture_output=True, text=True, timeout=30).stdout
                 img = next((v["image"] for v in json.loads(t[t.index("{"):]).get("vms", [])), "")
-        subprocess.run([sc, "run", "--jobs", str(out / "jobs.json"), "--out", str(out / "run"), "--class", "interactive", "--backend", "boat"],
+        subprocess.run([sc, "run", "--jobs", str(out / "jobs.json"), "--out", str(out / "run"), "--class", "gate", "--backend", "boat"],
                        cwd=code, env={**os.environ, "SUPERCOMPUTER_CONFIG": str(pathlib.Path(code) / "tests" / "laws.toml"), "SUPERCOMPUTER_IMAGE": img},
                        stdout=sys.stderr, timeout=3600)
         res = {}
@@ -1949,8 +1952,9 @@ def on_boat(names: list[str], code: str) -> dict:
                 res[n] = json.loads(line)
         return res
     finally:
-        import shutil
-        shutil.rmtree(out, ignore_errors=True)
+        if not keep:
+            import shutil
+            shutil.rmtree(out, ignore_errors=True)
 
 
 def main():
@@ -1960,7 +1964,7 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--one", help=argparse.SUPPRESS)
     ap.add_argument("-j", type=int, default=1)  # (here: one at a time, niced; the laptop runs light work)
-    ap.add_argument("--boat", action="store_true", help="each scenario a job of one interactive batch on boat (the gate's way)")
+    ap.add_argument("--boat", action="store_true", help="each scenario a job of one gate batch on boat (SC_SCENARIOS_OUT keeps receipts)")
     a = ap.parse_args()
     if a.one:
         print(json.dumps(run_one(a.one, a.code), default=str))
