@@ -349,6 +349,26 @@ class LeaseClientTests(unittest.TestCase):
                     renew.assert_not_called()
                     provider.assert_not_called()
 
+    def test_renew_transport_failure_rechecks_provider_before_pinning_work(self):
+        for provider_up in (False, True):
+            with self.subTest(provider_up=provider_up):
+                s = S.Scheduler.__new__(S.Scheduler)
+                vm = S.VMState('vm', 'image', 'large', 'warm')
+                vm.lease, vm.ready, vm.t_renew = dict(self.lease), True, 0.0
+                with patch.object(S.time, 'monotonic', return_value=1000.0), \
+                     patch.object(s, '_renew_lease', side_effect=RuntimeError('vm is stopped')), \
+                     patch.object(s, '_boat_up', return_value=provider_up) as check, \
+                     patch.object(s, '_lost_vm') as lost:
+                    delay = s._tick(vm)
+                check.assert_called_once_with('vm')
+                self.assertFalse(vm.ready)
+                if provider_up:
+                    self.assertEqual(delay, 5.0)
+                    lost.assert_not_called()
+                else:
+                    self.assertIsNone(delay)
+                    lost.assert_called_once_with(vm)
+
     def test_startup_budget_allows_fenced_takeover_past_ten_seconds(self):
         clock = [0.0]
         (self.root / 'scheduler').mkdir()

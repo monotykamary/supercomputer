@@ -95,6 +95,23 @@ def test_gate_deadline_and_bringup_cap():
     assert pool.grow(target["gate_vms"], S.time.time()) == target["gate_vms"]
 
 
+def test_gate_capacity_reserves_the_dispatch_quantum():
+    from unittest.mock import patch
+    s = sched()
+    s.bring_up = 120
+    b = batch(s, klass=2, n=816)
+    for it in b.items.values():
+        it.est = 300
+    for i in range(28):
+        vm(s, str(i))
+    targets = []
+    for interval in (0, 30):
+        with patch.object(S, 'FULL_S', interval):
+            s._plan(S.time.time())
+            targets.append(next(iter(s.target.values()))['gate_vms'])
+    assert targets[1] > targets[0], targets
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

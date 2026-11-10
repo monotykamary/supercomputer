@@ -2437,7 +2437,8 @@ class Scheduler:
         pool.probing = pool.half and any(s["ok"] is None for s in self.starts_log if s["t"] > self.br["t_trip"])
         self.target = {}
         for (image, vm_type), its in groups.items():
-            S, bu = vm_slots(vm_type), max(30.0, self.bring_up)
+            # A worker can wait one full scheduling pass after becoming ready.
+            S, bu = vm_slots(vm_type), max(30.0, self.bring_up) + FULL_S
             B = BREAK_EVEN_OVERRIDE_S or rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS, vm_mult(vm_type))
             held = [v for v in live if v.image == image and v.type == vm_type]
             coming = self.creating.get((image, vm_type), 0)
@@ -2949,8 +2950,12 @@ class Scheduler:
                 if not self._renew_lease(vm):
                     return None
             except Exception:
-                # No placement while authority cannot be verified; keep running data.
+                # No placement while authority cannot be verified. A stopped VM
+                # cannot renew at all: do not pin its work/capacity forever.
                 vm.ready = False
+                if not self._boat_up(vm.id):
+                    self._lost_vm(vm)
+                    return None
                 return 5.0
             vm.ready = True
         with vm.lock:

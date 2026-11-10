@@ -668,6 +668,7 @@ def timing_free_vms(code):
 def needless_mixed(code):
     from tests.sim.harness import items
     sim = _sim(code)
+    sim.S.BREAK_EVEN_OVERRIDE_S = 900  # replay this pre-economics incident at its original growth budget
     _warm(sim, 12)
     sim.treadmill(base_vms=8, filler_s=600, backlog=True)
     sim.scheduler()
