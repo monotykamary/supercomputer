@@ -79,6 +79,12 @@ becomes 3,500 / 7,000 seconds respectively. No boat API is called in the plannin
   `gate_window` retains that feasible tail if the deadline is too close or already missed; it does not promise an
   impossible completion. Indivisible jobs may straddle the horizon, and the bring-up cap/breaker can delay capacity.
 
+**Why the counts have those roundings.** Write `Q = S * B > 0` and `D = max(0, W - C)`. For economic growth,
+`k = floor(D / Q)` implies `k * Q <= D < (k + 1) * Q`: every one of the `k` starts is backed by a full workload,
+and the next is not. In particular `W <= C` gives zero. For a gate, use its available per-new-VM slot-time `Q > 0`
+and `n = ceil(D / Q)`: `C + n * Q >= W`, while one fewer VM cannot cover a positive deficit. `Pool.grow` admits
+that request whenever the breaker is closed and it fits the remaining bring-up/max-VM room. The admission
+predicates and cap implication are machine checked; the measured-value division boundary is separately tested.
 The no-needless-start law is for **economic** starts. A gate whose work the held pool clears in 40 minutes still
 needs deadline capacity for 15 minutes. Applying the economic veto to it would contradict the deadline law.
 The existing exceptions also remain: an empty/failed pool needs a service VM, and an unserved exclusive batch a
@@ -197,7 +203,12 @@ keeps both fixed-horizon mistakes (900 seconds starts needlessly; 3,600 seconds 
 The existing `Pool.grow` laws enforce the bring-up cap and breaker independently: a gate's requested starts are
 admitted when there is room and the breaker allows them. Arithmetic over measured prices and variable division
 is outside these linear admission proofs; `tests/test_growth.py` checks the floor/ceiling boundaries and actual
-scheduler wiring. `gate_68_slot_hours` and `steady_small_submissions` replay full scheduler/client runs.
+scheduler wiring. `gate_68_slot_hours` and `steady_small_submissions` replay full scheduler/client runs. The former also requires
+every newly created VM to deliver real gate work; it does not use a no-cap VM-count bound against staggered starts.
+
+`SC_LAWS_OUT=/path/to/receipts tests/check_laws.sh` keeps every proof/refutation receipt.
+`CHECK_LAWS_RESULTS_ONLY=1 SC_LAWS_OUT=/path/to/receipts tests/check_laws.sh` revalidates saved receipts without
+running any prover. Missing/empty module receipts fail, as do unknown laws or refutations without a run.
 
 `check_laws.sh` uses `npx gdp-wired-cli` (a release after 0.42.0: sets, Literal aliases, laws over ignored arguments, from any state, laws of eventually),
 or `GDP_WIRED_CLI="bun <gdp-wired>/core/cli.ts"`. A law that no longer holds comes back broken with the run that breaks
