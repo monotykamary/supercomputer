@@ -48,53 +48,50 @@ horizon/preempt defaults). The design is docs/multi-client.md, Stages 1 and 4 an
 
 ## Report
 
-### Implementation and commits
+### Current state
 
-Stage 1 implementation is recorded, but **this lane is NOT rollout-ready**: the full scenario gate is not green and the coordinator halted shared-pool lifecycle testing. Stages 2/3 (shared starts escrow/accounting and cross-client preemption) are not implemented.
+Stage 1 is implemented and rebased onto `origin/main` at `1fa659f` (hot scheduler handoff and controller staging). Tested code tip: `4ee23ef885cc240296be8d5b265ea534c25e5198`. **GREEN: all final gates passed.** Stages 2/3 (shared start escrow/accounting and cross-client preemption) remain out of scope.
 
-- `92bf6c0` — design of record.
-- `2378455` — agent-side file-locked leases, boot/epoch fencing, non-killing drain, per-client keys and owner-scoped results.
-- `ca769a0` — birth reservations, client/scheduler renewal and adoption, fail-closed stop/delete/TTL changes, lease-loss requeue, and conservative maintenance.
-- `1c82208` — executable laws, four broken counterparts, and independent two-/three-client incident simulations.
-- `ba312e3` — five-machine quiet-barrier rollout plan and guarded, pinned-revision `ROLLOUT.sh`.
-- `ae30f43` — parallel warm-pool lease validation to address startup latency; **dedicated-VM verification still required**.
+### Commits and integration
 
-No deployment, push, local `scheduler serve`, or manual change to shared workers/controller was made. All executable tests were submitted through the installed client with `SUPERCOMPUTER_CONTROLLER=1`, backend Boat, class `submission`. Local checks were limited to file/git operations, `git diff --check`, and `bash -n ROLLOUT.sh`.
+- `bfa13b1`: design of record.
+- `4b1e9c5`, `dc9aabf`: VM-local locked leases, boot/epoch fencing, non-killing drain, per-client keys/results, birth reservations, renewal/adoption, fenced cleanup and lease-loss requeue. Agent upgrades retain and guard `lease.json`; hot handoff carries exact lease/TTL and running/finishing identities. Ambiguous replies do not authorize bootstrap.
+- `fa7db22`, `74cfcab`, `f04ab19`: ownership laws and independent-client scenarios, first-migration safety, concurrent warm-pool validation. `ROLLOUT.sh` is upstream's compatible hot-staging script, not the superseded drain/setup script.
+- `35d4c59`, `a7a12d4`: preserve unclaimed booting VMs, monotonic startup budget, fenced TTL, mixed timing reuse and stopped-provider recovery, retaining upstream break-even economics.
+- `c51f28f`: exact live-parent lease restoration without network calls on the four-second handoff path; explicit drain-parameter invariant and handoff regressions.
+- `e9f7f2c`: preserve urgent two-second result polling after the queue drains.
+- `92f8a2b`, `d258ec4`, `a594fcc`: whole-job capacity for uniform one-slot gates, floating-point lower-bound protection, and a common feasible horizon for held and incoming workers.
+- `b3a22af`: discrete dispatch-boundary regression and a handoff fixture that cannot spawn provider TTL work.
+- `ca87795`: bounded default of 12 concurrent bootstraps. A traced isolated gate passed in 1092.56 s with every created VM used; 10 missed the bound, while 16 bought unused workers. Explicit policy overrides remain honored.
+- `4ee23ef`: configurable `SC_SCENARIOS_CPU`, default 2. Final scenarios reserve 4 CPUs rather than relaxing the unchanged real-time watchdog or assertions.
 
 ### Verification receipts
 
-- `runs/leases-laws2/gate.log` and `runs/leases-laws2/run/summary.tsv`: complete law gate **passed** — **483 proven, 119 broken variants refuted (602/602)**. This includes all **10 VMLease laws** and the explicit LocalItem per-lease progress law. All 9 positive modules exited 0; all 13 negative modules exited 1 with the required refutations.
-- `runs/leases-laws1/run/broken.broken_vm_leases.py.log`: all **four deliberately broken counterparts refuted**, each with a counterexample (CLI verdict `broken`).
-- `runs/leases-pass3/remote/multi-client.log`: **all three** incident scenarios passed (`lease_two_schedulers`, `lease_three_schedulers`, `lease_sleep_restore`), exercising independent machine identities on one pool, a long-lived client, a local scheduler beside a controller, sleep and restored snapshots.
-- The first complete gate exposed legacy tests which assumed unfenced cleanup/token replacement. Those fixtures were changed to assert the new safety contract, not to restore unsafe behavior. The old unconditional LocalItem progress law also exposed endless lease revocation; its replacement explicitly proves progress per lease interval and records the stable-availability assumption.
-- `runs/leases-final-units/remote/summary.tsv`: complete unit suite **passed** (exit 0, 24.5 s job time), including 28 bootstrap tests, 26 lease-client tests, and 12 VM-lease persistence tests. This precedes the final `ae30f43` startup follow-up.
-- `runs/leases-gate5/gate.log`: full scenario gate **FAILED — 24/75 passed**, including both real assertion failures and Boat-lost/no-result jobs. Several failures report scheduler-start timeout; `ae30f43` addresses sequential warm-pool lease validation, but its corrected rerun was stopped before verification. The three new multi-client scenarios passed.
-- `runs/leases-final-small/remote/`: two infrastructure failures (`code=-1`, `seconds=-1`, VM lost); neither is test execution or a passing result. No success is claimed for a merely submitted or queued job.
+All execution uses the installed client with `SUPERCOMPUTER_CONTROLLER=1`, backend Boat, class `gate`. Candidate schedulers run only inside the mocked provider simulation, not against actual shared workers. Local work is limited to file/git operations and short read-only controller checks.
 
-### Coordinator safety stop
+Final runs share immutable tree **`b69d577002e5`** from code **`4ee23ef`**:
 
-At the coordinator's stop instruction, all further shared-pool submissions ceased. Closed exact owned IDs: `20261110-182226-5rx6vr` (the remaining active batch), `20261110-174331-0pcwiu`, and `20261110-174640-7gqwvr`. Also issued idempotent closes for `20261110-174154-fi3k08`, `20261110-174226-4ovrbm`, and `20261110-180116-pzovar`, already completed/closed. The controller returned **no remaining `supercomputer-leases` batches**. The last local collector was terminated by exact PIDs after remote closure, preventing its automatic retry from resubmitting.
+| Gate | State | Receipt | Batch |
+| --- | --- | --- | --- |
+| All 80 scenarios, 4 CPU/job | **PASS, 80/80**, no known failures | `runs/leases-hotreload7-scenarios/gate.log` | `20261110-194922-9eqcsw` |
+| All laws (`SC_CHECK_CLASS=gate`) | **PASS**, 499 proven + 125 refuted (624/624) | `runs/leases-hotreload7-laws/gate.log` | `20261110-194922-nu935u` |
+| Full units, including real socket/flock handoff | **PASS**, 44.52 s | `runs/leases-hotreload7-units/remote/summary.tsv` | `20261110-194922-exyxo3` |
 
-The coordinator reported unforced shared-VM stops and suspects lifecycle tests; that root cause is **not established by this lane**. Do not run any lifecycle test on the shared pool again. All further lifecycle tests require a dedicated, explicitly owned disposable VM (`boat new`, then delete that exact VM after testing), with no shared worker hosting them. No such VM was created here after the stop instruction.
+All 80 final scenario jobs returned; no Boat losses or missing results. The large gate finished in **1092.56 s** (bound 1200 s), with **68 created workers, zero unused starts, and zero lost rows**. No assertions or watchdogs were relaxed.
 
-### Required five-machine rollout order (coordinator only)
+Final unit logs contain no thread/assertion errors. Real socket handoff/rollback response gaps were 0.545 / 1.720 s.
 
-1. **Freeze launches on all five hosts:** sandbox `bx_uxa4mxjf`, MacBook Air, mini, anh-1, and controller `bx_gz4zdtbh`. Pause automatic launchers/treadmills and new submissions. Let existing jobs, gates and result collection finish; do not kill their work.
-2. **Close the global old-runtime barrier:** stop every old scheduler and long-lived batch process only after drain, disable automatic restarts, and verify this on all five hosts. An asleep/unreachable anh-1 or another missing acknowledgement blocks activation. Installing a package is not proof that a running Python process has upgraded.
-3. **Keep the barrier closed.** Install the same reviewed, merged **immutable SHA** in order: **sandbox → MacBook Air → mini → anh-1**. Verify all installed code hashes match. Never copy `live/`, `owner`, `owner.key`, or cached agent keys between machines.
-4. **Controller last, from the updated Air, between gates:** run the reviewed `controller setup --vms 0` procedure only after its old processes are stopped. Attest running `code`, `code_installed`, and expected `agent_code`; verify all five machine owner IDs are distinct. The script prints this last command but does not execute it.
-5. Only after all attestations, reopen **new controller work first**, then sandbox/Air/mini/anh-1 launchers. Any failed install/hash/runtime check leaves the barrier closed. Do not restart an old runtime while new workers exist.
+Predecessor `a594fcc` passed all units in 31.37 s (real handoff/rollback response gaps 0.347 / 0.976 s) and **499 laws + 125 broken variants = 624/624**. Its scenario run returned all 80 jobs, with no Boat loss: the large gate was 0.63 s late with two unused starts, and `wide_behind_filler` hit the simulator wall-clock watchdog. The latter passed unchanged in isolation: all 120 wide items delivered in 135.7 s (`runs/leases-wide-isolated/remote/wide_behind_filler.log`). These predecessor receipts are not substituted for the final gates.
 
-**What old code sees:** new workers are named `<image>~l`, which the old exact-name adopter excludes. Names alone do not protect a VM ID already cached by an old process. Therefore old code may remain on disk during installation, but no old runtime may execute in the mixed-installation window. Known legacy workers are migrated only after that barrier. Unexpected old code is still contained by relinquishing a contested VM without stopping it; this fallback is not the no-contest rollout guarantee.
+### Safety and rollout
 
-`ROLLOUT.sh` requires `SC_ROLLOUT_QUIESCED=all-five` plus a 40-character merged commit SHA, fails on installation/hash mismatch, and never automatically reopens launches. That acknowledgement is an operator precondition, not an automatic proof of quiescence. Script syntax was checked; **the rollout was not run**.
+No push, deployment, local `scheduler serve`, or manual change to shared workers/controller was performed. Recovery checks found zero remaining owned batches before each new final submission; no duplicate collector was started. The earlier shared-pool stops were diagnosed by the coordinator as its old Mac scheduler/fence race, not this lane's tests; the temporary dedicated-VM requirement was lifted.
 
-### Scope and open issues
+New workers carry the `~l` suffix, which old discovery does not match. If an old client nevertheless contests a worker, the new client fails closed and yields without token replacement, kill, stop, delete, or TTL reduction. Account-level commands from an old runtime cannot be fenced by a new agent: the **first incompatible migration still requires all five old runtimes and their automatic launchers quiescent**. Subsequent compatible hot updates preserve the machine's lease holder identity and use upstream's staged rollout without draining jobs or restarting the controller.
 
-- **Do not roll out.** Investigate the shared-pool safety incident and complete the remaining startup/scenario validation on a dedicated VM before merge/rollout. The suspected test causing unforced stops has not been identified.
-- Busy pre-lease jobs are deliberately left untouched until they finish or their existing TTL expires; drain them before migration. Incomplete/unclassified work fails closed rather than being killed or treated as success.
-- LocalItem progress is per granted-lease interval. Global completion requires eventual stable availability; endless revocations and other clients holding all capacity forever are explicitly excluded.
-- Raw account-level commands from an old client cannot be fenced by a new agent; the all-five quiet barrier is mandatory for the no-contest guarantee.
+`ROLLOUT.sh` requires an immutable merged SHA and explicit protocol-compatibility acknowledgement. It stages the sandbox, Air, mini, anh-1 and controller and prints installed/active/pending state. It was not executed. On anh-1, the old scheduler's different Python installation must be accounted for during the initial migration; replacing the uv tool alone is not proof that the old runtime changed.
+
+LocalItem progress is per granted-lease interval. Eventual completion assumes stable availability; infinite revocation or other clients holding all capacity forever is excluded. Busy pre-lease work is never killed to manufacture a passing rollout.
 
 
 ## Rollout (coordinator, 2026-11-10; the user: "make sure the other macs get updated so it follows the same lease protocol")
