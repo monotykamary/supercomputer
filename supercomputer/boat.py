@@ -9,7 +9,8 @@ time after it, and deleted only on teardown or when an image changes.
 A repo's image is one named snapshot, built in layers (its supercomputer.toml's, or its hooks' layers()), each layer a
 snapshot of its own, so changing a layer rebuilds it and the ones above only. The pool is a registry of VM ids in
 LIVE/boat-pool.json (~/.local/share/supercomputer/live: every repo on this machine shares one, as they share the boat
-account and its start limits), guarded by a lock: a batch leases VMs of its repo's image (its pid on each), resumes
+account and its start limits), guarded by a local lock as a cache. The VM agent grants the actual
+owner/boot/epoch lease under its own file lock; a batch records its pid locally, resumes
 the stopped ones, creates the rest within the plan's limits (`boat limits`: active VMs, starts per minute, hour and
 day), and releases them at the end. Every VM a batch holds has a TTL renewed while the client lives (a VM whose client
 died stops by itself within 15 minutes); a released VM's TTL is the idle time, after which boat stops it.
@@ -29,7 +30,8 @@ filler for up to 45 minutes after their last real work, then go (README, "Schedu
 A batch: the repo as git sees it (tracked and untracked files that aren't ignored, the submodules' too, minus the
 config's ignore patterns). On a VM that is already up with its warm agent (agent.py's daemon), the batch talks to the
 agent directly over boat's token-gated HTTPS URL and a token of ours: the tree is synced by hash (only files the VM
-has never seen move), and no boat API call is made but a TTL extension in the background. Otherwise (a VM resumed or
+has never seen move). Claims and fallback renewal use boat exec; healthy item RPCs and tree sync go
+directly to the agent. Otherwise (a VM resumed or
 created) the tree goes as a tarball to one VM, which serves it to the others through a token-gated boat URL, and the
 warm agent is started on each VM for the next batch. Items run as agent.py describes, longest first by the last run's
 times, each VM taking what fits its free CPUs (2 vCPU and 4 GB a slot, as Modal's default container).
@@ -53,6 +55,7 @@ import sys
 import tarfile
 import threading
 import time
+import tempfile
 import urllib.parse
 
 from . import config
@@ -168,17 +171,57 @@ def exec_json(vm: str, argv: list[str], timeout: int = 60, tries: int = 4, sem=N
     raise RuntimeError(f"{vm}: {last}")
 
 
-def stop_vm(vm: str) -> bool:
-    """Stops a VM; one boat can't stop (its final snapshot failed: a broken VM) is deleted instead. True if stopped."""
-    out = boat("stop", vm, "--yes", "--json", check=False, timeout=180)
-    if R.stop_fallback("Final snapshot failed" in out or "stop aborted" in out) == "deleted":
-        log(f"{vm}: boat can't stop it ({out.split('error')[1][:100] if 'error' in out else ''}); deleted")
-        boat("delete", vm, "--yes", "--json", check=False, timeout=180)
-        with contextlib.suppress(Exception):
-            with Registry().locked() as d:
-                d["vms"].pop(vm, None)
-        return False
-    return True
+def _stop_clock() -> float:
+    # Linux includes suspend; on macOS the wall clock also includes laptop sleep.
+    clock = getattr(time, "CLOCK_BOOTTIME", None)
+    return time.clock_gettime(clock) if clock is not None else time.time()
+
+
+def _stop_budget(issued: tuple[float, float]) -> float:
+    """Count fence round trip, suspend, and both provider calls inside STOP_S.
+
+    The monotonic companion protects against wall-clock rollback on macOS.
+    Keep 30 seconds unused, and never give one provider call over 90 seconds.
+    """
+    elapsed = max(0.0, _stop_clock() - issued[0], time.monotonic() - issued[1])
+    return min(90.0, max(0.0, 270.0 - elapsed))
+
+def stop_vm(vm: str, lease: dict | None = None) -> bool:
+    """Reserve provider capacity BEFORE fencing; never queue past STOP_S."""
+    with _sem:
+        slot = contextlib.nullcontext()
+        issued = (_stop_clock(), time.monotonic())
+        if not fence_stop(vm, lease, sem=slot):
+            return False
+        budget = _stop_budget(issued)
+        if budget < 1:
+            return False
+        out = boat("stop", vm, "--yes", "--json", check=False, timeout=budget, sem=slot)
+        if R.stop_fallback("Final snapshot failed" in out or "stop aborted" in out) == "deleted":
+            log(f"{vm}: boat cannot snapshot-stop it; fenced delete fallback")
+            budget = _stop_budget(issued)
+            if budget < 1:
+                return False
+            boat("delete", vm, "--yes", "--json", check=False, timeout=budget, sem=slot)
+            with contextlib.suppress(Exception):
+                with Registry().locked() as d:
+                    d["vms"].pop(vm, None)
+            return False
+        return True
+
+
+def delete_vm(vm: str, lease: dict | None = None) -> bool:
+    """A missing/unreachable lease is never permission to delete a sandbox."""
+    with _sem:
+        slot = contextlib.nullcontext()
+        issued = (_stop_clock(), time.monotonic())
+        if not fence_stop(vm, lease, sem=slot):
+            return False
+        budget = _stop_budget(issued)
+        if budget < 1:
+            return False
+        boat("delete", vm, "--yes", "--json", check=False, timeout=budget, sem=slot)
+        return True
 
 
 def limits() -> dict:
@@ -381,7 +424,10 @@ def build_layer(name: str, snap: str, script: str, parent: str | None):
     log(f"building layer {name} as {snap}" + (f" from {parent}" if parent else ""))
     args = ["new", "--ttl", "7200", "--no-env", "--no-monitoring", "--json"] + (["--from", parent] if parent else [])
     vm = None
-    for line in boat(*args, timeout=900).splitlines():
+    # A maintenance builder is not a pool worker of the image it is creating.
+    with new_vm_args(snap + "-build") as (birth_args, nonce):
+        output = boat(*args, *birth_args, timeout=900)
+    for line in output.splitlines():
         with contextlib.suppress(Exception):
             vm = vm or json.loads(line).get("id")
     if not vm:
@@ -392,12 +438,20 @@ def build_layer(name: str, snap: str, script: str, parent: str | None):
     ticket.write_text(json.dumps({"vm": vm, "pid": os.getpid(), "host": socket.gethostname(), "snapshot": snap}))
     try:
         wait_running([vm])
+        source = base64.b64encode((HERE / "agent.py").read_bytes()).decode()
+        claim = {"owner": owner_id(), "vm_id": vm, "nonce": nonce}
+        granted = ship_agent(vm, source, [], claim=claim)
+        if not granted.get("ok"):
+            raise LeaseLost(f"{vm}: build claim refused")
         path = ":".join([*project().path, "$HOME/.local/bin", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"])
         b64 = base64.b64encode((f"set -ex\nexport DEBIAN_FRONTEND=noninteractive PATH={path}\n" + script).encode()).decode()
         exec_json(vm, ["bash", "-c", 'rm -rf ~/.sc/build && mkdir -p ~/.sc/build && echo "$1" | base64 -d > ~/.sc/build/l.sh && (setsid nohup bash -c "bash ~/.sc/build/l.sh > ~/.sc/build/l.log 2>&1; echo \\$? > ~/.sc/build/l.rc" > /dev/null 2>&1 &) && echo "{}"', "_", b64])
         t0 = time.time()
         while True:
             time.sleep(20)
+            renewed = lease_vm(vm, "renew", granted)
+            if renewed.get("ok") is not True or renewed.get("stale"):
+                raise LeaseLost(f"{vm}: builder lease lost; no further writes or snapshot")
             r = exec_(vm, ["bash", "-c", "cat ~/.sc/build/l.rc 2>/dev/null; echo; tail -c 600 ~/.sc/build/l.log"], 60)
             out = r.get("stdout", "")
             rc = out.split("\n", 1)[0].strip()
@@ -417,6 +471,9 @@ def build_layer(name: str, snap: str, script: str, parent: str | None):
         if r.get("exitCode") != 0:
             raise RuntimeError(f"layer {name}: credential-looking files on the build VM, not saved: {r.get('stdout', '')[-600:]}")
         log(f"  {name} built in {int(time.time() - t0)} s; saving {snap}")
+        renewed = lease_vm(vm, "renew", granted)
+        if renewed.get("ok") is not True or renewed.get("stale"):
+            raise LeaseLost(f"{vm}: builder lease lost before snapshot")
         boat("snapshot", vm, snap, "--json", timeout=1800)
         for _ in range(180):
             s = named_snapshots().get(snap)
@@ -426,8 +483,8 @@ def build_layer(name: str, snap: str, script: str, parent: str | None):
         else:
             raise RuntimeError(f"snapshot {snap} not ready")
     finally:
-        boat("delete", vm, "--yes", "--json", check=False, timeout=180)
-        ticket.unlink(missing_ok=True)
+        if delete_vm(vm):
+            ticket.unlink(missing_ok=True)
 
 
 # What may not be in an image (names only are printed): boat's own login (config.json with a token), our keys, git and
@@ -502,9 +559,9 @@ def retire(d: dict, image: str):
     mine = lambda snap: snap.startswith((f"{p.prefix}-", f"{p.final_prefix}-"))
     old = [i for i, v in d["vms"].items() if entry(v).retire(mine(v["snapshot"]), v["snapshot"] in keep)]  # (rules.boat.Entry.retire)
     for i in old:
-        d["vms"].pop(i)
-        forget_agent(i)
-        threading.Thread(target=boat, args=("delete", i, "--yes", "--json"), kwargs={"check": False}, daemon=False).start()
+        if delete_vm(i):
+            d["vms"].pop(i)
+            forget_agent(i)
     if old:
         log(f"deleted {len(old)} VMs of superseded images")
 
@@ -609,9 +666,9 @@ def reconcile(d: dict, live: dict):
             # billed: a batch would take it as up and wait for it in vain)
             if not s.get("dataExpiredAt"):
                 log(f"{i}: {'stuck stopping, no disk' if s.get('hydrated') is False else 'stopped without a snapshot'}: deleted")
-            d["vms"].pop(i)
-            forget_agent(i)
-            threading.Thread(target=boat, args=("delete", i, "--yes", "--json"), kwargs={"check": False}, daemon=False).start()
+            if delete_vm(i):
+                d["vms"].pop(i)
+                forget_agent(i)
         else:
             d["vms"][i]["state"] = s.get("state")
 
@@ -622,22 +679,9 @@ REFRESH_DAYS = 12  # a VM stopped this long is resumed and stopped again when a 
 def refresh_old(d: dict, image: str):
     """Free VMs of the pool's type stopped for REFRESH_DAYS: resumed and stopped again (in the background, a start each,
     within the starts left), which restarts boat's clock; others boat drops after 14 days."""
-    old = [i for i, v in d["vms"].items() if lease_free(v) and v.get("state") == "stopped" and v["type"] == VM_TYPE and time.time() - v.get("last_used", time.time()) > REFRESH_DAYS * 86400]
-    try:  # (rules.boat.refresh_count: at most 4, within the starts left; none when boat's limits can't be read)
-        left, ok = starts_left(limits(), ours(d)), True
-    except Exception:
-        left, ok = 0, False
-    old = old[:R.refresh_count(len(old), left, ok)]
-    note_starts(len(old), d)
-
-    def one(i):
-        boat("resume", i, "--json", check=False, timeout=300)
-        boat("stop", i, "--yes", "--json", check=False, timeout=300)
-    for i in old:
-        d["vms"][i]["last_used"] = time.time()
-        threading.Thread(target=one, args=(i,), daemon=True).start()
-    if old:
-        log(f"refreshing {len(old)} VMs stopped over {REFRESH_DAYS} days")
+    # Stage 1 cannot reserve stopped disks account-wide. Do not spend a start
+    # solely to refresh one, or stop a VM a concurrent resumer may now hold.
+    return
 
 
 def lease_free(v: dict) -> bool:
@@ -658,7 +702,7 @@ def undeclare(name: str, d: dict | None = None) -> list[str]:
         with Registry().locked() as d:
             ids = undeclare(name, d)
         for i in ids:
-            threading.Thread(target=boat, args=("extend", i, "--ttl", str(IDLE), "--json"), kwargs={"check": False}).start()
+            threading.Thread(target=shrink_ttl, args=(i, IDLE)).start()
         return ids
     d.get("demand", {}).pop(name, None)
     now, ids = time.time(), []
@@ -1077,6 +1121,129 @@ def forget_agent(vm: str):
     agent_file(vm).unlink(missing_ok=True)
 
 
+LEASE_NAME_SUFFIX = "~l"
+
+
+def owner_id() -> str:
+    """Stable random identity per machine; process handoff must not change owner."""
+    LIVE.mkdir(parents=True, exist_ok=True)
+    with open(LIVE / "owner.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = LIVE / "owner"
+        if path.exists():
+            value = path.read_text().strip()
+            if value:
+                return value
+        value = secrets.token_hex(24)
+        with config.private_umask():
+            path.write_text(value + "\n")
+        return value
+
+
+def owner_key() -> str:
+    """One local credential per machine; losing a VM cache must not rotate it."""
+    owner_id()
+    with open(LIVE / "owner.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = LIVE / "owner.key"
+        if path.exists():
+            return path.read_text().strip()
+        token = secrets.token_urlsafe(32)
+        with config.private_umask():
+            path.write_text(token + "\n")
+        return token
+
+
+@contextlib.contextmanager
+def new_vm_args(image: str):
+    """Birth reservation is present before boat reports the new VM ready."""
+    nonce = secrets.token_hex(24)
+    with tempfile.TemporaryDirectory(prefix="sc-birth-") as tmp:
+        path = pathlib.Path(tmp) / "birth.json"
+        path.write_text(json.dumps({"owner": owner_id(), "nonce": nonce}))
+        yield ["--name", image + LEASE_NAME_SUFFIX, "--file", f"{VM_ROOT}/birth.json={path}"], nonce
+
+
+def lease_vm(vm: str, op: str = "claim", lease: dict | None = None, nonce: str = "", sem=None) -> dict:
+    payload = {**(lease or {}), "owner": owner_id(), "vm_id": vm}
+    if nonce:
+        payload["nonce"] = nonce
+    encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+    try:
+        return exec_json(vm, ["python3", VM_ROOT + "/agent.py", "lease", op, encoded], 30, 1, sem)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "lease" in message and any(word in message for word in ("KeyError", "no command", "unsupported command")):
+            raise LeaseProtocolLost(f"{vm}: lease protocol disappeared; old client wins") from exc
+        raise
+
+
+def remember_lease(vm: str, lease: dict):
+    if lease.get("ok") and not lease.get("stale") and lease.get("boot") and lease.get("epoch"):
+        write_agent(vm, {**(read_agent(vm) or {}), "lease": {**lease, "owner": owner_id(), "vm_id": vm}})
+
+
+def _stop_fence(vm: str, lease: dict | None = None, sem=None) -> dict:
+    lease = lease or (read_agent(vm) or {}).get("lease")
+    if (not lease or lease.get("owner", lease.get("holder")) != owner_id()
+            or lease.get("vm_id") != vm or not lease.get("boot")
+            or type(lease.get("epoch")) is not int or lease["epoch"] <= 0):
+        return {}
+    try:
+        answer = lease_vm(vm, "fence_stop", lease, sem=sem) if sem is not None else lease_vm(vm, "fence_stop", lease)
+        return answer if answer.get("ok") is True and not answer.get("stale") else {}
+    except Exception as exc:
+        log(f"{vm}: stop/delete not fenced; leaving to TTL ({str(exc)[:120]})")
+        return {}
+
+
+def fence_stop(vm: str, lease: dict | None = None, sem=None) -> bool:
+    return bool(_stop_fence(vm, lease, sem))
+
+
+def shrink_ttl(vm: str, ttl: int, lease: dict | None = None) -> bool:
+    lease = lease or (read_agent(vm) or {}).get("lease")
+    with _sem:
+        slot = contextlib.nullcontext()
+        issued = (_stop_clock(), time.monotonic())
+        fence = _stop_fence(vm, lease, sem=slot)
+        if not fence:
+            return False
+        budget = _stop_budget(issued)
+        if budget < 1:
+            return False
+        boat("extend", vm, "--ttl", str(ttl), "--json", check=False, timeout=budget, sem=slot)
+        with contextlib.suppress(Exception):
+            lease_vm(vm, "release", {**lease, "stop_nonce": fence.get("stop_nonce")}, sem=slot)
+        return True
+
+
+def rename_leased_vm(vm: str, image: str, lease: dict) -> bool:
+    """A handed-off worker stops matching old clients' exact image name."""
+    name = image + LEASE_NAME_SUFFIX
+    if (read_agent(vm) or {}).get("lease_name") == name:
+        return True
+    try:
+        check = lease_vm(vm, "check", lease)
+        if check.get("ok") is not True or check.get("stale"):
+            return False
+        boat("rename", vm, name, "--json", timeout=60)
+        write_agent(vm, {**(read_agent(vm) or {}), "lease_name": name})
+        return True
+    except Exception as exc:
+        log(f"{vm}: lease name not confirmed; old client wins any contest ({str(exc)[:120]})")
+        return False
+
+def agent_health(vm: str, timeout: float = 8) -> dict:
+    """Public HTTP only: an exec-only view must not steal during a front outage."""
+    info = read_agent(vm) or {}
+    url = info.get("url")
+    if not url:
+        url = bj("host", vm, str(AGENT_PORT), "--localhost", "--private")["url"]
+        write_agent(vm, {**info, "url": url})
+    return AgentClient(vm, url, "").who(timeout)
+
+
 EXEC_ARG = 60_000  # (bytes of one boat exec argument: well under the kernel's 128 KB a string)
 EXEC_BODY = 4_000_000  # (a request sent over boat exec when the front fails, in parts of EXEC_ARG: a 4,000-file manifest)
 
@@ -1084,8 +1251,9 @@ EXEC_BODY = 4_000_000  # (a request sent over boat exec when the front fails, in
 # Static program + positional arguments only. No source, path or token is shell code.
 _AGENT_BOOTSTRAP = r'''
 # sc-agent-bootstrap: bounded staged source install
-import base64, hashlib, json, os, re, stat, sys
+import base64, hashlib, json, os, re, stat, sys, types
 op, root, name, owner = sys.argv[1:5]
+answer = {}
 if (not os.path.isabs(root) or not re.fullmatch(r'bootstrap-[0-9a-f]{48}', name)
         or not re.fullmatch(r'[0-9a-f]{48}', owner)):
     raise ValueError('invalid bootstrap path')
@@ -1134,6 +1302,8 @@ try:
                 stream.write(chunk.encode('ascii')); stream.flush(); os.fsync(stream.fileno())
         elif op == 'commit':
             digest, size = sys.argv[5:7]
+            lease = json.loads(base64.b64decode(sys.argv[7])) if len(sys.argv) > 7 else {}
+            claim = json.loads(base64.b64decode(sys.argv[8])) if len(sys.argv) > 8 else {}
             src = os.open('payload.b64', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=work)
             with os.fdopen(src, 'rb') as stream: data = base64.b64decode(stream.read(), validate=True)
             if len(data) != int(size) or hashlib.sha256(data).hexdigest() != digest:
@@ -1145,8 +1315,20 @@ try:
             except FileNotFoundError: old = None
             if old is not None and not stat.S_ISREG(old.st_mode):
                 raise ValueError('unsafe installed agent')
-            os.replace('agent.py', 'agent.py', src_dir_fd=work, dst_dir_fd=fd)
-            os.fsync(fd)
+            # Verified staged code acquires/checks the lease BEFORE replacement.
+            module = types.ModuleType('sc_staged_agent')
+            module.__file__ = os.path.join(root, name, 'agent.py')
+            sys.modules[module.__name__] = module
+            exec(compile(data, module.__file__, 'exec'), module.__dict__)
+            module.ROOT = module.pathlib.Path(root)
+            if claim:
+                answer = module.lease('claim', claim)
+                if not answer.get('ok') or answer.get('stale'):
+                    print(json.dumps(answer)); sys.exit(0)
+                lease = dict(answer, owner=claim['owner'], vm_id=claim['vm_id'])
+            with module.lease_guard(lease):
+                os.replace('agent.py', 'agent.py', src_dir_fd=work, dst_dir_fd=fd)
+                os.fsync(fd)
         elif op != 'cleanup':
             raise ValueError('invalid bootstrap operation')
         if op in ('commit', 'cleanup'):
@@ -1159,17 +1341,19 @@ try:
         os.close(work)
 finally:
     os.close(fd)
-print('{}')
+print(json.dumps(answer))
 '''
 
 
-def ship_agent(vm: str, agent_b64: str, args: list[str], timeout: int = 60, tries: int = 4, sem=None):
+def ship_agent(vm: str, agent_b64: str, args: list[str], timeout: int = 60, tries: int = 4, sem=None, lease: dict | None = None, claim: dict | None = None):
     """Stage bounded argv chunks; verify the full source before atomic install/start.
 
     No append/commit is retried: an ambiguous append cannot silently duplicate a
     chunk. A failed upload never touches the installed agent. Cleanup owns only
     one cryptographically random directory, on success as well as failure.
     """
+    if not lease and not claim:
+        raise LeaseLost(f"{vm}: source installation requires a lease or birth claim")
     source = base64.b64decode(agent_b64, validate=True)
     digest = hashlib.sha256(source).hexdigest()
     name = 'bootstrap-' + secrets.token_hex(24)
@@ -1181,21 +1365,52 @@ def ship_agent(vm: str, agent_b64: str, args: list[str], timeout: int = 60, trie
         remote('init')
         for k in range(0, len(agent_b64), EXEC_ARG):
             remote('append', str(k), agent_b64[k:k + EXEC_ARG])
-        remote('commit', digest, str(len(source)))
+        encode = lambda value: base64.b64encode(json.dumps(value or {}).encode()).decode()
+        granted = remote('commit', digest, str(len(source)), encode(lease), encode(claim))
+        if granted.get('stale') or (claim and not granted.get('ok')):
+            return granted
+        if claim:
+            lease = {**granted, 'owner': claim['owner'], 'vm_id': vm}
+            remember_lease(vm, lease)
     finally:
         # Also handles an init/commit whose response was lost. O_NOFOLLOW and the
         # random owned basename prevent cleanup from following another path.
         remote('cleanup')
     # Retry only the original command, never append or partially repeat an
     # install. Preserve arbitrary commands, JSON results, timeout/tries and sem.
+    if not args:
+        return {**(lease or {}), 'ok': True}
     return exec_json(vm, ['python3', VM_ROOT + '/agent.py', *args], timeout, tries, sem)
 
 
-def bootstrap_agent(vm: str, agent_b64: str, token: str, timeout: int = 90, tries: int = 3):
-    return ship_agent(vm, agent_b64, ['start-daemon', str(AGENT_PORT), token], timeout, tries)
+def bootstrap_agent(vm: str, agent_b64: str, token: str, timeout: int = 90, tries: int = 3,
+                    lease: dict | None = None, nonce: str = ""):
+    # Ask the VM through verified staged source before installing any code.
+    claim = None if lease else {"owner": owner_id(), "vm_id": vm, "nonce": nonce}
+    result = ship_agent(vm, agent_b64, [], timeout, tries, lease=lease, claim=claim)
+    if result.get("stale") or not result.get("ok"):
+        return result
+    lease = lease or {**result, "owner": owner_id(), "vm_id": vm}
+    remember_lease(vm, {**lease, "ok": True})
+    exec_json(vm, ["python3", VM_ROOT + "/agent.py", "keys", "add", owner_id(), token], timeout, tries)
+    fence = base64.b64encode(json.dumps(lease).encode()).decode()
+    result = exec_json(vm, ["python3", VM_ROOT + "/agent.py", "start-daemon", str(AGENT_PORT), token, fence], timeout, tries)
+    if result.get("ok") is True:
+        write_agent(vm, {**(read_agent(vm) or {}), "token": token, "lease": lease})
+    return result
 
 
 class AgentError(RuntimeError):
+    pass
+
+
+class LeaseProtocolLost(AgentError):
+    """An old client replaced the lease protocol; do not bootstrap it back."""
+    pass
+
+
+class LeaseLost(AgentError):
+    """Expected contention, not a VM failure; never repair or stop the new holder."""
     pass
 
 
@@ -1204,8 +1419,10 @@ class AgentClient:
     cookie and redirects; the cookie is kept with the URL, 0600, so the next process skips that round trip) and ours
     in X-SC-Token. Kept-alive connections, shared by the batch's threads."""
 
-    def __init__(self, vm: str, url: str, token: str, cookie: str = ""):
+    def __init__(self, vm: str, url: str, token: str, cookie: str = "", lease: dict | None = None):
         self.vm, self.token = vm, token
+        self.owner = owner_id()
+        self.lease = lease if lease is not None else ((read_agent(vm) or {}).get("lease") or {})
         u = urllib.parse.urlparse(url)
         self.url, self.host, self.base, self.query = url, u.netloc, u.path.rstrip("/"), u.query
         self.cookie = cookie
@@ -1265,7 +1482,8 @@ class AgentClient:
     EXEC_OK = {"ping", "vtick", "killitem", "itemlogs", "begin", "prep", "tree", "have", "pull", "pullcache", "upgrade"}
 
     def rpc(self, cmd: str, *args, timeout: float = 60):
-        body = json.dumps({"cmd": cmd, "args": list(args)}).encode()
+        args = [*args, {"_lease": {**self.lease, "owner": self.owner, "vm_id": self.vm}}] if cmd != "lease" else list(args)
+        body = json.dumps({"cmd": cmd, "args": args}).encode()
         try:
             code, data, _ = self._req("POST", "/rpc", body, timeout)
             if code == 502 and cmd in self.EXEC_OK and len(body) < EXEC_BODY:
@@ -1282,7 +1500,7 @@ class AgentClient:
         return json.loads(data)
 
     def _rpc_exec(self, body: bytes, timeout: float) -> tuple[int, bytes]:
-        script = ("import base64,sys,urllib.request,os;t=open(os.path.expanduser('~/.sc/token')).read().strip();a=sys.argv[1];"
+        script = ("import base64,sys,urllib.request,os;t=sys.argv[2];a=sys.argv[1];"
                   "b=(open(a[1:]).read() if a.startswith('@') else a);a.startswith('@') and os.unlink(a[1:]);"
                   f"r=urllib.request.Request('http://127.0.0.1:{AGENT_PORT}/rpc',data=base64.b64decode(b),headers={{'X-SC-Token':t,'Content-Type':'application/json'}});"
                   f"sys.stdout.write(urllib.request.urlopen(r,timeout={int(timeout)}).read().decode())")
@@ -1294,13 +1512,13 @@ class AgentClient:
                 w = exec_(self.vm, ["bash", "-c", 'printf %s "$1" >> "$2"', "_", b64[k:k + EXEC_ARG], arg[1:]], 60)
                 if w.get("exitCode") != 0:
                     raise AgentError(f"{self.vm}: the agent didn't answer, by boat's front nor by boat exec (its body's part: {str(w.get('stderr') or w.get('error'))[-160:]})")
-        r = exec_(self.vm, ["python3", "-c", script, arg], int(timeout) + 15)
+        r = exec_(self.vm, ["python3", "-c", script, arg, self.token], int(timeout) + 15)
         if r.get("exitCode") != 0:
             raise AgentError(f"{self.vm}: the agent didn't answer, by boat's front nor by boat exec ({str(r.get('stderr') or r.get('error'))[-160:]})")
         return 200, r.get("stdout", "").encode()
 
     def raw(self, cmd: str, *args, timeout: float = 120) -> bytes:
-        code, data, _ = self._req("POST", "/rpc", json.dumps({"cmd": cmd, "args": list(args)}).encode(), timeout)
+        code, data, _ = self._req("POST", "/rpc", json.dumps({"cmd": cmd, "args": [*args, {"_lease": {**self.lease, "owner": self.owner, "vm_id": self.vm}}]}).encode(), timeout)
         if code != 200:
             raise AgentError(f"{self.vm}: {cmd}: {code} {data[:300]!r}")
         return data
@@ -1310,6 +1528,15 @@ class AgentClient:
         if code != 200:
             raise AgentError(f"{self.vm}: {path}: {code} {out[:300]!r}")
         return json.loads(out)
+
+    def who(self, timeout: float = 8) -> dict:
+        code, data, _ = self._req("GET", "/health", timeout=timeout)
+        if code != 200:
+            raise AgentError(f"{self.vm}: health: {code}")
+        answer = json.loads(data)
+        if not answer.get("lease"):
+            raise AgentError(f"{self.vm}: lease protocol missing; old client wins")
+        return answer
 
     def ping(self, timeout: float = 8) -> dict:
         r = self.rpc("ping", timeout=timeout)
@@ -1394,6 +1621,8 @@ class VM:
         self.released = False  # let go before the batch's end (nothing left for it): another batch may lease it
         self.skipped = False  # leased stopped, then not resumed: the batch no longer needed it
         self.http: AgentClient | None = None  # its warm agent, once it answers: ticks, logs and kills go there
+        self.lease: dict = {}
+        self.birth_nonce = ""
         self.letting_go: threading.Thread | None = None  # (the worker giving it back early: close() waits for it)
 
 
@@ -1600,6 +1829,8 @@ class Session:
             cl = agent_client(vm.id)
             if cl is None:
                 raise AgentError("no agent recorded")
+            self._claim_vm(vm)
+            cl.lease = vm.lease
             t0 = time.time()
             r = cl.rpc("begin", self.agent_version, self.batch, self.tree.id, self.ctx_b64, timeout=60)
             if r.get("version") != self.agent_version:
@@ -1613,6 +1844,10 @@ class Session:
             threading.Thread(target=cl.keep, daemon=True).start()
         except Exception as e:
             if vm.t_ready:
+                return
+            if isinstance(e, LeaseLost):
+                vm.dead = True
+                self._release([vm.id])
                 return
             log(f"{vm.id}: its warm agent: {str(e)[:200]}; by boat exec")
             vm.http = None
@@ -1705,7 +1940,7 @@ class Session:
                         self.counts["resumed"] += res.tries
                         # a stopped disk boat no longer keeps (14 days): the VM goes, a new one from the image takes its place
                         log(f"{vm.id}: its stopped disk expired; a new VM instead")
-                        boat("delete", vm.id, "--yes", "--json", check=False, timeout=180)
+                        delete_vm(vm.id, vm.lease)
                         vm.dead = True
                         self._release([vm.id], deleted=True)
                         self._create(1, vm.type)
@@ -1725,7 +1960,7 @@ class Session:
             log(f"{vm.id}: {e}")
             self.last_error = f"{vm.id}: {str(e)[:200]}"
             vm.dead = True
-            if vm.t_running and self.mine(vm.id):  # up but of no use to this batch: stopped now, not at the batch's end
+            if not isinstance(e, LeaseLost) and vm.t_running and self.mine(vm.id):  # only our current lease may stop
                 stop_vm(vm.id)
             self._release([vm.id])
 
@@ -1758,7 +1993,8 @@ class Session:
                 log("no starts left this hour or day: no more VMs for this batch")
                 self.short = True
                 break
-            out = boat("new", "--from", self.image, "--type", vm_type, "--count", str(room), "--ttl", str(BACKSTOP), "--no-env", "--no-monitoring", "--json", timeout=600, check=False)
+            with new_vm_args(self.image) as (birth_args, birth_nonce):
+                out = boat("new", "--from", self.image, "--type", vm_type, "--count", str(room), "--ttl", str(BACKSTOP), "--no-env", "--no-monitoring", *birth_args, "--json", timeout=600, check=False)
             ids = []
             for line in out.splitlines():
                 with contextlib.suppress(Exception):
@@ -1784,7 +2020,8 @@ class Session:
                         d["vms"][i] = {"type": vm_type, "snapshot": self.image, "created": time.time(), "last_used": time.time(), "state": "starting", "lease": None,
                                        "until": time.time() + ttl}
                 for i in ids:
-                    boat("extend", i, "--ttl", str(ttl), "--json", check=False)
+                    # No granted lease yet: keep the original birth TTL.
+                    pass
                 break
             with self.reg.locked() as d:
                 for i in ids:
@@ -1793,6 +2030,7 @@ class Session:
             self.counts["created"] += len(ids)
             for i in ids:
                 vm = VM(i, vm_type, "created")
+                vm.birth_nonce = birth_nonce
                 self.vms[i] = vm
                 self._go(self._bring_up_new, vm)
             n -= len(ids)
@@ -1807,8 +2045,8 @@ class Session:
             log(f"{vm.id}: {e}")
             self.last_error = f"{vm.id}: {str(e)[:200]}"
             vm.dead = True
-            if self.mine(vm.id):
-                stop_vm(vm.id)
+            if not isinstance(e, LeaseLost) and self.mine(vm.id):
+                stop_vm(vm.id, vm.lease)
             self._release([vm.id])
 
     def mine(self, vm_id: str) -> bool:
@@ -1825,6 +2063,7 @@ class Session:
 
     # -- preparing (a VM without a warm agent: the tree as a tarball, from the seed VM's URL or from here)
     def _prepare(self, vm: VM):
+        self._claim_vm(vm)
         if not self.mine(vm.id):
             raise RuntimeError("no longer this batch's (it ended, or let the VM go)")
         with self.cv:
@@ -1898,12 +2137,37 @@ class Session:
             self.ready.append(vm)
             self.cv.notify_all()
 
+    def _claim_vm(self, vm: VM):
+        if vm.lease:
+            return
+        old = (read_agent(vm.id) or {}).get("lease") or {}
+        if old and vm.how != "resumed":
+            try:
+                # claim is idempotent for our held lease, and reopens our
+                # released lease with a fresh epoch for the next local batch.
+                reply = lease_vm(vm.id, "claim", old)
+            except Exception as exc:
+                raise LeaseLost(f"{vm.id}: lease protocol unavailable; leaving VM alone") from exc
+            if not reply.get("ok") or reply.get("stale"):
+                raise LeaseLost(f"{vm.id}: lease lost; leaving VM alone")
+            vm.lease = {**reply, "owner": owner_id(), "vm_id": vm.id}
+        else:
+            token = (read_agent(vm.id) or {}).get("token") or owner_key()
+            reply = bootstrap_agent(vm.id, self.agent_b64, token, nonce=vm.birth_nonce)
+            if not reply.get("ok") or reply.get("stale"):
+                raise LeaseLost(f"{vm.id}: claim refused; leaving running items alone")
+            vm.lease = (read_agent(vm.id) or {}).get("lease") or {}
+            write_agent(vm.id, {**(read_agent(vm.id) or {}), "token": token})
+        remember_lease(vm.id, {**vm.lease, "ok": True})
+        if vm.how != "created":
+            rename_leased_vm(vm.id, self.image, vm.lease)
+
     def _warm_agent(self, vm: VM):
         """The VM's warm agent started (the agent.py the batch shipped, a token of ours) and its boat URL recorded; the
         batch's ticks go there from now on."""
         try:
-            tok = secrets.token_urlsafe(24)
-            r = self._agent(vm, ["start-daemon", str(AGENT_PORT), tok], 60, tries=2)
+            tok = (read_agent(vm.id) or {}).get("token") or owner_key()
+            r = bootstrap_agent(vm.id, self.agent_b64, tok, 60, 2, lease=vm.lease)
             if not r.get("ok"):
                 raise AgentError(str(r)[:300])
             old = read_agent(vm.id) or {}
@@ -1919,22 +2183,37 @@ class Session:
                 url = bj("host", vm.id, str(AGENT_PORT), "--localhost", "--private")["url"]
                 cl = AgentClient(vm.id, url, tok)
                 cl.ping()
-            write_agent(vm.id, {"url": url, "token": tok, "t": time.time(), "version": self.agent_version})
+            write_agent(vm.id, {**(read_agent(vm.id) or {}), "url": url, "token": tok, "t": time.time(), "version": self.agent_version, "lease": vm.lease})
             if not vm.dead and not vm.released:
                 vm.http = cl
         except Exception as e:
             log(f"{vm.id}: no warm agent ({str(e)[:200]})")
 
     def _agent(self, vm: VM, args: list[str], timeout: int = 60, ship: bool = False, tries: int = 4, sem=None):
-        if ship:  # the agent itself, with the batch's first call to each VM
-            return ship_agent(vm.id, self.agent_b64, args, timeout, tries, sem)
-        return exec_json(vm.id, ["python3", f"{VM_ROOT}/agent.py", *args], timeout, tries, sem)
+        if ship:
+            result = ship_agent(vm.id, self.agent_b64, [], timeout, tries, sem, lease=vm.lease)
+            if result.get("stale"):
+                raise LeaseLost(f"{vm.id}: stale install fence")
+        cmd, *values = args
+        if cmd == "tick":
+            values = [values[0], json.loads(base64.b64decode("".join(values[1:])))]
+        request = {"cmd": cmd, "args": [*values, {"_lease": vm.lease}]}
+        payload = base64.b64encode(json.dumps(request).encode()).decode()
+        result = exec_json(vm.id, ["python3", f"{VM_ROOT}/agent.py", "rpc", payload], timeout, tries, sem)
+        if result.get("stale"):
+            raise LeaseLost(f"{vm.id}: stale lease")
+        return result
 
     def _tick(self, vm: VM, msg: dict) -> dict:
         if vm.http:
             try:
-                return vm.http.rpc("tick", self.batch, msg, timeout=60)
+                reply = vm.http.rpc("tick", self.batch, msg, timeout=60)
+                if reply.get("stale"):
+                    raise LeaseLost(f"{vm.id}: stale lease")
+                return reply
             except Exception as e:
+                if isinstance(e, LeaseLost):
+                    raise
                 log(f"{vm.id}: its warm agent ({str(e)[:160]}): by boat exec")
                 vm.http = None
         b64 = base64.b64encode(json.dumps(msg).encode()).decode()
@@ -2087,6 +2366,16 @@ class Session:
                     fails = 0
                     acks, unsent = [], []
                 except Exception as e:
+                    if isinstance(e, LeaseLost):
+                        vm.dead = True
+                        # Expected fencing is not an item/VM failure. Undo admission
+                        # locally; never signal the old job or stop the new holder.
+                        with lock:
+                            for it, _ in running.values():
+                                fate = fate_of(it)
+                                fate.fenced()
+                                queue.append(it)
+                        return
                     fails += 1
                     log(f"{vm.id}: tick failed ({fails}): {str(e)[:200]}")
                     if "not found (404)" in str(e):  # the VM is gone (deleted): no use asking again
@@ -2238,11 +2527,9 @@ class Session:
         vm.letting_go = threading.current_thread()
         ttl = self.warm_ttls([vm], held=sum(1 for v in list(self.vms.values()) if not v.dead and v.t_end is None) + 1) if self.idle is None else {}
         t = ttl.get(vm.id, self.idle if self.idle is not None else IDLE)
-        ext = threading.Thread(target=boat, args=("extend", vm.id, "--ttl", str(max(t, 30)), "--json"), kwargs={"check": False})
-        ext.start()  # (with the logs' round trip, not after it)
         self._collect(vm)
+        shrink_ttl(vm.id, max(t, 30), vm.lease)
         vm.released, vm.t_end = True, time.time()
-        ext.join()
         if env("VERBOSE") == "2":
             log(f"{vm.id}: let go")
         self._release([vm.id], idle=t, up={vm.id}, ttl=ttl)
@@ -2300,10 +2587,14 @@ class Session:
     harvest_oleans = harvest_caches  # (gdp-wired's older name)
 
     def _heartbeat(self):
-        while not self.stop.wait(300):
+        while not self.stop.wait(60):
             for vm in list(self.vms.values()):
-                if not vm.dead and vm.t_end is None:
+                if not vm.dead and vm.t_end is None and vm.lease:
                     with contextlib.suppress(Exception):
+                        renewed = lease_vm(vm.id, "renew", vm.lease)
+                        if not renewed.get("ok") or renewed.get("stale"):
+                            vm.dead = True
+                            continue
                         boat("extend", vm.id, "--ttl", str(BACKSTOP), "--json", check=False)
 
     def close(self, kill: bool = True) -> dict:
@@ -2336,17 +2627,16 @@ class Session:
                 if not done:
                     with contextlib.suppress(Exception):
                         self._agent(vm, ["kill", self.batch], 60)
-            if self.seed_vm is vm:
-                with contextlib.suppress(Exception):
-                    exec_(vm.id, ["bash", "-c", f"pkill -f 'http.server 8765' ; rm -rf {VM_ROOT}/srv"], 30)
+            # The shared seed server/data belong to the VM; TTL cleans it.
+            # Never name-kill a process another owner could now be using.
             vm.t_end = time.time()
             if self.teardown:
-                boat("delete", vm.id, "--yes", "--json", check=False, timeout=180)
-                forget_agent(vm.id)
+                if delete_vm(vm.id, vm.lease):
+                    forget_agent(vm.id)
             elif ttl.get(vm.id, idle) <= 0:
-                stop_vm(vm.id)
+                stop_vm(vm.id, vm.lease)
             else:
-                boat("extend", vm.id, "--ttl", str(ttl.get(vm.id, idle)), "--json", check=False)
+                shrink_ttl(vm.id, ttl.get(vm.id, idle), vm.lease)
         ts = [threading.Thread(target=wind, args=(vm,)) for vm in keep]
         [t.start() for t in ts]
         [t.join(timeout=400) for t in ts]
@@ -3055,29 +3345,24 @@ def reap():
                 stop.append(i)
         for name in [n for n in d.get("demand", {}) if not declared(d, n)]:  # a client gone: what it kept up stops soon
             for i in undeclare(name, d):
-                threading.Thread(target=boat, args=("extend", i, "--ttl", str(IDLE), "--json"), kwargs={"check": False}).start()
+                threading.Thread(target=shrink_ttl, args=(i, IDLE)).start()
                 print(f"{i}: kept for {name}, which declares no more work: stops in {IDLE} s")
     # (in parallel, each call bounded: reap never hangs on one VM)
-    ts = [threading.Thread(target=exec_, args=(i, ["bash", "-c", f"python3 ~/.sc/agent.py kill {b} 2>/dev/null || python3 ~/.gdpw/agent.py kill {b} 2>/dev/null || true"], 30), daemon=True) for i, b in kill]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join(60)
     for i, b in kill:
-        print(f"released {i} (client gone), killed batch {b}")
-    ts = [threading.Thread(target=stop_vm, args=(i,), daemon=True) for i in set(stop) | {i for i, _ in kill}]
+        print(f"released local cache for {i} (client gone); batch {b} drains under VM TTL")
+    ts = [threading.Thread(target=stop_vm, args=(i,), daemon=True) for i in set(stop)]
     for t in ts:
         t.start()
     for t in ts:
         t.join(90)
-    for i in set(stop) | {i for i, _ in kill}:
-        print(f"stopped idle {i}")
+    for i in set(stop):
+        print(f"requested fenced stop of idle {i}")
     for t in LIVE.glob("boat-build-*.json"):
         b = json.loads(t.read_text())
         if not pid_alive(b["pid"], b.get("host", "")):
-            boat("delete", b["vm"], "--yes", "--json", check=False)
-            t.unlink()
-            print(f"deleted orphan build VM {b['vm']}")
+            if delete_vm(b["vm"]):
+                t.unlink()
+                print(f"deleted orphan build VM {b['vm']}")
     live = sandboxes()
     up = [i for i, s in live.items() if s.get("state") in RUNNING]
     mine = set(reg.read()["vms"])
@@ -3108,13 +3393,20 @@ def teardown(everything: bool = False, vm_type: str = ""):
             # (rules.boat.Entry.teardown: this repo's older images only; another repo's free VMs only with --all or --type)
             if entry(v).teardown(everything, v["snapshot"].startswith((f"{p.prefix}-", f"{p.final_prefix}-")), v["snapshot"] == img, bool(vm_type) and v["type"] == vm_type):
                 gone.append(i)
-                d["vms"].pop(i)
+    deleted = []
     def rm(i):
-        boat("delete", i, "--yes", "--json", check=False, timeout=180)
+        if delete_vm(i):
+            deleted.append(i)
+        else:
+            log(f"{i}: no accepted delete fence; left to TTL")
     ts = [threading.Thread(target=rm, args=(i,)) for i in gone]
     [t.start() for t in ts]
     [t.join() for t in ts]
-    print(f"deleted {len(gone)} VMs")
+    with Registry().locked() as d:
+        for i in deleted:
+            d["vms"].pop(i, None)
+            forget_agent(i)
+    print(f"deleted {len(deleted)} VMs")
 
 
 def starts_summary(since: str = "24h"):

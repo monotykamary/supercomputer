@@ -491,7 +491,18 @@ class Creation:
 class LocalItem:
     """An item of a local session (Session.run): taken by a VM's worker, finished with its row; lost (its VM died, its
     runner vanished) it runs once more on boat with no fallback, else goes to the fallback (Modal) at once; a run that
-    gives up finishes what's queued. Finished exactly once."""
+    gives up finishes what's queued. Finished exactly once.
+
+    Progress is per granted-lease interval, not unconditional across revocations.
+    Under the existing fairness assumption (queued work is eventually taken when
+    this client has capacity; a running VM eventually reports or fails), an active
+    interval ends in completion or an explicit lease-loss yield. A successful
+    take starts a fresh interval. Fencing returns the item to the queue without
+    consuming a failure retry; it must not pretend that its progress rank fell.
+    Endless lease revocation can prevent completion, so global eventual finish
+    additionally requires eventual stable availability. This is Stage 1's local
+    L4 scope: other clients' held VMs are absent, never capacity owed to us.
+    """
 
     # gdp: law an item is finished exactly once: finishes <= 1 and ((state == "finished") == (finishes == 1))
     # gdp: law with no fallback an item runs again on boat at most once: tries <= 1
@@ -500,7 +511,7 @@ class LocalItem:
     # gdp: law a queued item has run no more than it was lost: state != "queued" or runs <= tries
     # gdp: law a running item has run once more than it was lost: state != "running" or runs == tries + 1
     # gdp: law an item lost once was run once: tries <= runs
-    # gdp: law an item handed to the session is eventually finished (its VMs keep failing it, or report it): state != "finished" leads to state == "finished" by 3 - tries - runs via state == "queued" -> take(); state == "running" -> done(lost = true)
+    # gdp: law a lease interval eventually finishes the item or explicitly yields its lease: state != "finished" and not lease_lost leads to state == "finished" or lease_lost by 3 - tries - runs via state == "queued" -> take(); state == "running" -> done(lost = true)
 
     def __init__(self, on_lost: bool):
         self.on_lost = on_lost
@@ -508,11 +519,13 @@ class LocalItem:
         self.tries = 0
         self.runs = 0
         self.finishes = 0
+        self.lease_lost = False
 
     def take(self) -> bool:
         if self.state != "queued":
             return False
         self.state = "running"
+        self.lease_lost = False
         self.runs += 1
         return True
 
@@ -524,6 +537,15 @@ class LocalItem:
             self._lose()
         else:
             self._finish()
+
+    # gdp: law lease revocation never charges an attempt failure: tries == old(tries)
+    # gdp: law lease revocation never fabricates a completion: finishes == old(finishes)
+    def fenced(self) -> None:
+        """End this lease interval without a failure or invented result; await a fresh take."""
+        if self.state == "running":
+            self.state = "queued"
+            self.runs -= 1
+            self.lease_lost = True
 
     def give_up(self) -> None:
         """The run gives up (no VM ready in --max-wait, every VM lost): what's queued finishes, to the fallback."""

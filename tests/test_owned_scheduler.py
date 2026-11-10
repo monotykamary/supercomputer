@@ -47,7 +47,15 @@ class OwnedSchedulerTests(unittest.TestCase):
         self.s._h = lambda: Mock()
         self.vm = S.VMState("vm-test", "test-image", S.boat.VM_TYPE, "warm")
         self.vm.ready = True
+        self.vm.lease = {"ok": True, "owner": "fixture-owner", "holder": "fixture-owner",
+                         "boot": "fixture-boot", "epoch": 3, "vm_id": self.vm.id}
+        self.vm.t_renew = S.time.monotonic()
+        owner_patch = patch.object(S.boat, "owner_id", return_value="fixture-owner")
+        owner_patch.start()
+        self.addCleanup(owner_patch.stop)
         self.vm.client = Mock()
+        self.vm.client.lease = self.vm.lease
+        self.vm.client.owner = "fixture-owner"
         self.s.vms[self.vm.id] = self.vm
         self.write_batch()
 

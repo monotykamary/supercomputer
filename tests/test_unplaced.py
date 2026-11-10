@@ -45,6 +45,8 @@ def test_idle_foreign_inventory_is_refreshed():
     v = vm(s, "A")
     v.foreign = v.slots
     v.t_agent = time.time()
+    v.lease = {"owner": boat.owner_id(), "vm_id": v.id, "boot": "test-boot", "epoch": 1}
+    v.t_renew = time.monotonic()  # This fixture already holds a freshly verified lease.
     v.client = SimpleNamespace(rpc=lambda *a, **k: {"running": [], "done": []}, ping=lambda **k: {})
     s._tick(v)
     assert v.foreign == 0, "empty VMs must keep polling until foreign slots are actually gone"

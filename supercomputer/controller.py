@@ -199,81 +199,67 @@ def stage(vm: str):
     print(json.dumps({"machine": vm, **receipts[-1]}, sort_keys=True))
 
 
+def _publish_hints(vm: str, hints: dict) -> bool:
+    """Copy discovery hints, never keys, fences, or authoritative ownership."""
+    script = """import json,os,pathlib,fcntl
+L=pathlib.Path(os.path.expanduser('~/sc/live'))
+L.mkdir(parents=True,exist_ok=True)
+m=json.load(__import__('sys').stdin)
+with open(L/'boat-pool.lock','a') as lk:
+ fcntl.flock(lk,2)
+ p=L/'boat-pool.json'
+ d=json.loads(p.read_text()) if p.exists() else {'vms':{}}
+ for i,v in m.items():
+  d.setdefault('vms',{}).setdefault(i,v)
+ tmp=p.with_suffix('.handover.tmp')
+ tmp.write_text(json.dumps(d,indent=1))
+ tmp.replace(p)
+print('HINTS-OK')
+"""
+    import base64
+    encoded = base64.b64encode(script.encode()).decode()
+    code, out = ssh(vm, f"python3 -c \"import base64;exec(base64.b64decode('{encoded}'))\"", json.dumps(hints).encode())
+    return code == 0 and "HINTS-OK" in out
+
+
 def handover(vm: str, n: int):
-    """n of this registry's free, stopped VMs of the repo's image move to the controller's (this registry forgets
-    them, so no client here leases one the controller holds)."""
-    img = boat.image_name()
-    code, out = ssh(vm, f"cat {SC}/live/boat-pool.json 2>/dev/null || echo '{{}}'")
-    try:
-        theirs = json.loads(out.strip() or "{}")
-    except Exception:
-        theirs = {}
-    theirs.setdefault("vms", {})
-    have = sum(1 for v in theirs["vms"].values() if v.get("snapshot") == img)
-    moved, agents = {}, {}
-    if n - have > 0:
-        with boat.Registry().locked() as d:
-            free = [i for i, v in d["vms"].items() if v.get("snapshot") == img and v.get("type") == boat.VM_TYPE and boat.lease_free(v) and v.get("state") == "stopped"]
-            for i in free[:ops.handover_count(n, have, len(free))]:
-                moved[i] = d["vms"].pop(i)
-                agents[i] = boat.read_agent(i)
-                boat.forget_agent(i)
-            images = d.get("images", [])
-        theirs["vms"].update(moved)
-        theirs.setdefault("images", images)
-        code, out = ssh(vm, f"cat > {SC}/live/boat-pool.json.in && mv {SC}/live/boat-pool.json.in {SC}/live/boat-pool.json && echo HO-OK", json.dumps(theirs, indent=1).encode())
-        if not _handed(moved, agents, "HO-OK" in out):
-            moved = {}
-    print(f"handed over {len(moved)} VMs (the controller holds {have + len(moved)} of {img})")
-
-
-def _handed(moved: dict, agents: dict, remote_ok: bool) -> bool:
-    """The VMs taken from this registry for the controller's (rules.ops.HandoverVM): where the controller's write
-    wasn't confirmed, put back here (and their agents), so no VM is in neither registry."""
-    put_back = {}
-    for i in moved:
-        h = ops.HandoverVM()
-        h.take()
-        h.written(remote_ok)
-        if h.here:
-            put_back[i] = moved[i]
-    if put_back:
-        with boat.Registry().locked() as d:
-            for i, v in put_back.items():
-                d["vms"].setdefault(i, v)
-        for i in put_back:
-            if agents.get(i):
-                boat.write_agent(i, agents[i])
-        print(f"the controller's registry not written: {len(put_back)} VMs kept here", file=sys.stderr)
-    return not put_back
+    """Advertise stopped capacity; the receiver must claim it on the VM after resume."""
+    image = boat.image_name()
+    hints = {}
+    for i, v in boat.Registry().read().get("vms", {}).items():
+        if v.get("snapshot") == image and v.get("type") == boat.VM_TYPE and boat.lease_free(v) and v.get("state") == "stopped":
+            hints[i] = {k: x for k, x in v.items() if k not in ("lease", "owner")}
+            hints[i]["lease"] = None
+            if len(hints) >= n:
+                break
+    if n <= 0:
+        hints = {}
+    ok = _publish_hints(vm, hints) if hints else True
+    print(f"advertised {len(hints) if ok else 0} stopped VMs; receiver claims on resume (no keys transferred)")
 
 
 def handover_warm(vm: str, owner: str = "treadmill") -> int:
-    """VMs a client here just released (its kept-up ones: `owner`), with their warm agents, to the controller, so its
-    scheduler leases them up and warm, with no start (this registry forgets them)."""
-    now = time.time()
-    moved, agents = {}, {}
-    with boat.Registry().locked() as d:
-        for i, v in list(d["vms"].items()):
-            if boat.lease_free(v) and v.get("state") in boat.RUNNING and v.get("until", 0) > now + 30 and (v.get("owner") == owner or not owner):
-                moved[i] = d["vms"].pop(i)
-                a = boat.read_agent(i)
-                if a:
-                    agents[i] = a
-                    boat.forget_agent(i)
-    if not moved:
+    """Release our idle warm leases and advertise them, without exporting agent keys."""
+    now, hints = time.time(), {}
+    for i, v in boat.Registry().read().get("vms", {}).items():
+        if not (boat.lease_free(v) and v.get("state") in boat.RUNNING and v.get("until", 0) > now + 30
+                and (v.get("owner") == owner or not owner)):
+            continue
+        lease = (boat.read_agent(i) or {}).get("lease")
+        if not lease:
+            continue
+        try:
+            answer = boat.lease_vm(i, "release", lease=lease)
+        except Exception:
+            continue
+        if not answer.get("ok") or answer.get("stale"):
+            continue
+        hints[i] = {k: x for k, x in v.items() if k not in ("lease", "owner")}
+        hints[i]["lease"] = None
+    if not hints or not _publish_hints(vm, hints):
         return 0
-    script = "import json,os,pathlib\nL=pathlib.Path(os.path.expanduser('~/sc/live'))\nm=json.loads(open(0).read())\n" \
-             "import fcntl\nwith open(L/'boat-pool.lock','a') as lk:\n  fcntl.flock(lk,2)\n  p=L/'boat-pool.json'\n  d=json.loads(p.read_text()) if p.exists() else {'vms':{}}\n" \
-             "  d.setdefault('vms',{}).update(m['vms'])\n  p.write_text(json.dumps(d,indent=1))\n(L/'agents').mkdir(exist_ok=True,mode=0o700)\n" \
-             "for i,a in m['agents'].items():\n  f=L/'agents'/(i+'.json'); fd=os.open(f,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600); os.write(fd,json.dumps(a).encode()); os.close(fd)\nprint('IN',len(m['vms']))\n"
-    import base64
-    b64 = base64.b64encode(script.encode()).decode()
-    code, out = ssh(vm, f"echo {b64} | base64 -d > /tmp/ho.py && python3 /tmp/ho.py && rm /tmp/ho.py", json.dumps({"vms": moved, "agents": agents}).encode())
-    if not _handed(moved, agents, f"IN {len(moved)}" in out):
-        return 0
-    print(f"handed over {len(moved)} warm VMs ({len(agents)} with their agents): {out.strip()[-40:]}")
-    return len(moved)
+    print(f"advertised {len(hints)} released warm VMs (no agent keys transferred)")
+    return len(hints)
 
 
 def rekey(vm: str) -> str:

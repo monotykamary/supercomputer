@@ -52,9 +52,22 @@ def test_teardown_keeps_other_repos():
     boat.boat = lambda *a, **k: deleted.append(a[1]) if a[0] == "delete" else ""
     reg({"a": {"snapshot": mine_old, "type": "large", "lease": None}, "b": {"snapshot": mine_cur, "type": "large", "lease": None},
          "c": {"snapshot": theirs, "type": "large", "lease": None}, "d": {"snapshot": mine_old, "type": "large", "lease": {"pid": os.getpid(), "host": HERE, "batch": "x"}}})
-    boat.teardown()
-    assert deleted == ["a"], deleted
-    boat.boat, boat.sandboxes = no_boat, no_boat
+    lease = {"owner": boat.owner_id(), "vm_id": "a", "boot": "boot-a", "epoch": 1}
+    boat.write_agent("a", {"lease": lease})
+    previous = boat.lease_vm
+    fences = []
+    def fence(vm, op="claim", lease=None, nonce="", **kwargs):
+        fences.append((vm, op))
+        return {"ok": vm == "a" and op == "fence_stop"}
+    boat.lease_vm = fence
+    try:
+        boat.teardown()
+        assert deleted == ["a"], deleted
+        assert fences == [("a", "fence_stop")], fences
+        assert set(boat.Registry().read()["vms"]) == {"b", "c", "d"}
+    finally:
+        boat.lease_vm = previous
+        boat.boat, boat.sandboxes = no_boat, no_boat
 
 
 def test_ceil_minute_share():
@@ -149,15 +162,19 @@ def test_scheduled_reports_every_item():
 
 
 def test_reap_releases_dead_holder():
+    """Local death is not authority to kill a VM job: release only the cache."""
     boat.sandboxes = lambda: {"v1": {"state": "running"}, "v2": {"state": "running"}}
-    boat.exec_ = lambda *a, **k: {"exitCode": 0}
+    executed = []
+    boat.exec_ = lambda *a, **k: executed.append(a) or {"exitCode": 0}
     stopped = []
     boat.stop_vm = lambda i: stopped.append(i) or True
     reg({"v1": {"snapshot": "s", "type": "large", "state": "running", "lease": {"pid": DEAD, "host": "", "batch": "gone"}, "until": time.time() + 900},
          "v2": {"snapshot": "s", "type": "large", "state": "running", "lease": {"pid": os.getpid(), "host": HERE, "batch": "live"}, "until": 0, "last_used": 0}})
     boat.reap()
     d = boat.Registry().read()
-    assert d["vms"]["v1"]["lease"] is None and "v1" in stopped, (d["vms"]["v1"], stopped)
+    assert d["vms"]["v1"]["lease"] is None and "v1" not in stopped, (d["vms"]["v1"], stopped)
+    assert not executed, "dead holder work must drain without exec kills"
+    assert d["vms"]["v1"]["until"] > time.time(), "do not shorten its existing TTL"
     assert d["vms"]["v2"]["lease"]["batch"] == "live" and "v2" not in stopped
     boat.sandboxes, boat.exec_, boat.stop_vm = no_boat, no_boat, no_boat
 

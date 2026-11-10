@@ -99,6 +99,7 @@ def test_unclassified_admission_is_owned_and_inert():
 def test_unknown_durable_admission_is_never_stale_work():
     s = sched()
     v = vm(s, "A")
+    v.lease = {"ok": True, "owner": "fixture-owner", "holder": "fixture-owner", "boot": "fixture-boot", "epoch": 1, "vm_id": "A"}
     v.client = SimpleNamespace(rpc=Mock())
     with tempfile.TemporaryDirectory() as tmp:
         d = pathlib.Path(tmp)
@@ -138,6 +139,7 @@ def test_native_canary_rejects_before_worker_or_release():
     host = socket.gethostname()
     reg = {"vms": {"A": {"snapshot": "img", "type": "large", "state": "running",
                            "lease": {"pid": old_pid, "host": host, "batch": "scheduler"}}}}
+    grant = {"ok": True, "owner": "fixture-owner", "holder": "fixture-owner", "boot": "fixture-boot", "epoch": 7, "vm_id": "A"}
     client = SimpleNamespace(rpc=Mock())
     with tempfile.TemporaryDirectory() as tmp:
         d = pathlib.Path(tmp)
@@ -147,17 +149,24 @@ def test_native_canary_rejects_before_worker_or_release():
         s.canary = canary.Canary(d)
         s.canary.handing_off("old", "new", time.time())
         snap = {"from_pid": old_pid, "from": "old", "t": time.time(), "batches": ["missing"],
-                "vms": [{"id": "A", "image": "img", "type": "large", "items": [
+                "vms": [{"id": "A", "image": "img", "type": "large", "lease": grant, "items": [
                     {"batch": "missing", "name": "i0", "run_name": "i0", "state": "running"}]}]}
         (d / "handoff.json").write_text(json.dumps(snap))
         registry = SimpleNamespace(locked=lambda: nullcontext(reg))
         with patch.object(S, "DIR", d), patch.object(S, "Registry", lambda: registry), \
              patch.object(S.boat, "pid_alive", lambda *a: True), \
-             patch.object(S.boat, "agent_client", lambda *a: client), patch.object(S.threading, "Thread"):
+             patch.object(S.boat, "agent_client", lambda *a: client), \
+             patch.object(S.boat, "lease_vm", return_value=grant) as renew, \
+             patch.object(S.boat, "remember_lease") as remember, \
+             patch.object(S.boat, "rename_leased_vm", return_value=True) as rename, patch.object(S.threading, "Thread"):
             s._take_pool()
             assert s.recovery_blocked and s.recovery["missing"] == ["missing"]
             assert reg["vms"]["A"]["lease"]["pid"] == os.getpid()
             assert "A" in s.vms and not s.vms["A"].dead
+            assert s.vms["A"].lease == grant and client.lease == grant
+            renew.assert_called_once_with("A", "renew", lease=grant)
+            remember.assert_called_once_with("A", grant)
+            rename.assert_called_once_with("A", "img", grant)
             ack = json.loads((d / "handoff.ack").read_text())
             assert ack["taken"] == ["A"] and not ack["admissions"]["ready"]
             s._worker.assert_not_called()

@@ -415,11 +415,49 @@ def vm_fits(shape: tuple, vm, retired: set) -> bool:
                          bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
 
 
+class SchedulerAgentClient:
+    """Catch lease refusal on every scheduler RPC, before any fallback or kill."""
+    def __init__(self, client, scheduler, vm):
+        self.client, self.scheduler, self.vm_state = client, scheduler, vm
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def _call(self, method, *args, **kwargs):
+        if self.vm_state.dead:
+            raise AgentError("stale lease: VM relinquished")
+        try:
+            result = getattr(self.client, method)(*args, **kwargs)
+        except Exception as error:
+            if any(word in str(error).lower() for word in ("stale", "403", "400")):
+                self.scheduler._drop_stale(self.vm_state)
+            raise
+        if isinstance(result, dict) and (result.get("stale") or isinstance(result.get("result"), dict) and result["result"].get("stale")):
+            self.scheduler._drop_stale(self.vm_state)
+            raise AgentError("stale lease: VM relinquished")
+        return result
+
+    def rpc(self, *args, **kwargs):
+        return self._call("rpc", *args, **kwargs)
+
+    def ping(self, *args, **kwargs):
+        return self._call("ping", *args, **kwargs)
+
+    def put(self, *args, **kwargs):
+        return self._call("put", *args, **kwargs)
+
+    def raw(self, *args, **kwargs):
+        return self._call("raw", *args, **kwargs)
+
+
 class VMState:
     def __init__(self, id: str, image: str, vm_type: str, how: str):
         self.id, self.image, self.type, self.how = id, image, vm_type, how
         self.slots = vm_slots(vm_type)
         self.client: AgentClient | None = None
+        self.lease: dict = {}
+        self.t_renew = 0.0
+        self.ttl = boat.BACKSTOP
         self.ready = False
         self.dead = False
         self.prepared: set[str] = set()
@@ -547,7 +585,7 @@ class Scheduler:
             tmp.write_text(json.dumps(self.m))
             tmp.rename(p)
             st = {"breaker": self.br, "bring_up": self.bring_up, "wave": self.wave, "starts_log": self.starts_log[-200:],
-                  "held": {v.id: {"t_real": v.t_real, "draining": v.draining} for v in list(self.vms.values()) if not v.dead},
+                  "held": {v.id: {"t_real": v.t_real, "draining": v.draining, "lease": v.lease, "ttl": v.ttl} for v in list(self.vms.values()) if not v.dead},
                   "est": self.est_hist, "class_obs": {str(k): v[-200:] for k, v in self.class_obs.items()},
                   "hints": {k: h for k, h in self.hints.items() if h.get("until", 0) > time.time()},
                   "drains": {img: {"open": d.open, "t_last": d.t_last, "share": d.share, "quota": d.quota, "released": d.released}
@@ -733,6 +771,28 @@ class Scheduler:
                         d["vms"][vid]["lease"] = None
                 continue
             hb = self.held_before.get(vid, {})
+            vm.lease = i.get("lease") or hb.get("lease") or (boat.read_agent(vid) or {}).get("lease") or {}
+            vm.ttl = max(boat.BACKSTOP, int(i.get("ttl") or hb.get("ttl") or 0))
+            try:
+                if not vm.lease and not self.recovery_blocked:
+                    # This path has already proven a dead local scheduler in our
+                    # registry. Never use it for foreign/unsuffixed discovery.
+                    old_agent = boat.read_agent(vid) or {}
+                    migrated = boat.bootstrap_agent(vid, self.agent_b64, old_agent.get("token") or boat.owner_key())
+                    if migrated.get("ok") is True:
+                        vm.lease = (boat.read_agent(vid) or {}).get("lease") or {}
+                        cl = boat.agent_client(vid)
+                valid = cl is not None and self._renew_lease(vm)
+            except Exception:
+                valid = False
+            if not valid:
+                taken.remove(vid)
+                missing.append(vid)
+                continue
+            cl.lease = vm.lease
+            boat.remember_lease(vid, vm.lease)
+            boat.rename_leased_vm(vid, vm.image, vm.lease)
+            cl = SchedulerAgentClient(cl, self, vm)
             vm.client, vm.slots = cl, int(i.get("slots") or vm.slots)
             vm.prepared, vm.trees = set(i.get("prepared", [])), set(i.get("trees", []))
             vm.caches = {tuple(c) for c in i.get("caches", [])}
@@ -784,7 +844,7 @@ class Scheduler:
         if taken:  # (their TTLs renewed now, as re-attach did each: the heartbeat's next is 5 min away, and a few handoffs
             def extend(ids=list(taken)):  # in a row would let a TTL run out under running items)
                 with concurrent.futures.ThreadPoolExecutor(16) as ex:
-                    list(ex.map(lambda vid: boat.boat("extend", vid, "--ttl", str(boat.BACKSTOP), "--json", check=False), ids))
+                    list(ex.map(lambda vid: boat.boat("extend", vid, "--ttl", str(max(boat.BACKSTOP, self.vms[vid].ttl)), "--json", check=False), ids))
             threading.Thread(target=extend, daemon=True).start()
         self._handoff = {"t": now, "from_pid": old, "held": sorted(info), "taken": taken, "missing": missing, "snapshot": bool(snap), "checks": 0}
         if snap:
@@ -882,7 +942,7 @@ class Scheduler:
             if v.dead or not v.ready:
                 continue
             vms.append({"id": v.id, "image": v.image, "type": v.type, "slots": v.slots, "prepared": sorted(v.prepared), "trees": sorted(v.trees),
-                        "caches": sorted([list(c) for c in v.caches]), "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
+                        "caches": sorted([list(c) for c in v.caches]), "lease": v.lease, "ttl": v.ttl, "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
                         "items": [{"batch": it.batch.id, "name": it.name, "run_name": it.run_name,
                                    "state": "running" if it.state == "finishing" else it.state,
                                    "placement": it.last_placement, "launch_identity": it.launch_identity, "placed": it.placed}
@@ -987,6 +1047,20 @@ class Scheduler:
             return n
         if True:
             cl = boat.agent_client(vid)
+            cached = (boat.read_agent(vid) or {}).get("lease") or self.held_before.get(vid, {}).get("lease")
+            try:
+                grant = boat.lease_vm(vid, "renew", lease=cached) if cached else {}
+                if not grant.get("ok") or grant.get("stale") or not grant.get("boot"):
+                    self.reattach_empty = getattr(self, "reattach_empty", set()) | {vid}
+                    return 0
+            except boat.LeaseProtocolLost:
+                self.alert(f"{vid}: lease protocol lost; old client wins, left untouched")
+                self.reattach_empty = getattr(self, "reattach_empty", set()) | {vid}
+                return 0
+            except Exception:
+                return 0
+            if cl:
+                cl.lease = grant
             ok, why = False, "no agent recorded"
             try:
                 ok = cl is not None and cl.ping().get("version") is not None
@@ -996,7 +1070,7 @@ class Scheduler:
                 # (boat reports it up, its agent doesn't answer: repaired in place with its token, so its items, still
                 # running in sessions of their own, are taken back rather than run again)
                 with contextlib.suppress(Exception):
-                    boat.bootstrap_agent(vid, self.agent_b64, cl.token, 60, 2)
+                    boat.bootstrap_agent(vid, self.agent_b64, cl.token, 60, 2, lease=grant)
                     ok = cl.ping(timeout=15).get("version") is not None
                     if ok:
                         log(f"{vid}: its agent didn't answer after the restart: repaired in place")
@@ -1015,10 +1089,12 @@ class Scheduler:
                         ok = False
             if not ok:
                 return 0
-            threading.Thread(target=boat.boat, args=("extend", vid, "--ttl", str(boat.BACKSTOP), "--json"), kwargs={"check": False}, daemon=True).start()
+            ttl = max(boat.BACKSTOP, int(self.held_before.get(vid, {}).get("ttl", 0)))
+            threading.Thread(target=boat.boat, args=("extend", vid, "--ttl", str(ttl), "--json"), kwargs={"check": False}, daemon=True).start()
             pl0 = its[0][1]
             vm = VMState(vid, pl0["image"], pl0.get("type", boat.VM_TYPE), "warm")
-            vm.client = cl
+            cl = SchedulerAgentClient(cl, self, vm)
+            vm.client, vm.lease, vm.t_renew, vm.ttl = cl, grant, time.monotonic(), ttl
             vm.t_agent = 0.0  # (its agent's code checked at its first tick)
             running, finished, ticked = set(), set(), False
             with contextlib.suppress(Exception):
@@ -1546,7 +1622,7 @@ class Scheduler:
                 log(f"woke after {time.time() - t_loop:.0f} s asleep: TTLs renewed, adoption now, VMs boat stopped meanwhile let go with no strike to their items")
                 for v in list(self.vms.values()):
                     if not v.dead:
-                        threading.Thread(target=boat.boat, args=("extend", v.id, "--ttl", str(boat.BACKSTOP), "--json"), kwargs={"check": False}, daemon=True).start()
+                        threading.Thread(target=boat.boat, args=("extend", v.id, "--ttl", str(max(boat.BACKSTOP, v.ttl)), "--json"), kwargs={"check": False}, daemon=True).start()
                 if not getattr(self, "adopting", False):
                     self.adopting = True
                     threading.Thread(target=self._adopt, daemon=True).start()
@@ -1636,9 +1712,12 @@ class Scheduler:
                 apply_policy(new)
                 log(f"policy generation {new['generation']} in force: {diff}")
                 if "ttl_s" in diff:
+                    # A policy reduction must not blindly shorten a running VM.
+                    # Its old backstop survives until the fenced release path.
                     for v in list(self.vms.values()):
                         if not v.dead:
-                            threading.Thread(target=boat.boat, args=("extend", v.id, "--ttl", str(boat.BACKSTOP), "--json"), kwargs={"check": False}, daemon=True).start()
+                            v.ttl = max(v.ttl, boat.BACKSTOP)
+                            threading.Thread(target=boat.boat, args=("extend", v.id, "--ttl", str(v.ttl), "--json"), kwargs={"check": False}, daemon=True).start()
         g = self.pol.get("generation", 0)
         for v in list(self.vms.values()):
             v.gen = g
@@ -1974,6 +2053,8 @@ class Scheduler:
             for row in r.get("done", []):
                 self._accept_finished(vm, row)
         except Exception as e:
+            if vm.dead:
+                return  # A stale fence already requeued without a strike.
             if b.strict_once:
                 with self.lock:
                     it.state = "owned_refused"
@@ -2553,8 +2634,9 @@ class Scheduler:
             threading.Thread(target=self._create, args=(image, vm_type, create, k, b), daemon=True).start()
         return len(mine) + max(0, create)
 
-    def _bring(self, i: str, image: str, vm_type: str, how: str, k: int, b: Batch):
+    def _bring(self, i: str, image: str, vm_type: str, how: str, k: int, b: Batch, lease: dict | None = None, nonce: str = ""):
         vm = VMState(i, image, vm_type, how)
+        vm.lease, vm.birth_nonce = lease or {}, nonce
         with self.lock:
             if i in self.vms:  # (a VM is brought up once at a time: a second bring-up would replace its agent's token)
                 return
@@ -2605,32 +2687,60 @@ class Scheduler:
                     boat.note_starts(-1)
                     raise RuntimeError("boat refused the resume")
             started = started or vm.how == "created"
-            threading.Thread(target=boat.boat, args=("extend", vm.id, "--ttl", str(boat.BACKSTOP), "--json"), kwargs={"check": False}, daemon=True).start()
-            cl = boat.agent_client(vm.id) if vm.how in ("warm", "adopt") else None
+            if not boat.wait_running([vm.id], int(BREAK_READY)):
+                raise RuntimeError("never came up")
+            old = boat.read_agent(vm.id) or {}
+            cached = vm.lease or old.get("lease") or self.held_before.get(vm.id, {}).get("lease")
+            if vm.how in ("created", "resumed") or (not cached and vm.how != "adopt"):
+                tok = old.get("token") or boat.owner_key()
+                boot = boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90, nonce=getattr(vm, "birth_nonce", ""))
+                # Even a lost daemon response may have persisted the successful claim.
+                old = boat.read_agent(vm.id) or {}
+                cached = old.get("lease")
+                claim = boat.lease_vm(vm.id, "renew", lease=cached) if cached else boot
+            else:
+                claim = boat.lease_vm(vm.id, "renew", lease=cached) if cached else boat.lease_vm(vm.id, "claim")
+            if not claim.get("ok") or claim.get("stale") or not claim.get("boot") or not claim.get("epoch"):
+                if started:
+                    self._start_done(vm.id, False)
+                self._drop_stale(vm)
+                return
+            vm.lease = claim
+            boat.remember_lease(vm.id, claim)
+            if vm.how != "created":
+                boat.rename_leased_vm(vm.id, vm.image, claim)
+            vm.t_renew = time.monotonic()
+            boat.boat("extend", vm.id, "--ttl", str(vm.ttl), "--json", check=False)
+            cl = boat.agent_client(vm.id)
             ok = False
             if cl:
+                cl.lease = vm.lease
                 with contextlib.suppress(Exception):
                     ok = cl.ping().get("version") == self.agent_version
             if not ok:
                 if not boat.wait_running([vm.id], int(BREAK_READY)):
                     raise RuntimeError("never came up")
-                tok = secrets.token_urlsafe(24)
-                r = boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90)
+                tok = (boat.read_agent(vm.id) or {}).get("token") or old.get("token") or boat.owner_key()
+                r = boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90, lease=vm.lease, nonce=getattr(vm, "birth_nonce", ""))
                 if not r.get("ok"):
                     raise RuntimeError(f"agent: {r}")
                 old = boat.read_agent(vm.id) or {}
                 url = old.get("url") or boat.bj("host", vm.id, str(boat.AGENT_PORT), "--localhost", "--private")["url"]
-                cl = AgentClient(vm.id, url, tok)
+                cl = AgentClient(vm.id, url, tok, lease=vm.lease)
                 try:
                     cl.ping()
                 except AgentError:
                     url = boat.bj("host", vm.id, str(boat.AGENT_PORT), "--localhost", "--private")["url"]
-                    cl = AgentClient(vm.id, url, tok)
+                    cl = AgentClient(vm.id, url, tok, lease=vm.lease)
                     cl.ping()
-                boat.write_agent(vm.id, {"url": url, "token": tok, "t": time.time(), "version": self.agent_version})
+                boat.write_agent(vm.id, {"url": url, "token": tok, "t": time.time(), "version": self.agent_version, "lease": vm.lease})
+            cl = SchedulerAgentClient(cl, self, vm)
             vm.client = cl
             vm.agent, vm.t_agent = self.agent_version, time.time()
             r = cl.rpc("vtick", {"wait": 0}, timeout=30)
+            if r.get("stale"):
+                self._drop_stale(vm)
+                return
             vm.slots = max(1, int(r.get("cpus") or boat.TYPES[vm.type][0]) // boat.SLOT_CPU)
             vm.model = r.get("model", "")
             self._foreign(vm, r)  # (inventory before advertising this worker as usable)
@@ -2643,7 +2753,12 @@ class Scheduler:
                 self.bring_up = 0.8 * self.bring_up + 0.2 * (vm.t_ready - vm.t_lease)
             self._worker(vm)
             log(f"{vm.id} ({vm.how}) ready for {NAMES[k]} in {vm.t_ready - vm.t_lease:.0f} s" if vm.how != "adopt" else f"{vm.id} adopted (agent {vm.agent})")
+        except boat.LeaseProtocolLost:
+            self.alert(f"{vm.id}: lease protocol lost; old client wins, relinquished without stopping")
+            self._drop_stale(vm)
         except Exception as e:
+            if vm.dead:
+                return
             log(f"{vm.id}: {str(e)[:200]}")
             if started:
                 self._start_done(vm.id, False)
@@ -2658,7 +2773,8 @@ class Scheduler:
             if got <= 0:
                 return
             try:
-                out = boat.boat("new", "--from", image, "--type", vm_type, "--count", str(got), "--ttl", str(boat.BACKSTOP), "--no-env", "--no-monitoring", "--json", timeout=600, check=False)
+                with boat.new_vm_args(image) as (birth_args, nonce):
+                    out = boat.boat("new", "--from", image, *birth_args, "--type", vm_type, "--count", str(got), "--ttl", str(boat.BACKSTOP), "--no-env", "--no-monitoring", "--json", timeout=600, check=False)
             except Exception as e:  # (boat new that never answered (06:5x: a 600 s timeout for a small VM): no VM, the starts given back,
                 log(f"boat new --from {image} --type {vm_type}: {str(e)[:160]}; backing off 120 s")  # its image's starts backed off; a VM
                 out = ""  # made all the same is up with no owner: adoption takes it in (work queued) or stops it)
@@ -2679,11 +2795,43 @@ class Scheduler:
                     d["vms"][i] = {"type": vm_type, "snapshot": image, "created": time.time(), "last_used": time.time(), "state": "starting",
                                    "lease": {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": time.time(), "label": f"scheduler ({NAMES[k]})"}}
             for i in ids:
-                self._bring(i, image, vm_type, "created", k, b)
+                self._bring(i, image, vm_type, "created", k, b, nonce=nonce)
         finally:
             with self.lock:
                 self.creating[(image, vm_type)] = max(0, self.creating.get((image, vm_type), 0) - n)
             self.wake.set()
+
+    def _drop_stale(self, vm: VMState):
+        """Lease loss is not a VM fault: no stop, kill, or item strike."""
+        with self.lock:
+            vm.dead, vm.ready = True, False
+            if self.vms.get(vm.id) is vm:
+                self.vms.pop(vm.id, None)
+            for key, it in list(vm.running.items()):
+                vm.running.pop(key, None)
+                if it.batch.admission_closed or it.owned.closed:
+                    it.state = "cancel_pending"
+                    continue
+                it.fate.vm_lost(vm.id, True)
+                it.state, it.vm, it.head = "queued", None, True
+            vm.starts = []
+        self.wake.set()
+
+    def _renew_lease(self, vm: VMState) -> bool:
+        if not vm.lease:
+            self._drop_stale(vm)
+            return False
+        try:
+            r = boat.lease_vm(vm.id, "renew", lease=vm.lease)
+        except boat.LeaseProtocolLost:
+            self.alert(f"{vm.id}: lease protocol lost; old client wins, relinquished without stopping")
+            self._drop_stale(vm)
+            return False
+        if not r.get("ok") or r.get("stale"):
+            self._drop_stale(vm)
+            return False
+        vm.t_renew = time.monotonic()
+        return True
 
     def _boat_up(self, vm_id: str) -> bool:
         """boat's own word on a VM: up (a VM boat reports up is never called lost by us)."""
@@ -2702,7 +2850,9 @@ class Scheduler:
             return False
         vm.t_repair = time.time()
         with contextlib.suppress(Exception):
-            boat.bootstrap_agent(vm.id, self.agent_b64, vm.client.token, 60, 2)
+            if not self._renew_lease(vm):
+                return False
+            boat.bootstrap_agent(vm.id, self.agent_b64, vm.client.token, 60, 2, lease=vm.lease)
             if vm.client.ping(timeout=15).get("ok"):
                 log(f"{vm.id}: its agent didn't answer: repaired in place ({len(vm.running)} items running on)")
                 vm.failing, vm.fails = 0, 0
@@ -2773,6 +2923,17 @@ class Scheduler:
 
     def _tick(self, vm: VMState) -> float | None:
         """One tick of the VM (a call that waits for nothing): the seconds until its next, None when it's done."""
+        if vm.dead:
+            return None
+        if time.monotonic() - vm.t_renew >= 60:
+            try:
+                if not self._renew_lease(vm):
+                    return None
+            except Exception:
+                # No placement while authority cannot be verified; keep running data.
+                vm.ready = False
+                return 5.0
+            vm.ready = True
         with vm.lock:
             starts, acks = vm.starts, vm.acks
             vm.starts, vm.acks = [], []
@@ -2789,6 +2950,8 @@ class Scheduler:
             vm.t_agent = time.time()
             with contextlib.suppress(Exception):
                 self._check_agent(vm)
+        if vm.dead:
+            return None
         strict_starts = [st for st in starts if st.get("spec", {}).get("strict_once") is True]
         strict_acks = [ack for ack in acks if "launch_identity" in ack]
         starts = [st for st in starts if st not in strict_starts]
@@ -2800,6 +2963,8 @@ class Scheduler:
                     "vtick", {"start": strict_starts, "acks": strict_acks, "wait": 0}, timeout=self.TICK_S)
                 owned_done = strict_result.get("done", [])
             except Exception as error:
+                if vm.dead:
+                    return None
                 with self.lock:
                     for st in strict_starts:
                         item = vm.running.get((st["batch"], st["spec"]["name"]))
@@ -2809,9 +2974,16 @@ class Scheduler:
                     vm.acks = strict_acks + vm.acks  # unknown reply never discards acknowledgements
         try:
             r = vm.client.rpc("vtick", {"start": starts, "acks": acks, "wait": 0}, timeout=self.TICK_S)
+            if r.get("stale"):
+                self._drop_stale(vm)
+                return None
             r["done"] = owned_done + r.get("done", [])
             vm._fails, vm.failing = 0, 0
         except Exception as e:
+            if "stale" in str(e).lower() or "403" in str(e) or "400" in str(e):
+                self.alert(f"{vm.id}: lease protocol lost or refused; relinquished without stopping")
+                self._drop_stale(vm)
+                return None
             fails = vm._fails = getattr(vm, "_fails", 0) + 1
             vm.failing = fails
             outage = self._outage()
@@ -2823,6 +2995,8 @@ class Scheduler:
                 if self._repair(vm):
                     vm._fails = 0
                     return 0.0
+                if vm.dead:
+                    return None
             with vm.lock:
                 vm.starts = starts + vm.starts
                 vm.acks = acks + vm.acks
@@ -2871,11 +3045,16 @@ class Scheduler:
     def _foreign(self, vm: VMState, r: dict):
         """Runs the agent reports on the VM that this scheduler doesn't hold there: their slots counted taken (B11);
         one of an item done, or now running under another name, killed (a run nobody will read)."""
+        if vm.dead or not vm.lease:
+            return
         with self.lock:
             mine = set(vm.running)
             n, stale, stray, now = 0, [], 0, time.time()
             first, seen = getattr(vm, "_unowned", {}), {}  # (each unowned run's first sighting: stray only past STRAY_S)
             for x in r.get("running", []):
+                if x.get("owner") != boat.owner_id():
+                    n += vm.slots  # Unknown/foreign shape reserves capacity; never kill it.
+                    continue
                 key = (x.get("batch"), x.get("name"))
                 if key in mine:
                     if vm.running[key].batch.closed:  # (its client closed the batch, its kill lost: killed again, its slot ours till then)
@@ -2914,7 +3093,7 @@ class Scheduler:
                 threading.Thread(target=self._kill_run, args=(vm, bid, name), daemon=True).start()
 
     def _kill_run(self, vm: VMState, bid: str, name: str):
-        if getattr(self, "recovery_blocked", False) or self._unclassified(bid):
+        if vm.dead or not vm.lease or getattr(self, "recovery_blocked", False) or self._unclassified(bid):
             return
         with self.lock:
             b = self.batches.get(bid)
@@ -3128,6 +3307,8 @@ class Scheduler:
                                                          "error": f"boat failed it {it.fails} times (last: {why})"},), daemon=True).start()
 
     def _lost_vm(self, vm: VMState):
+        if vm.dead:
+            return
         log(f"{vm.id}: lost")
         with self.lock:
             vm.dead = True
@@ -3236,35 +3417,45 @@ class Scheduler:
 
     def _let_go(self, vm: VMState, stop: bool = False, keep: bool = False):
         if getattr(self, "recovery_blocked", False):
-            return  # uncertain ownership keeps even apparently idle leases
-        ttl = boat.BACKSTOP if keep else boat.IDLE
-        if not keep and not vm.dead:  # (a release: a start of its image within 25 min after it is churn; each logged with its reason)
-            if getattr(vm, "why_go", "") != "retired, empty" and not getattr(vm, "replace", False):  # (a VM retired by an operator, or deleted for its full disk, isn't capacity let go: no churn after it)
-                self._h().record_release(time.time(), vm.image, vm.id, vm.type)
-            log(f"{vm.id}: released{' and stopped' if stop else ''}: {getattr(vm, 'why_go', 'shutdown' if self.stop.is_set() else '?')}")
-        if getattr(vm, "replace", False):  # (its disk full past its cleaning: deleted, never back in the pool where a resume would find it full)
-            boat.boat("delete", vm.id, "--yes", "--json", check=False, timeout=180)
-            with Registry().locked() as d:
-                if ((d["vms"].get(vm.id) or {}).get("lease") or {}).get("pid") == os.getpid():
-                    d["vms"].pop(vm.id, None)
-            with self.lock:
-                if self.vms.get(vm.id) is vm:
-                    self.vms.pop(vm.id, None)
             return
-        if stop:
-            boat.stop_vm(vm.id)
-        else:
-            boat.boat("extend", vm.id, "--ttl", str(ttl), "--json", check=False)
+        if not vm.lease:
+            self._drop_stale(vm)
+            return
+        ttl = max(boat.BACKSTOP, vm.ttl) if keep else boat.IDLE
+        try:
+            if keep:
+                if not self._renew_lease(vm):
+                    return
+                boat.boat("extend", vm.id, "--ttl", str(ttl), "--json", check=False)
+                # Same-machine handoff retains its epoch and running jobs.
+            elif getattr(vm, "replace", False):
+                if not boat.delete_vm(vm.id, lease=vm.lease):
+                    self._drop_stale(vm)
+                    return
+            elif stop:
+                if not boat.stop_vm(vm.id, lease=vm.lease):
+                    self._drop_stale(vm)
+                    return
+            else:
+                # The helper reserves provider capacity before taking the stop
+                # fence, so queueing cannot outlive STOP_S and shrink a new holder.
+                if not boat.shrink_ttl(vm.id, ttl, vm.lease):
+                    self._drop_stale(vm)
+                    return
+        except Exception as e:
+            log(f"{vm.id}: release not confirmed; left to TTL: {str(e)[:160]}")
+            self._drop_stale(vm)
+            return
         now = time.time()
         with Registry().locked() as d:
             v = d["vms"].get(vm.id)
             if v and (v.get("lease") or {}).get("pid") == os.getpid():
-                v["lease"], v["last_used"] = None, now
-                v["until"] = 0 if stop else now + ttl
-                v["released"] = now  # (let go on purpose: adoption doesn't take it back for its hold, only for real work; B5)
-                v["owner"] = None
-                if not stop:
-                    v["state"] = "running"
+                if getattr(vm, "replace", False):
+                    d["vms"].pop(vm.id, None)
+                else:
+                    v["lease"], v["last_used"] = None, now
+                    v["until"] = 0 if stop else now + ttl
+                    v["released"], v["owner"] = now, None
         with self.lock:
             if self.vms.get(vm.id) is vm:
                 self.vms.pop(vm.id, None)
@@ -3667,60 +3858,63 @@ class Scheduler:
         return r.returncode == 0
 
     def _adopt(self):
-        """No VM of the pool up without a live owner, ever: every up VM of the pool's images (in the registry or not)
-        that no live client holds and this scheduler doesn't hold is adopted (its agent reached, repaired by boat exec
-        if need be) while its image has queued work or it's within its hold; stopped only with its image's queue empty
-        and its hold over (or when it can't be brought up at all).
-        At the start (after a restart, a handoff, a kill -9) and every 2 minutes."""
+        """Ask the VM, not our registry. Unheld VMs expire by TTL, never by us."""
         try:
             if getattr(self, "recovery_blocked", False):
                 return
             live = boat.sandboxes()
             now = time.time()
             with self.lock:
-                q_images = {it.batch.image for it in self.queued() if it.batch.klass <= 4}  # (real work: filler never a reason to keep a VM; B5)
-            took, stop, orphans = [], [], []  # (no cap on how many: every one of them is ours to keep or stop now)
-            with Registry().locked() as d:
-                images = {v.get("snapshot") for v in d["vms"].values()} | {b.image for b in self.batches.values()}
-                for i, sb in live.items():
-                    if (sb.get("state") not in boat.RUNNING or sb.get("name") not in images or i in self.vms
-                            or i in getattr(self, "_releasing", ()) or i in self.retired()):
+                queued = {it.batch.image for it in self.queued() if it.batch.klass <= 4}
+            silent = self.__dict__.setdefault("_adopt_silent", {})
+            for i, sb in live.items():
+                name = sb.get("name", "")
+                if (sb.get("state") not in boat.RUNNING or not name.endswith("~l")
+                        or name[:-2] not in queued or i in self.vms or i in self.retired()
+                        or i in getattr(self, "_releasing", ())):
+                    continue
+                try:
+                    health = boat.agent_health(i)
+                    who = health.get("lease")
+                    if not isinstance(who, dict):
+                        self.alert(f"{i}: lease protocol missing; old client wins, left untouched")
+                        continue  # Legacy protocol: old client wins, no bootstrap war.
+                    silent.pop(i, None)
+                    holder = who.get("holder") or who.get("owner")
+                    if holder and not who.get("lapsed") and who.get("state") not in ("released",):
                         continue
-                    v = d["vms"].get(i)
-                    if v is None:  # (up, of our image, in no registry: e.g. a scheduler on another host stopped)
-                        v = d["vms"][i] = {"type": sb.get("type", boat.VM_TYPE), "snapshot": sb["name"], "created": now, "last_used": now, "state": sb["state"], "lease": None}
-                    # (its decision: rules.VMLife.adopt_tick. Its owner: a live client (a batch holding its own VMs, or
-                    # this scheduler's own lease, new: being brought up), nobody (released a moment ago: it stops by
-                    # itself at its `until`, or a batch leases it), or a holder that died (this scheduler's own lease
-                    # older than 5 minutes on a VM it doesn't hold is one): an orphan whatever its `until`)
-                    l = v.get("lease") or {}
-                    mine = l.get("pid") == os.getpid() and l.get("host") == socket.gethostname() and now - l.get("since", now) > 300
-                    life = self._life(None, now, lease="client" if not mine and not boat.lease_free(v) else "none" if not l else "dead")
-                    life.until, life.last_used = float(v.get("until", 0) or 0), 0.0 if v.get("released") and not l else float(v.get("last_used", 0) or 0)
-                    life.pending = i in getattr(self, "reattach_pending", set())  # (re-attach is taking it back with its items)
-                    was_held = i in self.held_before or (l.get("batch") == "scheduler" and not mine)
-                    if life.lease == "dead" or (life.lease == "none" and life.until < now):  # (no live owner: health's orphans while it lasts)
-                        orphans.append(i)
-                    what = life.adopt_tick(now, sb["name"] in q_images, was_held)  # (held before, queued work, or within its hold)
-                    if what == "keep":
+                except Exception:
+                    # An HTTP outage is not permission to steal a known holder.
+                    first = silent.setdefault(i, time.monotonic())
+                    if time.monotonic() - first < BREAK_READY:
                         continue
-                    if what == "adopt":
-                        v["lease"] = {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": now, "label": "scheduler (adopted)"}
-                        took.append((i, sb["name"], v["type"]))
-                    else:
-                        v["lease"], v["until"] = None, 0
-                        stop.append(i)
-            for i, img, t in took:
-                self._bring(i, img, t, "adopt", 5, None)
-                hb = self.held_before.get(i)
-                if hb and i in self.vms:  # (its hold clock as the previous scheduler left it)
-                    self.vms[i].t_real = float(hb.get("t_real", now))
-            self._h().record_orphans(now, [i for i in orphans if i not in [t[0] for t in took] and i not in stop])
-            for i in stop:
-                self._h().record_release(now, live.get(i, {}).get("name", ""), i)
-                threading.Thread(target=boat.stop_vm, args=(i,), daemon=True).start()
-            if took or stop:
-                log(f"adoption: {len(took)} VMs with no live owner taken in, {len(stop)} stopped (nothing for them): {[i for i, *_ in took] + stop}")
+                    cached = Registry().read().get("vms", {}).get(i, {})
+                    if cached.get("lease"):
+                        continue
+                    # A missing local cache proves nothing about another machine.
+                    # Exec may discover a holder, but never permits stealing a
+                    # held lease (even lapsed) during an HTTP outage.
+                    try:
+                        remote = boat.lease_vm(i, "who")
+                    except Exception:
+                        continue
+                    if not remote.get("ok"):
+                        continue
+                    if (remote.get("holder") or remote.get("owner")) and remote.get("valid_boot", True) and remote.get("state") != "released":
+                        continue
+                try:
+                    claim = boat.lease_vm(i, "claim")
+                except Exception:
+                    continue
+                if (not claim.get("ok") or claim.get("stale") or claim.get("pending")
+                        or not claim.get("boot") or not claim.get("epoch")):
+                    continue  # Draining previous owner's jobs is not available capacity.
+                boat.remember_lease(i, claim)
+                with Registry().locked() as d:
+                    v = d["vms"].setdefault(i, {"type": sb.get("type", boat.VM_TYPE), "snapshot": name[:-2], "created": now})
+                    v.update({"last_used": now, "state": sb["state"], "lease": {
+                        "pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": now, "label": "scheduler (adopted)"}})
+                self._bring(i, name[:-2], v["type"], "adopt", 5, None, lease=claim)
         except Exception as e:
             log(f"adoption: {str(e)[:200]}")
         finally:
@@ -3736,7 +3930,16 @@ class Scheduler:
         sessions of their own, run on), through itself, else by boat exec."""
         if vm.running or getattr(vm, "starts", []):
             return  # Never replace an agent beneath any live or starting item.
+        if vm.dead or not self._renew_lease(vm):
+            return
         r = vm.client.ping()
+        if r.get("stale"):
+            self._drop_stale(vm)
+            return
+        if r.get("version") != vm.agent and vm.agent:
+            self.alert(f"{vm.id}: agent changed outside holder; old client wins, relinquished")
+            self._drop_stale(vm)
+            return
         vm.agent, vm.t_agent = str(r.get("version")), time.time()
         if vm.agent == self.agent_version:
             return
@@ -3759,11 +3962,13 @@ class Scheduler:
                     return
 
     def _heartbeat(self):
-        while not self.stop.wait(300):
+        while not self.stop.wait(60):
             for v in list(self.vms.values()):
                 if not v.dead:
                     with contextlib.suppress(Exception):
-                        boat.boat("extend", v.id, "--ttl", str(boat.BACKSTOP), "--json", check=False)
+                        if self._renew_lease(v):
+                            v.ttl = max(boat.BACKSTOP, v.ttl)
+                            boat.boat("extend", v.id, "--ttl", str(v.ttl), "--json", check=False)
 
     def shutdown(self):
         """A restart (a deploy, the service restarted): VMs running items keep them (their TTL renewed, their leases

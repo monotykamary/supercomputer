@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import time
+from unittest.mock import Mock, patch
 
 os.environ["SUPERCOMPUTER_LIVE"] = tempfile.mkdtemp(prefix="sc-ops-wiring-")
 os.environ["SUPERCOMPUTER_TREADMILL"] = tempfile.mkdtemp(prefix="sc-ops-tm-")
@@ -174,14 +175,44 @@ def test_env_precedence():
     assert config.env("ZZT_NONE", "d") == "d"
 
 
-def test_handover_puts_back_on_a_failed_write():
+def test_handover_failed_or_successful_write_keeps_local_discovery_and_keys():
     from supercomputer import controller
+    record = {"snapshot": "img", "type": boat.VM_TYPE, "state": "stopped", "lease": None, "owner": "old-local"}
     with boat.Registry().locked() as d:
-        d["vms"] = {}
-    assert not controller._handed({"vm1": {"snapshot": "img"}}, {}, False)
-    assert "vm1" in boat.Registry().read()["vms"]
-    assert controller._handed({"vm2": {"snapshot": "img"}}, {}, True)
-    assert "vm2" not in boat.Registry().read()["vms"]
+        d["vms"] = {"vm1": dict(record)}
+    for remote_ok in (False, True):
+        with patch.object(boat, "image_name", return_value="img"), \
+             patch.object(boat, "read_agent") as read_key, patch.object(boat, "forget_agent") as forget_key, \
+             patch.object(controller, "_publish_hints", return_value=remote_ok) as publish:
+            controller.handover("controller-fixture", 1)
+            publish.assert_called_once_with("controller-fixture", {"vm1": {"snapshot": "img", "type": boat.VM_TYPE, "state": "stopped", "lease": None}})
+            assert boat.Registry().read()["vms"]["vm1"] == record
+            read_key.assert_not_called()
+            forget_key.assert_not_called()
+
+
+def test_warm_handover_releases_only_accepted_fence_without_exporting_keys():
+    from supercomputer import controller
+    record = {"snapshot": "img", "type": boat.VM_TYPE, "state": "running", "until": time.time() + 600,
+              "lease": None, "owner": "treadmill"}
+    fence = {"ok": True, "owner": "fixture-owner", "boot": "fixture-boot", "epoch": 4, "vm_id": "vm1"}
+    with boat.Registry().locked() as d:
+        d["vms"] = {"vm1": dict(record)}
+    for accepted in (False, True):
+        with patch.object(boat, "read_agent", return_value={"token": "never-transfer", "lease": fence}), \
+             patch.object(boat, "lease_vm", return_value={"ok": accepted, "stale": not accepted}) as release, \
+             patch.object(boat, "forget_agent") as forget, \
+             patch.object(controller, "_publish_hints", return_value=True) as publish:
+            assert controller.handover_warm("controller-fixture") == int(accepted)
+            release.assert_called_once_with("vm1", "release", lease=fence)
+            if accepted:
+                hints = publish.call_args.args[1]
+                assert hints["vm1"]["lease"] is None
+                assert "token" not in json.dumps(hints) and "owner" not in hints["vm1"]
+            else:
+                publish.assert_not_called()
+            assert boat.Registry().read()["vms"]["vm1"] == record
+            forget.assert_not_called()
 
 
 if __name__ == "__main__":
