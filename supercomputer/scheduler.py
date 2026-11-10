@@ -1919,7 +1919,7 @@ class Scheduler:
                     it.state = "cancel_pending"
                     return
             if b.strict_once:
-                OwnedAgentClient(vm.client, self.agent_version).rpc("capabilities")
+                self._owned_client(vm).rpc("capabilities")
             self._prepare(b, vm)
             vm.prep_fails = 0  # (prepared: a candidate again; rules.may_slot)
             spec = {k: v for k, v in it.spec.items() if k not in ("est", "weight", "vm_type", "meta", "try", "orig", "timing")} | {"cpus": it.weight * boat.SLOT_CPU, "name": it.run_name, "launch_identity": it.launch_identity}
@@ -1953,7 +1953,7 @@ class Scheduler:
                         f.write(json.dumps(it.last_placement) + "\n")
             vm.fails = 0
             # (the start goes at once, beside the worker's long poll: a placed item doesn't wait for that poll to end)
-            cl = OwnedAgentClient(vm.client, self.agent_version) if b.strict_once else vm.client
+            cl = self._owned_client(vm) if b.strict_once else vm.client
             r = cl.rpc("vtick", {"start": [{"batch": b.id, "spec": spec}], "wait": 0}, timeout=60)
             if b.strict_once and r.get("err"):
                 raise OwnedAgentRefused("owned preparation lost; placement held")
@@ -2051,13 +2051,14 @@ class Scheduler:
         else:
             raise AgentError(f"{vm.id}: the batch's preparation there never ended (3 waits)")
         try:
-            cl = OwnedAgentClient(vm.client, self.agent_version) if b.strict_once else vm.client
+            cl = self._owned_client(vm) if b.strict_once else vm.client
             t = b.tree
-            r = cl.rpc("begin", self.agent_version, b.id, t["id"], b.ctx_b64, timeout=60)
+            version = cl.version if b.strict_once else self.agent_version
+            r = cl.rpc("begin", version, b.id, t["id"], b.ctx_b64, timeout=60)
             if r.get("ok"):
                 r = r["prep"]
             else:
-                if b.strict_once and (r.get("version") != self.agent_version or r.get("need") != "manifest"):
+                if b.strict_once and (r.get("version") != version or r.get("need") != "manifest"):
                     raise OwnedAgentRefused("strict begin refused: no fallback preparation")
                 r = cl.rpc("tree", t["id"], t["files"], t["links"], timeout=120)
                 if not r.get("ok") and r.get("missing"):
@@ -2119,7 +2120,7 @@ class Scheduler:
         if not gits:
             return
         try:
-            cl = OwnedAgentClient(vm.client, self.agent_version) if b.strict_once else vm.client
+            cl = self._owned_client(vm) if b.strict_once else vm.client
             r = cl.rpc("verify", t["id"], gits, timeout=120)
         except Exception as e:
             if not b.strict_once and "no command verify" in str(e):  # (an agent from before: upgraded in place between items, checked then)
@@ -2795,7 +2796,7 @@ class Scheduler:
         owned_done = []
         if strict_starts or strict_acks:
             try:
-                strict_result = OwnedAgentClient(vm.client, self.agent_version).rpc(
+                strict_result = self._owned_client(vm).rpc(
                     "vtick", {"start": strict_starts, "acks": strict_acks, "wait": 0}, timeout=self.TICK_S)
                 owned_done = strict_result.get("done", [])
             except Exception as error:
@@ -3581,6 +3582,10 @@ class Scheduler:
             # Imports and source copies happened while placement continued.
             request_lock = getattr(self, "_request_lock", self.lock)
             with request_lock, self.lock:
+                if any(it.batch.strict_once and not it.start_done.is_set()
+                       for v in self.vms.values() for it in v.running.values()):
+                    log("handoff deferred until in-flight strict launches settle; placement continues")
+                    return
                 self.handing_off = True
                 self.stop.set()
                 self._metrics_save()
@@ -3721,6 +3726,10 @@ class Scheduler:
         finally:
             self.adopting = False
             self.wake.set()
+
+    def _owned_client(self, vm: VMState):
+        # Busy agents keep their exact wire version until their safe-point upgrade.
+        return OwnedAgentClient(vm.client, getattr(vm, "agent", "") or self.agent_version)
 
     def _check_agent(self, vm: VMState):
         """Agents follow the code: one whose hash isn't this scheduler's agent.py is upgraded in place (its items, in

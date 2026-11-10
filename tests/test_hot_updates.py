@@ -128,6 +128,15 @@ class Guards(unittest.TestCase):
         b.deliver.assert_called_once()
         self.assertEqual(len(vm.acks), 1)
 
+    def test_busy_agent_keeps_its_wire_version_until_upgrade(self):
+        import types
+        s = object.__new__(scheduler.Scheduler)
+        s.agent_version = 'next-agent'
+        vm = types.SimpleNamespace(client=object(), agent='running-agent')
+        self.assertEqual(s._owned_client(vm).version, 'running-agent')
+        vm.agent = ''
+        self.assertEqual(s._owned_client(vm).version, 'next-agent')
+
     def test_service_tracks_handoff_child(self):
         text = controller.unit('scheduler', 'python3 -m supercomputer scheduler serve', '/tmp/tool', {})
         self.assertIn('NotifyAccess=all', text)
