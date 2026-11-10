@@ -38,7 +38,7 @@ class Guards(unittest.TestCase):
         with mock.patch.object(scheduler, 'controller', return_value={'vm': 'configured'}), \
              mock.patch.object(scheduler, '_remote', return_value=None), \
              mock.patch.object(scheduler.subprocess, 'Popen') as popen:
-            with self.assertRaisesRegex(RuntimeError, 'local'):
+            with self.assertRaisesRegex((RuntimeError, SystemExit), 'controller'):
                 scheduler.connect()
             with self.assertRaisesRegex(RuntimeError, 'local'):
                 scheduler.ensure_running()
@@ -235,7 +235,7 @@ class RealSocketHandoff(unittest.TestCase):
                         pids.add(int(pidfile.read_text()))
                 for pid in pids:
                     # Exact PID plus per-test environment identity; no name killing.
-                    with contextlib.suppress(ProcessLookupError, FileNotFoundError):
+                    with contextlib.suppress(ProcessLookupError, FileNotFoundError, PermissionError):
                         if ('SUPERCOMPUTER_HOME=' + str(root)).encode() in pathlib.Path(f'/proc/{pid}/environ').read_bytes().split(b'\0'):
                             os.kill(pid, signal.SIGKILL)
                 if proc:

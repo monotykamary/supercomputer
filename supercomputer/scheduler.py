@@ -4342,7 +4342,7 @@ _remote_ok: dict = {}
 
 def controller() -> dict | None:
     """The controller on boat (LIVE/controller.json with its URL and token), if one is set up and not turned off."""
-    if os.environ.get("SUPERCOMPUTER_CONTROLLER", "auto") in ("0", ""):  # (off by default: this machine's scheduler owns the pool)
+    if os.environ.get("SUPERCOMPUTER_CONTROLLER", "0") in ("0", ""):  # (off by default: this machine's scheduler owns the pool)
         return None
     with contextlib.suppress(Exception):
         c = json.loads((config.LIVE / "controller.json").read_text())
@@ -4360,7 +4360,7 @@ def connect() -> "Client":
         return r
     if ((controller() or os.environ.get("SUPERCOMPUTER_CONTROLLER") == "1")
             and os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK", "0") in ("0", "")):
-        raise SystemExit("configured controller unavailable; not starting this machine's scheduler beside it")
+        raise SystemExit("the controller on boat doesn't answer: configured controller unavailable; not starting this machine's scheduler beside it")
     return ensure_running()
 
 
@@ -4377,6 +4377,8 @@ def _remote() -> "Client | None":
             cl.keep()
         except Exception as e:
             _remote_ok.pop("ok", None)  # a transient handoff is not a sticky fallback decision
+            if os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK") == "1":
+                return None  # deliberate opt-in, never a consequence of an update
             raise RuntimeError(f"configured controller unavailable; no local fallback ({str(e)[:120]})") from e
     return _remote_ok["ok"]
 
@@ -4403,7 +4405,8 @@ def current() -> "Client | None":
 
 def ensure_running() -> Client:
     """The scheduler, started (detached, its log in LIVE/scheduler/log) if no client started it yet."""
-    if controller() or os.environ.get("SUPERCOMPUTER_CONTROLLER") == "1":
+    if ((controller() or os.environ.get("SUPERCOMPUTER_CONTROLLER") == "1")
+            and os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK") != "1"):
         remote = _remote()
         if remote is None:
             raise RuntimeError("configured controller unavailable; refusing local scheduler startup")
