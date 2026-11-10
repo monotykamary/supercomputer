@@ -1297,7 +1297,10 @@ def _legacy_start(d: pathlib.Path, spec: dict):
 
 def start(d: pathlib.Path, spec: dict):
     if spec.get("strict_once") is not True:
-        return _legacy_start(d, spec)
+        with _rpc_gate_lock, _ownership_lock():
+            if (ROOT / "owned-upgrading").exists():
+                raise ValueError("admission fenced for agent replacement")
+            return _legacy_start(d, spec)
     _item_ids(d.name, spec["name"])
     strict = True
     identity = _launch_nonce(spec["launch_identity"]) if strict else secrets.token_hex(16)
@@ -1817,6 +1820,23 @@ def strict_unresolved():
         return True
 
 
+def upgrade_busy():
+    """Unfinished legacy jobs and unresolved strict ownership both defer updates.
+
+    Called under the ownership lock shared with start(), including bootstrap
+    from another interpreter. Missing/malformed completion is not proof of idle.
+    """
+    if strict_unresolved():
+        return True
+    try:
+        for job in (ROOT / "b").glob("*/jobs/*"):
+            if job.is_dir() and not (job / "done.json").exists() and not (job / "acked.json").exists():
+                return True
+        return False
+    except OSError:
+        return True
+
+
 def owned_cacheput(name, key, data):
     import tempfile
     with tempfile.NamedTemporaryFile(dir=ROOT, suffix=".tar.gz", delete=False) as f:
@@ -1997,12 +2017,13 @@ def daemon(port: str):
                     return self._send(200, out)
                 if cmd == "owned_rpc":
                     return self._send(200, owned_rpc(a[0]))
-                if cmd == "upgrade":  # no source write or replacement while strict ownership is unresolved
+                if cmd == "upgrade":  # idle is decided atomically against ALL starts
+                    data = base64.b64decode(a[0], validate=True)
+                    compile(data, "agent.py.new", "exec")
                     with _rpc_gate_lock, _ownership_lock():
-                        if strict_unresolved():
+                        if upgrade_busy():
                             return self._send(200, {"ok": False, "error": "owned_upgrade_blocked"})
                         (ROOT / "owned-upgrading").write_text(VERSION)
-                    data = base64.b64decode(a[0])
                     (ROOT / "agent.py.new").write_bytes(data)
                     os.replace(ROOT / "agent.py.new", ROOT / "agent.py")
                     subprocess.Popen([sys.executable, "-c", "import subprocess,sys,time; time.sleep(0.5); subprocess.run([sys.executable, sys.argv[1], 'start-daemon', sys.argv[2], sys.argv[3]])",
@@ -2055,7 +2076,7 @@ def start_daemon(port: str, token: str) -> dict:
     if what == "keep":
         return {"ok": True, "again": True}
     with _ownership_lock():
-        if strict_unresolved():
+        if upgrade_busy():
             return {"ok": False, "error": "owned_upgrade_blocked"}
         # Published while holding the same lock as strict start: no new launch can race replacement.
         (ROOT / "owned-upgrading").write_text(VERSION)
