@@ -2103,6 +2103,7 @@ def run_one(name: str, code: str) -> dict:
 def on_boat(names: list[str], code: str) -> dict:
     """Every scenario a job of one gate batch on boat, on the pool's image (python3 there).
     SC_SCENARIOS_OUT retains the jobs, raw logs and summary for missing-worker diagnosis and targeted retries.
+    SC_SCENARIOS_CPU reserves CPU per simulation (default 2); raise it on contended hosts, not the watchdog.
     """
     import tempfile
     sc = os.path.expanduser("~/.local/bin/supercomputer")
@@ -2112,7 +2113,7 @@ def on_boat(names: list[str], code: str) -> dict:
     keep = keep or legacy_keep
     out.mkdir(parents=True, exist_ok=True)
     try:
-        jobs = [{"name": n, "cmd": f"set -o pipefail; PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3 -P tests/scenarios.py --one {n} --code . | tail -1", "timeout": 900, "cpu": 2}
+        jobs = [{"name": n, "cmd": f"set -o pipefail; PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3 -P tests/scenarios.py --one {n} --code . | tail -1", "timeout": 900, "cpu": max(1, int(os.environ.get("SC_SCENARIOS_CPU", "2")))}
                 for n in names]
         (out / "jobs.json").write_text(json.dumps(jobs))
         img = os.environ.get("SC_LAWS_IMAGE", "")
