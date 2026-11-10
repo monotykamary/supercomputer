@@ -369,6 +369,22 @@ class LeaseClientTests(unittest.TestCase):
                     self.assertIsNone(delay)
                     lost.assert_called_once_with(vm)
 
+    def test_urgent_results_keep_fast_polling_after_queue_drains(self):
+        from types import SimpleNamespace
+        for klass, expected in ((2, 2.0), (3, 10.0)):
+            with self.subTest(klass=klass):
+                s = S.Scheduler.__new__(S.Scheduler)
+                s.stop, s.shed, s._any_queued = Mock(), False, False
+                s.stop.is_set.return_value = False
+                vm = S.VMState('vm', 'image', 'large', 'warm')
+                vm.ready, vm.t_renew = True, 1000.0
+                vm.running = {('b', 'i'): SimpleNamespace(batch=SimpleNamespace(klass=klass))}
+                vm.client = Mock()
+                vm.client.rpc.return_value = {'done': [], 'running': []}
+                with patch.object(S.time, 'monotonic', return_value=1000.0), \
+                     patch.object(s, '_disk'), patch.object(s, '_foreign'):
+                    self.assertEqual(s._tick(vm), expected)
+
     def test_startup_budget_allows_fenced_takeover_past_ten_seconds(self):
         clock = [0.0]
         (self.root / 'scheduler').mkdir()

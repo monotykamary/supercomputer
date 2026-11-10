@@ -3062,7 +3062,9 @@ class Scheduler:
             self._accept_finished(vm, row)
         if r.get("done") or vm.acks:
             return 0.5  # (its acks out soon)
-        return 2.0 if (busy_queue or not vm.running) and not self.shed else 10.0
+        # A drained queue can still have an urgent final result in flight.
+        urgent = any(it.batch.klass <= 2 for it in vm.running.values())
+        return 2.0 if (busy_queue or urgent or not vm.running) and not self.shed else 10.0
 
     def _disk(self, vm: VMState, d: dict):
         """The agent's word on its disk with each tick (an agent before 11-02 says nothing: as fit as before): below
