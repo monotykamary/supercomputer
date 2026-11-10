@@ -195,7 +195,7 @@ class BootstrapTransport(unittest.TestCase):
 
 
 class SchedulerBootstrapWiring(unittest.TestCase):
-    def test_all_four_oversized_callers_route_through_shared_helper(self):
+    def test_bootstraps_share_helper_but_ambiguous_upgrade_never_bootstraps(self):
         tree = ast.parse(Path(scheduler.__file__).read_text())
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Scheduler')
         names = {'_reattach_vm', '_up', '_repair', '_check_agent'}
@@ -205,7 +205,7 @@ class SchedulerBootstrapWiring(unittest.TestCase):
             helpers = [n for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                        and isinstance(n.func.value, ast.Name) and n.func.value.id == 'boat'
                        and n.func.attr == 'bootstrap_agent']
-            self.assertEqual(len(helpers), 1, name)
+            self.assertEqual(len(helpers), 0 if name == "_check_agent" else 1, name)
             self.assertFalse(any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                                  and n.func.attr == 'exec_json' for n in ast.walk(node)), name)
 

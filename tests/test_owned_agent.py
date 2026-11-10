@@ -171,8 +171,9 @@ class CancellationDecisions(OwnedFixture):
             return real([sys.executable, "-c", "pass"], **kwargs)
         with mock.patch.object(A.subprocess, "Popen", side_effect=legacy_child), \
              mock.patch.object(A, "_owned_write", side_effect=AssertionError("legacy fsync")), \
-             mock.patch.object(A, "_ownership_lock", side_effect=AssertionError("legacy flock")):
+             mock.patch.object(A, "_ownership_lock", wraps=A._ownership_lock) as admission_gate:
             A.start(self.d, {"name": self.name})  # deliberately no strict_once or launch_identity
+            admission_gate.assert_called_once()  # upgrades must fence legacy starts too
             self.assertFalse(A._owned_children)
             self.assertFalse((self.root / "owned-items").exists())
             p = A._children[0]

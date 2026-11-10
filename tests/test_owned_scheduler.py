@@ -355,23 +355,24 @@ class OwnedSchedulerTests(unittest.TestCase):
         class BoundACKs(list):
             def append(self, ack):
                 test.assertEqual(ack, expected_ack)
-                test.assertIs(test.vm.running[(test.b.id, original_name)], test.it)
-                test.assertEqual(test.it.fate.state, "placed")
-                test.assertEqual(test.b.rows, [])
+                test.assertNotIn((test.b.id, original_name), test.vm.running)
+                test.assertEqual(test.it.fate.state, "done")
+                test.assertEqual(test.it.state, "done")
+                test.assertEqual(len(test.b.rows), 1)
                 super().append(ack)
         self.vm.acks = BoundACKs()
         def rpc(command, *args, **kwargs):
             self.assertEqual(command, "itemlogs")
             self.assertEqual(args, (self.b.id, original_name))
-            self.assertEqual(self.it.state, "done")
+            self.assertEqual(self.it.state, "finishing")
             self.assertEqual(self.it.fate.state, "done")
             self.assertNotIn((self.b.id, original_name), self.vm.running)
+            self.assertIs(self.vm.finishing[(self.b.id, original_name)], self.it)
             self.assertEqual(self.vm.used(), 0)
             self.assertEqual(self.b.rows, [])
-            self.assertEqual(self.vm.acks, [expected_ack])
-            # Baseline legacy ACK is already queued, bound to the old run.
-            # A scheduling pass can reuse capacity while output is pending;
-            # that ACK must not name or remove the follower placement.
+            self.assertEqual(self.vm.acks, [])
+            # Capacity is reusable while output is pending, but an update must
+            # retain this terminal identity until commit, then ACK the old run.
             with patch.object(S.threading, "Thread"):
                 self.assertTrue(self.s._place(follower, self.vm))
             observed.append(True)
@@ -421,13 +422,14 @@ class OwnedSchedulerTests(unittest.TestCase):
         class ACKs(list):
             def append(self, value):
                 test.assertEqual(value, ack)
-                test.assertIn(key, test.vm.running)
-                test.assertEqual(test.it.fate.state, "placed")
+                test.assertNotIn(key, test.vm.running)
+                test.assertEqual(test.it.fate.state, "done")
+                test.assertEqual(len(test.b.rows), 1)
                 events.append("ack")
                 super().append(value)
         class Running(dict):
             def pop(self, value, default=None):
-                test.assertEqual(test.vm.acks, [ack])
+                test.assertEqual(test.vm.acks, [])
                 test.assertEqual(test.vm.busy_s, 5)
                 test.assertEqual(test.vm.idle_since, 90)
                 test.assertEqual(test.it.fate.state, "placed")
@@ -438,7 +440,7 @@ class OwnedSchedulerTests(unittest.TestCase):
         def fate():
             self.assertNotIn(key, self.vm.running)
             self.assertEqual((self.vm.busy_s, self.vm.idle_since), (15, 110))
-            self.assertEqual(self.it.state, "done")
+            self.assertEqual(self.it.state, "finishing")
             self.assertEqual(self.b.slot_s, 0)
             events.append("fate")
             finished()
@@ -453,14 +455,14 @@ class OwnedSchedulerTests(unittest.TestCase):
             self.assertEqual(args, (self.b.id, self.it.run_name))
             self.assertEqual((self.b.obs_s, self.b.obs_n), (7, 1))
             self.assertEqual(self.b.rows, [])
-            self.assertFalse(self.s.wake.is_set())
+            self.assertTrue(self.s.wake.is_set())
             events.append("logs")
             return {"out": "kept", "err": ""}
         def delivery(row):
             self.assertEqual((self.root / "queue" / f"{self.b.id}.logs" / self.it.run_name / "out").read_text(), "kept")
             self.assertEqual(row["run_name"], key[1])
             self.assertEqual(row["seconds"], 7)
-            self.assertFalse(self.s.wake.is_set())
+            self.assertTrue(self.s.wake.is_set())
             events.append("deliver")
             deliver(row)
         self.s.wake.clear()
@@ -470,7 +472,7 @@ class OwnedSchedulerTests(unittest.TestCase):
              patch.object(self.s, "_learn", side_effect=learning), \
              patch.object(self.b, "deliver", side_effect=delivery):
             self.assertTrue(self.s._accept_finished(self.vm, {"batch": key[0], "name": key[1], "code": 0, "seconds": 7}))
-        self.assertEqual(events, ["ack", "release", "fate", "learn", "logs", "deliver"])
+        self.assertEqual(events, ["release", "fate", "learn", "logs", "deliver", "ack"])
         self.assertTrue(self.s.wake.is_set())
         self.assertEqual(self.s.est_hist[self.s.est_key(self.it)], 7)
         self.assertEqual(self.s.class_obs[self.b.klass], [7])
@@ -489,7 +491,7 @@ class OwnedSchedulerTests(unittest.TestCase):
         def checked_transition():
             self.assertNotIn(key, self.vm.running)
             self.assertEqual((self.vm.busy_s, self.vm.idle_since), (15, 110))
-            self.assertEqual(self.vm.acks, [{"batch": key[0], "name": key[1]}])
+            self.assertEqual(self.vm.acks, [])
             seen.append(transition)
             original()
         with patch.object(S.time, "time", return_value=110), \
@@ -497,6 +499,7 @@ class OwnedSchedulerTests(unittest.TestCase):
              patch.object(self.s, "_unprepare"):
             self.assertTrue(self.s._accept_finished(self.vm, {"batch": key[0], "name": key[1], **ending}))
         self.assertEqual(seen, [transition])
+        self.assertEqual(self.vm.acks, [{"batch": key[0], "name": key[1]}])
         self.assertEqual(self.it.fate.state, "queued")
         self.assertEqual(self.it.state, "queued")
         self.assertEqual(self.b.rows, [])
