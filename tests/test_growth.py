@@ -145,6 +145,19 @@ def test_uniform_gate_does_not_count_fractional_future_slots():
     assert next(iter(s.target.values()))['gate_vms'] == 1, s.target
 
 
+def test_uniform_gate_keeps_one_job_after_fractional_bringup_subtraction():
+    for duration in (300.1, 1000.3, 100.001, 79.99):
+        s = sched()
+        s.bring_up = 123.45
+        now = S.time.time()
+        b = batch(s, klass=2, n=4)
+        b.t0 = now - S.GATE_HORIZON + 10
+        for it in b.items.values():
+            it.est = duration
+        plan = s._plan(now)
+        assert plan and next(iter(s.target.values()))['gate_vms'] >= 1, (duration, s.target)
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

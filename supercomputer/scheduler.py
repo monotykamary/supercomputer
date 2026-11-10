@@ -2496,7 +2496,7 @@ class Scheduler:
                 hw = sum(sz(it) for it in hi)
                 durations = {sz(it) for it in hi} if all(not it.timing and it.weight == 1 for it in hi) else set()
                 whole = next(iter(durations)) if len(durations) == 1 else 0.0
-                new_window = max(60.0, H - bu)
+                new_window = max(60.0, item_s, H - bu)  # preserve one full job despite float cancellation
                 new_capacity = S * (math.floor(new_window / whole) * whole if whole else new_window)
                 # the held VMs' slot-time within H a gate can have: free slots and lower classes' at once, the rest
                 # as their items (interactive, gate, submission) end; VMs still coming up, after their bring-up
@@ -2527,7 +2527,7 @@ class Scheduler:
                             for x in running)
                         cap_hi += fits * whole
                     elif whole:
-                        cap_hi += slots * math.floor(max(0.0, H - bu) / whole) * whole
+                        cap_hi += slots * math.floor(new_window / whole) * whole
                     else:
                         cap_hi += max(0.0, slots * (ready_H if v.ready else max(0.0, H - bu)) - taken)
                 cap_hi += coming * new_capacity
