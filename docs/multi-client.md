@@ -167,7 +167,29 @@ follows its holder. The registry, its lock and `ours()` stay local. The batch-he
   lease protocol gone (`lease` answers 400, or the version changes under it), gives the VM up without stopping it,
   and raises an alert naming the VM. The old client wins every contested VM, with no flip-flop and no kill war;
 - old and new clients are then as unsafe as two old clients today, but only on VMs the old one already had in its
-  registry. Upgrade every machine together (`uv tool install` on each), and the mix lasts minutes.
+  registry. This fallback is containment, not a no-contest rolling-upgrade guarantee.
+
+**Required no-contest rollout: a global quiet barrier, not live rolling activation.** Freeze
+new submissions and automatic launchers on all five machines (sandbox, MacBook Air, mini, anh-1,
+controller). Let existing jobs, result collection, and gates finish without killing work. Then
+stop every old scheduler and long-lived batch process and disable automatic restarts; a package
+upgrade alone does not replace Python code already loaded in memory. An unreachable or sleeping
+machine without a verified quiescence acknowledgement blocks activation.
+
+With all five old runtimes confirmed absent, keep the barrier closed and install the same
+immutable merged revision in this order: sandbox, MacBook Air, mini, anh-1. Update the controller
+from the Air last, between gates, with `controller setup --vms 0`. Verify its running `code`,
+`code_installed`, and `agent_code`, not just the four installed hashes. Only then reopen launches,
+controller first and the four client machines afterward. Confirm per-machine owner IDs differ;
+never copy `live/`, owner keys, or agent-key caches between hosts.
+
+During the mixed-installation window old code may remain on disk but no old runtime executes,
+so it cannot act on a cached legacy VM ID. New VMs appear as `<image>~l` and are invisible to the
+old exact-name adopter. Legacy workers are migrated only after the quiet barrier has eliminated
+their possible old holders. If any host cannot acknowledge the barrier, do not run the rollout
+or activate new workers. `ROLLOUT.sh` requires this acknowledgement and an immutable revision;
+it installs four clients and prints the final controller command but does not itself prove
+quiescence or reopen the barrier.
 
 ### Stage 1 implementation boundaries
 
