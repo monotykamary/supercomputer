@@ -759,17 +759,14 @@ class Scheduler:
                 taken.append(vid)
                 reg[vid] = dict(v)
             missing = [vid for vid in info if vid not in taken]
-        for vid in list(taken):
+        def acquire(vid):
+            # Do not serialize network round trips over a whole warm pool before
+            # opening the scheduler port. Each VM has its own independent fence.
             i, r = info.get(vid, {}), reg[vid]
             cl = boat.agent_client(vid)
             vm = VMState(vid, i.get("image") or r.get("snapshot"), i.get("type") or r.get("type") or boat.VM_TYPE, "warm")
-            if cl is None and not self.recovery_blocked:  # uncertain ownership keeps the lease even without an agent
-                taken.remove(vid)
-                missing.append(vid)
-                with Registry().locked() as d:
-                    if vid in d["vms"] and (d["vms"][vid].get("lease") or {}).get("pid") == me:
-                        d["vms"][vid]["lease"] = None
-                continue
+            if cl is None and not self.recovery_blocked:
+                return cl, vm, False
             hb = self.held_before.get(vid, {})
             vm.lease = i.get("lease") or hb.get("lease") or (boat.read_agent(vid) or {}).get("lease") or {}
             vm.ttl = max(boat.BACKSTOP, int(i.get("ttl") or hb.get("ttl") or 0))
@@ -785,13 +782,25 @@ class Scheduler:
                 valid = cl is not None and self._renew_lease(vm)
             except Exception:
                 valid = False
+            if valid:
+                cl.lease = vm.lease
+                boat.remember_lease(vid, vm.lease)
+                boat.rename_leased_vm(vid, vm.image, vm.lease)
+            return cl, vm, valid
+
+        with concurrent.futures.ThreadPoolExecutor(32) as ex:
+            acquired = dict(zip(taken, ex.map(acquire, taken)))
+        for vid in list(taken):
+            i, hb = info.get(vid, {}), self.held_before.get(vid, {})
+            cl, vm, valid = acquired[vid]
             if not valid:
                 taken.remove(vid)
                 missing.append(vid)
+                if cl is None and not self.recovery_blocked:
+                    with Registry().locked() as d:
+                        if vid in d["vms"] and (d["vms"][vid].get("lease") or {}).get("pid") == me:
+                            d["vms"][vid]["lease"] = None
                 continue
-            cl.lease = vm.lease
-            boat.remember_lease(vid, vm.lease)
-            boat.rename_leased_vm(vid, vm.image, vm.lease)
             cl = SchedulerAgentClient(cl, self, vm)
             vm.client, vm.slots = cl, int(i.get("slots") or vm.slots)
             vm.prepared, vm.trees = set(i.get("prepared", [])), set(i.get("trees", []))

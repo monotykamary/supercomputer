@@ -158,7 +158,9 @@ def test_native_canary_rejects_before_worker_or_release():
              patch.object(S.boat, "agent_client", lambda *a: client), \
              patch.object(S.boat, "lease_vm", return_value=grant) as renew, \
              patch.object(S.boat, "remember_lease") as remember, \
-             patch.object(S.boat, "rename_leased_vm", return_value=True) as rename, patch.object(S.threading, "Thread"):
+             patch.object(S.boat, "rename_leased_vm", return_value=True) as rename, \
+             patch.object(S.concurrent.futures, "ThreadPoolExecutor", lambda *a, **kw: nullcontext(SimpleNamespace(map=lambda f, xs: map(f, xs)))), \
+             patch.object(S.threading, "Thread"):
             s._take_pool()
             assert s.recovery_blocked and s.recovery["missing"] == ["missing"]
             assert reg["vms"]["A"]["lease"]["pid"] == os.getpid()
