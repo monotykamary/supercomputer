@@ -16,13 +16,21 @@ if [ -n "${GIT_INDEX_FILE:-}" ] && [ -z "${CHECK_LAWS_INDEX:-}" ]; then
   exit $rc
 fi
 read -r -a cli <<< "${GDP_WIRED_CLI:-npx -y gdp-wired-cli@0.43.0}"
-out="$(mktemp -d)"
-trap 'rm -rf "$out"' EXIT
+out="${SC_LAWS_OUT:-$(mktemp -d)}"
+mkdir -p "$out"
+if [ -z "${SC_LAWS_OUT:-}" ]; then trap 'rm -rf "$out"' EXIT; fi
 # (every module of supercomputer/rules/, every file of broken variants tests/broken_*.py; each one CLI run, at once,
-# on boat: an interactive batch through the scheduler (the laptop runs only light work: three local CLI runs held its
+# on boat: a gate batch through the scheduler (the laptop runs only light work: three local CLI runs held its
 # load at 100 for 3 minutes a commit, 11-01 07:02); CHECK_LAWS_LOCAL=1 runs them here instead, one at a time, niced)
 good_files=($(ls "$here"/supercomputer/rules/*.py | grep -v "/__init__.py$")) broken_files=("$here"/tests/broken_*.py)
-if [ -z "${CHECK_LAWS_LOCAL:-}" ]; then
+if [ -n "${CHECK_LAWS_RESULTS_ONLY:-}" ]; then
+  [ -n "${SC_LAWS_OUT:-}" ] || { echo "SC_LAWS_OUT required for saved receipts" >&2; exit 1; }
+  for j in "$out"/run/*.log; do
+    [ -f "$j" ] || continue
+    n="$(basename "$j" .log)"
+    sed '/^--- stderr ---$/,$d' "$j" > "$out/$n.json"
+  done
+elif [ -z "${CHECK_LAWS_LOCAL:-}" ]; then
   py="${SC_PYTHON:-python3}"
   "$py" -I - "$here" "$out" "${cli[*]}" "${good_files[@]}" -- "${broken_files[@]}" <<'PY'
 import json, pathlib, sys
@@ -38,17 +46,19 @@ for kind, files, ms in (("good", args[:k], ""), ("broken", args[k + 1:], " --ms 
 PY
   img="${SC_LAWS_IMAGE:-$("$HOME/.local/bin/supercomputer" scheduler status 2>/dev/null | "$py" -I -c 'import json,sys; t=sys.stdin.read(); s=json.loads(t[t.index("{"):]); print(next((v["image"] for v in s.get("vms", [])), ""))' 2>/dev/null)}"
   (cd "$here" && SUPERCOMPUTER_CONFIG="$here/tests/laws.toml" SUPERCOMPUTER_IMAGE="$img" \
-     "$HOME/.local/bin/supercomputer" run --jobs "$out/jobs.json" --out "$out/run" --class interactive --backend boat >&2) || true
+     "$HOME/.local/bin/supercomputer" run --jobs "$out/jobs.json" --out "$out/run" --class gate --backend boat >&2) || true
   for j in "$out"/run/*.log; do
     [ -f "$j" ] || continue
     n="$(basename "$j" .log)"
     sed '/^--- stderr ---$/,$d' "$j" > "$out/$n.json"
   done
 else
-  for f in "${good_files[@]}"; do nice -n 19 "${cli[@]}" check "$f" --root "$here" --no-propose --json > "$out/good.$(basename "$f").json"; done
-  for f in "${broken_files[@]}"; do nice -n 19 "${cli[@]}" check "$f" --root "$here" --no-propose --ms 90000 --json > "$out/broken.$(basename "$f").json"; done
+  # JSON verdicts below are authoritative: a CLI may exit 1 for an expected
+  # broken law too. Still collect every module; refusals/missing JSON fail below.
+  for f in "${good_files[@]}"; do nice -n 19 "${cli[@]}" check "$f" --root "$here" --no-propose --json > "$out/good.$(basename "$f").json" || true; done
+  for f in "${broken_files[@]}"; do nice -n 19 "${cli[@]}" check "$f" --root "$here" --no-propose --ms 90000 --json > "$out/broken.$(basename "$f").json" || true; done
 fi
-python3 -I - "$out" <<'PY'
+python3 -I - "$out" "${good_files[@]}" -- "${broken_files[@]}" <<'PY'
 import glob, json, os, sys
 def rules(f):
     try:
@@ -57,6 +67,13 @@ def rules(f):
         return [{"entry": os.path.basename(f), "ok": False, "refusals": [f"no output: {e}"], "laws": []}]
     return d if isinstance(d, list) else d.get("rules", [])
 bad = []
+expected = sys.argv[2:]
+cut = expected.index("--")
+for kind, files in (("good", expected[:cut]), ("broken", expected[cut + 1:])):
+    for f in files:
+        receipt = os.path.join(sys.argv[1], f"{kind}.{os.path.basename(f)}.json")
+        if not os.path.exists(receipt) or not rules(receipt):
+            bad.append(f"missing or empty receipt: {kind}.{os.path.basename(f)}")
 good = [r for f in sorted(glob.glob(os.path.join(sys.argv[1], "good.*.json"))) for r in rules(f)]
 broken = [r for f in sorted(glob.glob(os.path.join(sys.argv[1], "broken.*.json"))) for r in rules(f)]
 for want, rs in (("proven", good), ("broken", broken)):

@@ -43,14 +43,61 @@ blocks, not money thresholds; prepaid balance information includes both plan hou
 failed an item 3 times (a VM lost, its row missing, its preparation failed, no VM ready within the batch's max wait),
 retried on another VM each time; a batch run with `--backend modal` stays on Modal.
 
-**Growth is demand-driven,** evaluated on every queue change (`_plan`), never on a timer:
-- deficit = queued slot-time of every class but filler (a submission client's counted up to its share) minus what the
-  held and coming VMs clear within HORIZON [1 h], their running real work deducted; a deficit > 0 starts its VMs;
-- gates (and interactive checks) are exempt from that horizon and sized to their own, GATE_HORIZON [15 min]: the VMs
-  that finish what's queued of them within it, from their items' expected times (the last run's), after the slots
-  free now or held by fillers and sweeps; three bars at once start a VM or two, not one per item;
+**Growth is earned by marginal work,** evaluated on every queue change (`_plan`), never on a timer.
+For each VM type, let `S` be its slots and `R` its VM-hour price. The economic break-even is
+
+```
+hold_dollars = hold_s * vm_hour_dollars / 3600
+R = vm_hour_dollars * (type_vcpus / default_vcpus)
+B = 3600 * max(hold_dollars, start_dollars) / R
+```
+
+Holding an idle default VM for `hold_s` defines the policy's existing opportunity-cost baseline, in the same
+**default-VM dollars** as the digest. A start must earn at least that cost, or its replacement price when higher.
+Convert money back to busy time using the new VM's rate: a large VM provides twice the default capacity per second,
+so do not impose the default VM's wall time on it again. The actual release hold remains 45 minutes for every type;
+only growth's cost comparison is normalized.
+
+`start_dollars` defaults to $0.03, the first paid-start bracket (`boat limits` on 2026-11-10 reports $0.03, $0.05 and
+$0.07 brackets). `vm_hour_dollars` defaults to $0.036 per default-VM hour, as in that response and the billing digest.
+These are opportunity prices, including for free starts and prepaid hours: both consume shared allowances. Set the
+price input when the marginal tariff changes, not to tune a queue timeout. With a 2,700-second hold the baseline is
+$0.027, so break-even at the first bracket is 1,500 seconds for a large VM and 3,000 for a default VM. At $0.07 it
+becomes 3,500 / 7,000 seconds respectively. No boat API is called in the planning loop.
+
+- `W` is queued real slot-time (all classes except filler, each contended submission client counted only up to its
+  remaining share). `C` is held and coming usable capacity over `B`, minus running real work within `B`.
+- Ordinary growth is `floor(max(0, W - C) / (S * B))`, not a ceiling: each additional VM has a **whole break-even
+  workload left after the held/coming pool and earlier starts have been credited**. A partial VM does not buy a
+  start. In particular, when the held pool clears the queue within break-even, ordinary growth is zero.
+- Gates (and interactive checks) have a separate deadline, `GATE_HORIZON` [15 min]: add the minimum VMs whose
+  capacity covers the gate deficit before `batch.t0 + GATE_HORIZON`, after bring-up, using a **ceiling**. The
+  remaining deadline shrinks on each replan; it is never reset to another 15 minutes. Held free slots and
+  slots reclaimable from filler/sweeps count first; running higher work, foreign runs and coming VMs' bring-up are
+  deducted. The target is the maximum of economic growth and gate growth, not their sum. As before, this is an
+  estimate-based fluid capacity promise. An indivisible item needs at least its own runtime plus bring-up, so
+  `gate_window` retains that feasible tail if the deadline is too close or already missed; it does not promise an
+  impossible completion. Indivisible jobs may straddle the horizon, and the bring-up cap/breaker can delay capacity.
+
+**Why the counts have those roundings.** Write `Q = S * B > 0` and `D = max(0, W - C)`. For economic growth,
+`k = floor(D / Q)` implies `k * Q <= D < (k + 1) * Q`: every one of the `k` starts is backed by a full workload,
+and the next is not. In particular `W <= C` gives zero. For a gate, use its available per-new-VM slot-time `Q > 0`
+and `n = ceil(D / Q)`: `C + n * Q >= W`, while one fewer VM cannot cover a positive deficit. `Pool.grow` admits
+that request whenever the breaker is closed and it fits the remaining bring-up/max-VM room. The admission
+predicates and cap implication are machine checked; the measured-value division boundary is separately tested.
+The no-needless-start law is for **economic** starts. A gate whose work the held pool clears in 40 minutes still
+needs deadline capacity for 15 minutes. Applying the economic veto to it would contradict the deadline law.
+The existing exceptions also remain: an empty/failed pool needs a service VM, and an unserved exclusive batch a
+matching lane. Classes, floors, the breaker and the bring-up cap are unchanged. `horizon_s` is retired as a policy
+knob: legacy saved values are ignored and cannot be set. Status reports the economic inputs and each target's
+`break_even_s`. Only the explicit `SUPERCOMPUTER_HORIZON` environment override remains, for controlled comparisons
+and forensic replay of old policies (two historical placement scenarios used 900 seconds). It is unset by default,
+is never inferred from a saved policy, and disables the economic guarantee by substituting the requested window;
+it is not a way to tune production growth. The new gate and steady-submission scenarios exercise economics, not
+that override.
 - an interactive check alone starts one VM, and none while any VM of its image is held;
-- each new VM must have at least 3x its bring-up time (measured, ~10-120 s) of queued work;
+- the existing 3x bring-up usefulness guard (measured, ~10-120 s) still applies to ordinary growth; it cannot veto
+  capacity required by a gate deadline or an exclusive service lane;
 - bounded by BRINGUP [10] VMs coming up at once (the scheduler's own load guard; the rest queue) and boat's
   per-minute limit and pacing (StartGate). No VM ceiling by default (`max_vms` in the policy sets one if
   needed, and the digest counts when it binds), and no VM-hour or dollar budget: the starts above are the economy.
@@ -100,7 +147,7 @@ and the breaker survive too.
 **Durable and upgrade-safe.**
 - One policy: `live/policy.json`, with a generation (`supercomputer policy` shows it, `supercomputer policy k=v ...`
   sets knobs: floor, floor_default, floor_idle_s, floor_by_image (`floor_by_image=img=0,img2=1`), max_vms (unset: no
-  limit), hold_s, gate_horizon_s, horizon_s, idle_s, ttl_s, bringup, sub_vms, sub_preempt_s, boat_tries). The scheduler reads it every tick: VMs already up and items already running follow a
+  limit), hold_s, gate_horizon_s, start_dollars, vm_hour_dollars, idle_s, ttl_s, bringup, sub_vms, sub_preempt_s, boat_tries). The scheduler reads it every tick: VMs already up and items already running follow a
   change within a tick, no restart (`status` shows any VM or item on an older generation).
 - One scheduler, the newest: a lock per pool; a scheduler that finds a new code hash installed (stable 60 s, and
   importing) hands off atomically: it stops, writes what it holds (`live/scheduler/handoff.json`), gives the port and
@@ -149,6 +196,19 @@ never released", "no start while the breaker is open (but one probe)", ...). A p
 
     tests/check_laws.sh        # every law proven and checked from every state the laws allow (gdp-wired), every broken variant refuted with a run
     python3 tests/test_wiring.py   # scheduler.py's decisions through the rules, today's incidents replayed (no boat call); test_boat_wiring, test_ops_wiring, test_integrity_wiring likewise
+
+Growth admission is in `rules/growth.py`: a start needs a full marginal VM workload, no economic start when
+held/coming capacity clears the queue, and a gate capacity deficit requests a start. `tests/broken_growth.py`
+keeps both fixed-horizon mistakes (900 seconds starts needlessly; 3,600 seconds withholds a deadline start).
+The existing `Pool.grow` laws enforce the bring-up cap and breaker independently: a gate's requested starts are
+admitted when there is room and the breaker allows them. Arithmetic over measured prices and variable division
+is outside these linear admission proofs; `tests/test_growth.py` checks the floor/ceiling boundaries and actual
+scheduler wiring. `gate_68_slot_hours` and `steady_small_submissions` replay full scheduler/client runs. The former also requires
+every newly created VM to deliver real gate work; it does not use a no-cap VM-count bound against staggered starts.
+
+`SC_LAWS_OUT=/path/to/receipts tests/check_laws.sh` keeps every proof/refutation receipt.
+`CHECK_LAWS_RESULTS_ONLY=1 SC_LAWS_OUT=/path/to/receipts tests/check_laws.sh` revalidates saved receipts without
+running any prover. Missing/empty module receipts fail, as do unknown laws or refutations without a run.
 
 `check_laws.sh` uses `npx gdp-wired-cli` (a release after 0.42.0: sets, Literal aliases, laws over ignored arguments, from any state, laws of eventually),
 or `GDP_WIRED_CLI="bun <gdp-wired>/core/cli.ts"`. A law that no longer holds comes back broken with the run that breaks

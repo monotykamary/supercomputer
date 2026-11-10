@@ -11,7 +11,7 @@ submits its items and gets its rows back; the scheduler decides which VM runs wh
 
 Round-robin across clients within a class. Capacity comes from a warm slot, then a lower class's slot, then a free
 start, then a paid one (Modal only on boat's errors, a missing image or the cap). Growth is demand-driven (_plan): the
-queued slot-time against what the held pool clears within HORIZON, gates against GATE_HORIZON, each new VM with 3x its
+queued slot-time against what the held pool clears within break-even, gates against GATE_HORIZON, each new VM with 3x its
 bring-up of work, at most BRINGUP_MAX coming up at once and MAX_VMS (a technical ceiling). No money caps: "no limits,
 but be smart with our money" (the user, 10-31). The pool shrinks damped: VMs
 above the floor (the treadmill's hint) run filler for HOLD s after their last real work, then go (stopped 60 s later).
@@ -128,11 +128,16 @@ def _env(k: str, d):
 
 # The policy's knobs (README, "Scheduling policy"); $SUPERCOMPUTER_<KNOB> overrides each.
 BRINGUP_MAX = _env("BRINGUP", 10)  # VMs being brought up at once (the scheduler's own load guard); the rest wait their turn
-HORIZON = _env("HORIZON", 3600.0)  # work the warm pool clears within this needs no start
 GATE_HORIZON = _env("GATE_HORIZON", 900.0)  # a gate gets the VMs that finish it within this (its items' last times)
 MAX_VMS = int(os.environ.get("SUPERCOMPUTER_MAX_VMS") or 0) or 10 ** 9  # none by default (the user: "no limit"); set, a technical ceiling
-HOLD = _env("HOLD", 2700.0)  # a VM above the floor runs filler this long after its last real work, then goes (45 min: a paid start's
-# break-even for a large VM is about 42-58 min, and a start is never free: the allowance is shared with other projects)
+HOLD = _env("HOLD", 2700.0)  # above-floor filler hold; its default-VM cost also values the shared start allowance
+# Opportunity prices, not spend limits: free starts consume a shared allowance.
+START_DOLLARS = _env("START_DOLLARS", 0.03)  # first paid-start bracket (higher brackets: $0.05, $0.07)
+VM_HOUR_DOLLARS = _env("VM_HOUR_DOLLARS", 0.036)  # per default-VM hour, like the digest
+# Explicit legacy replay only, never a policy knob or an automatic live-policy fallback.
+BREAK_EVEN_OVERRIDE_S = _env("HORIZON", 0.0)
+if not math.isfinite(BREAK_EVEN_OVERRIDE_S) or BREAK_EVEN_OVERRIDE_S < 0:
+    raise ValueError("SUPERCOMPUTER_HORIZON must be a finite positive replay override, or 0 to disable")
 SUB_VMS = _env("SUB_VMS", 8)  # a submission client's VMs' worth of slots at once
 BOAT_TRIES = _env("BOAT_TRIES", 3)  # boat failures (a VM lost, a row missing, no VM ready) before an item goes to Modal
 DRAIN_STEP = _env("DRAIN_STEP", 0.25)  # past their hold, the VMs above the floor shed by at most this share (rounded up) a window
@@ -159,7 +164,7 @@ POLICY = config.LIVE / "policy.json"
 
 
 def policy_defaults() -> dict:
-    return {"floor": _env("FLOOR", 8), "max_vms": 0 if MAX_VMS >= 10 ** 9 else MAX_VMS, "hold_s": HOLD, "gate_horizon_s": GATE_HORIZON, "horizon_s": HORIZON, "idle_s": boat.IDLE,
+    return {"floor": _env("FLOOR", 8), "max_vms": 0 if MAX_VMS >= 10 ** 9 else MAX_VMS, "hold_s": HOLD, "gate_horizon_s": GATE_HORIZON, "start_dollars": START_DOLLARS, "vm_hour_dollars": VM_HOUR_DOLLARS, "idle_s": boat.IDLE,
             "ttl_s": boat.BACKSTOP, "bringup": BRINGUP_MAX, "sub_vms": SUB_VMS, "sub_preempt_s": SUB_PREEMPT, "boat_tries": BOAT_TRIES, "classes": list(CLASSES),
             "drain_step": DRAIN_STEP, "drain_every_s": DRAIN_EVERY, "floor_always": bool(FLOOR_ALWAYS),
             "floor_default": FLOOR_DEFAULT, "floor_idle_s": FLOOR_IDLE, "floor_by_image": dict(FLOOR_BY_IMAGE),
@@ -169,6 +174,7 @@ def policy_defaults() -> dict:
 def read_policy() -> dict:
     with contextlib.suppress(Exception):
         p = json.loads(POLICY.read_text())
+        p.pop("horizon_s", None)  # retired: old policy files do not restore a growth time knob
         return {**policy_defaults(), **p}
     return {**policy_defaults(), "generation": 0}
 
@@ -187,6 +193,7 @@ def write_policy(changes: dict) -> dict:
             p[k] = {str(a): int(b) for a, b in v.items()}
             continue
         p[k] = (str(v).lower() in ("1", "true", "yes")) if isinstance(d, bool) else type(d)(v) if not isinstance(d, list) else v
+    rules.break_even_s(float(p["hold_s"]), float(p["start_dollars"]), float(p["vm_hour_dollars"]))
     if p["blob_cache_bytes"] < 0 or p["blob_cache_grace_s"] < 60 or p["blob_cache_max_age_s"] < p["blob_cache_grace_s"]:
         raise SystemExit("blob cache requires bytes >= 0, grace >= 60s, and max age >= grace")
     p["generation"] = pol.generation
@@ -199,9 +206,10 @@ def write_policy(changes: dict) -> dict:
 
 
 def apply_policy(p: dict):
-    global MAX_VMS, HOLD, GATE_HORIZON, HORIZON, BRINGUP_MAX, SUB_VMS, SUB_PREEMPT, BOAT_TRIES, DRAIN_STEP, DRAIN_EVERY, FLOOR_ALWAYS, FLOOR_DEFAULT, FLOOR_IDLE, FLOOR_BY_IMAGE
+    global MAX_VMS, HOLD, GATE_HORIZON, START_DOLLARS, VM_HOUR_DOLLARS, BRINGUP_MAX, SUB_VMS, SUB_PREEMPT, BOAT_TRIES, DRAIN_STEP, DRAIN_EVERY, FLOOR_ALWAYS, FLOOR_DEFAULT, FLOOR_IDLE, FLOOR_BY_IMAGE
     MAX_VMS = rules.max_vms_of(int(p.get("max_vms") or 0))  # (0 or unset: no limit)
-    HOLD, GATE_HORIZON, HORIZON = float(p["hold_s"]), float(p["gate_horizon_s"]), float(p["horizon_s"])
+    HOLD, GATE_HORIZON = float(p["hold_s"]), float(p["gate_horizon_s"])
+    START_DOLLARS, VM_HOUR_DOLLARS = float(p.get("start_dollars", START_DOLLARS)), float(p.get("vm_hour_dollars", VM_HOUR_DOLLARS))
     BRINGUP_MAX, SUB_VMS, SUB_PREEMPT, BOAT_TRIES = int(p["bringup"]), int(p["sub_vms"]), float(p["sub_preempt_s"]), int(p["boat_tries"])
     boat.IDLE, boat.LONG, boat.BACKSTOP = int(p["idle_s"]), int(p["idle_s"]), int(p["ttl_s"])
     DRAIN_STEP, DRAIN_EVERY = min(1.0, max(0.01, float(p.get("drain_step", 0.25)))), max(1.0, float(p.get("drain_every_s", 300.0)))
@@ -1466,7 +1474,7 @@ class Scheduler:
                     "shed": self.shed, "load": self.load, "bring_up_s": round(self.bring_up, 1), "alerts": self.alerts[-5:],
                     "policy": self.pol, "code": self.code, "code_installed": code_hash(), "agent_code": self.agent_version, "stale": self.stale(),
                     "agents": {v.id: v.agent for v in live},
-                    "knobs": {"bringup": BRINGUP_MAX, "horizon_s": HORIZON, "gate_horizon_s": GATE_HORIZON, "hold_s": HOLD, "sub_vms": SUB_VMS, "max_vms": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": self.pol["floor"]},
+                    "knobs": {"bringup": BRINGUP_MAX, "break_even_override_s": BREAK_EVEN_OVERRIDE_S or None, "start_dollars": START_DOLLARS, "vm_hour_dollars": VM_HOUR_DOLLARS, "gate_horizon_s": GATE_HORIZON, "hold_s": HOLD, "sub_vms": SUB_VMS, "max_vms": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": self.pol["floor"]},
                     # (the old keys, for older clients)
                     "starts_by_class": {n: self.m["starts"][n]["free"] + self.m["starts"][n]["paid"] for n in CLASSES}, "preempted": sum(self.m["preempted"].values()),
                     "hints": {k: {kk: vv for kk, vv in h.items() if kk != "pid"} for k, h in self.hints.items() if h["until"] > now}}
@@ -2260,7 +2268,8 @@ class Scheduler:
     def _plan(self, now: float) -> dict:
         """VMs to start per image, demand-driven (README, "Scheduling policy"):
         - the deficit: queued slot-time (every class but filler; a submission client's capped at SUB_VMS VMs) less
-          what the pool held (and coming) clears within HORIZON, its running real work deducted;
+          what the pool held (and coming) clears within break-even, its running real work deducted;
+          only a whole marginal VM of work earns an economic start;
         - a gate's (and an interactive check's) own need, exempt from that horizon: the VMs that finish what's queued
           of them within GATE_HORIZON, after the slots free now or held by lower classes (fillers, sweeps);
         - an interactive check alone starts at most one VM, and none while any VM of its image is held;
@@ -2283,6 +2292,7 @@ class Scheduler:
         self.target = {}
         for (image, vm_type), its in groups.items():
             S, bu = vm_slots(vm_type), max(30.0, self.bring_up)
+            B = BREAK_EVEN_OVERRIDE_S or rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS, vm_mult(vm_type))
             held = [v for v in live if v.image == image and v.type == vm_type]
             coming = self.creating.get((image, vm_type), 0)
             real = [it for it in its if it.batch.klass <= 4]
@@ -2314,14 +2324,17 @@ class Scheduler:
             for c, w in subs.items():  # (a client's work past its share is demand while its share doesn't bind: the same
                 held_c = sum(x.weight for v in held for x in v.running.values() if x.batch.klass == 3 and x.batch.client == c)
                 binds = contended(first[c]) if contended is not None and c in first else (len(subs) > 1 or any(it.batch.klass <= 2 for it in real))
-                work += rules.sub_demand(w, max(0, SUB_VMS * S - held_c) * HORIZON, binds)  # contention placement reads, rules.contends)
-            busy = sum(x.weight * min(HORIZON, max(0.0, self.est_of(x) - (now - (x.t_start or now)))) for v in held for x in v.running.values() if x.batch.klass <= 4)
-            cap = sum(rules.usable_slots(v.slots, getattr(v, "foreign", 0), False) * HORIZON for v in held) + coming * S * HORIZON - busy
-            n_def = math.ceil((work - cap) / (S * HORIZON)) if work > cap else 0
+                work += rules.sub_demand(w, max(0, SUB_VMS * S - held_c) * B, binds)  # contention placement reads, rules.contends)
+            busy = sum(x.weight * min(B, max(0.0, self.est_of(x) - (now - (x.t_start or now)))) for v in held for x in v.running.values() if x.batch.klass <= 4)
+            cap = max(0.0, sum(rules.usable_slots(v.slots, getattr(v, "foreign", 0), False) * B for v in held) + coming * S * B - busy)
+            n_def = rules.economic_vms(work, cap, S * B)
             hi = [it for it in real if it.batch.klass <= 2]
             n_hi = 0
             if hi:
-                H = GATE_HORIZON
+                # A deadline, not a fresh horizon every tick: bringing up VMs
+                # consumes the gate's time too. Keep a feasible item-sized tail.
+                item_s = max(sz(it) / (S if it.timing else it.weight) for it in hi)
+                H = rules.gate_window(max(0.0, min(GATE_HORIZON, min(it.batch.t0 + GATE_HORIZON - now for it in hi))), bu, item_s)
                 hw = sum(sz(it) for it in hi)
                 # the held VMs' slot-time within H a gate can have: free slots and lower classes' at once, the rest
                 # as their items (interactive, gate, submission) end; VMs still coming up, after their bring-up
@@ -2343,7 +2356,7 @@ class Scheduler:
                                     for x in v.running.values() if x.batch.klass <= 3)
                     cap_hi += max(0.0, slots * (H if v.ready else max(0.0, H - bu)) - taken)
                 cap_hi += coming * S * max(0.0, H - bu)
-                n_hi = math.ceil((hw - cap_hi) / (S * max(60.0, H - bu))) if hw > cap_hi else 0
+                n_hi = rules.gate_vms(hw, cap_hi, S * max(60.0, H - bu))
                 if all(it.batch.klass == 1 for it in hi):  # (a check alone: one VM, and only when none is held)
                     n_hi = 0 if (held or coming) else 1
             want = max(n_def, n_hi)
@@ -2380,9 +2393,9 @@ class Scheduler:
             lane_need = rules.exclusive_lanes(len(unserved), reused, coming + sum(1 for v in held if not v.ready))
             stranded = bool(hi) and cap_hi <= 0 and not coming
             want = max(want, lane_need, int(stranded))
-            useful = max(useful, lane_need)
+            useful = max(useful, lane_need, n_hi)  # deadline capacity is not an economic admission
             if (not held and not coming) or stuck or stranded:  # (work with nowhere to go: one VM, whatever it amounts to)
-                useful = max(useful, 1)
+                want, useful = max(want, 1), max(useful, 1)
             n = min(want, useful)
             # (reuse before create, across types: a VM of the image of another type, empty or running only what this
             # work may take (filler; a gate's, sweeps too), with the slots and the usable memory its items need, is one
@@ -2414,12 +2427,12 @@ class Scheduler:
                                and (not self._held(v, None, now) or v.reserved[0] in tim))  # (set aside for one of them: theirs)
                 # (the starts this work earns: the VMs its other items fill, and one per timing item no free VM takes;
                 # a start past those, with such a VM free, is needless: 08:17, a submission's own starts were counted)
-                earned = math.ceil(sum(sz(it) for it in real if it not in tim) / (S * HORIZON)) + max(0, len(tim) - free_fit) if len(tim) < len(real) else max(0, len(tim) - free_fit)
+                earned = math.ceil(sum(sz(it) for it in real if it not in tim) / (S * B)) + max(0, len(tim) - free_fit) if len(tim) < len(real) else max(0, len(tim) - free_fit)
                 if len(tim) == len(real):
                     n = min(n, earned)
                 if n > earned and free_fit:
                     self._h().record_needless(now, n - earned, image, vm_type)
-            tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "why": ""}
+            tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "break_even_s": B, "growth_source": "legacy override" if BREAK_EVEN_OVERRIDE_S else "economics", "why": ""}
             if n > 0:
                 tgt["why"] = "breaker" if now < pool.open_until else "probe" if pool.half else ""
                 if self.shed:

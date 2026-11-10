@@ -1518,7 +1518,8 @@ def memo_memory(code):
           "three submission clients of 300 items each on 6 VMs with the treadmill's sweeps: their shares don't bind (no one waits under its own), so their work is the plan's demand and the pool grows for it (19:32: 2,400 items, waits p50 25 min, want 0)")
 def subs_past_shares(code):
     from tests.sim.harness import items
-    sim = _sim(code, policy={"sub_vms": 1, "horizon_s": 900})
+    sim = _sim(code, policy={"sub_vms": 1})
+    sim.S.BREAK_EVEN_OVERRIDE_S = 900  # replay this incident's explicit old horizon, not the production default
     _warm(sim, 6)
     sim.treadmill(base_vms=6, filler_n=0, sweep_n=24, sweep_s=600)
     sim.scheduler()
@@ -1675,7 +1676,8 @@ def partial_tree(code):
           "the treadmill's filler on 16 VMs; two submission clients of 2-slot items, then a bar of 2-slot and 1-slot gate items over them: every slot to real work while it waits, the submissions' waits minutes, not hours")
 def starvation_1325(code):
     from tests.sim.harness import items
-    sim = _sim(code, policy={"horizon_s": 900})  # (the live policy's horizon: work past what the pool clears in 15 min starts VMs)
+    sim = _sim(code)
+    sim.S.BREAK_EVEN_OVERRIDE_S = 900  # this incident used an explicit 900-second growth override
     _warm(sim, 16)
     sim.treadmill(base_vms=8, filler_s=900, backlog=True, sweep_n=32, sweep_s=600)
     sim.scheduler()
@@ -1826,6 +1828,52 @@ def closed_legacy_slot(code):
     return sim, {"extra": extra}
 
 
+@scenario("11-10 68 slot-hour gate", ["lost", "clients", "threads"], 1800,
+          "one client queues 68 slot-hours on 28 large VMs: grow for the gate deadline, not the economic window")
+def gate_68_slot_hours(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"floor_default": 28})
+    _warm(sim, 28)
+    sim.scheduler()
+    bid = sim.batch("large-gate", "gate", items("g", 816, 300), after=30)
+
+    def extra(sim, m):
+        c = sim.clients[bid]
+        elapsed = c["t_end"] - c["t_submit"] if c["t_end"] else 1e9
+        made = [e for e in sim.w.events if e["kind"] == "start"]
+        scheds = [s for _, s in sim.w.sched_procs if s is not None]
+        h = getattr(scheds[-1], "health", None) if scheds else None
+        needless = sum(e.get("n", 1) for e in h.ev.get("needless", [])) if h else 0
+        m["gate_elapsed_s"], m["created"], m["needless_recorded"] = elapsed, len(made), needless
+        used = {v for it in sim.w.items.values() for v in it["finished_on"]}
+        unused = [e["vm"] for e in made if e["vm"] not in used]
+        m["unused_starts"] = unused
+        # The bring-up cap staggers arrivals: a no-cap VM-count bound would
+        # falsely call deadline capacity needless. Every start must run work.
+        # Work is indivisible: the last 300-second item can straddle the fluid
+        # horizon. Allow one item, not another hour; all jobs must be delivered.
+        return {"near_gate_horizon": elapsed <= sim.S.GATE_HORIZON + 300,
+                "grew": bool(made), "no_needless_start": needless == 0 and not unused}
+    return sim, {"extra": extra}
+
+
+@scenario("economic growth: steady small submissions", ["lost", "clients", "threads"], 1500,
+          "a held four-VM pool clears repeated small submissions without any start")
+def steady_small_submissions(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"floor_default": 4})
+    _warm(sim, 4)
+    sim.scheduler()
+    for i in range(20):
+        sim.batch("steady", "submission", items(f"s{i}-", 8, 45), after=30 + i * 60)
+
+    def extra(sim, m):
+        made = [e for e in sim.w.events if e["kind"] == "start"]
+        m["created"] = len(made)
+        return {"no_start": not made}
+    return sim, {"extra": extra}
+
+
 # ------------------------------------------------------------------------------------------------ running
 def run_one(name: str, code: str) -> dict:
     from tests.sim import metrics
@@ -1876,13 +1924,16 @@ def run_one(name: str, code: str) -> dict:
 
 
 def on_boat(names: list[str], code: str) -> dict:
-    """Every scenario a job of one interactive batch on boat, on the pool's image (python3 there): the checkout shipped
-    as tests/laws.toml says, each job's last line its result (08:25: 4 scenarios at once here held the laptop's load at 65)."""
+    """Every scenario a job of one gate batch on boat, on the pool's image (python3 there).
+    SC_SCENARIOS_OUT retains the jobs, raw logs and summary for missing-worker diagnosis and targeted retries.
+    """
     import tempfile
     sc = os.path.expanduser("~/.local/bin/supercomputer")
-    out = pathlib.Path(tempfile.mkdtemp(prefix="sc-scen-"))
+    keep = os.environ.get("SC_SCENARIOS_OUT")
+    out = pathlib.Path(keep) if keep else pathlib.Path(tempfile.mkdtemp(prefix="sc-scen-"))
+    out.mkdir(parents=True, exist_ok=True)
     try:
-        jobs = [{"name": n, "cmd": f"PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3 -P tests/scenarios.py --one {n} --code . 2>/dev/null | tail -1", "timeout": 900, "cpu": 2}
+        jobs = [{"name": n, "cmd": f"set -o pipefail; PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3 -P tests/scenarios.py --one {n} --code . | tail -1", "timeout": 900, "cpu": 2}
                 for n in names]
         (out / "jobs.json").write_text(json.dumps(jobs))
         img = os.environ.get("SC_LAWS_IMAGE", "")
@@ -1890,7 +1941,7 @@ def on_boat(names: list[str], code: str) -> dict:
             with contextlib.suppress(Exception):
                 t = subprocess.run([sc, "scheduler", "status"], capture_output=True, text=True, timeout=30).stdout
                 img = next((v["image"] for v in json.loads(t[t.index("{"):]).get("vms", [])), "")
-        subprocess.run([sc, "run", "--jobs", str(out / "jobs.json"), "--out", str(out / "run"), "--class", "interactive", "--backend", "boat"],
+        subprocess.run([sc, "run", "--jobs", str(out / "jobs.json"), "--out", str(out / "run"), "--class", "gate", "--backend", "boat"],
                        cwd=code, env={**os.environ, "SUPERCOMPUTER_CONFIG": str(pathlib.Path(code) / "tests" / "laws.toml"), "SUPERCOMPUTER_IMAGE": img},
                        stdout=sys.stderr, timeout=3600)
         res = {}
@@ -1901,8 +1952,9 @@ def on_boat(names: list[str], code: str) -> dict:
                 res[n] = json.loads(line)
         return res
     finally:
-        import shutil
-        shutil.rmtree(out, ignore_errors=True)
+        if not keep:
+            import shutil
+            shutil.rmtree(out, ignore_errors=True)
 
 
 def main():
@@ -1912,7 +1964,7 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--one", help=argparse.SUPPRESS)
     ap.add_argument("-j", type=int, default=1)  # (here: one at a time, niced; the laptop runs light work)
-    ap.add_argument("--boat", action="store_true", help="each scenario a job of one interactive batch on boat (the gate's way)")
+    ap.add_argument("--boat", action="store_true", help="each scenario a job of one gate batch on boat (SC_SCENARIOS_OUT keeps receipts)")
     a = ap.parse_args()
     if a.one:
         print(json.dumps(run_one(a.one, a.code), default=str))
