@@ -208,9 +208,10 @@ def _run(self, until: float, real_limit: float = 600.0):
             th = self.ready.popleft()
             if th.done:
                 continue
-            if th.proc.laptop and self.now < self.frozen_until and th.proc.alive:
+            frozen = max(self.frozen_until, th.proc.env.get("frozen_until", 0.0))
+            if th.proc.laptop and self.now < frozen and th.proc.alive:
                 th.wait_id += 1
-                heapq.heappush(self.heap, (self.frozen_until, next(self.seq), th, th.wait_id))
+                heapq.heappush(self.heap, (frozen, next(self.seq), th, th.wait_id))
                 continue
             self.cur = th
             self.switches += 1

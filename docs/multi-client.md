@@ -77,7 +77,7 @@ version. Stage 2 picks how it travels.
 **Implementation decisions (2026-11-10).** Stage 1 uses a 180 s lease. Reclaim never kills a previous
 holder's running items: a competing claim freezes new placement by the lapsed holder and waits for the
 VM to drain (or its existing TTL to expire) before granting. Done rows remain readable by their owner.
-This drain rule supersedes kill-on-claim wording in the original sketch below. Mixed rollout uses
+The operational details below use this drain rule; claim never sends a kill. Mixed rollout uses
 `<image>~l`: old adoption sees no exact image-name match; an old client explicitly resuming a VM from
 its own registry wins, and the new client relinquishes it without stopping or fighting its agent.
 
@@ -92,8 +92,10 @@ the daemon is dead.
 
 - `claim(owner)` succeeds when the record is from another boot, released, stopping for longer than `STOP_S` (300 s),
   lapsed, or already held by `owner`. A birth claim of another owner within its window (below) blocks it. On
-  success it raises the epoch and returns (boot, epoch). Items of any previous owner still alive are fenced: killed,
-  or for strict items cancelled through `cancelitem`. Their done rows are kept for that owner.
+  an ownership grant it raises the epoch and returns (boot, epoch); an idempotent claim by the current holder
+  retains its epoch. If previous-owner items are alive, the claim returns busy/draining instead of granting:
+  old-holder placement and renewal stop, but the jobs are not signalled. After they finish, a new claim may
+  grant the VM. Done rows stay with their original owner.
 - `renew`, `release` and `fence_stop` need the current (boot, epoch). Every holder `vtick` renews.
 - Starting an item needs the current (boot, epoch), and no live item of another owner on the VM. So does `kill`,
   `killitem`, `cancelitem`, `upgrade` and `start-daemon`. A stale caller gets `{"stale": true}` and never an error that
@@ -107,7 +109,7 @@ The owner id is one random id per machine (`live/owner`). It isn't a pid, so a h
 machine renews the lease instead of claiming it: no epoch change, no fencing.
 
 **Reaching an agent: a keyring, not one token.** The daemon accepts any token in `~/.sc/keys/` and reads the
-directory again when it changes. A client adds its own key through `boat exec` (`agent.py keys add <owner> <token>`),
+directory on authentication. A client keeps its machine key privately in `live/owner.key` and adds it through `boat exec` (`agent.py keys add <owner> <token>`),
 so the account's own authority is the proof. Nobody ever replaces another client's key, and no secret is shared
 between machines, as SKILL.md's "no shared keys" asks. `start_daemon` keeps a live daemon of the same version whatever
 the token. That ends the flip above. The controller's `handover_warm`, which moves agent tokens between machines
@@ -166,6 +168,29 @@ follows its holder. The registry, its lock and `ours()` stay local. The batch-he
   and raises an alert naming the VM. The old client wins every contested VM, with no flip-flop and no kill war;
 - old and new clients are then as unsafe as two old clients today, but only on VMs the old one already had in its
   registry. Upgrade every machine together (`uv tool install` on each), and the mix lasts minutes.
+
+### Stage 1 implementation boundaries
+
+This branch implements the VM lease protocol, not stages 2 or 3. Agent source installation,
+HTTP mutation and exec mutation use the same VM file lock. Fresh VMs carry a birth file before
+readiness; a verified staged agent claims them before replacing installed source. Per-machine
+owner/key files stay local. The scheduler and `SUPERCOMPUTER_SCHEDULER=0` batch path both use
+the protocol; neither local registry state nor a missing agent response authorizes a stop.
+Maintenance (`reap`, retirement, teardown and disk replacement) fails closed without an accepted
+stop fence. Empty pre-lease workers already in this machine's registry can migrate through the
+staged bootstrap; busy legacy workers are left untouched to finish under the old client/TTL
+instead of stealing or killing their jobs. Drain those legacy workers before coordinated rollout.
+Speculative stopped-disk refresh is disabled rather than resuming and stopping an
+unheld VM. Fence round-trip time, laptop sleep, provider stop, and its delete fallback all count
+against a client-side deadline shorter than the 300 s stopping window; an expired receipt
+never authorizes another provider mutation.
+
+A holder renews while healthy; a missing HTTP route falls back to exec renewal. An adopter that
+cannot reach HTTP may inspect an old record through exec after the grace, but may not steal a
+valid held lease through that path, even when it is lapsed. Snapshot recovery with a new boot
+invalidates the old fence immediately; restoration of the same boot follows the VM-clock lapse
+rule. The account-wide starts ledger, reserve escrow, shared breaker and cross-client preemption
+remain future stages. Nothing in this branch deploys or upgrades the live controller.
 
 ## Stage 2: the ledger, the escrow and the shared bookkeeping
 
@@ -279,7 +304,8 @@ law.
     # gdp: law a claim takes a VM only from nobody, itself, or a holder released or lapsed: not result or old(holder) == "" or old(holder) == by or old(released) or old(lapsed)
     # gdp: law every grant raises the epoch of its boot: not result or boot != old(boot) or epoch > old(epoch)
 
-`claim` by another owner moves `mine` into `foreign` (fenced, being killed). `start` refuses while `foreign > 0`.
+A competing eligible claim with any live inventory marks the VM draining and returns no grant.
+`start` refuses while draining or while `foreign > 0`. No claim kills jobs.
 
 **L2. A stale epoch's item is never accepted.** On `VMLease.start`:
 
@@ -317,6 +343,12 @@ fails, and a failure strikes the item (`waited`, `rules/scheduler.py:130-131`). 
 other clients holding every VM of the image for ever while no start is allowed. Under stage 1 alone, F3 doesn't hold
 across clients, and the law holds per client: other clients' VMs count as absent.
 
+For the direct-session `LocalItem`, the shipped proof is explicitly per granted-lease interval:
+an active interval eventually finishes or yields on lease loss; a fresh take begins another
+interval. Fencing neither charges a failure attempt nor invents a completion. Global eventual
+completion additionally requires eventual stable lease availability. Endless lease revocation
+is excluded rather than hidden by a weakened rank or a retry strike.
+
 **L5. Merges lose nothing and agree.** Rule `Slice` (per client, per key): state `version`, `owner`, `value`; step
 `merge(v2, o2, x2)`:
 
@@ -337,8 +369,9 @@ and for the ledger, per client, `merged_starts`' laws as they stand.
 - **A partition between a client and its VMs** (boat's front down): its leases lapse unless the exec renew gets
   through. Others can't claim them except over HTTP to the same agents. If the front is down for them too, nobody
   claims, and the breaker's outage rule (`rules.outage`) pauses starts as today.
-- **A laptop asleep for hours:** its leases lapse within `lease_s`. VMs with queued work elsewhere are claimed, which
-  fences the laptop's items; the rest stop at their TTL, as they do today without heartbeats. On wake it finds stale
+- **A laptop asleep for hours:** its leases lapse within `lease_s`. A claim for queued work elsewhere puts a busy VM
+  into draining, without signalling the laptop's items. Ownership transfers only after those jobs finish; the rest
+  stop at their TTL, as they do today without heartbeats. On wake it finds stale
   answers or stopped VMs, re-queues with no strike, pulls the shared state before spending above its floor, and finds
   its share reclaimed if it was asleep past `L`.
 - **Clock skew:** no safety decision compares two machines' clocks. Lapses are timed on the VM's own boot clock,
@@ -368,12 +401,11 @@ and for the ledger, per client, `merged_starts`' laws as they stand.
    sleeping laptop's share sits idle.
 3. **Paid starts.** Leave them unbudgeted (the breaker only, as now), or add a shared per-hour paid ceiling as a loop
    guard rather than a budget.
-4. **A lapsed holder's running items.** Fence (kill) them when another client claims the VM, as designed, or let them
-   drain under the TTL first, which keeps a sleeping laptop's work but leaves VMs held longer.
-5. **`lease_s`.** 180 s proposed. Longer keeps a slow or briefly cut-off holder's VMs, shorter frees a sleeping one's
-   sooner.
-6. **Rollout.** Is "upgrade every machine together, an old client wins contested VMs during the mix" acceptable, or
-   should stage 1 wait for a flag on every machine?
+4. **A lapsed holder's running items — decided.** Drain under the existing TTL without signalling them; grant only
+   once empty. This keeps a sleeping laptop's work but leaves VMs held longer.
+5. **`lease_s` — decided.** 180 s on the VM's `CLOCK_BOOTTIME` only.
+6. **Rollout — decided.** Use `~l` names; old clients see no exact-name adoption match. An old client that resumes
+   a VM already in its registry wins the contest; the new client alerts and relinquishes without stopping it.
 7. **The controller.** Keep it as an always-on client (default planner, receiver of reclaimed shares), or retire it now
    that the local fallback is safe.
 8. **Stage 3.** Is cross-machine preemption wanted (a gate here kills filler there)? Is one default floor per image

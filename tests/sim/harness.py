@@ -33,20 +33,29 @@ def items(prefix: str, n: int, s: float | list = 60, est: float | None = None, w
 
 
 class Sim:
-    def __init__(self, code_dir: str, seed: int = 1, cfg: dict | None = None, policy: dict | None = None, live: str | None = None):
+    def __init__(self, code_dir: str, seed: int = 1, cfg: dict | None = None, policy: dict | None = None, live: str | None = None,
+                 shared=None, machine: str = "local"):
         self.tmp = live or tempfile.mkdtemp(prefix="sc-sim-")
-        self.k = K.Kernel(T0, seed)
-        self.code = W.load_code(code_dir, self.tmp)
+        self.machine = machine
+        self.k = shared.k if shared is not None else K.Kernel(T0, seed)
+        package = "supercomputer" if shared is None else "supercomputer_sim_" + machine.replace("-", "_")
+        self.code = W.load_code(code_dir, self.tmp, name=package)
         self.w = W.World(self.k, self.code, self.tmp, seed, cfg)
+        self.w.machine = machine
+        self.peers = shared.peers if shared is not None else []
+        self.peers.append(self)
+        if shared is not None:
+            self.w.share_pool(shared.w)
         self.S, self.B = self.code.sched, self.code.boat
         # (the live policy's values where they differ from the code's defaults: sub_preempt_s 45 since 11-01 17:10)
         policy = {"sub_preempt_s": 45.0, **(policy or {})}
         (pathlib.Path(self.tmp) / "policy.json").write_text(json.dumps({**self.S.policy_defaults(), "generation": 1, **policy}))
         self.samples: list[dict] = []
-        self.clients: dict[str, dict] = {}
+        self.clients: dict[str, dict] = shared.clients if shared is not None else {}
         self.trees: dict[str, dict] = {}
         self.batch_n = 0
-        self.k.start(self.k.world, self.w.tick, name="boat ttl")
+        if shared is None:
+            self.k.start(self.k.world, self.w.tick, name="boat ttl")
         self.k.start(self.k.world, self._sampler, name="sampler")
 
     # -- trees: their blobs in the scheduler's blob store, as a client's push_tree leaves them
@@ -81,14 +90,15 @@ class Sim:
               verify: bool = False) -> str:
         """A client process submitting one batch through boat.Scheduled.run (the real client), then closing it."""
         self.batch_n += 1
-        bid = f"{client}-{self.batch_n}"
+        bid = f"{self.machine}-{client}-{self.batch_n}" if len(self.peers) > 1 else f"{client}-{self.batch_n}"
         rec = {"client": client, "klass": klass, "items": {it["name"]: None for it in its}, "lost": {}, "error": None, "t_submit": None, "t_end": None, "image": image}
         self.clients[bid] = rec
         proc = self.k.spawn_proc(client, laptop=True)
+        proc.env["machine"] = self.machine
         for it in its:
             self.w.items[(bid, it["name"])] = {"klass": klass, "image": image, "submitted": None, "delivered": None, "runs": 0, "running": 0, "boat_vms": set(), "ours": 0,
                                                "finished_on": [], "est": it.get("est"), "s": it.get("sim_s"), "client": client, "timing": bool(it.get("timing")),
-                                               "weight": int(it.get("weight", 1)), "vm_type": it.get("vm_type") or (vm_type if vm_named else None), "memory": it.get("memory")}
+                                               "machine": self.machine, "weight": int(it.get("weight", 1)), "vm_type": it.get("vm_type") or (vm_type if vm_named else None), "memory": it.get("memory")}
         self.w.batches[bid] = rec
         t = self.tree(tree)
 
@@ -155,6 +165,7 @@ class Sim:
         they overlap; closed once every run returned. The record's "rows" by run: what each run's on_done got."""
         rec = {"client": client, "runs": [], "errors": [], "closed": False}
         proc = self.k.spawn_proc(client, laptop=True)
+        proc.env["machine"] = self.machine
         t = self.tree(tree)
         s = object.__new__(self.B.Scheduled)
         s.sched, s.klass = self.S, self.S.klass(klass)
@@ -191,6 +202,7 @@ class Sim:
                   backlog: bool = False):
         """The treadmill: its hint (the floor) every minute, a filler batch (and a sweep's) kept submitted."""
         proc = self.k.spawn_proc("treadmill", laptop=True)
+        proc.env["machine"] = self.machine
         cl = W.SimSchedClient(self.w)
 
         def hints():
@@ -233,6 +245,7 @@ class Sim:
 
     def status_monitor(self, every: float = 30.0):
         proc = self.k.spawn_proc("status", laptop=True)
+        proc.env["machine"] = self.machine
         cl = W.SimSchedClient(self.w)
 
         def mon():
@@ -258,7 +271,7 @@ class Sim:
     def held_by(self) -> dict:
         """Each VM's owner: a live scheduler holding it, a live lease in the registry, or released a moment ago."""
         owners = {}
-        for proc, s in self.w.sched_procs:
+        for proc, s in [entry for peer in self.peers for entry in peer.w.sched_procs]:
             if proc.alive and s is not None:
                 for vid, vm in list(getattr(s, "vms", {}).items()):
                     if not getattr(vm, "dead", False):
@@ -318,5 +331,10 @@ class Sim:
         finally:
             self.k.shutdown()
 
+    def peer(self, code_dir: str, machine: str, **kw):
+        """An independent real scheduler/client install sharing only Boat and the virtual clock."""
+        return Sim(code_dir, shared=self, machine=machine, **kw)
+
     def cleanup(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        for peer in self.peers:
+            shutil.rmtree(peer.tmp, ignore_errors=True)

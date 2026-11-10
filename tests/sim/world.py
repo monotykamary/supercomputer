@@ -143,6 +143,13 @@ class Disk:
         self.batches: dict[str, BDir] = {}
         self.version = ""
         self.token = ""
+        self.keys = {}
+        self.lease = None
+        self.lease_state = "released"
+        self.lease_renewed = 0.0
+        self.stopping_at = 0.0
+        self.stop_nonce = ""
+        self.birth = {}
         self.free_mb, self.total_mb = 100_000, 150_000  # (its disk: an agent since 11-02 reports it with each vtick)
         self.scratch: list = []  # [(mtime, mb)]: a job's leftovers in the home (anvil's state), its agent's to clean
         self.partial_first = False  # (the first tree verified here lacks files: a tree left short, its ready mark kept)
@@ -197,6 +204,12 @@ class World:
         self.th, self.tm = self.sh["threading"], self.sh["time"]
         self.ticker = None
         self.patch(code)
+
+    def share_pool(self, other):
+        """Share the provider, never local registries, agent credentials or scheduler locks."""
+        self.pool = getattr(other, "pool", other)
+        for field in ("vms", "events", "items", "batches", "front_down", "api_down", "client_errors", "log_lines"):
+            setattr(self, field, getattr(self.pool, field))
 
     # -- bookkeeping
     def note(self, kind, **kw):
@@ -285,7 +298,7 @@ class World:
             vs = [v for v in vs if v.state == RUNNING]
         page = int(self.cfg.get("list_page", 10 ** 9))
         vs.sort(key=lambda v: (v.state == RUNNING, v.t_created))
-        return json.dumps({"sandboxes": [{"id": v.id, "name": v.image, "state": v.state, "type": v.type, "snapshotAvailable": True} for v in vs[:page]],
+        return json.dumps({"sandboxes": [{"id": v.id, "name": getattr(v, "pool_name", v.image), "state": v.state, "type": v.type, "snapshotAvailable": True} for v in vs[:page]],
                            "pageInfo": {"hasMore": len(vs) > page, "limit": page, "nextCursor": "c" if len(vs) > page else None}})
 
     def cli_snapshots(self, args):
@@ -304,11 +317,14 @@ class World:
         return json.dumps(self.limits())
 
     def _new_id(self):
+        if hasattr(self, "pool"):
+            return self.pool._new_id()
         self.next_id += 1
         return "bx_" + hashlib.sha256(f"{self.next_id}".encode()).hexdigest()[:8]
 
     def cli_new(self, args):
         image = args[args.index("--from") + 1]
+        name = args[args.index("--name") + 1] if "--name" in args else image
         vm_type = args[args.index("--type") + 1] if "--type" in args else "large"
         n = int(args[args.index("--count") + 1]) if "--count" in args else 1
         ttl = int(args[args.index("--ttl") + 1]) if "--ttl" in args else 900
@@ -319,6 +335,11 @@ class World:
                 lines.append(json.dumps({"event": "error", "error": "rate_limited"}))
                 continue
             v = self.add_vm(image, vm_type, ttl)
+            v.pool_name = name
+            if "--file" in args:
+                target, source = args[args.index("--file") + 1].split("=", 1)
+                if target.endswith("/birth.json"):
+                    v.disk.birth = json.loads(pathlib.Path(source).read_text())
             self.note("start", vm=v.id, image=image, how="created", by=self.k.current_proc().name)
             lines.append(json.dumps({"event": "created", "id": v.id}))
         return "\n".join(lines)
@@ -387,16 +408,24 @@ class World:
         with v.cv:
             v.cv.notify_all()
 
+    def audit_stop(self, v):
+        if hasattr(self.code.agent, "VMLease"):
+            r = Agent(self, v).lease_rule()
+            if self.code.boat.owner_id() != r.holder or self.vms[v.id].disk.lease_state != "stopping":
+                self.note("unsafe_stop", vm=v.id, by=self.code.boat.owner_id(), holder=r.holder)
+
     def cli_stop(self, args):
         v = self.vms.get(args[1])
         if v is None:
             return ("not found",)
+        self.audit_stop(v)
         self.stop(v, "us")
         return json.dumps({"id": v.id, "state": "stopped"})
 
     def cli_delete(self, args):
         v = self.vms.get(args[1])
         if v is not None:
+            self.audit_stop(v)
             self.stop(v, "us")
             v.state = "deleted"
         return "{}"
@@ -410,6 +439,10 @@ class World:
             self.note("release", vm=v.id, image=v.image, by=self.k.current_proc().name)
         v.until = self.k.now + ttl
         return json.dumps({"id": v.id, "until": v.until})
+
+    def cli_rename(self, args):
+        self.vms[args[1]].pool_name = args[2]
+        return "{}"
 
     def cli_host(self, args):
         return json.dumps({"url": f"https://{args[1]}.sim.boat/"})
@@ -431,6 +464,13 @@ class World:
             v.files[argv[-1]] = v.files.get(argv[-1], "") + argv[-2]
             return json.dumps({"exitCode": 0, "stdout": "", "stderr": "", "success": True})
         script = " ".join(argv)
+        if len(argv) >= 4 and argv[0] == "python3" and argv[2] == "lease":
+            payload = json.loads(base64.b64decode(argv[4])) if len(argv) > 4 else {}
+            r = Agent(self, v).c_lease(argv[3], payload)
+            return json.dumps({"exitCode": 0, "stdout": json.dumps(r), "stderr": "", "success": True})
+        if len(argv) >= 6 and argv[0] == "python3" and argv[2:4] == ["keys", "add"]:
+            v.disk.keys[argv[4]] = argv[5]
+            return json.dumps({"exitCode": 0, "stdout": '{"ok":true}', "stderr": "", "success": True})
         if argv[:2] == ['python3', '-c'] and '# sc-agent-bootstrap:' in argv[2]:
             # Transport only: same full digest and agent rules as the real install.
             # Only source-upload file operations are modeled. No verdict,
@@ -455,6 +495,13 @@ class World:
                 r = {}
             elif op == 'commit':
                 digest, size = argv[7:9]
+                granted = {}
+                if len(argv) > 10:
+                    fence, claim = [json.loads(base64.b64decode(x)) for x in argv[9:11]]
+                    ag = Agent(self, v)
+                    granted = ag.c_lease("claim", claim) if claim else ({"ok": True} if ag.lease_rule().accepts(fence.get("owner", ""), fence.get("boot", ""), fence.get("epoch", 0), fence.get("vm_id", "")) else {"stale": True})
+                    if not granted.get("ok"):
+                        return json.dumps({"exitCode": 0, "stdout": json.dumps(granted), "stderr": "", "success": True})
                 b64 = v.files.get(payload, '')
                 data = base64.b64decode(b64, validate=True)
                 if len(data) != int(size) or hashlib.sha256(data).hexdigest() != digest:
@@ -462,7 +509,7 @@ class World:
                 v.files[root + '/agent.py'] = data.decode()
                 v.files.pop(payload, None)
                 v.files.pop(marker, None)
-                r = {}
+                r = granted
             elif op == 'cleanup':
                 v.files.pop(payload, None)
                 v.files.pop(marker, None)
@@ -473,7 +520,12 @@ class World:
         if (len(argv) >= 3 and argv[0] == "python3" and argv[2] == "start-daemon"
                 and argv[1] in v.files):
             b64 = base64.b64encode(v.files[argv[1]].encode()).decode()
-            r = self.start_daemon(v, b64, argv[-1])
+            if len(argv) > 5:
+                fence = json.loads(base64.b64decode(argv[5]))
+                r = Agent(self, v).c_lease("renew", fence)
+                if not r.get("ok"):
+                    return json.dumps({"exitCode": 0, "stdout": json.dumps(r), "stderr": "", "success": True})
+            r = self.start_daemon(v, b64, argv[4])
             return json.dumps({"exitCode": 0, "stdout": json.dumps(r) + "\n", "stderr": "", "success": True})
         if "start-daemon" in script:
             b64 = argv[argv.index("_") + 1] if "_" in argv else ""
@@ -496,6 +548,7 @@ class World:
         ver = hashlib.sha256(base64.b64decode(b64)).hexdigest()[:12] if b64 else v.disk.version
         A = _Rules(self.code.agent)
         alive = v.daemon == "up" or (v.daemon == "hung" and "answers(" not in _src(getattr(self.code.agent, "start_daemon", None)))
+        v.disk.keys.setdefault("legacy", tok)
         what = A.Access().keep_daemon(alive, v.disk.token == tok, v.disk.version == ver)
         if what == "keep":
             return {"ok": True, "again": True}
@@ -510,9 +563,13 @@ class World:
         """A VM up with its agent (a pool already warm). held: the pool as a previous scheduler left it (its lease a
         dead process's, in the hold clocks it saved: the next scheduler takes it back); else free in the registry."""
         v = self.add_vm(image, vm_type, ttl, up_now=True)
+        v.pool_name = image + getattr(self.code.boat, "LEASE_NAME_SUFFIX", "")
         v.disk.token, v.disk.version, v.daemon, v.t_daemon = token, self.code.agent.VERSION, "up", self.k.now
         B = self.code.boat
-        B.write_agent(v.id, {"url": f"https://{v.id}.sim.boat/", "token": token, "t": self.k.now, "version": v.disk.version})
+        info = {"url": f"https://{v.id}.sim.boat/", "token": token, "t": self.k.now, "version": v.disk.version}
+        if hasattr(self.code.agent, "VMLease"):
+            info["lease"] = Agent(self, v).c_lease("claim", {"owner": B.owner_id(), "vm_id": v.id})
+        B.write_agent(v.id, info)
         reg = B.Registry()
         d = reg.read()
         lease = {"pid": 40999, "host": __import__("socket").gethostname(), "batch": "scheduler", "since": self.k.now - 3600, "label": "scheduler (before)"} if held else None
@@ -536,7 +593,9 @@ class World:
         if v.daemon == "hung":
             self.k.sleep(timeout)
             raise TimeoutError("timed out")
-        if cl.token != v.disk.token:
+        if path.split("?")[0] == "/health":
+            return 200, json.dumps(Agent(self, v).c_lease("who", {})).encode(), "application/json"
+        if cl.token != v.disk.token and cl.token not in v.disk.keys.values():
             return 403, b'{"error": "token"}', "application/json"
         code, data = self.agent_dispatch(v, path.split("?")[0], body or b"", timeout)
         if v.state != RUNNING:
@@ -629,7 +688,8 @@ class World:
         """A scheduler process (serve): it waits for the one alive to exit (the lock), then runs."""
         label = label or self.code_installed
         code = code or self.codes.get(label) or self.code
-        proc = self.k.spawn_proc(f"scheduler-{len(self.sched_procs)}", laptop=True)
+        proc = self.k.spawn_proc(f"{getattr(self, 'machine', 'local')}-scheduler-{len(self.sched_procs)}", laptop=True)
+        proc.env["machine"] = getattr(self, "machine", "local")
         proc.env["code"] = label
         entry = [proc, None]
         self.sched_procs.append(entry)
@@ -694,8 +754,10 @@ class World:
         self.note("install", code=code_hash, broken=broken)
 
     def laptop_sleep(self, seconds: float):
-        self.note("sleep", s=seconds)
-        self.k.frozen_until = self.k.now + seconds
+        self.note("sleep", s=seconds, machine=getattr(self, "machine", "local"))
+        for proc in self.k.procs.values():
+            if proc.env.get("machine") == getattr(self, "machine", "local"):
+                proc.env["frozen_until"] = self.k.now + seconds
 
     # -- the world's own clock: TTLs, boat's own stops, the samples
     def tick(self, every: float = 5.0):
@@ -785,7 +847,82 @@ class Agent:
     def __init__(self, w: World, v: VMRec):
         self.w, self.v, self.d, self.A = w, v, v.disk, _Rules(w.code.agent)
 
+    def lease_rule(self):
+        """Hydrate the actual shipped rule from the VM's persistent record and live inventory."""
+        if self.d.lease is None:
+            self.d.lease = self.A.VMLease()
+        rule = self.d.lease
+        live = [p["job"] for p in self.v.procs.values() if p["alive"]]
+        rule.mine = sum(getattr(j, "owner", "") == rule.holder for j in live)
+        rule.foreign = len(live) - rule.mine
+        return rule
+
+    def c_lease(self, op, payload):
+        rule = self.lease_rule()
+        now = self.w.k.now
+        boot = str(self.v.boot)
+        changed = rule.boot != boot or rule.vm_id != self.v.id
+        lapsed = now - self.d.lease_renewed >= 180
+        counts = {}
+        for p in self.v.procs.values():
+            if p["alive"]:
+                owner = getattr(p["job"], "owner", "")
+                counts[owner] = counts.get(owner, 0) + 1
+        view = lambda: {"ok": True, "holder": rule.holder, "owner": rule.holder,
+                        "boot": rule.boot, "epoch": rule.epoch, "vm_id": self.v.id,
+                        "state": self.d.lease_state, "lapsed": lapsed or changed,
+                        "draining": rule.draining, "items": counts, "counts": counts, "protocol": 1,
+                        "valid_boot": not changed, "lease_s": 180, "uptime": now - (self.v.t_up or now)}
+        if op == "who":
+            return view()
+        by = payload.get("owner", "")
+        if op == "claim":
+            birth = self.d.birth
+            if now - (self.v.t_up or now) < 600 and birth and (birth.get("owner") != by or birth.get("nonce") != payload.get("nonce")):
+                return {"ok": False, "busy": True, "birth": True}
+            stopping = self.d.lease_state == "stopping" and now - self.d.stopping_at < 300 and not changed
+            if not rule.claim(by, boot, self.v.id, lapsed, self.d.lease_state == "released" or (self.d.lease_state == "stopping" and not stopping), stopping):
+                self.w.note("claim_refused", vm=self.v.id, by=by, draining=rule.draining)
+                return {"ok": False, "busy": True, "draining": rule.draining}
+            self.d.lease_state, self.d.lease_renewed = "held", now
+            self.d.birth = {}
+            self.w.note("lease_granted", vm=self.v.id, by=by, boot=boot, epoch=rule.epoch)
+            return view()
+        if changed or not rule.accepts(by, payload.get("boot", ""), payload.get("epoch", 0), payload.get("vm_id", "")):
+            return {"stale": True, "ok": False}
+        if op in ("renew", "check", "fence_stop") and self.d.lease_state != "held":
+            return {"stale": True, "ok": False}
+        if op == "check":
+            pass
+        elif op == "renew":
+            self.d.lease_renewed = now
+        elif op == "release":
+            if self.d.lease_state == "stopping" and (not self.d.stop_nonce or payload.get("stop_nonce") != self.d.stop_nonce):
+                return {"stale": True, "ok": False}
+            self.d.lease_state = "released"
+        elif op == "fence_stop":
+            if not rule.fence_stop(by, payload.get("boot", ""), payload.get("epoch", 0), payload.get("vm_id", "")):
+                return {"stale": True, "ok": False}
+            self.d.stop_nonce = f"{self.w.rng.getrandbits(192):048x}"
+            self.d.lease_state, self.d.stopping_at = "stopping", now
+            self.w.note("stop_fenced", vm=self.v.id, by=by)
+            return {**view(), "stop_nonce": self.d.stop_nonce}
+        else:
+            return {"ok": False, "error": "unknown lease op"}
+        return view()
+
     def rpc(self, cmd, a, timeout):
+        a = list(a)
+        self.fence = a.pop()["_lease"] if a and isinstance(a[-1], dict) and "_lease" in a[-1] else {}
+        self.caller = self.fence.get("owner", "")
+        if hasattr(self.A._A, "VMLease") and cmd not in ("lease", "ping"):
+            r = self.lease_rule()
+            writable = cmd not in ("itemlogs", "logs", "have", "cacheout")
+            current = r.boot == str(self.v.boot) and r.vm_id == self.v.id
+            if writable and (not current or self.d.lease_state != "held" or not r.accepts(self.caller, self.fence.get("boot", ""), self.fence.get("epoch", 0), self.fence.get("vm_id", ""))):
+                return {"stale": True}
+            if cmd == "vtick":
+                self.d.lease_renewed = self.w.k.now
         fn = getattr(self, f"c_{cmd}", None)
         if fn is None:
             return {"error": f"no command {cmd}"}
@@ -898,6 +1035,8 @@ class Agent:
         j = bd.jobs.get(name) if bd else None
         has_pid = j is not None and j.pid is not None
         done = j is not None and (j.done is not None or j.acked)
+        if j is not None and getattr(j, "owner", "") != getattr(self, "caller", ""):
+            return {"stale": True}
         if j is not None and self.A.Kill().kills(has_pid, done):
             self.w.k.sleep(0.05)  # (kill_tree: sudo kill)
             p = self.v.procs.get(j.pid)
@@ -984,11 +1123,16 @@ class Agent:
         if name in bd.jobs:  # (a start sent again)
             return
         j = bd.jobs[name] = Job(spec, self.w.k.now, max(1, int(spec.get("cpus", 2))))
+        j.owner = getattr(self, "caller", "")
         pid = len(self.v.procs) + 1 + 1000 * self.v.boot
         while pid in self.v.procs:
             pid += 1
         self.v.procs[pid] = {"job": j, "batch": bid, "name": spec.get("sim_name") or re.sub(r"~s\d+$", "", name), "alive": True}
         j.pid = pid
+        owners = {getattr(p["job"], "owner", "") for p in self.v.procs.values() if p["alive"]}
+        self.w.note("item_started", vm=self.v.id, batch=bid, item=name, owner=j.owner)
+        if len(owners) > 1:
+            self.w.note("mixed_owners", vm=self.v.id, owners=sorted(owners))
         self.w.k.start(self.w.k.world, self.w.run_item, (self.v, bid, name, j, pid), name=f"item {name}")
 
     def report(self, bid, bd: BDir):
@@ -1002,7 +1146,7 @@ class Agent:
                 j.done = {"name": name, "code": -1, "seconds": -1, "lost": True, "err": "its process gone without a word"}
                 j.mtime = self.w.k.now
                 what = "done"
-            if what in ("done", "lost"):
+            if what in ("done", "lost") and getattr(j, "owner", "") == getattr(self, "caller", ""):
                 done.append(j.done)
             elif what in ("running", "torn"):
                 running.append(name)
@@ -1012,7 +1156,7 @@ class Agent:
         for a in msg.get("acks", []):
             bd = self.d.batches.get(a["batch"])
             j = bd.jobs.get(a["name"]) if bd else None
-            if j is not None and self.A.Ticks().ack(j.done is not None):
+            if j is not None and getattr(j, "owner", "") == getattr(self, "caller", "") and self.A.Ticks().ack(j.done is not None):
                 j.acked, j.done = True, None
         for st in msg.get("start", []):
             bd = self.d.batches.get(st["batch"])
@@ -1021,6 +1165,9 @@ class Agent:
                 ready = bd.tid in self.d.trees
             if not self.A.BatchDirs(0).may_start(ready):
                 return {"err": f"batch {st['batch']} isn't prepared here", "batch": st["batch"]}
+            fence = getattr(self, "fence", {})
+            if hasattr(self.A._A, "VMLease") and not self.lease_rule().start(fence.get("owner", ""), fence.get("boot", ""), fence.get("epoch", 0), fence.get("vm_id", "")):
+                return {"stale": True}
             self.start(st["batch"], bd, st["spec"])
         wait, t0 = float(msg.get("wait", 20)), self.w.k.now
         while True:
@@ -1028,7 +1175,7 @@ class Agent:
             for bid, bd in list(self.d.batches.items()):
                 dn, rn = self.report(bid, bd)
                 done += [{**r, "batch": bid} for r in dn]
-                running += [{"batch": bid, "name": n} for n in rn]
+                running += [{"batch": bid, "name": n, "owner": getattr(bd.jobs[n], "owner", "")} for n in rn]
             if self.A.Ticks().stop(bool(done), bool(running), int(self.w.k.now - t0), int(wait)):
                 break
             left = t0 + wait - self.w.k.now
@@ -1111,7 +1258,7 @@ class SimSchedClient:
         w = self.w
         w.k.sleep(0.002)
         ls = w.live_sched()
-        if ls is None or (w.k.now < w.k.frozen_until):
+        if ls is None or (w.k.now < max(w.k.frozen_until, ls[0].env.get("frozen_until", 0.0))):
             raise ConnectionRefusedError(f"[Errno 61] Connection refused ({path})")
         proc, s = ls
         box = {}

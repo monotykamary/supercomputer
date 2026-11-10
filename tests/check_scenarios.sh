@@ -22,12 +22,13 @@ fi
 # As with check_laws.sh, the installed client ships this candidate; it does not
 # run the candidate scheduler against the live pool. A nonzero job is a failure
 # even though `supercomputer run` itself exits successfully after collecting it.
-out="$(mktemp -d)"
-trap 'rm -rf "$out"' EXIT
+out="${SC_CHECK_OUT:-$(mktemp -d)}"
+mkdir -p "$out"
+if [ -z "${SC_CHECK_OUT:-}" ]; then trap 'rm -rf "$out"' EXIT; fi
 printf '%s\n' '[{"name":"unit-tests","cmd":"OWNED_LIFECYCLE_BOAT_TEST=1 CHECK_SCENARIOS_LOCAL=1 CHECK_SCENARIOS_UNITS=1 SC_PYTHON=$(command -v python3) bash tests/check_scenarios.sh","timeout":1800,"cpu":2}]' > "$out/jobs.json"
 img="${SC_LAWS_IMAGE:-$("$HOME/.local/bin/supercomputer" scheduler status 2>/dev/null | "$py" -I -c 'import json,sys; t=sys.stdin.read(); s=json.loads(t[t.index("{"):]); print(next((v["image"] for v in s.get("vms", [])), ""))' 2>/dev/null)}"
-(cd "$here" && SUPERCOMPUTER_CONFIG="$here/tests/laws.toml" SUPERCOMPUTER_IMAGE="$img" \
-  "$HOME/.local/bin/supercomputer" run --jobs "$out/jobs.json" --out "$out/run" --class gate --backend boat)
+(cd "$here" && SUPERCOMPUTER_CONTROLLER=1 SUPERCOMPUTER_CONFIG="$here/tests/laws.toml" SUPERCOMPUTER_IMAGE="$img" \
+  "$HOME/.local/bin/supercomputer" run --jobs "$out/jobs.json" --out "$out/run" --class "${SC_CHECK_CLASS:-submission}" --backend boat)
 "$py" -I - "$out/run" <<'PY'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])

@@ -1242,7 +1242,7 @@ def _truth_waste(sim, every: float = 15.0) -> dict:
             now = sim.k.now
             B = sim.code.boat
             ls = sim.w.live_sched()
-            if ls is None or now < sim.k.frozen_until:  # (no scheduler to place anything: a switch, the laptop asleep; health
+            if ls is None or now < max(sim.k.frozen_until, ls[0].env.get("frozen_until", 0.0)):  # (no scheduler to place anything: a switch, the laptop asleep; health
                 prev.clear()  # measures nothing then either)
                 t_prev[0] = None
                 continue
@@ -1287,7 +1287,8 @@ def _truth_waste(sim, every: float = 15.0) -> dict:
                 used += sum(w for key, w in held_by.get(v.id, {}).items() if key not in alive_runs)
                 caps[v.id] = [v, max(0, slots - used), fil, swp, slots]
             waiters = []
-            for key, it in sim.w.items.items():
+            local_items = {key: it for key, it in sim.w.items.items() if it.get("machine", sim.machine) == sim.machine}
+            for key, it in local_items.items():
                 queued = it["submitted"] is not None and it["delivered"] is None and it["running"] == 0 and sim.w.batches[key[0]]["t_end"] is None
                 if not queued or key in placed:
                     since.pop(key, None)
@@ -1296,7 +1297,7 @@ def _truth_waste(sim, every: float = 15.0) -> dict:
                 if it["klass"] in real and now - since[key] >= grace:
                     waiters.append(it)
             any_real = any(it["klass"] in real and it["submitted"] is not None and it["delivered"] is None and it["running"] == 0
-                           for it in sim.w.items.values())
+                           for it in local_items.values())
             others = lambda c: any(w["klass"] in ("interactive", "gate") or (w["klass"] == "submission" and w["client"] != c and run_by.get(w["client"], 0) < sub_share) for w in waiters)
             cur: dict = {}
             for it in sorted(waiters, key=lambda it: real.index(it["klass"])):
@@ -1949,13 +1950,97 @@ def steady_small_submissions(code):
     return sim, {"extra": extra}
 
 
+# ------------------------------------------------------------------- independent clients sharing a provider
+
+def _shared_leases(code, count=2, sleep=False, restored=False):
+    """Several real Scheduler.run loops; only provider VMs/time are shared, never local state."""
+    from tests.sim.harness import IMAGE, items
+    from tests.sim.world import Agent
+    import copy
+    sim = _sim(code, machine="controller", cfg={"boot_s": (5, 10), "resume_s": (3, 5)})
+    mac = sim.peer(code, "mac", cfg={"boot_s": (5, 10)})
+    peers = [sim, mac]
+    if count == 3:
+        peers.append(sim.peer(code, "local-test", cfg={"boot_s": (5, 10)}))
+    _warm(sim, 2)
+    sim.scheduler(idle_exit=2000)
+    sim.at(5, lambda: sim.batch("long-lived-batch", "submission", items("controller-", 8, 320), collect=True))
+    # The Mac's scheduler does not exist initially: a long-lived batch starts it later.
+    sim.at(75, lambda: mac.batch("spawned-by-batch", "submission", items("mac-", 8, 260), collect=True), name="batch spawns Mac scheduler")
+    if count == 3:
+        local = peers[2]
+        sim.at(100, lambda: local.batch("test-beside-controller", "submission", items("local-", 8, 210), collect=True))
+    if sleep:
+        sim.at(150, lambda: mac.w.laptop_sleep(400), name="Mac sleeps while controller stays awake")
+        sim.at(570, lambda: mac.batch("after-wake", "submission", items("wake-", 4, 60), collect=True))
+    probes = {}
+    if restored:
+        def restore():
+            # A captured disk record, with no live job to destroy, is restored under both
+            # a new boot and a new sandbox id. Exercise the same RPC admission as schedulers.
+            v = sim.w.add_vm(IMAGE, up_now=True)
+            v.pool_name = IMAGE + "~l"
+            v.daemon, v.disk.version = "up", sim.code.agent.VERSION
+            old = Agent(sim.w, v).c_lease("claim", {"owner": sim.B.owner_id(), "vm_id": v.id})
+            fence = {"_lease": old}
+            copied = copy.deepcopy(v.disk)
+            sim.w.stop(v, "boat")
+            sim.w._up(v)
+            v.daemon = "up"
+            probes["reboot_stale"] = Agent(sim.w, v).rpc("vtick", [{"wait": 0}, fence], 1).get("stale") is True
+            renewed = Agent(sim.w, v).c_lease("claim", {"owner": sim.B.owner_id(), "vm_id": v.id})
+            probes["reboot_reclaim"] = renewed.get("ok") and renewed.get("boot") != old.get("boot")
+            fork = sim.w.add_vm(IMAGE, up_now=True)
+            fork.disk, fork.daemon, fork.pool_name = copied, "up", IMAGE + "~l"
+            fork_fence = {"_lease": {**old, "vm_id": fork.id}}  # AgentClient always binds the physical target id.
+            probes["fork_stale"] = Agent(sim.w, fork).rpc("vtick", [{"wait": 0}, fork_fence], 1).get("stale") is True
+            claimed = Agent(sim.w, fork).c_lease("claim", {"owner": mac.B.owner_id(), "vm_id": fork.id})
+            probes["fork_reclaim"] = claimed.get("ok") and claimed.get("vm_id") == fork.id
+        sim.at(700, restore, name="restore snapshot and resume disk")
+    def extra(sim, m):
+        events = sim.w.events
+        schedulers = [s for peer in peers for _, s in peer.w.sched_procs if s is not None]
+        completed = [r for r in sim.clients.values() if r.get("returned")]
+        m["lease_clients"] = {bid: {"error": r["error"], "lost": r["lost"], "done": sum(x is not None for x in r["items"].values())} for bid, r in sim.clients.items()}
+        m["lease_probes"] = probes
+        return {"independent_schedulers": len(schedulers) >= count,
+                "distinct_machine_owners": len({peer.B.owner_id() for peer in peers}) == count,
+                "all_clients_returned": len(completed) == len(sim.clients) and len(completed) >= count,
+                "all_rows_delivered": all(all(row is not None and not row.get("lost") for row in r["items"].values()) and not r["lost"] for r in completed),
+                "no_mixed_owners": not any(e["kind"] == "mixed_owners" for e in events),
+                "no_nonholder_stop": not any(e["kind"] == "unsafe_stop" for e in events),
+                "each_owner_ran_work": len({e.get("owner") for e in events if e["kind"] == "item_started" and e.get("owner")}) >= count,
+                "restored_fences_refused": not restored or len(probes) == 4 and all(probes.values()),
+                "no_thread_errors": not sim.k.errors}
+    return sim, {"extra": extra, "shared_pool": True}
+
+
+@scenario("Stage 1 token war", [], 1500,
+          "a long-lived batch starts a Mac scheduler while the controller's real scheduler holds running work")
+def lease_two_schedulers(code):
+    return _shared_leases(code)
+
+
+@scenario("Stage 1 local fallback", [], 1600,
+          "controller, Mac and test-local real schedulers share one pool without stealing runs, tokens or stops")
+def lease_three_schedulers(code):
+    return _shared_leases(code, count=3)
+
+
+@scenario("Stage 1 sleep and snapshot", [], 1800,
+          "three real schedulers survive one machine asleep, resumed disk and copied snapshot; old fences never start")
+def lease_sleep_restore(code):
+    return _shared_leases(code, count=3, sleep=True, restored=True)
+
+
 # ------------------------------------------------------------------------------------------------ running
 def run_one(name: str, code: str) -> dict:
     from tests.sim import metrics
     sc = S[name]
     t0 = time.time()
     sim, opts = sc["fn"](code)
-    truth = _truth_waste(sim)  # (health's waste against the world's, every scenario: health_waste_agrees)
+    truths = {peer.machine: _truth_waste(peer) for peer in sim.peers}
+    truth = truths[sim.machine]  # Compare each scheduler only with its own placeable demand.
     err = None
     try:
         sim.run(sc["seconds"], real_limit=float(os.environ.get("SIM_REAL_LIMIT", "240")))
@@ -1968,7 +2053,7 @@ def run_one(name: str, code: str) -> dict:
     # (the scheduler's own health checks, where it has them, against the ground truth: no target it calls breached
     # that the run met, nor one it calls met that the run breached)
     ls = [s for p, s in sim.w.sched_procs if s is not None]
-    if ls and hasattr(ls[-1], "health_check"):
+    if ls and hasattr(ls[-1], "health_check") and not opts.get("shared_pool"):
         hs = ls[-1].health_check(sc["seconds"] / 60)
         m["health"] = {k: {"value": x["value"], "ok": x["ok"]} for k, x in hs.get("targets", {}).items()}
         pairs = {"busy": "busy", "churn": "churn", "orphans": "orphans", "modal": "modal", "strikes": "ours", "status": "status"}
@@ -1981,6 +2066,22 @@ def run_one(name: str, code: str) -> dict:
         m["waste_health"], m["waste_truth"], m["waste_truth_examples"] = hw, tw, truth["examples"]
         if "waste" in hs.get("targets", {}):  # (a code with health's waste: it agrees with the world's, to 0.3 of a slot)
             v["health_waste_agrees"] = (hw or 0.0) <= (tw or 0.0) + 0.3 and (tw or 0.0) <= (hw or 0.0) + 0.3
+    if opts.get("shared_pool"):
+        # Stage 1 owners cannot place another client's queue. Compare like scopes.
+        checks = {}
+        for peer in sim.peers:
+            scheds = [s for _, s in peer.w.sched_procs if s is not None]
+            if not scheds:
+                checks[peer.machine] = {"ok": False, "error": "no scheduler"}
+                continue
+            hs = scheds[-1].health_check(sc["seconds"] / 60)
+            hw = hs.get("targets", {}).get("waste", {}).get("value")
+            tr = truths[peer.machine]
+            tw = round(tr["sum"] / tr["n"], 1) if tr["n"] else None
+            checks[peer.machine] = {"health": hw, "truth": tw, "samples": tr["n"], "examples": tr["examples"],
+                                    "ok": abs((hw or 0.0) - (tw or 0.0)) <= 0.3}
+        m["health_waste_by_machine"] = checks
+        v["health_waste_agrees"] = all(c["ok"] for c in checks.values())
     if err:
         v["ran"] = False
     out = {"name": name, "ok": all(v.values()), "verdict": v, "metrics": m, "real_s": round(time.time() - t0, 1), "err": err,
@@ -2005,7 +2106,9 @@ def on_boat(names: list[str], code: str) -> dict:
     import tempfile
     sc = os.path.expanduser("~/.local/bin/supercomputer")
     keep = os.environ.get("SC_SCENARIOS_OUT")
-    out = pathlib.Path(keep) if keep else pathlib.Path(tempfile.mkdtemp(prefix="sc-scen-"))
+    legacy_keep = os.environ.get("SC_CHECK_OUT")
+    out = pathlib.Path(keep) if keep else pathlib.Path(legacy_keep) / "scenarios" if legacy_keep else pathlib.Path(tempfile.mkdtemp(prefix="sc-scen-"))
+    keep = keep or legacy_keep
     out.mkdir(parents=True, exist_ok=True)
     try:
         jobs = [{"name": n, "cmd": f"set -o pipefail; PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python3 -P tests/scenarios.py --one {n} --code . | tail -1", "timeout": 900, "cpu": 2}
@@ -2016,8 +2119,8 @@ def on_boat(names: list[str], code: str) -> dict:
             with contextlib.suppress(Exception):
                 t = subprocess.run([sc, "scheduler", "status"], capture_output=True, text=True, timeout=30).stdout
                 img = next((v["image"] for v in json.loads(t[t.index("{"):]).get("vms", [])), "")
-        subprocess.run([sc, "run", "--jobs", str(out / "jobs.json"), "--out", str(out / "run"), "--class", "gate", "--backend", "boat"],
-                       cwd=code, env={**os.environ, "SUPERCOMPUTER_CONFIG": str(pathlib.Path(code) / "tests" / "laws.toml"), "SUPERCOMPUTER_IMAGE": img},
+        subprocess.run([sc, "run", "--jobs", str(out / "jobs.json"), "--out", str(out / "run"), "--class", os.environ.get("SC_CHECK_CLASS", "gate"), "--backend", "boat"],
+                       cwd=code, env={**os.environ, "SUPERCOMPUTER_CONTROLLER": "1", "SUPERCOMPUTER_CONFIG": str(pathlib.Path(code) / "tests" / "laws.toml"), "SUPERCOMPUTER_IMAGE": img},
                        stdout=sys.stderr, timeout=3600)
         res = {}
         for n in names:

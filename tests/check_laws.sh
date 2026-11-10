@@ -16,9 +16,9 @@ if [ -n "${GIT_INDEX_FILE:-}" ] && [ -z "${CHECK_LAWS_INDEX:-}" ]; then
   exit $rc
 fi
 read -r -a cli <<< "${GDP_WIRED_CLI:-npx -y gdp-wired-cli@0.43.0}"
-out="${SC_LAWS_OUT:-$(mktemp -d)}"
+out="${SC_LAWS_OUT:-${SC_CHECK_OUT:-$(mktemp -d)}}"
 mkdir -p "$out"
-if [ -z "${SC_LAWS_OUT:-}" ]; then trap 'rm -rf "$out"' EXIT; fi
+if [ -z "${SC_LAWS_OUT:-${SC_CHECK_OUT:-}}" ]; then trap 'rm -rf "$out"' EXIT; fi
 # (every module of supercomputer/rules/, every file of broken variants tests/broken_*.py; each one CLI run, at once,
 # on boat: a gate batch through the scheduler (the laptop runs only light work: three local CLI runs held its
 # load at 100 for 3 minutes a commit, 11-01 07:02); CHECK_LAWS_LOCAL=1 runs them here instead, one at a time, niced)
@@ -45,8 +45,8 @@ for kind, files, ms in (("good", args[:k], ""), ("broken", args[k + 1:], " --ms 
 (out / "jobs.json").write_text(json.dumps(jobs))
 PY
   img="${SC_LAWS_IMAGE:-$("$HOME/.local/bin/supercomputer" scheduler status 2>/dev/null | "$py" -I -c 'import json,sys; t=sys.stdin.read(); s=json.loads(t[t.index("{"):]); print(next((v["image"] for v in s.get("vms", [])), ""))' 2>/dev/null)}"
-  (cd "$here" && SUPERCOMPUTER_CONFIG="$here/tests/laws.toml" SUPERCOMPUTER_IMAGE="$img" \
-     "$HOME/.local/bin/supercomputer" run --jobs "$out/jobs.json" --out "$out/run" --class gate --backend boat >&2) || true
+  (cd "$here" && SUPERCOMPUTER_CONTROLLER=1 SUPERCOMPUTER_CONFIG="$here/tests/laws.toml" SUPERCOMPUTER_IMAGE="$img" \
+     "$HOME/.local/bin/supercomputer" run --jobs "$out/jobs.json" --out "$out/run" --class "${SC_CHECK_CLASS:-gate}" --backend boat >&2) || true
   for j in "$out"/run/*.log; do
     [ -f "$j" ] || continue
     n="$(basename "$j" .log)"
