@@ -176,6 +176,7 @@ class Pool:
     # gdp: law one probe at a time while half-open: not half or not old(probing) or coming == old(coming)
     # gdp: law starts never take the pool past max_vms: coming == old(coming) or held + coming <= max_vms
     # gdp: law no start while the breaker is open (but one probe): coming == old(coming) or (now >= open_until and (not half or coming == old(coming) + 1))
+    # gdp: law requested gate capacity is admitted when the breaker and caps allow: want < 0 or now < open_until or half or want > bringup - old(coming) or want > max_vms - held - old(coming) or result == want
     def grow(self, want: int, now: float) -> int:
         """How many starts to make now for `want` more VMs; they are counted as coming."""
         if want <= 0 or now < self.open_until:

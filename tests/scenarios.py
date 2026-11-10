@@ -1518,7 +1518,7 @@ def memo_memory(code):
           "three submission clients of 300 items each on 6 VMs with the treadmill's sweeps: their shares don't bind (no one waits under its own), so their work is the plan's demand and the pool grows for it (19:32: 2,400 items, waits p50 25 min, want 0)")
 def subs_past_shares(code):
     from tests.sim.harness import items
-    sim = _sim(code, policy={"sub_vms": 1, "horizon_s": 900})
+    sim = _sim(code, policy={"sub_vms": 1})
     _warm(sim, 6)
     sim.treadmill(base_vms=6, filler_n=0, sweep_n=24, sweep_s=600)
     sim.scheduler()
@@ -1675,7 +1675,7 @@ def partial_tree(code):
           "the treadmill's filler on 16 VMs; two submission clients of 2-slot items, then a bar of 2-slot and 1-slot gate items over them: every slot to real work while it waits, the submissions' waits minutes, not hours")
 def starvation_1325(code):
     from tests.sim.harness import items
-    sim = _sim(code, policy={"horizon_s": 900})  # (the live policy's horizon: work past what the pool clears in 15 min starts VMs)
+    sim = _sim(code)  # growth follows economics; gates retain their own deadline
     _warm(sim, 16)
     sim.treadmill(base_vms=8, filler_s=900, backlog=True, sweep_n=32, sweep_s=600)
     sim.scheduler()
@@ -1823,6 +1823,50 @@ def closed_legacy_slot(code):
         stale = sum(len(v.running) for v in s.vms.values() if v.id == vs[0].id)
         m["closed_legacy_slots"] = stale
         return {"closed_slot_released": stale == 0}
+    return sim, {"extra": extra}
+
+
+@scenario("11-10 68 slot-hour gate", ["lost", "clients", "threads"], 1800,
+          "one client queues 68 slot-hours on 28 large VMs: grow for the gate deadline, not the economic window")
+def gate_68_slot_hours(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"floor_default": 28})
+    _warm(sim, 28)
+    sim.scheduler()
+    bid = sim.batch("large-gate", "gate", items("g", 816, 300), after=30)
+
+    def extra(sim, m):
+        c = sim.clients[bid]
+        elapsed = c["t_end"] - c["t_submit"] if c["t_end"] else 1e9
+        made = [e for e in sim.w.events if e["kind"] == "start"]
+        scheds = [s for _, s in sim.w.sched_procs if s is not None]
+        h = getattr(scheds[-1], "health", None) if scheds else None
+        needless = sum(e.get("n", 1) for e in h.ev.get("needless", [])) if h else 0
+        m["gate_elapsed_s"], m["created"], m["needless_recorded"] = elapsed, len(made), needless
+        import math
+        H = sim.S.GATE_HORIZON
+        max_starts = math.ceil((68 * 3600 - 28 * 4 * H) / (4 * (H - sim.B.BRING_UP)))
+        # Work is indivisible: the last 300-second item can straddle the fluid
+        # horizon. Allow one item, not another hour; all jobs must be delivered.
+        return {"near_gate_horizon": elapsed <= sim.S.GATE_HORIZON + 300,
+                "grew": bool(made), "no_needless_start": needless == 0 and len(made) <= max_starts}
+    return sim, {"extra": extra}
+
+
+@scenario("economic growth: steady small submissions", ["lost", "clients", "threads"], 1500,
+          "a held four-VM pool clears repeated small submissions without any start")
+def steady_small_submissions(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"floor_default": 4})
+    _warm(sim, 4)
+    sim.scheduler()
+    for i in range(20):
+        sim.batch("steady", "submission", items(f"s{i}-", 8, 45), after=30 + i * 60)
+
+    def extra(sim, m):
+        made = [e for e in sim.w.events if e["kind"] == "start"]
+        m["created"] = len(made)
+        return {"no_start": not made}
     return sim, {"extra": extra}
 
 
