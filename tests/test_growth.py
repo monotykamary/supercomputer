@@ -158,6 +158,24 @@ def test_uniform_gate_keeps_one_job_after_fractional_bringup_subtraction():
         assert plan and next(iter(s.target.values()))['gate_vms'] >= 1, (duration, s.target)
 
 
+def test_held_worker_freed_during_boot_beats_a_new_worker():
+    s = sched()
+    s.bring_up = 120
+    now = S.time.time()
+    b = batch(s, bid='waiting', klass=2, n=3)
+    b.t0 = now - S.GATE_HORIZON + 250
+    for it in b.items.values():
+        it.est = 300
+    busy = batch(s, bid='running', klass=2, n=2)
+    v = vm(s, 'held')
+    for it in busy.items.values():
+        it.est, it.t_start, it.state, it.vm = 300, now - 200, 'running', v
+        v.running[(busy.id, it.name)] = it
+    # Both occupied slots free before a new VM would boot and can finish a
+    # waiting item earlier. Buying another VM cannot improve this deadline.
+    assert not s._plan(now), s.target
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

@@ -2521,9 +2521,12 @@ class Scheduler:
                         # Count complete jobs after each occupied slot is released.
                         running = [x for x in v.running.values() if x.batch.klass <= 3]
                         used = sum(v.slots if x.timing else x.weight for x in running)
-                        fits = max(0, slots - used) * math.floor(ready_H / whole)
+                        # Compare existing and new workers at the same feasible
+                        # completion horizon; an existing slot freed during boot
+                        # beats buying an otherwise-unused new worker.
+                        fits = max(0, slots - used) * math.floor(H / whole)
                         fits += sum((v.slots if x.timing else x.weight) * math.floor(
-                            max(0.0, ready_H - max(0.0, self.est_of(x) - (now - (x.t_start or now)))) / whole)
+                            max(0.0, H - max(0.0, self.est_of(x) - (now - (x.t_start or now)))) / whole)
                             for x in running)
                         cap_hi += fits * whole
                     elif whole:
