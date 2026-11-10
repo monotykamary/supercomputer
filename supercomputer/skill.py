@@ -72,7 +72,7 @@ def text() -> str:
     k = ctl.get("knobs") or {}
     vals = {"live_now": f"{ctl['state']}.", "controller_vm": info.get("vm", "?"), "controller_state": ctl["state"], "key_id": info.get("key_id", "<id>"),
             "floor": ctl.get("floor", "8, the treadmill's default"), "max_vms": "none set" if not k.get("max_vms") else f"a ceiling of {k['max_vms']} set", "bringup": k.get("bringup", scheduler.BRINGUP_MAX),
-            "gate_horizon": round(k.get("gate_horizon_s", scheduler.GATE_HORIZON) / 60), "horizon": round(k.get("horizon_s", scheduler.HORIZON) / 60),
+            "gate_horizon": round(k.get("gate_horizon_s", scheduler.GATE_HORIZON) / 60),
             "hold": round(k.get("hold_s", scheduler.HOLD) / 60), "sub_vms": k.get("sub_vms", scheduler.SUB_VMS), "sub_preempt": round(k.get("sub_preempt_s", scheduler.SUB_PREEMPT)), "limits": lim}
     # (a checkout: SKILL.md at its root; an installed wheel: inside the package)
     skill = next((p for p in (config.SRC / "SKILL.md", pathlib.Path(__file__).parent / "SKILL.md") if p.exists()), config.SRC / "SKILL.md")
