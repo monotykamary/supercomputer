@@ -132,3 +132,5 @@ and a rollback that selects the candidate. Load scenarios test the item/VM
 invariants. Real subprocess tests separately check listener/flock inheritance
 and boot-failure rollback, with provider calls disabled. The isolated real-socket
 case is not a real five-machine deployment or a loaded-controller benchmark.
+
+Verified 2026-11-10: a docs-only update rolled out hot to all five machines under load (canary batch and live lanes), no item killed or re-run.
