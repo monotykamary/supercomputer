@@ -126,6 +126,25 @@ def test_ready_gate_capacity_does_not_include_new_worker_bringup():
     assert next(iter(s.target.values()))['gate_vms'] > 0, s.target
 
 
+def test_uniform_gate_does_not_count_fractional_future_slots():
+    s = sched()
+    s.bring_up = 120
+    now = S.time.time()
+    b = batch(s, bid='waiting', klass=2, n=3)
+    b.t0 = now - S.GATE_HORIZON + 250
+    for it in b.items.values():
+        it.est = 300
+    busy = batch(s, bid='running', klass=2, n=2)
+    v = vm(s, 'held')
+    for it in busy.items.values():
+        it.est, it.t_start, it.state, it.vm = 300, now - 150, 'running', v
+        v.running[(busy.id, it.name)] = it
+    # Two free slots fit two jobs. Each occupied slot has only 150 seconds
+    # left in the item-sized tail, not enough for a third 300-second job.
+    s._plan(now)
+    assert next(iter(s.target.values()))['gate_vms'] == 1, s.target
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

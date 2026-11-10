@@ -2494,6 +2494,10 @@ class Scheduler:
                 H = rules.gate_window(remaining, bu, item_s)
                 ready_H = max(remaining, item_s)  # a ready VM does not get the new VM's bring-up extension
                 hw = sum(sz(it) for it in hi)
+                durations = {sz(it) for it in hi} if all(not it.timing and it.weight == 1 for it in hi) else set()
+                whole = next(iter(durations)) if len(durations) == 1 else 0.0
+                new_window = max(60.0, H - bu)
+                new_capacity = S * (math.floor(new_window / whole) * whole if whole else new_window)
                 # the held VMs' slot-time within H a gate can have: free slots and lower classes' at once, the rest
                 # as their items (interactive, gate, submission) end; VMs still coming up, after their bring-up
                 cap_hi = 0.0
@@ -2512,9 +2516,22 @@ class Scheduler:
                     else:
                         taken = sum((v.slots if x.timing else x.weight) * min(ready_H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
                                     for x in v.running.values() if x.batch.klass <= 3)
-                    cap_hi += max(0.0, slots * (ready_H if v.ready else max(0.0, H - bu)) - taken)
-                cap_hi += coming * S * max(0.0, H - bu)
-                n_hi = rules.gate_vms(hw, cap_hi, S * max(60.0, H - bu))
+                    if whole and v.ready:
+                        # Uniform one-slot jobs cannot use fractional future gaps.
+                        # Count complete jobs after each occupied slot is released.
+                        running = [x for x in v.running.values() if x.batch.klass <= 3]
+                        used = sum(v.slots if x.timing else x.weight for x in running)
+                        fits = max(0, slots - used) * math.floor(ready_H / whole)
+                        fits += sum((v.slots if x.timing else x.weight) * math.floor(
+                            max(0.0, ready_H - max(0.0, self.est_of(x) - (now - (x.t_start or now)))) / whole)
+                            for x in running)
+                        cap_hi += fits * whole
+                    elif whole:
+                        cap_hi += slots * math.floor(max(0.0, H - bu) / whole) * whole
+                    else:
+                        cap_hi += max(0.0, slots * (ready_H if v.ready else max(0.0, H - bu)) - taken)
+                cap_hi += coming * new_capacity
+                n_hi = rules.gate_vms(hw, cap_hi, new_capacity)
                 if all(it.batch.klass == 1 for it in hi):  # (a check alone: one VM, and only when none is held)
                     n_hi = 0 if (held or coming) else 1
             want = max(n_def, n_hi)
