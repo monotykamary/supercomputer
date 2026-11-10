@@ -5,6 +5,7 @@ import os
 import pathlib
 import sys
 import tempfile
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from supercomputer import canary, health  # noqa: E402
@@ -16,12 +17,27 @@ def test_client_gone_is_no_error():
 
 
 def test_alert_after_two_checks():
-    h = health.Health()
-    h.record_status(1000.0, 2.5)
-    assert h.tick(1001.0) == []
-    a = h.tick(1061.0)
-    assert len(a) == 1 and "status" in a[0], a
-    assert h.tick(1121.0) == []  # (said once until it clears)
+    # This fixture measures status alerts, not the validation runner's flags.
+    with patch.object(health, "env_flags", return_value=[]):
+        h = health.Health()
+        h.record_status(1000.0, 2.5)
+        assert h.tick(1001.0) == []
+        a = h.tick(1061.0)
+        assert len(a) == 1 and "status" in a[0], a
+        assert h.tick(1121.0) == []  # (said once until it clears)
+
+
+def test_controller_flag_is_an_independent_breach():
+    with patch.dict(os.environ, {"SUPERCOMPUTER_CONTROLLER": "1", "SUPERCOMPUTER_SCHEDULER": "1",
+                                 "SUPERCOMPUTER_URGENT": "0", "GDPW_BOAT_URGENT": "0"}):
+        h = health.Health()
+        h.record_status(1000.0, 2.5)
+        assert h.tick(1001.0) == []
+        alerts = h.tick(1061.0)
+        assert len(alerts) == 2, alerts
+        assert any("status breached" in a for a in alerts), alerts
+        assert any("env breached" in a for a in alerts), alerts
+        assert h.tick(1121.0) == []
 
 
 def test_canary_hands_back_on_a_new_breach_only():
