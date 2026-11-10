@@ -224,12 +224,13 @@ _code_cache: dict = {}
 def code_hash(pkg: pathlib.Path | None = None) -> str:
     """The installed tool's code (config.SRC's, whatever this process runs: a hand-back runs a kept copy): a hash of
     its modules (by their mtimes, rehashed only when one changed)."""
-    files = sorted((pkg or config.SRC / "supercomputer").glob("*.py"))
-    key = tuple((f.name, f.stat().st_mtime_ns) for f in files)
+    root = pkg or config.SRC / "supercomputer"
+    files = sorted(root.rglob("*.py"))
+    key = tuple((str(f.relative_to(root)), f.stat().st_mtime_ns, f.stat().st_size) for f in files)
     if _code_cache.get(str(pkg)) != key:
         h = hashlib.sha256()
         for f in files:
-            h.update(f.name.encode() + b"\0" + f.read_bytes() + b"\0")
+            h.update(str(f.relative_to(root)).encode() + b"\0" + f.read_bytes() + b"\0")
         _code_cache[str(pkg)], _code_cache[f"{pkg}#"] = key, h.hexdigest()[:12]
     return _code_cache[f"{pkg}#"]
 
@@ -684,7 +685,7 @@ class Scheduler:
                     continue
                 if vid not in info and v.get("state") not in boat.RUNNING:
                     continue  # (a lease left on a VM boat had stopped: nothing to hold)
-                v["lease"] = {"pid": me, "host": host, "batch": "scheduler", "since": now, "label": "scheduler (taken over)"}
+                v["lease"] = {**l, "pid": me, "host": host, "batch": "scheduler", "since": now, "label": "scheduler (taken over)"}
                 taken.append(vid)
                 reg[vid] = dict(v)
             missing = [vid for vid in info if vid not in taken]
@@ -728,6 +729,15 @@ class Scheduler:
                         else:
                             starting.append((it, vm))  # Legacy agents deduplicate the same run name.
             self.vms[vid] = vm
+        expected_items = {(v["id"], x["batch"], x["name"], x["run_name"]): x.get("launch_identity")
+                          for v in info.values() for x in v.get("items", []) if x["batch"] not in closed}
+        actual_items = {(v.id, it.batch.id, it.name, it.run_name): it.launch_identity
+                        for v in self.vms.values() for it in v.running.values()}
+        items_ready = not snap or expected_items == actual_items
+        if not items_ready:
+            self.recovery_blocked = True
+            self.recovery["ready"] = False
+            self.recovery["items_ready"] = False
         if not self.recovery_blocked:
             for vid in taken:
                 self._worker(self.vms[vid])
@@ -746,14 +756,22 @@ class Scheduler:
             threading.Thread(target=extend, daemon=True).start()
         self._handoff = {"t": now, "from_pid": old, "held": sorted(info), "taken": taken, "missing": missing, "snapshot": bool(snap), "checks": 0}
         if snap:
-            with contextlib.suppress(Exception):
-                tmp = DIR / "handoff.ack.tmp"
-                tmp.write_text(json.dumps({"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing, "admissions": self.recovery}))
-                tmp.rename(DIR / "handoff.ack")
+            self._handoff_ack = {"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing,
+                                 "admissions": self.recovery, "items_ready": items_ready}
+            if not os.environ.get("SUPERCOMPUTER_HANDOFF_FDS"):
+                self._publish_handoff_ack()
         if taken or missing:
             log(f"took over {len(taken)} VMs in one write of the registry ({'the handoff of pid ' + str(old) if snap else 'the previous scheduler gone'}); "
                 f"{len(missing)} not taken{': ' + str(missing[:6]) if missing else ''}")
         self._h().record_handoff(now, len(info) if snap else len(taken), len(taken), len(missing) if snap else 0, 0, 0)
+
+    def _publish_handoff_ack(self):
+        """Publish only after the inherited listener is serving and state is attached."""
+        ack = getattr(self, "_handoff_ack", None)
+        if ack is not None:
+            tmp = DIR / "handoff.ack.tmp"
+            tmp.write_text(json.dumps(ack))
+            tmp.rename(DIR / "handoff.ack")
 
     def _reconcile_taken(self, vms: list):
         """The VMs taken over, each asked once what runs there: an item held as running there that its agent neither
@@ -2781,6 +2799,8 @@ class Scheduler:
                 self._lost_vm(vm)
                 return None
             return float(min(20, 2 * fails))
+        if self.stop.is_set():
+            return None  # The successor owns observations after the frozen snapshot.
         if r.get("err"):  # (a batch's directory gone from the VM: prepared again)
             self._unprepare(vm, r.get("batch"))
             with self.lock:
@@ -2887,12 +2907,11 @@ class Scheduler:
         if b is not None and not b.strict_once:
             if getattr(self, "handing_off", False):
                 return False
-            # Legacy ticks/preparation queued the ACK before _finished in 40.
-            # A concurrent tick may send it during optional log I/O. Do not
-            # impose the owned durable-commit barrier on this protocol.
+            if not self._finished_legacy(vm, row):
+                return False
             with vm.lock:
                 vm.acks.append(ack)
-            return self._finished_legacy(vm, row)
+            return True
         if not self._finished(vm, row):
             return False
         with vm.lock:
@@ -2920,8 +2939,14 @@ class Scheduler:
 
     def _finished_legacy(self, vm: VMState, row: dict):
         if getattr(self, "handing_off", False):
-            return False  # (handing off: the row is the next scheduler's, its agent sends it again, unacked)
+            return False
+        # Keep the placement held during log I/O; a switch can then take it
+        # without seeing done in memory but no row on disk.
+        if not row.get("preempted") and not row.get("lost"):
+            self._finished_logs(vm, row["batch"], row["name"])
         with self.lock:
+            if getattr(self, "handing_off", False):
+                return False
             it = vm.running.pop((row["batch"], row["name"]), None)
             if it is None:
                 return True
@@ -2961,12 +2986,7 @@ class Scheduler:
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
                         "placement": {"vm": vm.id, "type": vm.type, "cpu": vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
-        if row.get("preempted") or row.get("lost") or b.closed or it.state != "done":
-            self.wake.set()
-            return True
-        # (its output kept here before its row goes out: a restart of the scheduler loses neither)
-        self._finished_logs(vm, b.id, it.run_name)
-        b.deliver(done)
+                b.deliver(done)  # same lock as the snapshot; ACK only after this commit
         self.wake.set()
         return True
 
@@ -3002,7 +3022,7 @@ class Scheduler:
         if not row.get("preempted") and not row.get("lost"):
             self._finished_logs(vm, b.id, key[1])
         with self.lock:
-            if (b.closed or b.admission_closed or it.owned.closed
+            if (getattr(self, "handing_off", False) or b.closed or b.admission_closed or it.owned.closed
                     or vm.running.get(key) is not it):
                 return False
             if not self._result_identity_matches(it, row):
@@ -3490,86 +3510,101 @@ class Scheduler:
             self._h().record_billing(time.time(), health.billing_problems(boat.limits()))
 
     def handoff(self, back_to: str | None = None):
-        """A new code version installed: this scheduler hands the pool to it and exits only once the new one holds every
-        VM it held (rules.handoff_done). Nothing is let go: each VM keeps its TTL and its items run on; the queue,
-        placements, outputs and accounts are on disk; this one's VMs, as it knows them, in handoff.json; the next
-        scheduler (systemd restarts it on the controller; here this one starts it) takes them all in one write of the
-        registry before it serves and says so (handoff.ack). Should it not take them all, this one keeps them (its
-        leases its own throughout) and hands them to its own code's kept copy instead, the new code rejected. Only once
-        the new code imports: a broken install keeps this one running."""
+        """Transfer the listening socket and locked file description; never drain.
+
+        The old process retains both descriptors until a serving successor has
+        acknowledged every admission and running identity. Failed candidates
+        are killed without shutdown/release; saved code gets the same snapshot.
+        """
         new = back_to or code_hash()
-        home, src = str(config.HOME), str(config.SRC)
-        if not back_to and not self._imports(new):
+        if getattr(self, "_handoff_preparing", False):
             return
-        log(f"code {self.code} -> {new} {'(the canary handing back)' if back_to else 'installed'}: handing the pool over (VMs and items stay; the next scheduler takes them all at once)")
-        if getattr(self, "handing_off", False):
-            return  # (one handoff at a time)
-        self.handing_off = True
-        if not back_to:
-            self.canary.handing_off(self.code, new, time.time())
-        self.stop.set()
-        self._metrics_save()
-        time.sleep(rules.switch_wait(sum(len(v.running) for v in list(self.vms.values())), 15.0))  # (no wait for what's in flight:
-        with self.lock:  # this one keeps no row from here (_finished) and acks none, the next one takes its items as they are)
-            snap = self._handoff_snapshot()
-        tmp = DIR / "handoff.json.tmp"
-        tmp.write_text(json.dumps(snap))
-        tmp.rename(DIR / "handoff.json")
-        (DIR / "handoff.ack").unlink(missing_ok=True)
-        self.released_lock = True  # (the port and the lock to the next one; this process alive, its leases its own, till its word)
-        with contextlib.suppress(Exception):
-            self._srv.shutdown()
-            self._srv.server_close()
-        with contextlib.suppress(Exception):
-            fcntl.flock(self._lockf, fcntl.LOCK_UN)
-        held = {v["id"] for v in snap["vms"]}
-        for attempt, to in enumerate([back_to or None, self.code] if not back_to else [back_to]):
-            path = str(DIR / "code" / to) if to else src  # (a hand-back: a kept copy, config.SRC still the install)
-            proc = None
-            if not os.environ.get("INVOCATION_ID") or to:  # (not under systemd: the next scheduler started here, waiting for the lock)
+        self._handoff_preparing = True
+        try:
+            if not back_to:
+                if not self._imports(new):
+                    return
+                if self.canary.snapshot(new, config.SRC / "supercomputer") is None:
+                    self.alert("handoff refused: cannot preserve candidate source")
+                    return
+            candidates = [new, self.code] if new != self.code else [new]
+            if not all((DIR / "code" / c / "supercomputer").is_dir() for c in candidates):
+                self.alert("handoff refused: saved rollback code is missing")
+                return
+            log(f"code {self.code} -> {new}: handing the pool over (listener, lock, VMs and items retained)")
+            # Imports and source copies happened while placement continued.
+            request_lock = getattr(self, "_request_lock", self.lock)
+            with request_lock, self.lock:
+                self.handing_off = True
+                self.stop.set()
+                self._metrics_save()
+                snap = self._handoff_snapshot()
+            if not back_to:
+                self.canary.handing_off(self.code, new, time.time())
+            inherited = hasattr(self, "_srv") and hasattr(self, "_lockf")
+            fds = (self._srv.socket.fileno(), self._lockf.fileno()) if inherited else ()
+            if inherited:
+                self._srv.shutdown()  # closes no descriptor; the TCP backlog stays live
+            self.released_lock = True  # simulator/diagnostics; do NOT unlock the shared flock
+            held = {v["id"] for v in snap["vms"]}
+            for attempt, target in enumerate(candidates):
+                snap["t"] = time.time()
+                tmp = DIR / "handoff.json.tmp"
+                tmp.write_text(json.dumps(snap))
+                tmp.rename(DIR / "handoff.json")
+                (DIR / "handoff.ack").unlink(missing_ok=True)
+                path = str(DIR / "code" / target)
+                env = {**os.environ, "PYTHONPATH": path, "SUPERCOMPUTER_HOME": str(config.HOME),
+                       "SUPERCOMPUTER_SRC": str(config.SRC)}
+                if inherited:
+                    env["SUPERCOMPUTER_HANDOFF_FDS"] = ",".join(map(str, fds))
                 with open(DIR / "log", "a") as lf:
-                    proc = subprocess.Popen([sys.executable, "-P", "-m", "supercomputer", "scheduler", "serve", "--idle-exit", str(self.idle_exit), "--takeover"],
-                                            stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True, close_fds=True,
-                                            env={**os.environ, "PYTHONPATH": path, "SUPERCOMPUTER_HOME": home, "SUPERCOMPUTER_SRC": src}, cwd=home)
-            src = pathlib.Path(path) / "supercomputer" / "scheduler.py"
-            with contextlib.suppress(Exception):
-                if "def _take_pool" not in src.read_text():  # (a code from before the atomic handoff (a hand-back to one):
-                    log(f"handoff: code {to or new} takes the pool by re-attach, not by this handoff: exiting")  # it never answers;
-                    os._exit(0)  # waiting on it would leave two schedulers, the old way's the only one it knows)
-            ack, t0 = None, time.time()
-            while time.time() - t0 < 120:
-                with contextlib.suppress(Exception):
-                    a = json.loads((DIR / "handoff.ack").read_text())
-                    if float(a.get("of", 0)) == float(snap["t"]):
-                        ack = a
+                    proc = subprocess.Popen([sys.executable, "-P", "-m", "supercomputer", "scheduler", "serve",
+                                             "--idle-exit", str(self.idle_exit), "--takeover"],
+                                            stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,
+                                            start_new_session=True, close_fds=True, pass_fds=fds,
+                                            env=env, cwd=str(config.HOME))
+                ack, deadline = None, time.time() + 4
+                while not rules.handoff_expired(time.time(), deadline):
+                    with contextlib.suppress(Exception):
+                        a = json.loads((DIR / "handoff.ack").read_text())
+                        if a.get("of") == snap["t"]:
+                            ack = a
+                            break
+                    if proc.poll() is not None:
                         break
-                time.sleep(0.5)
-            taken = held & set(ack.get("taken", [])) if ack else set()
-            died = {vid for vid in held - taken if not self._boat_up(vid)} if ack else set()
-            if rules.handoff_done(len(held), len(taken), len(died), ack is not None) == "exit" and ack.get("admissions", {}).get("ready", True):
-                log(f"handoff: the new scheduler (pid {ack.get('pid')}) holds {len(taken)} of the {len(held)} VMs held here ({len(died)} gone): exiting")
-                os._exit(0)
-            why = f"handoff to {to or new} failed: {'no word from the new scheduler in 120 s' if ack is None else f'it took {len(taken)} of {len(held)} VMs'}"
-            if ack and not ack.get("admissions", {}).get("ready", True):
-                why += "; admission check failed: " + json.dumps(ack["admissions"], sort_keys=True)
-            self.alert(why + ("; the pool to this code's kept copy" if attempt == 0 and not back_to else ""))
-            if proc is not None and proc.pid:  # (the new one, by its exact pid: it lets go of what it took, its leases ours again below)
-                with contextlib.suppress(Exception):
-                    os.kill(proc.pid, 15)
-            if not back_to and attempt == 0:
-                d = self.canary.read()
-                d.update({"state": "rejected", "rejected": sorted(set(d.get("rejected", [])) | {new}), "why": why})
-                self.canary.write(d)
-            with Registry().locked() as d:  # (whatever it took back to this process, for the next try's take-over)
-                for vid in held:
-                    v = d["vms"].get(vid)
-                    if v is not None and (v.get("lease") or {}).get("batch") == "scheduler":
-                        v["lease"] = {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": time.time(), "label": "scheduler (handoff kept)"}
-            snap["t"] = time.time()
-            tmp.write_text(json.dumps(snap))
-            tmp.rename(DIR / "handoff.json")
-            (DIR / "handoff.ack").unlink(missing_ok=True)
-        os._exit(0)
+                    time.sleep(0.05)
+                if ack and rules.handoff_ready(
+                        set(ack.get("taken", [])) == held and not ack.get("missing"),
+                        ack.get("admissions", {}).get("ready") is True,
+                        ack.get("items_ready") is True):
+                    _notify_service(ack["pid"])
+                    log(f"handoff: serving pid {ack['pid']} holds every VM and running identity; exiting")
+                    os._exit(0)
+                # A failed candidate must not run shutdown(), release or race rollback.
+                if proc.pid:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(proc.pid, 9)
+                    proc.wait(timeout=5)
+                why = f"handoff to {target} failed readiness: {ack!r}"
+                self.alert(why)
+                if target != self.code:
+                    d = self.canary.read()
+                    d.update({"state": "rejected", "rejected": sorted(set(d.get("rejected", [])) | {target}), "why": why})
+                    self.canary.write(d)
+                with Registry().locked() as d:
+                    for vid in held:
+                        v = d["vms"].get(vid)
+                        if v is not None:
+                            v["lease"] = {**(v.get("lease") or {}), "pid": rules.handoff_owner(os.getpid(), proc.pid, False),
+                                          "host": socket.gethostname(), "batch": "scheduler"}
+            # Keep descriptors/ownership alive if even saved code cannot boot;
+            # never claim an unsafe partial recovery succeeded.
+            self.alert("handoff blocked: candidate and saved code failed; listener and leases retained")
+            while True:
+                time.sleep(60)
+        finally:
+            self._handoff_preparing = False
 
     def _imports(self, new: str) -> bool:
         """Whether the installed code imports (a broken install is never handed the pool: an alert, once)."""
@@ -3644,15 +3679,18 @@ class Scheduler:
     def _check_agent(self, vm: VMState):
         """Agents follow the code: one whose hash isn't this scheduler's agent.py is upgraded in place (its items, in
         sessions of their own, run on), through itself, else by boat exec."""
-        if any(it.batch.strict_once for it in vm.running.values()):
-            return  # no upgrade/repair may discard a live or quarantined strict owner
+        if vm.running or vm.starts:
+            return  # Never replace an agent beneath any live or starting item.
         r = vm.client.ping()
         vm.agent, vm.t_agent = str(r.get("version")), time.time()
         if vm.agent == self.agent_version:
             return
         tok = vm.client.token
         try:
-            vm.client.rpc("upgrade", self.agent_b64, str(boat.AGENT_PORT), tok, timeout=30)
+            upgraded = vm.client.rpc("upgrade", self.agent_b64, str(boat.AGENT_PORT), tok, timeout=30)
+            if upgraded.get("ok") is False:
+                vm.t_agent = 0  # retry at the next empty safe point, never bootstrap around a refusal
+                return
         except Exception:
             boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90)
         for _ in range(30):
@@ -3794,11 +3832,25 @@ def queue_results(name: str) -> dict:
     return out
 
 
+def _notify_service(pid: int | None = None):
+    """Let systemd follow the inherited-listener child (NotifyAccess=all)."""
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.connect(address)
+        sock.sendall((f"MAINPID={pid}\nREADY=1" if pid else "READY=1").encode())
+
+
 # --------------------------------------------------------------------------------------------- the server
 def serve(idle_exit: float = 120, takeover: bool = False):
     DIR.mkdir(parents=True, exist_ok=True)
-    lockf = open(DIR / "serve.lock", "a")
-    for k in range(120 if takeover else 1):  # (one scheduler per pool: the lock; a takeover waits for the old one to go)
+    inherited = os.environ.pop("SUPERCOMPUTER_HANDOFF_FDS", "")
+    listen_fd, lock_fd = map(int, inherited.split(",")) if inherited else (-1, -1)
+    lockf = os.fdopen(lock_fd, "a") if inherited else open(DIR / "serve.lock", "a")
+    for k in range(0 if inherited else (120 if takeover else 1)):  # (one scheduler per pool: the lock; a takeover waits for the old one to go)
         try:
             fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
             break
@@ -3808,7 +3860,15 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                 return
             time.sleep(0.5)
     os.environ["SUPERCOMPUTER_CLIENT"] = CLIENT
+    # _take_pool defers its ACK until this process actually serves.
+    if inherited:
+        os.environ["SUPERCOMPUTER_HANDOFF_FDS"] = inherited
     s = Scheduler(idle_exit)
+    os.environ.pop("SUPERCOMPUTER_HANDOFF_FDS", None)
+    if inherited and s.recovery_blocked:
+        s._publish_handoff_ack()
+        return  # no worker, placement or release under uncertain ownership
+    s._request_lock = threading.RLock()
     if (DIR / "token").exists() and (DIR / "token").read_text().strip():  # (the same token across restarts: clients keep theirs)
         s.token = (DIR / "token").read_text().strip()
     with config.private_umask():
@@ -3836,7 +3896,13 @@ def serve(idle_exit: float = 120, takeover: bool = False):
         def do_POST(self):
             c0 = _cpu_now()
             try:
-                return self._post()
+                if self.path in ("/poll", "/status", "/health", "/logs", "/capabilities"):
+                    return self._post()
+                with s._request_lock:
+                    if s.stop.is_set():
+                        self.close_connection = True
+                        return self._send(503, {"error": "scheduler handoff; retry the same endpoint"})
+                    return self._post()
             finally:
                 s._cpu_add("http " + self.path.split("?")[0], c0)
 
@@ -3883,6 +3949,9 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                     return self._send(200, s.health_check(float(m.get("minutes", 30))))
                 if p == "/rollback":
                     return self._send(200, s.rollback(m.get("code") or None))
+                if p == "/reload":
+                    threading.Thread(target=s.handoff, daemon=True).start()
+                    return self._send(200, {"ok": True, "code": s.code, "installed": code_hash()})
                 if p == "/blobs/have":  # (a remote client: which of its tree's files the controller lacks)
                     return self._send(200, {"missing": blobcache.have(BLOBS, m["keys"])})
                 if p == "/drain":  # (a deploy: no new item placed; what runs goes on, and comes back after the restart)
@@ -3928,14 +3997,23 @@ def serve(idle_exit: float = 120, takeover: bool = False):
 
     for k in range(60):  # (the old scheduler's port, freed as it exits)
         try:
-            srv = Srv(("127.0.0.1", PORT), H)
+            if inherited:
+                srv = Srv(("127.0.0.1", PORT), H, bind_and_activate=False)
+                srv.socket.close()
+                srv.socket = socket.socket(fileno=listen_fd)
+                srv.server_address = srv.socket.getsockname()
+            else:
+                srv = Srv(("127.0.0.1", PORT), H)
             break
         except OSError:
             if k == 59:
                 raise
             time.sleep(0.5)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    s._srv, s._lockf = srv, lockf  # (a handoff gives both to the next scheduler before it exits)
+    s._srv, s._lockf = srv, lockf  # same open descriptions across handoff, including the flock
+    if not inherited:
+        _notify_service()
+    s._publish_handoff_ack()
     hook = threading.excepthook
 
     def died(a):  # (a thread of the scheduler dead of an exception: health's errors; a client gone isn't one)
@@ -4208,7 +4286,7 @@ _remote_ok: dict = {}
 
 def controller() -> dict | None:
     """The controller on boat (LIVE/controller.json with its URL and token), if one is set up and not turned off."""
-    if os.environ.get("SUPERCOMPUTER_CONTROLLER", "0") in ("0", ""):  # (off by default: this machine's scheduler owns the pool)
+    if os.environ.get("SUPERCOMPUTER_CONTROLLER", "auto") in ("0", ""):  # (off by default: this machine's scheduler owns the pool)
         return None
     with contextlib.suppress(Exception):
         c = json.loads((config.LIVE / "controller.json").read_text())
@@ -4219,18 +4297,14 @@ def controller() -> dict | None:
 
 def connect() -> "Client":
     """The scheduler a batch goes to: the controller on boat when it answers (checked once a process), else this
-    machine's, started if need be (the local fallback). A client told to use the controller (SUPERCOMPUTER_CONTROLLER
-    set, LIVE/controller.json present) never falls back: a second scheduler beside the controller adopts its VMs (the
-    agent-token war), and one inside a job VM that can't reach the controller stops its own host. It stops with the
-    reason instead; SUPERCOMPUTER_CONTROLLER_FALLBACK=1 brings the local fallback back for that client."""
+    machine's, started if need be. A configured controller never silently falls
+    back; SUPERCOMPUTER_CONTROLLER_FALLBACK=1 is the explicit local opt-in."""
     r = _remote()
     if r:
         return r
-    if controller() and os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK", "0") in ("0", ""):
-        raise SystemExit("the controller on boat doesn't answer and this client is set to use it (SUPERCOMPUTER_CONTROLLER): "
-                         "not starting this machine's scheduler beside it. Check `supercomputer controller status`; inside a "
-                         "boat VM, use controller.json's http transport (boat forward needs a boat login), or set "
-                         "SUPERCOMPUTER_CONTROLLER_FALLBACK=1 to fall back on purpose.")
+    if ((controller() or os.environ.get("SUPERCOMPUTER_CONTROLLER") == "1")
+            and os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK", "0") in ("0", "")):
+        raise SystemExit("configured controller unavailable; not starting this machine's scheduler beside it")
     return ensure_running()
 
 
@@ -4246,8 +4320,8 @@ def _remote() -> "Client | None":
             _remote_ok["ok"] = cl
             cl.keep()
         except Exception as e:
-            print(f"[scheduler] the controller on boat doesn't answer ({str(e)[:120]}): this machine's scheduler", file=sys.stderr, flush=True)
-            _remote_ok["ok"] = None
+            _remote_ok.pop("ok", None)  # a transient handoff is not a sticky fallback decision
+            raise RuntimeError(f"configured controller unavailable; no local fallback ({str(e)[:120]})") from e
     return _remote_ok["ok"]
 
 
@@ -4273,6 +4347,11 @@ def current() -> "Client | None":
 
 def ensure_running() -> Client:
     """The scheduler, started (detached, its log in LIVE/scheduler/log) if no client started it yet."""
+    if controller() or os.environ.get("SUPERCOMPUTER_CONTROLLER") == "1":
+        remote = _remote()
+        if remote is None:
+            raise RuntimeError("configured controller unavailable; refusing local scheduler startup")
+        return remote
     if not running():
         DIR.mkdir(parents=True, exist_ok=True)
         home = str(pathlib.Path(boat.__file__).resolve().parent.parent)
