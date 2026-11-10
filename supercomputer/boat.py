@@ -2498,7 +2498,9 @@ class Scheduled(Session):
                     if getattr(self.client, "remote", None):  # (the controller's: its again, never this machine's)
                         self.sched._remote_ok.clear()
                         self.client = self.sched._remote() or self.client
-                    elif time.time() - t_err > 10:  # (this machine's, gone past a handoff's second (a kill -9): started again; it takes back the queue from disk)
+                    elif time.time() - t_err > 10 and not self.sched.controller():
+                        # Recover a crashed LOCAL owner only. A controller appearing
+                        # during an old client's lifetime must never revive a rival.
                         self.client = self.sched.ensure_running()
                 continue
             for row in r.get("rows", []):
