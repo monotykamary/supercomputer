@@ -45,8 +45,10 @@ PY
     sed '/^--- stderr ---$/,$d' "$j" > "$out/$n.json"
   done
 else
-  for f in "${good_files[@]}"; do nice -n 19 "${cli[@]}" check "$f" --root "$here" --no-propose --json > "$out/good.$(basename "$f").json"; done
-  for f in "${broken_files[@]}"; do nice -n 19 "${cli[@]}" check "$f" --root "$here" --no-propose --ms 90000 --json > "$out/broken.$(basename "$f").json"; done
+  # JSON verdicts below are authoritative: a CLI may exit 1 for an expected
+  # broken law too. Still collect every module; refusals/missing JSON fail below.
+  for f in "${good_files[@]}"; do nice -n 19 "${cli[@]}" check "$f" --root "$here" --no-propose --json > "$out/good.$(basename "$f").json" || true; done
+  for f in "${broken_files[@]}"; do nice -n 19 "${cli[@]}" check "$f" --root "$here" --no-propose --ms 90000 --json > "$out/broken.$(basename "$f").json" || true; done
 fi
 python3 -I - "$out" <<'PY'
 import glob, json, os, sys

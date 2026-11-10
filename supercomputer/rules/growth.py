@@ -13,8 +13,8 @@ def break_even_s(hold_s: float, start_dollars: float, vm_hour_dollars: float) ->
     vm_hour_dollars is for this VM type, not a default-VM equivalent. Free starts
     still consume the shared allowance; prepaid hours still consume capacity.
     """
-    if not all(math.isfinite(x) for x in (hold_s, start_dollars, vm_hour_dollars)) or hold_s < 0 or start_dollars < 0 or vm_hour_dollars <= 0:
-        raise ValueError("growth requires finite nonnegative hold/start price and a positive VM-hour price")
+    if not all(math.isfinite(x) for x in (hold_s, start_dollars, vm_hour_dollars)) or hold_s < 0 or start_dollars < 0 or vm_hour_dollars <= 0 or (hold_s == 0 and start_dollars == 0):
+        raise ValueError("growth requires finite nonnegative hold/start price, positive VM-hour price and positive break-even")
     return max(hold_s, 3600.0 * start_dollars / vm_hour_dollars)
 
 

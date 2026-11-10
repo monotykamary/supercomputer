@@ -9,7 +9,7 @@ def test_economics():
     assert math.isclose(G.break_even_s(2700, 0.07, 0.072), 3500)
     assert math.isclose(G.break_even_s(2700, 0.07, 0.036), 7000)
     assert G.break_even_s(8000, 0.07, 0.036) == 8000
-    for args in ((-1, .07, .036), (2700, -.01, .036), (2700, .07, 0), (math.inf, .07, .036)):
+    for args in ((-1, .07, .036), (2700, -.01, .036), (2700, .07, 0), (math.inf, .07, .036), (0, 0, .036)):
         try:
             G.break_even_s(*args)
         except ValueError:
