@@ -128,7 +128,7 @@ def _env(k: str, d):
 
 
 # The policy's knobs (README, "Scheduling policy"); $SUPERCOMPUTER_<KNOB> overrides each.
-BRINGUP_MAX = _env("BRINGUP", 10)  # VMs being brought up at once (the scheduler's own load guard); the rest wait their turn
+BRINGUP_MAX = _env("BRINGUP", 12)  # VMs being brought up at once (the scheduler's own load guard); the rest wait their turn
 GATE_HORIZON = _env("GATE_HORIZON", 900.0)  # a gate gets the VMs that finish it within this (its items' last times)
 MAX_VMS = int(os.environ.get("SUPERCOMPUTER_MAX_VMS") or 0) or 10 ** 9  # none by default (the user: "no limit"); set, a technical ceiling
 HOLD = _env("HOLD", 2700.0)  # above-floor filler hold; its default-VM cost also values the shared start allowance
