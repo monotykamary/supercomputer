@@ -17,7 +17,7 @@ work they can't clear. Knobs are `$SUPERCOMPUTER_<KNOB>`; the defaults in bracke
 **Priority.** `interactive` > `gate` > `submission` > `sweep` > `filler` (`--class`, `$SUPERCOMPUTER_CLASS`; a small
 `run` batch is interactive, a bigger one a submission). Higher work takes a lower class's slot at once: an interactive
 or gate item kills a filler's or a sweep's item, which is queued again at the head of its class; a submission takes
-slots as lower items end (a filler's after waiting SUB_PREEMPT [90 s]). Within a class, clients are served
+slots as lower items end (a filler's after waiting SUB_PREEMPT [45 s]). Within a class, clients are served
 round-robin. A submission client holds at most SUB_VMS [8] VMs' worth of slots at once while a waiter that could take
 the slot exists (rules.contends: of its image, of a shape a VM takes, not backing off; a higher class, or another
 submission client under its share); a gate gets what it needs. An item needing several slots (a weight past 1) or a

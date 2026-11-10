@@ -112,7 +112,7 @@ Higher classes take lower classes' slots at once; within a class, clients are se
 | --- | --- | --- |
 | `interactive` | quick checks | a slot at once (a filler's or a sweep's item is re-queued) |
 | `gate` | bars and test suites | lower slots at once, then the VMs that finish it within 15 min |
-| `submission` | experiments | up to 8 VMs per client while others wait, a filler's slot after 90 s |
+| `submission` | experiments | up to 8 VMs per client while others wait, a filler's slot after 45 s |
 | `sweep`, `filler` | the treadmill's chains and soundness fill | whatever is left |
 
 A small batch defaults to `interactive`, a bigger one to `submission`.
