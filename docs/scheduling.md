@@ -166,6 +166,12 @@ Running the scheduler on a boat VM instead (`controller.py`, `supercomputer cont
 default: a small VM overloaded, and the local scheduler proved simpler. What it taught is in the policy above: one
 scheduler per pool, an agent daemon that ignores SIGPIPE, a breaker on starts, bounded bring-up, adoption.
 
+A client told to use the controller (`SUPERCOMPUTER_CONTROLLER=1` and a `live/controller.json`) never falls back
+to this machine's scheduler when the controller doesn't answer: it stops with the reason. A second scheduler beside
+the controller adopts its VMs, and one inside a job VM (which has no boat login, so `boat forward` can't come up)
+stops its own host. Inside a boat VM, reach the controller over its http transport; `SUPERCOMPUTER_CONTROLLER_FALLBACK=1`
+falls back on purpose.
+
 ## The terms (boat's TOS-6 and TOS-10)
 
 VMs stay busy or are released: a released VM stops 60 s later; VMs above the floor run filler for at most 45 minutes

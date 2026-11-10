@@ -4206,8 +4206,19 @@ def controller() -> dict | None:
 
 def connect() -> "Client":
     """The scheduler a batch goes to: the controller on boat when it answers (checked once a process), else this
-    machine's, started if need be (the local fallback)."""
-    return _remote() or ensure_running()
+    machine's, started if need be (the local fallback). A client told to use the controller (SUPERCOMPUTER_CONTROLLER
+    set, LIVE/controller.json present) never falls back: a second scheduler beside the controller adopts its VMs (the
+    agent-token war), and one inside a job VM that can't reach the controller stops its own host. It stops with the
+    reason instead; SUPERCOMPUTER_CONTROLLER_FALLBACK=1 brings the local fallback back for that client."""
+    r = _remote()
+    if r:
+        return r
+    if controller() and os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK", "0") in ("0", ""):
+        raise SystemExit("the controller on boat doesn't answer and this client is set to use it (SUPERCOMPUTER_CONTROLLER): "
+                         "not starting this machine's scheduler beside it. Check `supercomputer controller status`; inside a "
+                         "boat VM, use controller.json's http transport (boat forward needs a boat login), or set "
+                         "SUPERCOMPUTER_CONTROLLER_FALLBACK=1 to fall back on purpose.")
+    return ensure_running()
 
 
 def _remote() -> "Client | None":
