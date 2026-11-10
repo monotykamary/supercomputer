@@ -72,11 +72,11 @@ handoff receipt. No deployment was performed by this lane.
   Recursive source hashing includes `rules/`. Ordinary in-place installs are
   still discovered at the pointed source path.
 * `scheduler.py:3532` import-checks and snapshots the candidate while placement
-  continues. At the switch it serializes mutable HTTP requests, freezes the
-  state, stops accepting on the old server without closing its listening file
-  description, and passes both listener and flock to the child. The old process
-  does not unlock. The child does not rebind. Queued TCP connections survive.
-* The readiness receipt covers the exact held VM set, admissions and all
+  continues. At the switch it serializes mutable HTTP requests, freezes
+  mutations, keeps the old server answering health/status, and passes both
+  listener and flock to the child. The old process does not unlock. The child
+  does not rebind. Mutating requests retry the same endpoint until committed.
+* The readiness receipt covers every required held VM, admissions and all
   running `(vm, batch, item, run_name, launch_identity)` entries. On the real
   socket path it is published only after the successor serves. Failure or a
   four-second startup deadline kills only the candidate PID (no release path),
@@ -139,7 +139,8 @@ The first adoption of the protocol, and merging with `claude/vm-leases`, must be
 handled by the coordinator; subsequent compatible updates need no checkpoint.
 The sibling worktree's active script is not overwritten behind that lane's back.
 
-The GDP laws prove production ACK/deadline/rollback-owner guards, not arbitrary
+The GDP laws prove production ACK/deadline/rollback-owner guards plus required-VM
+selection, failed-handoff resumption and passive-candidate activation, not arbitrary
 network latency, systemd behavior or semantic equivalence of two versions of
 Python code. Broken variants retain a missing-item ACK, an off-by-one deadline
 and a rollback that selects the candidate. Load scenarios test the item/VM
