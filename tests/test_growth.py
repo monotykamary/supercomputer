@@ -101,7 +101,7 @@ def test_gate_capacity_reserves_the_dispatch_quantum():
     s.bring_up = 120
     b = batch(s, klass=2, n=816)
     for it in b.items.values():
-        it.est = 300
+        it.est = 380  # two jobs fit in 780 seconds, but not after a 30-second dispatch reserve
     for i in range(28):
         vm(s, str(i))
     targets = []

@@ -215,6 +215,7 @@ def test_live_handoff_preserves_fence_without_network_renewal():
              patch.object(S.boat, 'agent_client', return_value=client), \
              patch.object(S.boat, 'lease_vm', side_effect=AssertionError('network renewal on handoff')), \
              patch.object(S.boat, 'rename_leased_vm', side_effect=AssertionError('rename on handoff')), \
+             patch.object(S.threading, 'Thread'), \
              patch.object(S.concurrent.futures, 'ThreadPoolExecutor', lambda *a, **kw: nullcontext(SimpleNamespace(map=lambda f, xs: map(f, xs)))):
             s._take_pool()
         assert not s.recovery_blocked
