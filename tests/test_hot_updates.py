@@ -73,6 +73,17 @@ class Guards(unittest.TestCase):
                 self.assertTrue((root / 'live/code' / receipt['staged'] / 'supercomputer/scheduler.py').exists())
                 spawn.assert_not_called()
 
+    def test_stage_refuses_a_mismatched_snapshot(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(scheduler, 'DIR', pathlib.Path(d)), \
+             mock.patch.object(scheduler, 'code_hash', side_effect=['expected', 'different']), \
+             mock.patch.object(scheduler.canary.Canary, 'snapshot', return_value=pathlib.Path(d)), \
+             mock.patch.object(scheduler, 'Client') as client:
+            with self.assertRaisesRegex(RuntimeError, 'source changed'):
+                scheduler.stage_install()
+            self.assertFalse((pathlib.Path(d) / 'install.json').exists())
+            client.assert_not_called()
+
     def test_controller_stage_refuses_pre_handoff_runtime(self):
         client = mock.Mock()
         client.req.return_value = {'code': 'legacy'}
@@ -81,6 +92,41 @@ class Guards(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'no hot-handoff protocol'):
                 controller.stage('controller-fixture')
             ssh.assert_not_called()
+
+    def test_pending_completion_frees_slot_but_survives_snapshot(self):
+        import threading
+        import types
+        s = object.__new__(scheduler.Scheduler)
+        s.lock, s.wake, s.code = threading.RLock(), threading.Event(), 'old'
+        s.handing_off = False
+        b = types.SimpleNamespace(id='b', closed=False, strict_once=False, slot_s=0, deliver=mock.Mock())
+        item = types.SimpleNamespace(batch=b, name='x', run_name='x~s1', state='running',
+                                     t_start=0, weight=1, timing=False, peers=0, fate=mock.Mock(),
+                                     last_placement={'vm': 'v'}, launch_identity='identity', placed=1)
+        b.items = {'x': item}
+        vm = scheduler.VMState('v', 'image', 'large', 'warm')
+        vm.ready = True
+        vm.running[('b', 'x~s1')] = item
+        s.vms, s.batches = {'v': vm}, {'b': b}
+        captured = []
+        def during_logs(*args):
+            self.assertEqual(vm.used(), 0)
+            captured.append(s._handoff_snapshot())
+            s.handing_off = True
+        s._finished_logs = during_logs
+        row = {'batch': 'b', 'name': 'x~s1', 'code': 0, 'seconds': 0}
+        self.assertFalse(s._accept_finished(vm, row))
+        self.assertEqual(vm.acks, [])
+        b.deliver.assert_not_called()
+        self.assertEqual(captured[0]['vms'][0]['items'][0]['launch_identity'], 'identity')
+        self.assertEqual(captured[0]['vms'][0]['items'][0]['state'], 'running')
+        # The successor observes this same unacknowledged run, not a new start.
+        vm.running[('b', 'x~s1')] = vm.finishing.pop(('b', 'x~s1'))
+        item.state, s.handing_off = 'running', False
+        s._finished_logs = lambda *args: None
+        self.assertTrue(s._accept_finished(vm, row))
+        b.deliver.assert_called_once()
+        self.assertEqual(len(vm.acks), 1)
 
     def test_service_tracks_handoff_child(self):
         text = controller.unit('scheduler', 'python3 -m supercomputer scheduler serve', '/tmp/tool', {})

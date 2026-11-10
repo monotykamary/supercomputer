@@ -238,8 +238,8 @@ def stage_install() -> dict:
     source = pathlib.Path(__file__).resolve().parent
     target = code_hash(source)
     saved = canary.Canary(DIR).snapshot(target, source)
-    if saved is None:
-        raise RuntimeError("cannot snapshot staged code")
+    if saved is None or code_hash(saved) != target:
+        raise RuntimeError("staged source changed while snapshotting; retry after install completes")
     manifest = {"source": str(source.parent), "snapshot": str(saved.parent), "code": target}
     tmp = DIR / f"install.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(manifest))
@@ -427,6 +427,7 @@ class VMState:
         self.trees: set[str] = set()  # tree ids on it (a peer for other VMs' pulls)
         self.caches: set[tuple] = set()  # (name, key) of build caches it has whole
         self.running: dict[tuple, Item] = {}
+        self.finishing: dict[tuple, Item] = {}  # terminal on the agent; logs/row commit still pending
         self.model = ""
         self.starts: list[dict] = []
         self.acks: list[dict] = []
@@ -882,9 +883,10 @@ class Scheduler:
                 continue
             vms.append({"id": v.id, "image": v.image, "type": v.type, "slots": v.slots, "prepared": sorted(v.prepared), "trees": sorted(v.trees),
                         "caches": sorted([list(c) for c in v.caches]), "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
-                        "items": [{"batch": it.batch.id, "name": it.name, "run_name": it.run_name, "state": it.state,
+                        "items": [{"batch": it.batch.id, "name": it.name, "run_name": it.run_name,
+                                   "state": "running" if it.state == "finishing" else it.state,
                                    "placement": it.last_placement, "launch_identity": it.launch_identity, "placed": it.placed}
-                                  for it in list(v.running.values())]})
+                                  for it in list(v.running.values()) + list(getattr(v, "finishing", {}).values())]})
         return {"from_pid": os.getpid(), "t": time.time(), "from": self.code, "vms": vms,
                 "batches": sorted(set(self.batches) | set(getattr(self, "recovery_errors", {}))),
                 "admission_guard": True}
@@ -2973,16 +2975,16 @@ class Scheduler:
     def _finished_legacy(self, vm: VMState, row: dict):
         if getattr(self, "handing_off", False):
             return False
-        # Keep the placement held during log I/O; a switch can then take it
-        # without seeing done in memory but no row on disk.
-        if not row.get("preempted") and not row.get("lost"):
-            self._finished_logs(vm, row["batch"], row["name"])
+        # Terminal runs release capacity immediately, but remain in the
+        # handoff inventory until their row is committed and safe to ACK.
+        key = (row["batch"], row["name"])
+        pending = vm.__dict__.setdefault("finishing", {})
         with self.lock:
             if getattr(self, "handing_off", False):
                 return False
-            it = vm.running.pop((row["batch"], row["name"]), None)
+            it = vm.running.pop(key, None)
             if it is None:
-                return True
+                return key not in pending  # another poller is still committing it
             if it.t_start:
                 vm.busy_s += time.time() - it.t_start
             vm.idle_since = time.time()
@@ -3010,7 +3012,8 @@ class Scheduler:
                 else:
                     self._boat_failed(it, vm.id, f"its row lost on {vm.id}: {err or 'no reason given'}")
             else:
-                it.state = "done"
+                it.state = "finishing"
+                pending[key] = it
                 it.fate.finished()
                 b.slot_s += max(0.0, float(row.get("seconds", 0) or 0)) * it.weight
                 if float(row.get("seconds", -1) or -1) > 0:
@@ -3019,7 +3022,16 @@ class Scheduler:
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
                         "placement": {"vm": vm.id, "type": vm.type, "cpu": vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
-                b.deliver(done)  # same lock as the snapshot; ACK only after this commit
+        self.wake.set()
+        if it.state != "finishing":
+            return True
+        self._finished_logs(vm, b.id, it.run_name)
+        with self.lock:
+            if getattr(self, "handing_off", False):
+                return False  # successor sees pending as a terminal, unacknowledged run
+            b.deliver(done)  # same lock as the snapshot; ACK only after this commit
+            it.state = "done"
+            pending.pop(key, None)
         self.wake.set()
         return True
 
@@ -3557,8 +3569,9 @@ class Scheduler:
             if not back_to:
                 if not self._imports(new):
                     return
-                if self.canary.snapshot(new, installed_source() / "supercomputer") is None:
-                    self.alert("handoff refused: cannot preserve candidate source")
+                candidate = self.canary.snapshot(new, installed_source() / "supercomputer")
+                if candidate is None or code_hash(candidate) != new:
+                    self.alert("handoff refused: candidate source changed while snapshotting")
                     return
             candidates = [new, self.code] if new != self.code else [new]
             if not all((DIR / "code" / c / "supercomputer").is_dir() for c in candidates):

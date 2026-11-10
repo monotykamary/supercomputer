@@ -100,13 +100,16 @@ class SubprocessProxy:
         if "scheduler" in argv and "serve" in argv:
             pp = str((k.get("env") or {}).get("PYTHONPATH", ""))
             label = pp.rsplit("/code/", 1)[1].split("/")[0] if "/code/" in pp else self._w.code_installed
-            self._w.spawn_scheduler(takeover="--takeover" in argv, after=1.0, code=self._w.codes.get(label), label=label)
+            proc = self._w.spawn_scheduler(takeover="--takeover" in argv, after=1.0, code=self._w.codes.get(label), label=label)
 
             class P:
-                pid = 0
+                pid = proc.pid
 
                 def poll(self):
-                    return None
+                    return None if proc.alive else 1
+
+                def wait(self, timeout=5):
+                    return self.poll()
             return P()
         raise AssertionError(f"a real subprocess from the code under test: {argv!r}"[:300])
 
@@ -643,7 +646,12 @@ class World:
                         return
                     self.k.sleep(0.5)
                 os.environ["SUPERCOMPUTER_CLIENT"] = "scheduler"
-                s = code.sched.Scheduler(idle_exit)
+                try:
+                    s = code.sched.Scheduler(idle_exit)
+                except Exception as error:
+                    self.note("scheduler_boot_failed", pid=proc.pid, code=label, error=str(error))
+                    proc.alive = False
+                    return
                 entry[1] = s
                 self.note("scheduler_up", proc=proc.name, pid=proc.pid, code=self.code_installed)
             finally:
@@ -869,6 +877,9 @@ class Agent:
         return buf.getvalue()
 
     def c_upgrade(self, b64, port, tok):
+        if any(p["alive"] for p in self.v.procs.values()):
+            self.w.note("upgrade_deferred", vm=self.v.id)
+            return {"ok": False, "error": "owned_upgrade_blocked"}
         ver = hashlib.sha256(base64.b64decode(b64)).hexdigest()[:12]
         v = self.v
 

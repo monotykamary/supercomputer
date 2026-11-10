@@ -62,3 +62,73 @@ systemd semantics. The virtual-clock simulator alone cannot prove an inherited
 socket stays open or that service management preserves its child. A <5 second
 placement-bound claim requires both load scenarios and an actual subprocess
 handoff receipt. No deployment was performed by this lane.
+
+## Implemented update protocol
+
+* `scheduler.py:216` reads the explicit install pointer. `scheduler stage`
+  snapshots the newly installed source, publishes that pointer atomically and
+  reports installed/active hashes without starting a scheduler. This addresses
+  processes whose original import directory differs from the new installation.
+  Recursive source hashing includes `rules/`. Ordinary in-place installs are
+  still discovered at the pointed source path.
+* `scheduler.py:3532` import-checks and snapshots the candidate while placement
+  continues. At the switch it serializes mutable HTTP requests, freezes the
+  state, stops accepting on the old server without closing its listening file
+  description, and passes both listener and flock to the child. The old process
+  does not unlock. The child does not rebind. Queued TCP connections survive.
+* The readiness receipt covers the exact held VM set, admissions and all
+  running `(vm, batch, item, run_name, launch_identity)` entries. On the real
+  socket path it is published only after the successor serves. Failure or a
+  four-second startup deadline kills only the candidate PID (no release path),
+  restores parent lease metadata and tries saved code on the same descriptors.
+  The old process exits only after a complete receipt. If **both** candidates
+  fail, the old process retains the listener and ownership and alerts; it does
+  not claim placement recovered. This exceptional path still needs operator
+  repair and is not a universal bounded-liveness guarantee.
+* Legacy completion immediately frees the finished worker slot, but retains
+  the unacknowledged result identity in a separate `finishing` inventory during
+  log I/O. That inventory is included in the snapshot; the successor observes
+  the terminal agent row instead of re-running it. Row commit is under the
+  snapshot lock before ACK. Strict completion also rechecks the handoff flag
+  after log I/O. Holding finished slots through log I/O was tested and rejected:
+  it regressed `timing_subs_filler`, so no pool-growth rule was changed.
+* `scheduler.py:3869` serves inherited descriptors. The controller unit uses
+  `Type=notify`, `NotifyAccess=all`, `KillMode=process`; the old MainPID notifies
+  systemd of the acknowledged successor before exiting. Controller setup no
+  longer drains or restarts scheduler/treadmill for a code update. The explicit
+  `controller stage` path (`controller.py:182`) uploads code only and refuses a
+  controller lacking the hot-handoff capability.
+* `agent.py:1823` checks unresolved strict ownership and unfinished legacy jobs
+  under the same cross-process ownership lock as **all** starts. Upgrade fences
+  admission before replacing source. The scheduler defers busy upgrades and
+  never treats a refused/ambiguous upgrade RPC as permission to bootstrap a
+  replacement. Repair cannot install different agent code under known live work.
+* `scheduler.py:4319` fails closed for configured controllers. A long-lived
+  client retries its existing endpoint through handoff; `boat.py` will not
+  resurrect a local scheduler after a controller appears. An explicitly local
+  client retains crash recovery when no controller is configured.
+
+## Rollout boundary and evidence scope
+
+`ROLLOUT.sh` is the replacement for the coordinator's script currently in the
+leases worktree. After the reviewed commit is pushed, it publishes/stages code
+on the sandbox, Air, mini, anh-1 and controller, printing installed/active hashes
+and whether pickup is pending. It does not checkpoint agents, drain the pool,
+restart services or wait for running items. **It has not been executed.**
+
+The script requires an explicit compatible-lease-protocol acknowledgement.
+This lane cannot safely waive the leases lane's first migration barrier:
+old runtimes without a stage pointer/hot listener protocol cannot be taught
+those features by replacing files they already imported. Likewise a client
+that predates the new affinity guard still runs its original Python functions.
+The first adoption of the protocol, and merging with `claude/vm-leases`, must be
+handled by the coordinator; subsequent compatible updates need no checkpoint.
+The sibling worktree's active script is not overwritten behind that lane's back.
+
+The GDP laws prove production ACK/deadline/rollback-owner guards, not arbitrary
+network latency, systemd behavior or semantic equivalence of two versions of
+Python code. Broken variants retain a missing-item ACK, an off-by-one deadline
+and a rollback that selects the candidate. Load scenarios test the item/VM
+invariants. Real subprocess tests separately check listener/flock inheritance
+and boot-failure rollback, with provider calls disabled. The isolated real-socket
+case is not a real five-machine deployment or a loaded-controller benchmark.

@@ -939,6 +939,81 @@ def handoff_under_load(code):
     return sim, {}
 
 
+@scenario("hot reload", ["lost", "strikes", "modal", "clients", "threads"], 1800,
+          "full gate across deploy: exact worker runs preserved and placement resumes in under five seconds")
+def deploy_full_gate(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 8})
+    _warm(sim, 8)
+    sim.scheduler()
+    sim.at(10, lambda: sim.batch("full-gate", "gate", items("g", 128, 90)))
+    sim.at(100, lambda: sim.w.install("deployed"))
+    def extra(sim, m):
+        off = next((t for t, p, msg in sim.w.log_lines if "handing the pool over" in msg), None)
+        on = next((t for t, p, msg in sim.w.log_lines if off is not None and t >= off and "took over" in msg), None)
+        gap = on - off if on is not None else None
+        m["deploy_gap_s"] = gap
+        return {"every_item_runs_once": all(x["runs"] == 1 for x in sim.w.items.values()),
+                "placement_resumes_under_5s": gap is not None and gap < 5}
+    return sim, {"extra": extra}
+
+
+@scenario("hot reload rollback", ["lost", "strikes", "modal", "clients", "threads"], 1800,
+          "candidate raises during boot under a full gate; saved code recovers all runs")
+def failed_update_under_load(code):
+    import shutil
+    import tempfile
+    from tests.sim import world as W
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 8})
+    with tempfile.TemporaryDirectory(prefix="sc-reject-") as tmp:
+        shutil.copytree(pathlib.Path(code) / "supercomputer", pathlib.Path(tmp) / "supercomputer")
+        p = pathlib.Path(tmp) / "supercomputer/scheduler.py"
+        p.write_text(p.read_text() + '\n\ndef _rejected_boot(self):\n    raise RuntimeError("candidate rejected")\nScheduler._take_pool = _rejected_boot\n')
+        sim.w.add_code(W.load_code(tmp, sim.tmp, name="sc_rejected_boot"), "bad-boot")
+    _warm(sim, 8)
+    sim.scheduler()
+    sim.at(10, lambda: sim.batch("rollback-gate", "gate", items("g", 128, 90)))
+    sim.at(100, lambda: sim.w.install("bad-boot"))
+    def extra(sim, m):
+        state = json.loads((pathlib.Path(sim.tmp) / "scheduler/canary.json").read_text())
+        m["rollback"] = state
+        return {"candidate_rejected": "bad-boot" in state.get("rejected", []),
+                "original_code_restored": sim.w.live_sched()[0].env["code"] == "c0",
+                "every_item_runs_once": all(x["runs"] == 1 for x in sim.w.items.values())}
+    return sim, {"extra": extra}
+
+
+@scenario("agent safe point", ["lost", "strikes", "modal", "clients", "threads"], 1200,
+          "agent source changes under running gate work; replacements occur only after those runs finish")
+def agent_upgrade_under_load(code):
+    import base64
+    import hashlib
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 4})
+    _warm(sim, 4)
+    sim.scheduler()
+    sim.at(10, lambda: sim.batch("agent-gate", "gate", items("g", 16, 300)))
+    observed = {"busy_unchanged": False}
+    def update():
+        s = sim.w.live_sched()[1]
+        data = sim.code.agent_src + b'\n# next agent\n'
+        s.agent_b64 = base64.b64encode(data).decode()
+        s.agent_version = hashlib.sha256(data).hexdigest()[:12]
+        busy = [v for v in s.vms.values() if v.running]
+        old = {v.id: sim.w.vms[v.id].disk.version for v in busy}
+        for v in busy:
+            s._check_agent(v)
+        observed["busy_unchanged"] = bool(busy) and all(sim.w.vms[v.id].disk.version == old[v.id] for v in busy)
+    sim.at(100, update)
+    def extra(sim, m):
+        upgraded = [e for e in sim.w.events if e["kind"] == "upgraded"]
+        m["agent_upgrades"] = upgraded
+        return {**observed, "upgraded_at_idle": bool(upgraded),
+                "every_item_runs_once": all(x["runs"] == 1 for x in sim.w.items.values())}
+    return sim, {"extra": extra}
+
+
 @scenario("6ea38a3", ["lost", "strikes", "modal", "orphans", "clients", "threads"], 3000,
           "kill -9 of the scheduler with 12 VMs busy: the next client's poll starts it again, it takes everything back")
 def kill9(code):
@@ -1424,7 +1499,7 @@ def handoff_1430(code):
         t_on = next((t for t, p, msg in sim.w.log_lines if t_off is not None and t >= t_off and ("took over" in msg or "re-attached" in msg)), None)
         m["switch_pause_s"] = round(t_on - t_off, 1) if t_off is not None and t_on is not None else None
         return {"no_orphan": rec["orphans_max"] == 0, "pool_held_whole": rec["held_min"] is not None and rec["held_before"] is not None and rec["held_min"] >= rec["held_before"],
-                "placement_never_pauses_a_tick": m["switch_pause_s"] is not None and m["switch_pause_s"] < 15}
+                "placement_resumes_under_5s": m["switch_pause_s"] is not None and m["switch_pause_s"] < 5}
     return sim, {"extra": extra}
 
 

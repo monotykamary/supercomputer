@@ -1269,21 +1269,21 @@ def ownedrun(batch, name, root, identity):
 def _legacy_start(d: pathlib.Path, spec: dict):
     """Original non-opt-in launch path, including retry names and asynchronous publication."""
     j = d / "jobs" / spec["name"]
-    with _start_lock:
-        if j.exists():
-            return
-        j.mkdir(parents=True)
-        n = os.cpu_count() or 1
-        want = min(n, max(1, int(spec.get("cpus", 2))))
-        used = cpus_in_use(d)
-        free = [c for c in range(n) if c not in used]
-        grant = CpuGrant(n)
-        grant.held = min(n, len(used))
-        k = grant.grant(want)
-        cpus = free[:k] if k > 0 else list(range(n))[:want]
-        (j / "cpus").write_text(json.dumps(cpus if k > 0 else []))
-        (j / "taskset").write_text(json.dumps(cpus))
-        write_json(j / "spec.json", spec)
+    # start() already holds _ownership_lock, which includes _start_lock.
+    if j.exists():
+        return
+    j.mkdir(parents=True)
+    n = os.cpu_count() or 1
+    want = min(n, max(1, int(spec.get("cpus", 2))))
+    used = cpus_in_use(d)
+    free = [c for c in range(n) if c not in used]
+    grant = CpuGrant(n)
+    grant.held = min(n, len(used))
+    k = grant.grant(want)
+    cpus = free[:k] if k > 0 else list(range(n))[:want]
+    (j / "cpus").write_text(json.dumps(cpus if k > 0 else []))
+    (j / "taskset").write_text(json.dumps(cpus))
+    write_json(j / "spec.json", spec)
     try:
         with open(j / "agent.err", "w") as err:
             p = subprocess.Popen([sys.executable, str(ROOT / "agent.py"), "run", d.name, spec["name"]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
