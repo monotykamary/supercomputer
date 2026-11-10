@@ -15,6 +15,7 @@ if sys.platform != 'linux' or os.environ.get('OWNED_LIFECYCLE_BOAT_TEST') != '1'
     raise RuntimeError('Boat-only test; never import/execute on laptop')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from supercomputer import boat as B
+from supercomputer import scheduler as S
 
 
 class LeaseClientTests(unittest.TestCase):
@@ -326,6 +327,43 @@ class LeaseClientTests(unittest.TestCase):
                 self.assertEqual(B.bootstrap_agent('vm', 'source', 'my-token', nonce='birth'), answer)
                 remote.assert_not_called()
                 self.assertEqual(ship.call_args.kwargs['claim'], {'owner': self.owner, 'vm_id': 'vm', 'nonce': 'birth'})
+
+    def test_heartbeat_does_not_revoke_unclaimed_booting_vm(self):
+        for claimed in (False, True):
+            with self.subTest(claimed=claimed):
+                s = S.Scheduler.__new__(S.Scheduler)
+                vm = S.VMState('booting', 'image', 'large', 'created')
+                vm.lease = dict(self.lease) if claimed else {}
+                self.assertFalse(vm.ready)
+                s.vms = {vm.id: vm}
+                s.stop = Mock()
+                s.stop.wait.side_effect = [False, True]
+                with patch.object(s, '_renew_lease', return_value=True) as renew, patch.object(B, 'boat', return_value='{}') as provider:
+                    s._heartbeat()
+                self.assertFalse(vm.dead)
+                self.assertIs(s.vms[vm.id], vm)
+                if claimed:
+                    renew.assert_called_once_with(vm)
+                    provider.assert_called_once()
+                else:
+                    renew.assert_not_called()
+                    provider.assert_not_called()
+
+    def test_startup_budget_allows_fenced_takeover_past_ten_seconds(self):
+        clock = [0.0]
+        (self.root / 'scheduler').mkdir()
+        (self.root / 'scheduler' / 'token').write_text('test-token')
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(S, 'DIR', self.root / 'scheduler'), \
+             patch.object(S, 'running', side_effect=lambda: clock[0] >= 15.0), \
+             patch.object(S.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(S.time, 'sleep', side_effect=sleep), \
+             patch.object(S.subprocess, 'Popen') as spawn:
+            self.assertIsInstance(S.ensure_running(), S.Client)
+        spawn.assert_called_once()
+        self.assertGreaterEqual(clock[0], 15.0)
+        self.assertLess(clock[0], S.STARTUP_WAIT_S)
 
     def test_bootstrap_uses_first_install_grant_without_cached_agent(self):
         grant = dict(self.lease, ok=True)

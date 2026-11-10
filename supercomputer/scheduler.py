@@ -69,6 +69,7 @@ def _proc_cpu() -> float:
     return f() if f else 0.0
 
 
+STARTUP_WAIT_S = 120.0  # bounded time for fenced warm-pool takeover before the HTTP port opens
 FULL_S = 5.0  # a full pass at most this often (a batch submitted or closed: at once); light passes between
 STRAY_S = 120  # a run no item owns counts as stray (health) only past this: a kill retried once (60 s) and the ticks' lag; sooner it's a kill landing
 CLIENT = "scheduler"
@@ -851,9 +852,12 @@ class Scheduler:
             for it, vm in starting:
                 threading.Thread(target=self._start_on, args=(it, vm), daemon=True).start()
         if taken:  # (their TTLs renewed now, as re-attach did each: the heartbeat's next is 5 min away, and a few handoffs
-            def extend(ids=list(taken)):  # in a row would let a TTL run out under running items)
+            def extend(vms=tuple(self.vms.get(vid) for vid in taken)):  # hold objects, not mutable dictionary lookups
+                def one(vm):
+                    if vm is not None and not vm.dead:
+                        boat.boat("extend", vm.id, "--ttl", str(max(boat.BACKSTOP, vm.ttl)), "--json", check=False)
                 with concurrent.futures.ThreadPoolExecutor(16) as ex:
-                    list(ex.map(lambda vid: boat.boat("extend", vid, "--ttl", str(max(boat.BACKSTOP, self.vms[vid].ttl)), "--json", check=False), ids))
+                    list(ex.map(one, vms))
             threading.Thread(target=extend, daemon=True).start()
         self._handoff = {"t": now, "from_pid": old, "held": sorted(info), "taken": taken, "missing": missing, "snapshot": bool(snap), "checks": 0}
         if snap:
@@ -2569,9 +2573,15 @@ class Scheduler:
                                and (not self._held(v, None, now) or v.reserved[0] in tim))  # (set aside for one of them: theirs)
                 # (the starts this work earns: the VMs its other items fill, and one per timing item no free VM takes;
                 # a start past those, with such a VM free, is needless: 08:17, a submission's own starts were counted)
-                earned = math.ceil(sum(sz(it) for it in real if it not in tim) / (S * B)) + max(0, len(tim) - free_fit) if len(tim) < len(real) else max(0, len(tim) - free_fit)
-                if len(tim) == len(real):
-                    n = min(n, earned)
+                other = [it for it in real if it not in tim]
+                ordinary = rules.economic_vms(sum(sz(it) for it in other), 0.0, S * B)
+                if other and not held and not coming:
+                    ordinary = max(ordinary, 1)  # retain the service VM exception
+                urgent = rules.gate_vms(sum(sz(it) for it in other if it.batch.klass <= 2), 0.0, S * max(60.0, H - bu)) if hi else 0
+                earned = max(ordinary, urgent) + max(0, len(tim) - free_fit)
+                # Reusable timing work must not inflate a mixed group either;
+                # ordinary work pays break-even, while gates keep their deadline.
+                n = min(n, earned)
                 if n > earned and free_fit:
                     self._h().record_needless(now, n - earned, image, vm_type)
             tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "break_even_s": B, "growth_source": "legacy override" if BREAK_EVEN_OVERRIDE_S else "economics", "why": ""}
@@ -3973,7 +3983,9 @@ class Scheduler:
     def _heartbeat(self):
         while not self.stop.wait(60):
             for v in list(self.vms.values()):
-                if not v.dead:
+                # _bring registers booting VMs before their first grant. An
+                # unclaimed placeholder has not lost a lease; _up owns it.
+                if not v.dead and v.lease:
                     with contextlib.suppress(Exception):
                         if self._renew_lease(v):
                             v.ttl = max(boat.BACKSTOP, v.ttl)
@@ -4633,7 +4645,8 @@ def ensure_running() -> Client:
         with open(DIR / "log", "a") as lf:
             subprocess.Popen([sys.executable, "-P", "-m", "supercomputer", "scheduler", "serve"], stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,
                              start_new_session=True, close_fds=True, env=env, cwd=home)
-        for _ in range(100):
+        deadline = time.monotonic() + STARTUP_WAIT_S
+        while time.monotonic() < deadline:
             if running():
                 break
             time.sleep(0.1)

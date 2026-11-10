@@ -113,6 +113,28 @@ def test_exclusive_gate_reuses_idle_and_filler():
         assert not s._plan(time.time()), "do not start beside reusable exclusive capacity"
 
 
+def test_mixed_timing_reuses_other_types_without_buying_their_work():
+    for klass in (3, 2):
+        s = sched()
+        s.bring_up = 120.0
+        for i in range(12):
+            v = vm(s, f"large-{i}")
+            v.type, v.slots = "large", 8
+        timing = batch(s, "timing", klass=2, n=4)
+        timing.vm_type = "default"
+        for it in timing.items.values():
+            it.timing, it.weight, it.est = True, 2, 300.0
+        other = batch(s, "other", klass=klass, n=16)
+        other.vm_type = "default"
+        for it in other.items.values():
+            it.spec["vm_type"], it.weight, it.est = "default", 1, 600.0
+        window = S.BREAK_EVEN_OVERRIDE_S or S.rules.break_even_s(S.HOLD, S.START_DOLLARS, S.VM_HOUR_DOLLARS, S.vm_mult("default"))
+        ordinary = max(1, S.rules.economic_vms(9600.0, 0.0, S.vm_slots("default") * window))
+        urgent = S.rules.gate_vms(9600.0, 0.0, S.vm_slots("default") * (S.GATE_HORIZON - s.bring_up)) if klass == 2 else 0
+        plan = s._plan(time.time())
+        assert plan[("img", "default")][0] == max(ordinary, urgent), plan
+
+
 def test_report_includes_purchased_pack():
     from supercomputer import skill
     lim = {"starts": {"day": {"used": 1, "limit": 1680}}, "planIncluded": {"vmHoursRemaining": 0, "periodEnd": "2026-11-23"}, "packBalanceHours": 1000}

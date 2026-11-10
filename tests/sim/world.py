@@ -495,6 +495,10 @@ class World:
                 r = {}
             elif op == 'commit':
                 digest, size = argv[7:9]
+                b64 = v.files.get(payload, '')
+                data = base64.b64decode(b64, validate=True)
+                if len(data) != int(size) or hashlib.sha256(data).hexdigest() != digest:
+                    return json.dumps({'exitCode': 1, 'stdout': '', 'stderr': 'agent upload size/digest mismatch', 'success': False})
                 granted = {}
                 if len(argv) > 10:
                     fence, claim = [json.loads(base64.b64decode(x)) for x in argv[9:11]]
@@ -502,10 +506,6 @@ class World:
                     granted = ag.c_lease("claim", claim) if claim else ({"ok": True} if ag.lease_rule().accepts(fence.get("owner", ""), fence.get("boot", ""), fence.get("epoch", 0), fence.get("vm_id", "")) else {"stale": True})
                     if not granted.get("ok"):
                         return json.dumps({"exitCode": 0, "stdout": json.dumps(granted), "stderr": "", "success": True})
-                b64 = v.files.get(payload, '')
-                data = base64.b64decode(b64, validate=True)
-                if len(data) != int(size) or hashlib.sha256(data).hexdigest() != digest:
-                    return json.dumps({'exitCode': 1, 'stdout': '', 'stderr': 'agent upload size/digest mismatch', 'success': False})
                 v.files[root + '/agent.py'] = data.decode()
                 v.files.pop(payload, None)
                 v.files.pop(marker, None)
@@ -594,7 +594,8 @@ class World:
             self.k.sleep(timeout)
             raise TimeoutError("timed out")
         if path.split("?")[0] == "/health":
-            return 200, json.dumps(Agent(self, v).c_lease("who", {})).encode(), "application/json"
+            return 200, json.dumps({"ok": True, "version": v.disk.version,
+                                    "lease": Agent(self, v).c_lease("who", {})}).encode(), "application/json"
         if cl.token != v.disk.token and cl.token not in v.disk.keys.values():
             return 403, b'{"error": "token"}', "application/json"
         code, data = self.agent_dispatch(v, path.split("?")[0], body or b"", timeout)
@@ -723,10 +724,11 @@ class World:
         return proc
 
     def ensure_running(self):
-        """scheduler.ensure_running: started if none runs (nor is starting), then waited for (10 s at most)."""
+        """scheduler.ensure_running: same bounded startup budget as the code under test."""
         if self.live_sched() is None and self.pending_spawn == 0:
             self.spawn_scheduler(after=0.3)
-        for _ in range(100):
+        deadline = self.k.now + getattr(self.code.sched, "STARTUP_WAIT_S", 10.0)
+        while self.k.now < deadline:
             if self.live_sched() is not None:
                 break
             self.k.sleep(0.1)
@@ -878,14 +880,14 @@ class Agent:
         by = payload.get("owner", "")
         if op == "claim":
             birth = self.d.birth
-            if now - (self.v.t_up or now) < 600 and birth and (birth.get("owner") != by or birth.get("nonce") != payload.get("nonce")):
+            activated = not changed and rule.holder == birth.get("owner")
+            if now - (self.v.t_up or now) < 600 and birth and (birth.get("owner") != by or not activated and (not birth.get("nonce") or birth.get("nonce") != payload.get("nonce"))):
                 return {"ok": False, "busy": True, "birth": True}
             stopping = self.d.lease_state == "stopping" and now - self.d.stopping_at < 300 and not changed
             if not rule.claim(by, boot, self.v.id, lapsed, self.d.lease_state == "released" or (self.d.lease_state == "stopping" and not stopping), stopping):
                 self.w.note("claim_refused", vm=self.v.id, by=by, draining=rule.draining)
                 return {"ok": False, "busy": True, "draining": rule.draining}
             self.d.lease_state, self.d.lease_renewed = "held", now
-            self.d.birth = {}
             self.w.note("lease_granted", vm=self.v.id, by=by, boot=boot, epoch=rule.epoch)
             return view()
         if changed or not rule.accepts(by, payload.get("boot", ""), payload.get("epoch", 0), payload.get("vm_id", "")):
