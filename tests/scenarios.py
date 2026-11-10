@@ -959,6 +959,101 @@ def deploy_full_gate(code):
     return sim, {"extra": extra}
 
 
+@scenario("hot reload stopped holds", ["lost", "strikes", "modal", "clients", "threads"], 1800,
+          "three stopped VMs remain marked held and ready with no agent while a gate runs; prune only those empty holds before handing off")
+def handoff_stopped_holds(code):
+    import socket
+    from tests.sim.harness import items, IMAGE
+    sim = _sim(code, policy={"max_vms": 8})
+    _warm(sim, 8)
+    sim.scheduler()
+    sim.at(10, lambda: sim.batch("stopped-hold-gate", "gate", items("g", 128, 90)))
+    stale = []
+    def deploy():
+        proc, s = sim.w.live_sched()
+        def offer():
+            # Inject exactly the reported state at the offer boundary: no item
+            # may be placed on these synthetic holds while the fixture is built.
+            with s.lock:
+                for _ in range(3):
+                    v = sim.w.warm_vm(IMAGE)
+                    v.state, v.daemon = "stopped", "down"
+                    held = sim.S.VMState(v.id, IMAGE, v.type, "warm")
+                    held.ready, held.client = True, None
+                    held.lease = (sim.B.read_agent(v.id) or {}).get("lease") or {}
+                    sim.B.forget_agent(v.id)
+                    s.vms[v.id] = held
+                    with sim.B.Registry().locked() as d:
+                        d['vms'][v.id]['state'] = 'running'  # stale local observation, as in production
+                        d['vms'][v.id]['lease'] = {'pid': proc.pid, 'host': socket.gethostname(), 'batch': 'scheduler'}
+                    stale.append(v.id)
+                sim.w.install('stopped-hold-fix')
+                s.handoff()
+        sim.k.start(proc, offer, name='offer stopped holds')
+    sim.at(150, deploy)
+    def extra(sim, m):
+        current = sim.w.live_sched()
+        snapshot = pathlib.Path(sim.tmp) / "scheduler/handoff.used.json"
+        snap = json.loads(snapshot.read_text()) if snapshot.exists() else {}
+        m["handoff_log_tail"] = sim.w.log_lines[-15:]
+        off = next((t for t, p, msg in sim.w.log_lines if 'handing the pool over' in msg), None)
+        on = next((t for t, p, msg in sim.w.log_lines if off is not None and t >= off and 'took over' in msg), None)
+        m['stopped_holds'] = {'ids': stale, 'pruned': snap.get('unavailable'), 'gap_s': None if on is None else on-off}
+        return {'new_code_serves': bool(current) and current[0].env['code'] == 'stopped-hold-fix',
+                'empty_stopped_holds_pruned': len(stale) == 3 and set(stale) == set(snap.get('unavailable', {})),
+                'no_failed_readiness': not any('failed readiness' in msg for _, _, msg in sim.w.log_lines),
+                'every_item_runs_once': all(x['runs'] == 1 for x in sim.w.items.values()),
+                'placement_resumes_under_5s': on is not None and off is not None and on-off < 5}
+    return sim, {'extra': extra}
+
+
+@scenario("hot reload blocked", ["lost", "strikes", "modal", "clients", "threads"], 1800,
+          "both candidate and saved-code boots fail under load; the old scheduler resumes its loops and files, then accepts another update")
+def blocked_handoff_under_load(code):
+    import shutil
+    import tempfile
+    from tests.sim import world as W
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 8})
+    with tempfile.TemporaryDirectory(prefix="sc-blocked-") as tmp:
+        shutil.copytree(pathlib.Path(code) / "supercomputer", pathlib.Path(tmp) / "supercomputer")
+        p = pathlib.Path(tmp) / "supercomputer/scheduler.py"
+        p.write_text(p.read_text() + '\n\ndef _reject_boot(self):\n    raise RuntimeError("both boots rejected")\nScheduler._take_pool = _reject_boot\n')
+        sim.w.add_code(W.load_code(tmp, sim.tmp, name="sc_both_rejected"), "bad-boot")
+    _warm(sim, 8)
+    sim.scheduler()
+    sim.at(10, lambda: sim.batch("blocked-gate", "gate", items("g", 128, 90)))
+    observed = {}
+    def break_both():
+        observed['old_pid'] = sim.w.live_sched()[0].pid
+        sim.w.codes['c0'] = sim.w.codes['bad-boot']  # saved code can fail too; the live old instance is intact
+        sim.w.install('bad-boot')
+    def check_resumed():
+        current = sim.w.live_sched()
+        observed['original_resumed'] = bool(current) and current[0].pid == observed['old_pid']
+        observed['loops_live'] = bool(current) and not current[1].stop.is_set() and not current[1].handing_off
+        pid = pathlib.Path(sim.tmp) / 'scheduler/pid'
+        observed['pid_restored'] = pid.exists() and int(pid.read_text()) == observed['old_pid']
+        observed['handoff_files_cleared'] = not any((pathlib.Path(sim.tmp) / 'scheduler' / n).exists()
+                                                   for n in ('handoff.json', 'handoff.used.json', 'handoff.ack'))
+    def repair():
+        sim.w.codes['repaired'] = sim.code
+        sim.w.install('repaired')
+    sim.at(150, break_both)
+    sim.at(300, check_resumed)
+    sim.at(320, lambda: sim.batch('after-blocked', 'gate', items('after', 32, 90)))
+    sim.at(500, repair)
+    def extra(sim, m):
+        current = sim.w.live_sched()
+        m['blocked_handoff'] = observed
+        return {k: v for k, v in observed.items() if k != 'old_pid'} | {
+            'both_boots_failed': len([e for e in sim.w.events if e['kind'] == 'scheduler_boot_failed']) >= 2,
+            'subsequent_update_succeeds': bool(current) and current[0].env['code'] == 'repaired',
+            'resume_logged': any('old scheduler resumed' in msg for _, _, msg in sim.w.log_lines),
+            'every_item_runs_once': all(x['runs'] == 1 for x in sim.w.items.values())}
+    return sim, {'extra': extra}
+
+
 @scenario("hot reload rollback", ["lost", "strikes", "modal", "clients", "threads"], 1800,
           "candidate raises during boot under a full gate; saved code recovers all runs")
 def failed_update_under_load(code):

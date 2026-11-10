@@ -25,6 +25,65 @@ class Guards(unittest.TestCase):
         for pool, admissions, items in itertools.product((False, True), repeat=3):
             self.assertEqual(updates.handoff_ready(pool, admissions, items), pool and admissions and items)
 
+    def test_prune_empty_unavailable_holds_but_keep_every_owned_item(self):
+        import socket
+        import threading
+        s = object.__new__(scheduler.Scheduler)
+        s.lock, s.wake, s.batches = threading.RLock(), threading.Event(), {}
+        names = ['stopped', 'agentless', 'dead', 'running', 'finishing', 'starting', 'foreign', 'usable', 'unknown', 'coming']
+        s.vms = {n: scheduler.VMState(n, 'image', 'large', 'warm') for n in names}
+        for vm in s.vms.values():
+            vm.ready, vm.client = True, object()
+        s.vms['agentless'].client = s.vms['coming'].client = None
+        s.vms['coming'].ready = False
+        s.vms['dead'].dead = True
+        s.vms['running'].running['owned'] = object()
+        s.vms['finishing'].finishing['owned'] = object()
+        s.vms['starting'].starts.append({'start': 'pending'})
+        s.vms['foreign'].foreign = 1
+        observed = {n: {'state': 'stopped'} for n in ['stopped', 'running', 'finishing', 'starting', 'foreign']}
+        observed['usable'] = {'state': 'running'}
+        records = {'vms': {n: {'state': 'running', 'lease': {'pid': os.getpid(), 'host': socket.gethostname(),
+                                                          'batch': 'scheduler', 'owner': 'stable-owner'}} for n in names}}
+        @contextlib.contextmanager
+        def locked():
+            yield records
+        registry = mock.Mock()
+        registry.locked = locked
+        with mock.patch.object(scheduler, 'Registry', return_value=registry), \
+             mock.patch.object(scheduler.boat, 'stop_vm', side_effect=AssertionError('provider stop')), \
+             mock.patch.object(scheduler.boat, 'delete_vm', side_effect=AssertionError('provider delete')), \
+             mock.patch.object(scheduler.boat, 'shrink_ttl', side_effect=AssertionError('provider release')):
+            with s.lock:
+                s._prune_handoff_pool(observed)
+        self.assertEqual(set(s._handoff_pruned), {'stopped', 'agentless', 'dead'})
+        self.assertEqual(set(s.vms), set(names) - set(s._handoff_pruned))
+        for name in s._handoff_pruned:
+            self.assertIsNone(records['vms'][name]['lease'])
+        for name in s.vms:
+            self.assertEqual(records['vms'][name]['lease']['owner'], 'stable-owner')
+
+    def test_uncertain_admission_cannot_be_pruned_as_empty(self):
+        s = object.__new__(scheduler.Scheduler)
+        s.recovery_blocked = True
+        vm = scheduler.VMState('held', 'image', 'large', 'warm')
+        vm.dead, vm.client = True, None
+        self.assertTrue(s._handoff_vm_occupied(vm))
+        self.assertTrue(updates.handoff_required(s._handoff_vm_occupied(vm), True))
+
+    def test_rejected_candidate_cannot_start_workers_before_commit(self):
+        s = object.__new__(scheduler.Scheduler)
+        s._handoff_deferred = (123, [])
+        s.recovery_blocked, s.vms = False, {'held': object()}
+        s._worker = mock.Mock()
+        with mock.patch.object(scheduler.boat, 'pid_alive', return_value=True):
+            self.assertFalse(s._activate_handoff())
+            s._worker.assert_not_called()
+        with mock.patch.object(scheduler.boat, 'pid_alive', return_value=False):
+            self.assertTrue(s._activate_handoff())
+            self.assertTrue(s._activate_handoff())
+            s._worker.assert_called_once_with(s.vms['held'])
+
     def test_nested_code_changes_hash(self):
         with tempfile.TemporaryDirectory() as d:
             root = pathlib.Path(d)
@@ -145,7 +204,7 @@ class Guards(unittest.TestCase):
 
 
 class RealSocketHandoff(unittest.TestCase):
-    def exercise(self, rejected):
+    def exercise(self, rejected, blocked=False):
         if os.environ.get('OWNED_LIFECYCLE_BOAT_TEST') != '1':
             self.fail('run this regression on Boat with OWNED_LIFECYCLE_BOAT_TEST=1')
         with tempfile.TemporaryDirectory(prefix='sc-hot-') as tmp:
@@ -153,6 +212,10 @@ class RealSocketHandoff(unittest.TestCase):
             tool = root / 'tool'
             shutil.copytree(pathlib.Path(scheduler.__file__).parent, tool / 'supercomputer',
                             ignore=shutil.ignore_patterns('__pycache__'))
+            if blocked:
+                with (tool / "supercomputer/scheduler.py").open("a") as f:
+                    delay = "        time.sleep(10)\n" if blocked == "timeout" else ""
+                    f.write("\n_publish_ack_ok = Scheduler._publish_handoff_ack\ndef _bad_ack(self):\n    if getattr(self, '_handoff_ack', None):\n" + delay + "        self._handoff_ack['items_ready'] = False\n    _publish_ack_ok(self)\nScheduler._publish_handoff_ack = _bad_ack\n")
             with socket.socket() as reserve:
                 reserve.bind(('127.0.0.1', 0))
                 port = reserve.getsockname()[1]
@@ -192,18 +255,24 @@ class RealSocketHandoff(unittest.TestCase):
                     f.write('\n# update test candidate\n')
                     if rejected:
                         f.write('\ndef _reject_boot(self):\n    raise RuntimeError("candidate boot rejected")\nScheduler.reload = _reject_boot\n')
+                before = {name: (root / "live/scheduler" / name).read_bytes() if (root / "live/scheduler" / name).exists() else None
+                          for name in ("handoff.json", "handoff.used.json", "handoff.ack")}
                 req('/reload')
                 began = last = time.monotonic()
                 largest_gap = 0
                 switched = False
-                while time.monotonic() - began < 9:
+                while time.monotonic() - began < (13 if blocked else 9):
                     try:
                         current = req('/health')
                         pids.add(current['pid'])
                         now = time.monotonic()
                         largest_gap = max(largest_gap, now - last)
                         last = now
-                        if current['pid'] != proc.pid:
+                        if blocked and current['pid'] == proc.pid and "old scheduler resumed" in (root / "process.log").read_text():
+                            state = req("/status")
+                            switched = state["code"] == old
+                            break
+                        if not blocked and current['pid'] != proc.pid:
                             state = req('/status')
                             switched = state['code'] == old if rejected else state['code'] != old
                             if switched:
@@ -216,9 +285,19 @@ class RealSocketHandoff(unittest.TestCase):
                     pids.add(json.loads(ack_path.read_text())['pid'])
                 self.assertTrue(switched, (root / 'process.log').read_text())
                 self.assertLess(largest_gap, 5, (root / 'process.log').read_text())
-                ack = json.loads(ack_path.read_text())
-                self.assertTrue(ack['items_ready'])
-                self.assertTrue(ack['admissions']['ready'])
+                if blocked:
+                    self.assertIsNone(proc.poll())
+                    self.assertEqual(int((root / "live/scheduler/pid").read_text()), proc.pid)
+                    for name, data in before.items():
+                        path = root / "live/scheduler" / name
+                        self.assertEqual(path.read_bytes() if path.exists() else None, data, name)
+                    time.sleep(.6)  # the original run loop must not fall into shutdown
+                    self.assertEqual(req("/health")["pid"], proc.pid)
+                    self.assertEqual(req("/status")["code"], old)
+                else:
+                    ack = json.loads(ack_path.read_text())
+                    self.assertTrue(ack['items_ready'])
+                    self.assertTrue(ack['admissions']['ready'])
                 # A contender cannot acquire the inherited flock while the child serves.
                 import fcntl
                 with (root / 'live/scheduler/serve.lock').open('a') as contender:
@@ -226,7 +305,7 @@ class RealSocketHandoff(unittest.TestCase):
                         fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 if rejected:
                     self.assertEqual(json.loads((root / 'live/scheduler/canary.json').read_text())['state'], 'rejected')
-                print(json.dumps({'socket_handoff': 'rollback' if rejected else 'success',
+                print(json.dumps({'socket_handoff': 'blocked-resumed' if blocked else 'rollback' if rejected else 'success',
                                   'max_response_gap_s': round(largest_gap, 3), 'code': state['code']}))
             finally:
                 pidfile = root / 'live/scheduler/pid'
@@ -241,6 +320,12 @@ class RealSocketHandoff(unittest.TestCase):
                 if proc:
                     proc.wait(timeout=5)
                 log.close()
+
+    def test_both_candidates_timeout_without_blocking_health(self):
+        self.exercise(False, blocked="timeout")
+
+    def test_both_candidates_rejected_restore_original_socket_and_pid(self):
+        self.exercise(False, blocked=True)
 
     def test_successful_socket_handoff(self):
         self.exercise(False)

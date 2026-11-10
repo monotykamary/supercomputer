@@ -81,10 +81,24 @@ handoff receipt. No deployment was performed by this lane.
   socket path it is published only after the successor serves. Failure or a
   four-second startup deadline kills only the candidate PID (no release path),
   restores parent lease metadata and tries saved code on the same descriptors.
-  The old process exits only after a complete receipt. If **both** candidates
-  fail, the old process retains the listener and ownership and alerts; it does
-  not claim placement recovered. This exceptional path still needs operator
-  repair and is not a universal bounded-liveness guarantee.
+  The old process exits only after a complete receipt. Before offering the pool,
+  it prunes empty holds known dead, stopped/deleted/errored by a fresh provider
+  observation, or ready but lacking an agent. Missing provider observations are
+  not evidence of death. Running/finishing items, pending starts/preparations,
+  foreign work and unresolved admissions always keep their VM mandatory. This
+  only clears the old process's advisory local hold; it never stops a VM or
+  releases a VM-side lease. The snapshot records pruned IDs as `unavailable`.
+  Extra VMs a successor discovers do not make an otherwise complete ACK fail.
+* Handoff is now a reversible pause, not a stop of the scheduler's loops. A
+  candidate serves its readiness receipt but does not start workers or placement
+  until the parent commits by exiting. Failed candidates therefore cannot consume
+  results or start queued work that the parent would miss on resumption. If **both**
+  candidate and saved code fail, they are reaped, only their local lease metadata
+  is restored, and the original process restores its PID and previous handoff
+  files, wakes its existing loops and logs resumption. Its original listener
+  continues answering health/status throughout, including candidate timeouts.
+  Existing keep-alive connections cannot mutate a frozen snapshot. No third
+  successor, provider stop/delete or lease-release operation is used.
 * Legacy completion immediately frees the finished worker slot, but retains
   the unacknowledged result identity in a separate `finishing` inventory during
   log I/O. That inventory is included in the snapshot; the successor observes

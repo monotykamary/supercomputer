@@ -805,7 +805,8 @@ class Scheduler:
             cl, vm, valid = acquired[vid]
             if not valid:
                 taken.remove(vid)
-                missing.append(vid)
+                if vid in info:
+                    missing.append(vid)  # only offered VMs can fail the handoff
                 if cl is None and not self.recovery_blocked:
                     with Registry().locked() as d:
                         if vid in d["vms"] and (d["vms"][vid].get("lease") or {}).get("pid") == me:
@@ -849,7 +850,9 @@ class Scheduler:
             self.recovery_blocked = True
             self.recovery["ready"] = False
             self.recovery["items_ready"] = False
-        if not self.recovery_blocked:
+        deferred = bool(snap.get("admission_guard") and old)
+        self._handoff_deferred = (old, list(starting)) if deferred else None
+        if not self.recovery_blocked and not deferred:
             for vid in taken:
                 self._worker(self.vms[vid])
         if snap:  # (what the records place on the VMs handed over but the old one no longer held there: queued, as it was)
@@ -857,7 +860,7 @@ class Scheduler:
                 for it in b.items.values():
                     if getattr(it, "reattach", None) and it.reattach.get("vm") in self.vms and it.state == "queued":
                         it.reattach = None
-        if not self.recovery_blocked:
+        if not self.recovery_blocked and not deferred:
             for it, vm in starting:
                 threading.Thread(target=self._start_on, args=(it, vm), daemon=True).start()
         if taken:  # (their TTLs renewed now, as re-attach did each: the heartbeat's next is 5 min away, and a few handoffs
@@ -878,6 +881,22 @@ class Scheduler:
             log(f"took over {len(taken)} VMs in one write of the registry ({'the handoff of pid ' + str(old) if snap else 'the previous scheduler gone'}); "
                 f"{len(missing)} not taken{': ' + str(missing[:6]) if missing else ''}")
         self._h().record_handoff(now, len(info) if snap else len(taken), len(taken), len(missing) if snap else 0, 0, 0)
+
+    def _activate_handoff(self) -> bool:
+        """A loaded candidate remains passive until its live parent commits by exiting."""
+        deferred = getattr(self, "_handoff_deferred", None)
+        if deferred is None:
+            return True
+        old, starting = deferred
+        if not rules.handoff_activate(boat.pid_alive(old, socket.gethostname()), True):
+            return False
+        self._handoff_deferred = None
+        if not self.recovery_blocked:
+            for vm in self.vms.values():
+                self._worker(vm)
+            for it, vm in starting:
+                threading.Thread(target=self._start_on, args=(it, vm), daemon=True).start()
+        return True
 
     def _publish_handoff_ack(self):
         """Publish only after the inherited listener is serving and state is attached."""
@@ -957,11 +976,49 @@ class Scheduler:
             self.alert(why)
             self.handoff(back_to=d.get("from"))
 
+    def _handoff_vm_occupied(self, vm: VMState) -> bool:
+        """Unknown ownership and unfinished output are as binding as a live run."""
+        if (getattr(self, "recovery_blocked", False) or vm.running
+                or getattr(vm, "finishing", {}) or getattr(vm, "starts", [])
+                or getattr(vm, "preparing", {}) or getattr(vm, "foreign", 0)):
+            return True
+        return any(it.state != "done" and (getattr(it, "vm", None) is vm
+                   or (getattr(it, "reattach", None) or {}).get("vm") == vm.id)
+                   for b in self.batches.values() for it in b.items.values())
+
+    def _prune_handoff_pool(self, observed: dict):
+        """Forget empty, known-unavailable holds before offering the pool.
+
+        Caller holds self.lock: placement cannot race the occupancy recheck.
+        This only drops this process's advisory registry entry, never a VM-side
+        lease, worker, or provider resource. An absent listing entry is unknown.
+        """
+        pruned = {}
+        for vm in list(self.vms.values()):
+            state = (observed.get(vm.id) or {}).get("state")
+            reason = ("dead" if vm.dead else state if state in ("stopped", "deleted", "error")
+                      else "no agent" if vm.ready and vm.client is None else "")
+            if rules.handoff_required(self._handoff_vm_occupied(vm), bool(reason)):
+                continue
+            with Registry().locked() as d:
+                entry = d["vms"].get(vm.id)
+                lease = (entry or {}).get("lease") or {}
+                if (lease.get("pid") == os.getpid() and lease.get("host") == socket.gethostname()
+                        and lease.get("batch") == "scheduler"):
+                    entry["lease"] = None
+                    if state in ("stopped", "deleted", "error"):
+                        entry["state"] = state
+            self._drop_stale(vm)  # occupied was false, so no item is requeued
+            pruned[vm.id] = reason
+        self._handoff_pruned = pruned
+        if pruned:
+            log(f"handoff: pruned {len(pruned)} empty unavailable holds: {pruned}")
+
     def _handoff_snapshot(self) -> dict:
         """What the next scheduler takes at once: every VM held here and ready, with what it knows of it."""
         vms = []
         for v in list(self.vms.values()):
-            if v.dead or not v.ready:
+            if (v.dead or not v.ready) and not self._handoff_vm_occupied(v):
                 continue
             vms.append({"id": v.id, "image": v.image, "type": v.type, "slots": v.slots, "prepared": sorted(v.prepared), "trees": sorted(v.trees),
                         "caches": sorted([list(c) for c in v.caches]), "lease": v.lease, "ttl": v.ttl, "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
@@ -971,7 +1028,7 @@ class Scheduler:
                                   for it in list(v.running.values()) + list(getattr(v, "finishing", {}).values())]})
         return {"from_pid": os.getpid(), "t": time.time(), "from": self.code, "vms": vms,
                 "batches": sorted(set(self.batches) | set(getattr(self, "recovery_errors", {}))),
-                "admission_guard": True}
+                "admission_guard": True, "unavailable": dict(getattr(self, "_handoff_pruned", {}))}
 
     def _reattach(self):
         """Items placed before a restart and not done: their VMs leased again (their leases were this host's dead
@@ -1630,12 +1687,20 @@ class Scheduler:
 
     # -- the loop
     def run(self):
+        # ACK means loaded and serving, not permission to mutate the pool.
+        # Until the parent exits it may reject us and resume its original state.
+        while not self._activate_handoff():
+            if self.stop.wait(0.05):
+                return
         threading.Thread(target=self._heartbeat, daemon=True).start()
         threading.Thread(target=self._sampler, daemon=True).start()
         t_loop = time.time()
         while not self.stop.is_set():
             self.wake.wait(0.5)
             self.wake.clear()
+            if getattr(self, "handing_off", False):
+                t_loop = time.time()
+                continue
             if getattr(self, "recovery_blocked", False):
                 self._handoff_check(time.time())
                 continue
@@ -1798,6 +1863,8 @@ class Scheduler:
         now = time.time()
         self._med = {}
         with self.lock:
+            if getattr(self, "handing_off", False):
+                return
             if light:
                 q = [it for it in self._q_full if it.state == "queued"]
             else:
@@ -2976,6 +3043,8 @@ class Scheduler:
         """One tick of the VM (a call that waits for nothing): the seconds until its next, None when it's done."""
         if vm.dead:
             return None
+        if getattr(self, "handing_off", False):
+            return 0.5
         if time.monotonic() - vm.t_renew >= 60:
             try:
                 if not self._renew_lease(vm):
@@ -3687,6 +3756,8 @@ class Scheduler:
         floor, waves of real work and the gaps between them), saved every minute."""
         t_acc, t_save, t_adopt = time.time(), time.time(), 0.0
         while not self.stop.wait(5):
+            if getattr(self, "handing_off", False):
+                continue
             now = time.time()
             with contextlib.suppress(Exception):
                 # (a new install, unchanged for 60 s, that imports: rules.Install; no handoff while files are being
@@ -3803,6 +3874,42 @@ class Scheduler:
         with contextlib.suppress(Exception):
             self._h().record_billing(time.time(), health.billing_problems(boat.limits()))
 
+    def _reject_handoff_candidate(self, proc, previous_leases: dict):
+        """Reap before reclaiming its local records; never steal a foreign lease."""
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(proc.pid, 9)
+        proc.wait(timeout=5)
+        with Registry().locked() as d:
+            for vid, entry in d["vms"].items():
+                lease, before = entry.get("lease") or {}, previous_leases.get(vid)
+                ours_before = (before or {}).get("pid") == os.getpid() and (before or {}).get("host") == socket.gethostname()
+                child = (lease.get("pid") == proc.pid and lease.get("host") == socket.gethostname()
+                         and lease.get("batch") == "scheduler")
+                if child or (not lease and ours_before and vid in self.vms):
+                    entry["lease"] = before
+
+    def _resume_handoff(self, previous_files: dict):
+        """Restore the old process, not a third successor, after rejected boots."""
+        try:
+            for name, data in previous_files.items():
+                path = DIR / name
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    tmp = path.with_name(path.name + ".restore")
+                    tmp.write_bytes(data)
+                    tmp.replace(path)
+            tmp = DIR / "pid.restore"
+            tmp.write_text(str(os.getpid()))
+            tmp.replace(DIR / "pid")
+        finally:
+            self.handing_off, self.released_lock = False, False
+            self._full_now = True
+            self.wake.set()
+        _notify_service(os.getpid())
+        log(f"handoff: old scheduler resumed (pid {os.getpid()}); listener, loops and holds retained")
+
     def handoff(self, back_to: str | None = None):
         """Transfer the listening socket and locked file description; never drain.
 
@@ -3814,6 +3921,8 @@ class Scheduler:
         if getattr(self, "_handoff_preparing", False):
             return
         self._handoff_preparing = True
+        accepted, quiesced, active = False, False, None
+        previous_files, previous_leases = {}, {}
         try:
             if not back_to:
                 if not self._imports(new):
@@ -3826,25 +3935,35 @@ class Scheduler:
             if not all((DIR / "code" / c / "supercomputer").is_dir() for c in candidates):
                 self.alert("handoff refused: saved rollback code is missing")
                 return
+            # Observe provider state while the old scheduler still places work.
+            # A failed/partial listing never authorizes pruning an unseen VM.
+            observed = {}
+            with contextlib.suppress(Exception):
+                observed = boat.states(0)
             log(f"code {self.code} -> {new}: handing the pool over (listener, lock, VMs and items retained)")
-            # Imports and source copies happened while placement continued.
+            # Imports, source copies and provider observation happened while placement continued.
             request_lock = getattr(self, "_request_lock", self.lock)
             with request_lock, self.lock:
                 if any(it.batch.strict_once and not it.start_done.is_set()
                        for v in self.vms.values() for it in v.running.values()):
                     log("handoff deferred until in-flight strict launches settle; placement continues")
                     return
-                self.handing_off = True
-                self.stop.set()
+                self._prune_handoff_pool(observed)
+                previous_files = {name: (DIR / name).read_bytes() if (DIR / name).exists() else None
+                                  for name in ("handoff.json", "handoff.used.json", "handoff.ack")}
+                with Registry().locked() as d:
+                    previous_leases = {vid: v.get("lease") for vid, v in d["vms"].items()}
+                self.handing_off, quiesced = True, True
+                # A reversible pause, not stop: all existing loops stay alive.
                 self._metrics_save()
                 snap = self._handoff_snapshot()
             if not back_to:
                 self.canary.handing_off(self.code, new, time.time())
             inherited = hasattr(self, "_srv") and hasattr(self, "_lockf")
             fds = (self._srv.socket.fileno(), self._lockf.fileno()) if inherited else ()
-            if inherited:
-                self._srv.shutdown()  # closes no descriptor; the TCP backlog stays live
-            self.released_lock = True  # simulator/diagnostics; do NOT unlock the shared flock
+            # Keep the original accept loop alive for health/status even while a
+            # candidate hangs. Both processes reject mutations until committed.
+            self.released_lock = True  # simulator selection only; the shared flock stays locked
             held = {v["id"] for v in snap["vms"]}
             for attempt, target in enumerate(candidates):
                 snap["t"] = time.time()
@@ -3863,6 +3982,7 @@ class Scheduler:
                                             stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,
                                             start_new_session=True, close_fds=True, pass_fds=fds,
                                             env=env, cwd=str(config.HOME))
+                active = proc
                 ack, deadline = None, time.time() + 4
                 while not rules.handoff_expired(time.time(), deadline):
                     with contextlib.suppress(Exception):
@@ -3874,36 +3994,31 @@ class Scheduler:
                         break
                     time.sleep(0.05)
                 if ack and rules.handoff_ready(
-                        set(ack.get("taken", [])) == held and not ack.get("missing"),
+                        held <= set(ack.get("taken", [])) and not (held & set(ack.get("missing", []))),
                         ack.get("admissions", {}).get("ready") is True,
                         ack.get("items_ready") is True):
                     _notify_service(ack["pid"])
                     log(f"handoff: serving pid {ack['pid']} holds every VM and running identity; exiting")
+                    accepted = True
                     os._exit(0)
                 # A failed candidate must not run shutdown(), release or race rollback.
-                if proc.pid:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.kill(proc.pid, 9)
-                    proc.wait(timeout=5)
+                self._reject_handoff_candidate(proc, previous_leases)
+                active = None
                 why = f"handoff to {target} failed readiness: {ack!r}"
                 self.alert(why)
                 if target != self.code:
                     d = self.canary.read()
                     d.update({"state": "rejected", "rejected": sorted(set(d.get("rejected", [])) | {target}), "why": why})
                     self.canary.write(d)
-                with Registry().locked() as d:
-                    for vid in held:
-                        v = d["vms"].get(vid)
-                        if v is not None:
-                            v["lease"] = {**(v.get("lease") or {}), "pid": rules.handoff_owner(os.getpid(), proc.pid, False),
-                                          "host": socket.gethostname(), "batch": "scheduler"}
-            # Keep descriptors/ownership alive if even saved code cannot boot;
-            # never claim an unsafe partial recovery succeeded.
-            self.alert("handoff blocked: candidate and saved code failed; listener and leases retained")
-            while True:
-                time.sleep(60)
+            self.alert("handoff blocked: candidate and saved code failed; resuming old scheduler")
         finally:
-            self._handoff_preparing = False
+            try:
+                if rules.handoff_resume(accepted, quiesced):
+                    if active is not None:
+                        self._reject_handoff_candidate(active, previous_leases)
+                    self._resume_handoff(previous_files)
+            finally:
+                self._handoff_preparing = False
 
     def _imports(self, new: str) -> bool:
         """Whether the installed code imports (a broken install is never handed the pool: an alert, once)."""
@@ -4020,6 +4135,8 @@ class Scheduler:
 
     def _heartbeat(self):
         while not self.stop.wait(60):
+            if getattr(self, "handing_off", False):
+                continue
             for v in list(self.vms.values()):
                 # _bring registers booting VMs before their first grant. An
                 # unclaimed placeholder has not lost a lease; _up owns it.
@@ -4219,7 +4336,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                 if self.path in ("/poll", "/status", "/health", "/logs", "/capabilities"):
                     return self._post()
                 with s._request_lock:
-                    if s.stop.is_set():
+                    if s.stop.is_set() or getattr(s, "handing_off", False) or getattr(s, "_handoff_deferred", None):
                         self.close_connection = True
                         return self._send(503, {"error": "scheduler handoff; retry the same endpoint"})
                     return self._post()
