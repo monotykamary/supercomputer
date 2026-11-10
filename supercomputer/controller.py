@@ -92,11 +92,12 @@ LIMITS = {"scheduler": "CPUQuota=250%\nMemoryHigh=4G\nMemoryMax=5G\nTasksMax=150
 
 def unit(name: str, cmd: str, cwd: str, env: dict) -> str:
     envs = "\n".join(f"Environment={k}={v}" for k, v in env.items())
+    notify = "Type=notify\nNotifyAccess=all\nKillMode=process\n" if name == "scheduler" else ""
     return f"""[Unit]
 Description=supercomputer {name}
 After=network-online.target
 [Service]
-User=user
+{notify}User=user
 WorkingDirectory={cwd}
 {envs}
 ExecStartPre=+/bin/bash -c 'mkdir -p /run/sc-boat && chown user:user /run/sc-boat && chmod 700 /run/sc-boat'
@@ -156,15 +157,16 @@ def setup(vm: str, vms: int = 40, floor: int = 8, only: str = ""):
            "PATH": "/home/user/.bun/bin:/home/user/.elan/bin:/home/user/.ascii/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
     units = {f"supercomputer-{n}": unit(n, c.format(vms=floor), f"{SC}/tool" if n == "scheduler" else repo, env) for n, c in UNITS.items()}
     script = "set -e\n" + "".join(f"sudo tee /etc/systemd/system/{u}.service > /dev/null <<'EOF'\n{t}EOF\n" for u, t in units.items())
-    # (a deploy drains first: no new item placed for up to 45 s while running ones finish; what still runs then is
-    # re-attached by the restarted scheduler, every finished item's output being kept on the controller as it ends)
-    drain = (f"T={SC}/live/scheduler/token; if [ -s $T ] && curl -s -m 5 http://127.0.0.1:8790/health > /dev/null; then "
-             f"for i in $(seq 1 15); do r=$(curl -s -m 10 -H \"X-SC-Token: $(cat $T)\" -d '{{}}' http://127.0.0.1:8790/drain | python3 -c 'import json,sys;print(json.load(sys.stdin).get(\"running\",0))'); "
-             f"[ \"$r\" = 0 ] && break; sleep 3; done; echo drained:$r; fi\n")
+    # The running scheduler imports stable source and transfers its listener.
+    # Never turn an unsupported first-upgrade endpoint into a destructive restart.
+    reload = (f"T={SC}/live/scheduler/token; "
+              f"curl --fail --silent --show-error -m 10 -H \"X-SC-Token: $(cat $T)\" "
+              "-d '{}' http://127.0.0.1:8790/reload || "
+              "echo 'reload endpoint unavailable; leaving running scheduler to automatic install pickup'\n")
     if only == "treadmill":  # (the tool's files and the treadmill only: the scheduler, and every batch in it, untouched)
         script += "sudo systemctl daemon-reload\nsudo systemctl restart supercomputer-treadmill\necho UNITS-OK\n"
     else:
-        script += "sudo systemctl daemon-reload\n" + drain + "sudo systemctl enable --now supercomputer-scheduler\nsleep 3\nsudo systemctl enable --now supercomputer-treadmill\nsudo systemctl restart supercomputer-scheduler supercomputer-treadmill\necho UNITS-OK\n"
+        script += "sudo systemctl daemon-reload\nsudo systemctl enable --now supercomputer-scheduler\n" + reload + "sudo systemctl enable --now supercomputer-treadmill\necho UNITS-OK\n"
     code, out = ssh(vm, "bash -s", script.encode(), 300)
     assert "UNITS-OK" in out, out[-600:]
     for _ in range(30):
