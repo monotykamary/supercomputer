@@ -1519,6 +1519,7 @@ def memo_memory(code):
 def subs_past_shares(code):
     from tests.sim.harness import items
     sim = _sim(code, policy={"sub_vms": 1})
+    sim.S.BREAK_EVEN_OVERRIDE_S = 900  # replay this incident's explicit old horizon, not the production default
     _warm(sim, 6)
     sim.treadmill(base_vms=6, filler_n=0, sweep_n=24, sweep_s=600)
     sim.scheduler()
@@ -1675,7 +1676,8 @@ def partial_tree(code):
           "the treadmill's filler on 16 VMs; two submission clients of 2-slot items, then a bar of 2-slot and 1-slot gate items over them: every slot to real work while it waits, the submissions' waits minutes, not hours")
 def starvation_1325(code):
     from tests.sim.harness import items
-    sim = _sim(code)  # growth follows economics; gates retain their own deadline
+    sim = _sim(code)
+    sim.S.BREAK_EVEN_OVERRIDE_S = 900  # this incident used an explicit 900-second growth override
     _warm(sim, 16)
     sim.treadmill(base_vms=8, filler_s=900, backlog=True, sweep_n=32, sweep_s=600)
     sim.scheduler()

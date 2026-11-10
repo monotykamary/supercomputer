@@ -30,7 +30,7 @@ pods); `modal app list` after any Modal fallback. Never stop or delete VMs anoth
 
 **Money:** no limits, be smart. No VM-hour or dollar caps: warm slots and lower classes first, then free starts,
 then paid ones (~$0.03-0.07). The pool grows only when queued work beyond held and coming capacity pays for a new VM
-(at least its hold or start-price / VM-hour-price break-even), gates for what finishes them within {gate_horizon} min; idle VMs go; chains stop when they stop gaining.
+(the larger start-or-hold opportunity cost divided by its VM-hour price), gates for what finishes them within {gate_horizon} min; idle VMs go; chains stop when they stop gaining.
 No VM ceiling ({max_vms}); {bringup} VMs coming up at once is only the scheduler's own load guard.
 `supercomputer starts` and the digest report spend as information. {limits}
 

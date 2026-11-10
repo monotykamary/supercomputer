@@ -47,17 +47,23 @@ retried on another VM each time; a batch run with `--backend modal` stays on Mod
 For each VM type, let `S` be its slots and `R` its VM-hour price. The economic break-even is
 
 ```
-B = max(hold_s, 3600 * start_dollars / R)
+hold_dollars = hold_s * vm_hour_dollars / 3600
 R = vm_hour_dollars * (type_vcpus / default_vcpus)
+B = 3600 * max(hold_dollars, start_dollars) / R
 ```
 
-Holding an idle VM for `start_dollars / R` hours costs a replacement start. The policy already commits to a hold,
-so growth must justify at least that much work too: use the larger of the two, not another guessed time budget.
-`start_dollars` defaults to $0.07 (the upper paid-start tariff in the $0.03–0.07 range); `vm_hour_dollars` defaults
-to $0.036 per default-VM hour, as in the billing digest. They are opportunity prices, including for free starts and
-prepaid hours: both consume shared allowances. Set these economic inputs when the tariff changes, not to tune a
-queue timeout. With a 2,700-second hold, break-even is 3,500 seconds for a large VM and 7,000 for a default VM.
-No boat API is called in the planning loop.
+Holding an idle default VM for `hold_s` defines the policy's existing opportunity-cost baseline, in the same
+**default-VM dollars** as the digest. A start must earn at least that cost, or its replacement price when higher.
+Convert money back to busy time using the new VM's rate: a large VM provides twice the default capacity per second,
+so do not impose the default VM's wall time on it again. The actual release hold remains 45 minutes for every type;
+only growth's cost comparison is normalized.
+
+`start_dollars` defaults to $0.03, the first paid-start bracket (`boat limits` on 2026-11-10 reports $0.03, $0.05 and
+$0.07 brackets). `vm_hour_dollars` defaults to $0.036 per default-VM hour, as in that response and the billing digest.
+These are opportunity prices, including for free starts and prepaid hours: both consume shared allowances. Set the
+price input when the marginal tariff changes, not to tune a queue timeout. With a 2,700-second hold the baseline is
+$0.027, so break-even at the first bracket is 1,500 seconds for a large VM and 3,000 for a default VM. At $0.07 it
+becomes 3,500 / 7,000 seconds respectively. No boat API is called in the planning loop.
 
 - `W` is queued real slot-time (all classes except filler, each contended submission client counted only up to its
   remaining share). `C` is held and coming usable capacity over `B`, minus running real work within `B`.
@@ -65,18 +71,24 @@ No boat API is called in the planning loop.
   workload left after the held/coming pool and earlier starts have been credited**. A partial VM does not buy a
   start. In particular, when the held pool clears the queue within break-even, ordinary growth is zero.
 - Gates (and interactive checks) have a separate deadline, `GATE_HORIZON` [15 min]: add the minimum VMs whose
-  capacity covers the gate deficit in the time remaining after bring-up, using a **ceiling**. Held free slots and
+  capacity covers the gate deficit before `batch.t0 + GATE_HORIZON`, after bring-up, using a **ceiling**. The
+  remaining deadline shrinks on each replan; it is never reset to another 15 minutes. Held free slots and
   slots reclaimable from filler/sweeps count first; running higher work, foreign runs and coming VMs' bring-up are
   deducted. The target is the maximum of economic growth and gate growth, not their sum. As before, this is an
-  estimate-based fluid capacity promise (normal bring-up leaves at least 60 seconds); indivisible jobs may straddle
-  the horizon, and the bring-up cap/breaker can delay capacity.
+  estimate-based fluid capacity promise. An indivisible item needs at least its own runtime plus bring-up, so
+  `gate_window` retains that feasible tail if the deadline is too close or already missed; it does not promise an
+  impossible completion. Indivisible jobs may straddle the horizon, and the bring-up cap/breaker can delay capacity.
 
 The no-needless-start law is for **economic** starts. A gate whose work the held pool clears in 40 minutes still
 needs deadline capacity for 15 minutes. Applying the economic veto to it would contradict the deadline law.
 The existing exceptions also remain: an empty/failed pool needs a service VM, and an unserved exclusive batch a
-matching lane. Classes, floors, the breaker and the bring-up cap are unchanged. `HORIZON` / `SUPERCOMPUTER_HORIZON`
-are retired, with no override: that would reintroduce the arbitrary budget. Legacy `horizon_s` in a saved policy is
-ignored and cannot be set; status reports the economic inputs and each target's derived `break_even_s` instead.
+matching lane. Classes, floors, the breaker and the bring-up cap are unchanged. `horizon_s` is retired as a policy
+knob: legacy saved values are ignored and cannot be set. Status reports the economic inputs and each target's
+`break_even_s`. Only the explicit `SUPERCOMPUTER_HORIZON` environment override remains, for controlled comparisons
+and forensic replay of old policies (two historical placement scenarios used 900 seconds). It is unset by default,
+is never inferred from a saved policy, and disables the economic guarantee by substituting the requested window;
+it is not a way to tune production growth. The new gate and steady-submission scenarios exercise economics, not
+that override.
 - an interactive check alone starts one VM, and none while any VM of its image is held;
 - the existing 3x bring-up usefulness guard (measured, ~10-120 s) still applies to ordinary growth; it cannot veto
   capacity required by a gate deadline or an exclusive service lane;

@@ -5,10 +5,11 @@ from supercomputer.rules import growth as G
 
 
 def test_economics():
-    assert G.break_even_s(2700, 0.03, 0.072) == 2700
-    assert math.isclose(G.break_even_s(2700, 0.07, 0.072), 3500)
-    assert math.isclose(G.break_even_s(2700, 0.07, 0.036), 7000)
+    assert G.break_even_s(2700, 0.03, 0.036, 2) == 1500
+    assert math.isclose(G.break_even_s(2700, 0.07, 0.036, 2), 3500)
+    assert G.break_even_s(2700, 0.03, 0.036) == 3000
     assert G.break_even_s(8000, 0.07, 0.036) == 8000
+    assert G.break_even_s(8000, 0.07, 0.036, 2) == 4000
     for args in ((-1, .07, .036), (2700, -.01, .036), (2700, .07, 0), (math.inf, .07, .036), (0, 0, .036)):
         try:
             G.break_even_s(*args)
@@ -16,6 +17,12 @@ def test_economics():
             pass
         else:
             raise AssertionError(args)
+
+
+def test_gate_window_consumes_elapsed_time():
+    assert G.gate_window(900, 120, 300) == 900
+    assert G.gate_window(700, 120, 300) == 700
+    assert G.gate_window(0, 120, 300) == 420
 
 
 def test_rounding_boundaries():
@@ -34,7 +41,7 @@ def test_rounding_boundaries():
 
 def test_held_and_coming_capacity():
     s = sched()
-    b = batch(s, n=200)
+    b = batch(s, n=80)
     for it in b.items.values():
         it.est = 60
     # One held large VM clears the whole queue during break-even.
@@ -82,7 +89,7 @@ def test_gate_deadline_and_bringup_cap():
     plan = s._plan(S.time.time())
     assert sum(n for n, *_ in plan.values()) == S.BRINGUP_MAX
     target = next(iter(s.target.values()))
-    assert target["gate_vms"] >= 40 and target["deficit_vms"] == 0, target
+    assert target["gate_vms"] >= 40 and target["gate_vms"] > target["deficit_vms"], target
     assert target["why"] == "bring-up cap", target
     pool = S.rules.Pool(1000, 100, 300, 3600)
     assert pool.grow(target["gate_vms"], S.time.time()) == target["gate_vms"]

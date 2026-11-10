@@ -7,4 +7,4 @@ laws, or I/O and why.
                 the watchdog, the handoff, acquisition, placement, preemption
 """
 from .scheduler import *  # noqa: F401,F403
-from .growth import break_even_s, economic_start, economic_vms, gate_start, gate_vms  # noqa: F401
+from .growth import break_even_s, economic_start, economic_vms, gate_start, gate_vms, gate_window  # noqa: F401

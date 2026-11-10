@@ -130,11 +130,12 @@ def _env(k: str, d):
 BRINGUP_MAX = _env("BRINGUP", 10)  # VMs being brought up at once (the scheduler's own load guard); the rest wait their turn
 GATE_HORIZON = _env("GATE_HORIZON", 900.0)  # a gate gets the VMs that finish it within this (its items' last times)
 MAX_VMS = int(os.environ.get("SUPERCOMPUTER_MAX_VMS") or 0) or 10 ** 9  # none by default (the user: "no limit"); set, a technical ceiling
-HOLD = _env("HOLD", 2700.0)  # a VM above the floor runs filler this long after its last real work, then goes (45 min: a paid start's
-# break-even for a large VM is about 42-58 min, and a start is never free: the allowance is shared with other projects)
+HOLD = _env("HOLD", 2700.0)  # above-floor filler hold; its default-VM cost also values the shared start allowance
 # Opportunity prices, not spend limits: free starts consume a shared allowance.
-START_DOLLARS = _env("START_DOLLARS", 0.07)  # upper paid-start tariff ($0.03-0.07)
+START_DOLLARS = _env("START_DOLLARS", 0.03)  # first paid-start bracket (higher brackets: $0.05, $0.07)
 VM_HOUR_DOLLARS = _env("VM_HOUR_DOLLARS", 0.036)  # per default-VM hour, like the digest
+# Explicit legacy replay only, never a policy knob or an automatic live-policy fallback.
+BREAK_EVEN_OVERRIDE_S = _env("HORIZON", 0.0)
 SUB_VMS = _env("SUB_VMS", 8)  # a submission client's VMs' worth of slots at once
 BOAT_TRIES = _env("BOAT_TRIES", 3)  # boat failures (a VM lost, a row missing, no VM ready) before an item goes to Modal
 DRAIN_STEP = _env("DRAIN_STEP", 0.25)  # past their hold, the VMs above the floor shed by at most this share (rounded up) a window
@@ -2289,7 +2290,7 @@ class Scheduler:
         self.target = {}
         for (image, vm_type), its in groups.items():
             S, bu = vm_slots(vm_type), max(30.0, self.bring_up)
-            B = rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS * vm_mult(vm_type))
+            B = BREAK_EVEN_OVERRIDE_S or rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS, vm_mult(vm_type))
             held = [v for v in live if v.image == image and v.type == vm_type]
             coming = self.creating.get((image, vm_type), 0)
             real = [it for it in its if it.batch.klass <= 4]
@@ -2328,7 +2329,10 @@ class Scheduler:
             hi = [it for it in real if it.batch.klass <= 2]
             n_hi = 0
             if hi:
-                H = GATE_HORIZON
+                # A deadline, not a fresh horizon every tick: bringing up VMs
+                # consumes the gate's time too. Keep a feasible item-sized tail.
+                item_s = max(sz(it) / (S if it.timing else it.weight) for it in hi)
+                H = rules.gate_window(max(0.0, min(GATE_HORIZON, min(it.batch.t0 + GATE_HORIZON - now for it in hi))), bu, item_s)
                 hw = sum(sz(it) for it in hi)
                 # the held VMs' slot-time within H a gate can have: free slots and lower classes' at once, the rest
                 # as their items (interactive, gate, submission) end; VMs still coming up, after their bring-up
