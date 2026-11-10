@@ -112,6 +112,20 @@ def test_gate_capacity_reserves_the_dispatch_quantum():
     assert targets[1] > targets[0], targets
 
 
+def test_ready_gate_capacity_does_not_include_new_worker_bringup():
+    s = sched()
+    s.bring_up = 120
+    now = S.time.time()
+    b = batch(s, klass=2, n=150)
+    b.t0 = now - S.GATE_HORIZON + 350
+    for it in b.items.values():
+        it.est = 300
+    for i in range(28):
+        vm(s, str(i))
+    s._plan(now)
+    assert next(iter(s.target.values()))['gate_vms'] > 0, s.target
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

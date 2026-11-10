@@ -954,6 +954,7 @@ class Drain:
     them (rounded up) a window, a window lasting until every_s after its last shed: a big wave's surplus goes in steps,
     never at once. Each turn is one VM shed (its drain started, or released with nothing queued)."""
 
+    # gdp: law drain parameters remain within their validated range: step_pct >= 1 and step_pct <= 100 and every_s >= 1
     # gdp: law in any drain_every_s window at most ceil(drain_step x above-floor) VMs are shed: released <= quota
     # gdp: law a window's quota is its share of the VMs above the floor, rounded up: 100 * quota <= share + 99 and 100 * quota >= share
 

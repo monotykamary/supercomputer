@@ -771,6 +771,15 @@ class Scheduler:
             hb = self.held_before.get(vid, {})
             vm.lease = i.get("lease") or hb.get("lease") or (boat.read_agent(vid) or {}).get("lease") or {}
             vm.ttl = max(boat.BACKSTOP, int(i.get("ttl") or hb.get("ttl") or 0))
+            if (snap and not self.recovery_blocked and cl is not None and i.get("lease") == vm.lease
+                    and vm.lease.get("owner", vm.lease.get("holder")) == boat.owner_id()
+                    and vm.lease.get("vm_id") == vid and vm.lease.get("boot")
+                    and type(vm.lease.get("epoch")) is int and vm.lease["epoch"] > 0):
+                # The live same-machine parent handed us its exact capability.
+                # Do not put O(pool) network renewals on the four-second switch.
+                # Every worker RPC still verifies this fence on the VM.
+                cl.lease, vm.t_renew = vm.lease, time.monotonic()
+                return cl, vm, True
             try:
                 if not vm.lease and not self.recovery_blocked:
                     # This path has already proven a dead local scheduler in our
@@ -2481,7 +2490,9 @@ class Scheduler:
                 # A deadline, not a fresh horizon every tick: bringing up VMs
                 # consumes the gate's time too. Keep a feasible item-sized tail.
                 item_s = max(sz(it) / (S if it.timing else it.weight) for it in hi)
-                H = rules.gate_window(max(0.0, min(GATE_HORIZON, min(it.batch.t0 + GATE_HORIZON - now for it in hi))), bu, item_s)
+                remaining = max(0.0, min(GATE_HORIZON, min(it.batch.t0 + GATE_HORIZON - now for it in hi)))
+                H = rules.gate_window(remaining, bu, item_s)
+                ready_H = max(remaining, item_s)  # a ready VM does not get the new VM's bring-up extension
                 hw = sum(sz(it) for it in hi)
                 # the held VMs' slot-time within H a gate can have: free slots and lower classes' at once, the rest
                 # as their items (interactive, gate, submission) end; VMs still coming up, after their bring-up
@@ -2494,14 +2505,14 @@ class Scheduler:
                     if v.ready and not any(vm_fits(fit_shape(it), v, retired) for it in hi):
                         continue
                     slots = rules.usable_slots(v.slots, getattr(v, "foreign", 0), exclusive)
-                    left = [min(H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
+                    left = [min(ready_H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
                             for x in v.running.values() if x.batch.klass <= 3]
                     if exclusive:
                         taken = slots * max(left, default=0.0)  # one whole VM, not fragments on several
                     else:
-                        taken = sum((v.slots if x.timing else x.weight) * min(H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
+                        taken = sum((v.slots if x.timing else x.weight) * min(ready_H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
                                     for x in v.running.values() if x.batch.klass <= 3)
-                    cap_hi += max(0.0, slots * (H if v.ready else max(0.0, H - bu)) - taken)
+                    cap_hi += max(0.0, slots * (ready_H if v.ready else max(0.0, H - bu)) - taken)
                 cap_hi += coming * S * max(0.0, H - bu)
                 n_hi = rules.gate_vms(hw, cap_hi, S * max(60.0, H - bu))
                 if all(it.batch.klass == 1 for it in hi):  # (a check alone: one VM, and only when none is held)

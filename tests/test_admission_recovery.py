@@ -192,6 +192,38 @@ def test_blocked_recovery_can_never_pass_the_ten_minute_canary():
         assert c.read()["state"] == "watching"
 
 
+def test_live_handoff_preserves_fence_without_network_renewal():
+    s = sched()
+    s.code, s.recovery_errors, s.alerts = 'new', {}, []
+    s.retired, s._read_client_closes = lambda: set(), lambda: set()
+    s._worker = Mock()
+    old_pid, host = os.getpid() + 100000, socket.gethostname()
+    grant = {'ok': True, 'owner': 'fixture-owner', 'boot': 'boot', 'epoch': 7, 'vm_id': 'A'}
+    reg = {'vms': {'A': {'snapshot': 'img', 'type': 'large', 'state': 'running',
+                        'lease': {'pid': old_pid, 'host': host, 'batch': 'scheduler'}}}}
+    client = SimpleNamespace(rpc=Mock())
+    with tempfile.TemporaryDirectory() as tmp:
+        d = pathlib.Path(tmp)
+        s.canary = canary.Canary(d)
+        snap = {'from_pid': old_pid, 'from': 'old', 't': time.time(), 'batches': [],
+                'vms': [{'id': 'A', 'image': 'img', 'type': 'large', 'lease': grant, 'items': []}]}
+        (d / 'handoff.json').write_text(json.dumps(snap))
+        registry = SimpleNamespace(locked=lambda: nullcontext(reg))
+        with patch.object(S, 'DIR', d), patch.object(S, 'Registry', lambda: registry), \
+             patch.object(S.boat, 'pid_alive', return_value=True), \
+             patch.object(S.boat, 'owner_id', return_value='fixture-owner'), \
+             patch.object(S.boat, 'agent_client', return_value=client), \
+             patch.object(S.boat, 'lease_vm', side_effect=AssertionError('network renewal on handoff')), \
+             patch.object(S.boat, 'rename_leased_vm', side_effect=AssertionError('rename on handoff')), \
+             patch.object(S.concurrent.futures, 'ThreadPoolExecutor', lambda *a, **kw: nullcontext(SimpleNamespace(map=lambda f, xs: map(f, xs)))):
+            s._take_pool()
+        assert not s.recovery_blocked
+        assert s.vms['A'].lease == grant == client.lease
+        assert s.vms['A'].t_renew > 0
+        assert json.loads((d / 'handoff.ack').read_text())['taken'] == ['A']
+        s._worker.assert_called_once()
+
+
 def test_manifest_keeps_queued_only_batches():
     s = sched()
     s.code = "old"
