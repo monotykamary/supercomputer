@@ -1845,13 +1845,15 @@ def gate_68_slot_hours(code):
         h = getattr(scheds[-1], "health", None) if scheds else None
         needless = sum(e.get("n", 1) for e in h.ev.get("needless", [])) if h else 0
         m["gate_elapsed_s"], m["created"], m["needless_recorded"] = elapsed, len(made), needless
-        import math
-        H = sim.S.GATE_HORIZON
-        max_starts = math.ceil((68 * 3600 - 28 * 4 * H) / (4 * (H - sim.B.BRING_UP)))
+        used = {v for it in sim.w.items.values() for v in it["finished_on"]}
+        unused = [e["vm"] for e in made if e["vm"] not in used]
+        m["unused_starts"] = unused
+        # The bring-up cap staggers arrivals: a no-cap VM-count bound would
+        # falsely call deadline capacity needless. Every start must run work.
         # Work is indivisible: the last 300-second item can straddle the fluid
         # horizon. Allow one item, not another hour; all jobs must be delivered.
         return {"near_gate_horizon": elapsed <= sim.S.GATE_HORIZON + 300,
-                "grew": bool(made), "no_needless_start": needless == 0 and len(made) <= max_starts}
+                "grew": bool(made), "no_needless_start": needless == 0 and not unused}
     return sim, {"extra": extra}
 
 

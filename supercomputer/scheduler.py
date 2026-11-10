@@ -136,6 +136,8 @@ START_DOLLARS = _env("START_DOLLARS", 0.03)  # first paid-start bracket (higher 
 VM_HOUR_DOLLARS = _env("VM_HOUR_DOLLARS", 0.036)  # per default-VM hour, like the digest
 # Explicit legacy replay only, never a policy knob or an automatic live-policy fallback.
 BREAK_EVEN_OVERRIDE_S = _env("HORIZON", 0.0)
+if not math.isfinite(BREAK_EVEN_OVERRIDE_S) or BREAK_EVEN_OVERRIDE_S < 0:
+    raise ValueError("SUPERCOMPUTER_HORIZON must be a finite positive replay override, or 0 to disable")
 SUB_VMS = _env("SUB_VMS", 8)  # a submission client's VMs' worth of slots at once
 BOAT_TRIES = _env("BOAT_TRIES", 3)  # boat failures (a VM lost, a row missing, no VM ready) before an item goes to Modal
 DRAIN_STEP = _env("DRAIN_STEP", 0.25)  # past their hold, the VMs above the floor shed by at most this share (rounded up) a window
@@ -1472,7 +1474,7 @@ class Scheduler:
                     "shed": self.shed, "load": self.load, "bring_up_s": round(self.bring_up, 1), "alerts": self.alerts[-5:],
                     "policy": self.pol, "code": self.code, "code_installed": code_hash(), "agent_code": self.agent_version, "stale": self.stale(),
                     "agents": {v.id: v.agent for v in live},
-                    "knobs": {"bringup": BRINGUP_MAX, "start_dollars": START_DOLLARS, "vm_hour_dollars": VM_HOUR_DOLLARS, "gate_horizon_s": GATE_HORIZON, "hold_s": HOLD, "sub_vms": SUB_VMS, "max_vms": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": self.pol["floor"]},
+                    "knobs": {"bringup": BRINGUP_MAX, "break_even_override_s": BREAK_EVEN_OVERRIDE_S or None, "start_dollars": START_DOLLARS, "vm_hour_dollars": VM_HOUR_DOLLARS, "gate_horizon_s": GATE_HORIZON, "hold_s": HOLD, "sub_vms": SUB_VMS, "max_vms": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": self.pol["floor"]},
                     # (the old keys, for older clients)
                     "starts_by_class": {n: self.m["starts"][n]["free"] + self.m["starts"][n]["paid"] for n in CLASSES}, "preempted": sum(self.m["preempted"].values()),
                     "hints": {k: {kk: vv for kk, vv in h.items() if kk != "pid"} for k, h in self.hints.items() if h["until"] > now}}
@@ -2430,7 +2432,7 @@ class Scheduler:
                     n = min(n, earned)
                 if n > earned and free_fit:
                     self._h().record_needless(now, n - earned, image, vm_type)
-            tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "break_even_s": B, "why": ""}
+            tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "break_even_s": B, "growth_source": "legacy override" if BREAK_EVEN_OVERRIDE_S else "economics", "why": ""}
             if n > 0:
                 tgt["why"] = "breaker" if now < pool.open_until else "probe" if pool.half else ""
                 if self.shed:
