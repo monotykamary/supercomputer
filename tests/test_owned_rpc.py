@@ -128,6 +128,9 @@ class SchedulerFence(unittest.TestCase):
         self.assertEqual(self.it.state,'owned_refused')
     def test_mixed_ticks_keep_legacy_results_and_never_downgrade_strict(self):
         self.place_without_thread();self.s.shed=False;self.vm.t_agent=S.time.time()
+        self.assertEqual(self.vm.client.lease, self.vm.lease)
+        self.assertEqual(self.vm.lease["owner"], S.boat.owner_id())
+        self.vm.t_renew=S.time.monotonic()
         strict={'batch':self.b.id,'spec':{'name':self.it.run_name,'strict_once':True,'launch_identity':self.it.launch_identity}}
         legacy={'batch':'legacy','spec':{'name':'old'}}
         self.vm.starts=[strict,legacy]
@@ -144,6 +147,34 @@ class SchedulerFence(unittest.TestCase):
             accept.assert_called_once_with(self.vm,oldrow)
         self.assertEqual([x[0] for x in calls],['owned_rpc','vtick'])
         self.assertEqual(self.it.state,'owned_refused');self.assertEqual(len(self.vm.acks),1)
+
+    def test_stale_start_drops_without_strike_stop_or_legacy_fallback(self):
+        self.place_without_thread()
+        transport = self.vm.client
+        transport.rpc.return_value = {'ok': False, 'stale': True}
+        self.vm.client = S.SchedulerAgentClient(transport, self.s, self.vm)
+        tries = self.it.tries
+        with patch.object(self.s, '_prepare') as prepare, patch.object(self.s, '_boat_failed') as strike, patch.object(self.s, '_let_go') as stop:
+            self.s._start_on(self.it, self.vm)
+            prepare.assert_not_called();strike.assert_not_called();stop.assert_not_called()
+        self.assertTrue(self.vm.dead)
+        self.assertNotIn(self.vm.id, self.s.vms)
+        self.assertEqual(self.it.state, 'queued')
+        self.assertEqual(self.it.tries, tries)
+        self.assertEqual(transport.rpc.call_count, 1)
+        self.assertEqual(transport.rpc.call_args.args[0], 'owned_rpc')
+
+    def test_legacy_protocol_loss_alerts_and_drops_without_stop(self):
+        self.place_without_thread()
+        with patch.object(S.boat, 'lease_vm', side_effect=S.boat.LeaseProtocolLost('old CLI has no lease')), patch.object(self.s, 'alert') as alert, patch.object(self.s, '_let_go') as stop:
+            self.assertFalse(self.s._renew_lease(self.vm))
+            alert.assert_called_once()
+            self.assertIn(self.vm.id, alert.call_args.args[0])
+            self.assertIn('old client wins', alert.call_args.args[0])
+            stop.assert_not_called()
+        self.assertTrue(self.vm.dead)
+        self.assertNotIn(self.vm.id, self.s.vms)
+        self.assertEqual(self.it.state, 'queued')
 
     def test_no_upgrade_or_repair_with_held_strict_placement(self):
         self.place_without_thread()

@@ -71,6 +71,74 @@ VERSION = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]  
 Report = Literal["done", "running", "lost", "torn", "skip"]
 
 
+class VMLease:
+    # gdp: law no VM runs items of two owners at once: foreign == 0 or mine == 0
+    """Pure admission/fencing decisions; inventory is supplied under lease_lock."""
+    def __init__(self):
+        self.holder = ""
+        self.boot = ""
+        self.vm_id = ""
+        self.epoch = 0
+        self.mine = 0
+        self.foreign = 0
+        self.draining = False
+
+    # gdp: law only the holder accepts a fence: not result or by == holder
+    # gdp: law old boot fences are void: not result or b == boot
+    # gdp: law forked VM fences are void: not result or vm == vm_id
+    # gdp: law stale epoch fences are void: not result or e == epoch
+    def accepts(self, by: str, b: str, e: int, vm: str) -> bool:
+        return (by != "" and by == self.holder and b == self.boot and e == self.epoch
+                and vm == self.vm_id and not self.draining)
+
+    # gdp: law a nonholder never fences a stop: not result or by == holder
+    # gdp: law a stop requires the current boot and epoch: not result or (b == boot and e == epoch and vm == vm_id)
+    def fence_stop(self, by: str, b: str, e: int, vm: str) -> bool:
+        return self.accepts(by, b, e, vm)
+
+    def claim(self, by: str, b: str, vm: str, lapsed: bool, released: bool, stopping: bool) -> bool:
+        if by == "" or stopping:
+            return False
+        changed = b != self.boot or vm != self.vm_id
+        if not changed and by == self.holder and not released and not self.draining:
+            return True
+        if not (changed or self.holder == "" or lapsed or released or self.draining):
+            return False
+        if self.mine + self.foreign > 0:
+            self.draining = True
+            return False
+        self.holder = by
+        self.boot = b
+        self.vm_id = vm
+        self.epoch += 1
+        self.draining = False
+        return True
+
+    # gdp: law a stale epoch item is never accepted: not result or (by == holder and b == boot and e == epoch and vm == vm_id)
+    # gdp: law no foreign item admits a start: not result or foreign == 0
+    def start(self, by: str, b: str, e: int, vm: str) -> bool:
+        if not self.accepts(by, b, e, vm) or self.foreign > 0:
+            return False
+        self.mine += 1
+        return True
+
+    def ended(self, foreign: bool):
+        if foreign:
+            self.foreign = max(0, self.foreign - 1)
+        else:
+            self.mine = max(0, self.mine - 1)
+
+    # gdp: law reboot clears the previous holder: holder == ""
+    def rebooted(self):
+        self.holder = ""
+        self.boot = ""
+        self.vm_id = ""
+        self.epoch = 0
+        self.mine = 0
+        self.foreign = 0
+        self.draining = False
+
+
 class JobReport:
     """What an item of a batch on this VM is, from its files: acked (reported and taken: never again), done (its
     done.json), torn (a done.json half written: running, read again next time), running (its process alive, or being
@@ -832,6 +900,8 @@ def cache_names(name: str, key: str) -> list[str]:
 def drop_old_batches(batch: str, keep_s: float = 1800):
     # other batches' directories go once nothing of theirs runs and they've been quiet keep_s (the scheduler runs
     # several batches on one VM at once; a client's batch had the VM alone, and a late call of an older one keeps its tree)
+    if _lease_enabled():
+        return  # owner results/logs survive lease transfer until explicit owner ack
     now, rule = time.time(), BatchDirs(int(keep_s))
     for old in (ROOT / "b").glob("*") if (ROOT / "b").exists() else []:
         try:
@@ -869,6 +939,8 @@ def _clean_disk():
 
 
 def _clean_disk_once():
+    if _lease_enabled():
+        return  # never reclaim another owner's data as an incidental disk cleanup
     oldest = int(time.time())
     for j in (ROOT / "b").glob("*/jobs/*") if (ROOT / "b").exists() else []:
         with _quiet():
@@ -1296,6 +1368,15 @@ def _legacy_start(d: pathlib.Path, spec: dict):
 
 
 def start(d: pathlib.Path, spec: dict):
+    if _lease_enabled():
+        fence = getattr(_lease_local, "fence", None) or {}
+        rule = _lease_rule(_lease_record())
+        if not rule.start(fence.get("owner", ""), fence.get("boot", ""), fence.get("epoch", -1), fence.get("vm_id", "")):
+            raise LeaseStale("VM start fence or foreign inventory refused")
+        spec = {**spec, "owner": fence["owner"]}
+        j = d / "jobs" / spec["name"]
+        if j.exists() and _job_owner(j) != fence["owner"]:
+            raise LeaseStale("foreign item identity collision")
     if spec.get("strict_once") is not True:
         with _rpc_gate_lock, _ownership_lock():
             if (ROOT / "owned-upgrading").exists():
@@ -1417,6 +1498,8 @@ def _strict_job_identity(j):
 
 def _ack_job(j, expected_identity=None):
     """Only an exact identity-bound strict result can be retired; legacy is unchanged."""
+    if not _owner_readable(j):
+        return
     if not Ticks().ack((j / "done.json").exists()):
         return
     try:
@@ -1478,7 +1561,8 @@ def report(d: pathlib.Path) -> tuple[list, list]:
                 row = dict(row)
                 row.pop("launch_identity", None)
                 row.update(identity_untrusted=True, identity_error=identity_error or "terminal launch identity mismatch")
-            done.append(row)
+            if _owner_readable(j):
+                done.append({**row, "owner": _job_owner(j)} if _lease_enabled() else row)
         elif what in ("running", "torn"):
             running.append(j.name)
     return done, running
@@ -1566,7 +1650,7 @@ def vtick(msg: dict) -> dict:
                 except FileNotFoundError:  # (an old batch's directory dropped meanwhile)
                     continue
                 done += [{**r, "batch": d.name} for r in dn]
-                running += [{"batch": d.name, "name": n} for n in rn]
+                running += [{"batch": d.name, "name": n, "owner": _job_owner(d / "jobs" / n)} for n in rn]
         if Ticks().stop(bool(done), bool(running), int(time.time() - t0), int(wait)):
             break
         time.sleep(0.1)
@@ -1719,6 +1803,8 @@ def logs_tar(batch: str) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for j in sorted((d / "jobs").iterdir()) if (d / "jobs").exists() else []:
+            if not _owner_readable(j):
+                continue
             for f, cap in (("out", 400_000), ("err", 100_000)):
                 p = j / f
                 if p.exists():
@@ -1740,7 +1826,11 @@ def parts(blob: pathlib.Path, make, part: str) -> dict:
 
 
 def collect(batch: str, part: str) -> dict:
-    return parts(batch_dir(batch) / "logs.tar.gz", lambda: logs_tar(batch), part)
+    if _lease_enabled() and not _request_owner():
+        return {"ok": False, "stale": True}
+    owner = _request_owner() if _lease_enabled() else ""
+    suffix = hashlib.sha256(owner.encode()).hexdigest()[:16] if owner else "legacy"
+    return parts(batch_dir(batch) / f"logs-{suffix}.tar.gz", lambda: logs_tar(batch), part)
 
 
 def cache_tar(name: str, key: str) -> bytes:
@@ -1904,9 +1994,397 @@ def owned_rpc(request):
                 result = commands[cmd](*args)
             return {'ok': True, 'protocol': 1, 'version': VERSION, 'nonce': nonce,
                     'features': features, 'result': result}
+        except LeaseStale:
+            return {'ok': False, 'stale': True, 'protocol': 1, 'version': VERSION, 'nonce': nonce}
         except Exception as error:
             return {'ok': False, 'error': 'owned_dispatch_refused', 'detail': repr(error),
                     'protocol': 1, 'version': VERSION, 'nonce': nonce, 'features': features}
+
+
+# ------------------------------------------------------------------------------------------------------- VM leases
+LEASE_S, BIRTH_S, STOP_S = 180, 600, 300
+_lease_mutex = threading.RLock()
+_lease_local = threading.local()
+
+
+class LeaseStale(ValueError):
+    pass
+
+
+@contextlib.contextmanager
+def lease_lock(deadline=None):
+    """One reentrant thread lock AND flock shared by exec and HTTP."""
+    import fcntl
+    acquired = (_lease_mutex.acquire() if deadline is None else
+                _lease_mutex.acquire(timeout=max(0, deadline - time.monotonic())))
+    if not acquired:
+        raise TimeoutError("lease lock timed out")
+    try:
+        if getattr(_lease_local, "depth", 0):
+            _lease_local.depth += 1
+            try:
+                yield
+            finally:
+                _lease_local.depth -= 1
+            return
+        ROOT.mkdir(parents=True, exist_ok=True)
+        with open(ROOT / "lease.lock", "a") as f:
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("lease file lock timed out")
+                    time.sleep(0.01)
+            _lease_local.depth = 1
+            try:
+                yield
+            finally:
+                _lease_local.depth = 0
+                fcntl.flock(f, fcntl.LOCK_UN)
+    finally:
+        _lease_mutex.release()
+
+
+def _lease_boot():
+    return pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def _lease_now():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def _lease_enabled():
+    # No compatibility bypass after a lease has existed, including across reboot.
+    return (ROOT / "lease.json").exists() or (ROOT / "birth.json").exists()
+
+
+def _lease_record():
+    p = ROOT / "lease.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def _lease_save(record):
+    p = ROOT / "lease.json"
+    tmp = ROOT / "lease.json.new"
+    with open(tmp, "w") as f:
+        json.dump(record, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    fd = os.open(ROOT, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _job_owner(j):
+    p = j / "spec.json"
+    return json.loads(p.read_text()).get("owner", "") if p.exists() else ""
+
+
+def _lease_inventory():
+    """Conservative: an unreported job (even without PID yet) is still live.
+
+    Strict done rows can precede namespace exit; use its supervisor too. We never
+    signal here, and never convert a missing supervisor into an invented result.
+    """
+    counts = {}
+    for j in (ROOT / "b").glob("*/jobs/*"):
+        terminal = (j / "done.json").exists() or (j / "acked.json").exists()
+        pid = (j / "pid").read_text().strip() if (j / "pid").exists() else ""
+        live = not terminal or (pid.isdigit() and alive(int(pid)))
+        if live:
+            owner = _job_owner(j)
+            counts[owner] = counts.get(owner, 0) + 1
+    return counts
+
+
+def _lease_rule(record):
+    rule = VMLease()
+    for key in ("holder", "boot", "vm_id", "epoch", "draining"):
+        if key in record:
+            setattr(rule, key, record[key])
+    counts = _lease_inventory()
+    rule.mine = counts.get(rule.holder, 0)
+    rule.foreign = sum(n for owner, n in counts.items() if owner != rule.holder)
+    return rule
+
+
+def _lease_matches(record, fence, draining=False):
+    if not isinstance(fence, dict):
+        return False
+    rule = VMLease()
+    for key in ("holder", "boot", "vm_id", "epoch", "draining"):
+        if key in record:
+            setattr(rule, key, record[key])
+    if draining:
+        rule.draining = False
+    return (record.get("boot") == _lease_boot() and type(fence.get("epoch")) is int
+            and rule.accepts(fence.get("owner", ""), fence.get("boot", ""),
+                             fence["epoch"], fence.get("vm_id", "")))
+
+
+@contextlib.contextmanager
+def lease_guard(fence, deadline=None):
+    """Atomic install/mutation guard. Raises LeaseStale; never returns permission
+    on malformed state. An explicitly never-leased RunPod remains compatible.
+    """
+    with lease_lock(deadline):
+        record = _lease_record()
+        if _lease_enabled() and (not _lease_matches(record, fence) or record.get("state") != "held"):
+            raise LeaseStale("VM lease fence refused")
+        yield record
+
+
+def _lease_who(record=None):
+    record = _lease_record() if record is None else record
+    now, boot = _lease_now(), _lease_boot()
+    valid = record.get("boot") == boot
+    public = {k: v for k, v in record.items() if k != "stop_nonce"}
+    return {**public, "owner": record.get("holder", ""), "holder": record.get("holder", ""),
+            "boot": boot, "epoch": record.get("epoch", 0), "vm_id": record.get("vm_id", ""),
+            "state": record.get("state", "released"), "lease_s": LEASE_S,
+            "lapsed": not valid or now - record.get("renewed", 0) >= LEASE_S,
+            "valid_boot": valid, "uptime": now, "counts": _lease_inventory(),
+            "draining": bool(record.get("draining")), "protocol": 1}
+
+
+def lease(op, payload=None):
+    payload = payload or {}
+    with lease_lock():
+        r = _lease_record()
+        if op == "who":
+            return {"ok": True, **_lease_who(r)}
+        now, boot = _lease_now(), _lease_boot()
+        if op == "claim":
+            by, vm = payload.get("owner", ""), payload.get("vm_id", "")
+            if not isinstance(by, str) or not by or not isinstance(vm, str) or not vm:
+                return {"ok": False, "error": "owner and vm_id required"}
+            birth = ROOT / "birth.json"
+            if birth.exists() and now < BIRTH_S:
+                b = json.loads(birth.read_text())
+                # Once activated in THIS boot/id, repeated claims need only the fence.
+                activated = r.get("boot") == boot and r.get("vm_id") == vm and r.get("holder") == b.get("owner")
+                if by != b.get("owner") or (not activated and (not b.get("nonce") or payload.get("nonce") != b["nonce"])):
+                    return {"ok": False, "busy": True, "birth": True, **_lease_who(r)}
+            rule = _lease_rule(r)
+            same_identity = r.get("boot") == boot and r.get("vm_id") == vm
+            stopping = same_identity and r.get("state") == "stopping" and now - r.get("stopping_at", now) < STOP_S
+            granted = rule.claim(by, boot, vm, now - r.get("renewed", 0) >= LEASE_S,
+                                 r.get("state", "released") == "released" or (r.get("state") == "stopping" and not stopping), stopping)
+            if not granted:
+                if rule.draining:
+                    r["draining"] = True
+                    _lease_save(r)
+                return {"ok": False, "busy": True, **_lease_who(r)}
+            r.pop("stop_nonce", None)
+            r.update(holder=rule.holder, owner=rule.holder, boot=rule.boot, vm_id=rule.vm_id,
+                     epoch=rule.epoch, draining=False, state="held", renewed=now)
+            _lease_save(r)
+            return {"ok": True, **_lease_who(r)}
+        if op not in ("renew", "release", "fence_stop", "check"):
+            return {"ok": False, "error": "unknown lease operation"}
+        if not _lease_matches(r, payload) or (op in ("renew", "check", "fence_stop") and r.get("state") != "held"):
+            return {"ok": False, "stale": True, **_lease_who(r)}
+        if op == "renew":
+            r["renewed"] = now
+        elif op == "release":
+            if r.get("state") == "stopping" and (not r.get("stop_nonce") or payload.get("stop_nonce") != r["stop_nonce"]):
+                return {"ok": False, "stale": True, **_lease_who(r)}
+            r["state"] = "released"
+        elif op == "fence_stop":
+            if not _lease_rule(r).fence_stop(payload.get("owner", ""), payload.get("boot", ""),
+                                             payload.get("epoch", -1), payload.get("vm_id", "")):
+                return {"ok": False, "stale": True, **_lease_who(r)}
+            r.update(state="stopping", stopping_at=now, stop_nonce=secrets.token_hex(16))
+        if op != "check":
+            _lease_save(r)
+        result = {"ok": True, **_lease_who(r)}
+        if op == "fence_stop":
+            result["stop_nonce"] = r["stop_nonce"]
+        return result
+
+
+lease_op = lease
+
+
+def keys_add(owner, token):
+    if not isinstance(owner, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", owner) or not token:
+        raise ValueError("invalid client key")
+    with lease_lock():
+        d = ROOT / "keys"
+        d.mkdir(mode=0o700, exist_ok=True)
+        p = d / owner
+        if p.exists():
+            if not hmac.compare_digest(p.read_text().strip(), token):
+                raise ValueError("client key already registered; never replace another key")
+            return {"ok": True, "again": True}
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        return {"ok": True}
+
+
+def _token_owner(token):
+    for p in (ROOT / "keys").glob("*"):
+        if p.is_file() and hmac.compare_digest(token, p.read_text().strip()):
+            return p.name
+    return None
+
+
+@contextlib.contextmanager
+def _lease_request(fence):
+    previous = getattr(_lease_local, "fence", None)
+    _lease_local.fence = fence
+    try:
+        yield
+    finally:
+        _lease_local.fence = previous
+
+
+def _request_owner():
+    return (getattr(_lease_local, "fence", None) or {}).get("owner", "")
+
+
+def _owner_readable(j):
+    return not _lease_enabled() or (bool(_request_owner()) and _job_owner(j) == _request_owner())
+
+
+def _lease_mutation(fn):
+    def guarded(*args, **kwargs):
+        deadline = None
+        if fn.__name__ == "cancelitem":
+            wait = float(args[2] if len(args) > 2 else kwargs.get("wait_seconds", 10))
+            if not math.isfinite(wait) or not 0 <= wait <= 60:
+                raise ValueError("wait_seconds must be finite and between 0 and 60")
+            deadline = time.monotonic() + wait
+        try:
+            with lease_guard(getattr(_lease_local, "fence", None), deadline):
+                if fn.__name__ in ("kill", "kill_item", "cancelitem") and _lease_enabled():
+                    batch = args[0]
+                    jobs = ([batch_dir(batch) / "jobs" / args[1]] if len(args) > 1 else list((batch_dir(batch) / "jobs").glob("*")))
+                    if any(j.exists() and not _owner_readable(j) for j in jobs):
+                        raise LeaseStale("foreign job mutation refused")
+                if fn.__name__ == "cancelitem":
+                    # The lease acquisition consumes this request's original deadline.
+                    args = list(args)
+                    if len(args) > 2:
+                        args[2] = max(0, deadline - time.monotonic())
+                    else:
+                        kwargs["wait_seconds"] = max(0, deadline - time.monotonic())
+                return fn(*args, **kwargs)
+        except TimeoutError as error:
+            if fn.__name__ == "cancelitem":
+                return _owned_receipt(args[0], args[1], {}, str(error))
+            raise
+    return guarded
+
+
+# Wrappers cover internal/direct Python calls as well as both transport dispatchers.
+start = _lease_mutation(start)
+kill = _lease_mutation(kill)
+kill_item = _lease_mutation(kill_item)
+cancelitem = _lease_mutation(cancelitem)
+prep = _lease_mutation(prep)
+
+
+def _lease_tick(fn):
+    def guarded(*args):
+        msg = args[-1]
+        with lease_lock():
+            fence = getattr(_lease_local, "fence", None)
+            if _lease_enabled():
+                if msg.get("start"):
+                    with lease_guard(fence):
+                        pass
+                # A former owner may still read and ack its results at any epoch.
+                # Only the current unfrozen holder can renew or place anything.
+                current = _lease_matches(_lease_record(), fence) and _lease_record().get("state") == "held"
+                if current:
+                    lease("renew", fence)
+                result = fn(*args)
+                return result if current else {**result, "stale": True}
+            return fn(*args)
+    return guarded
+
+
+tick = _lease_tick(tick)
+vtick = _lease_tick(vtick)
+
+
+def begin(version, batch, tree, context):
+    if version != VERSION:
+        return {"ok": False, "version": VERSION}
+    tr = make_tree(tree, None, None)
+    if not tr.get("ok"):
+        return {"ok": False, "version": VERSION, "need": "manifest"}
+    return {"ok": True, "version": VERSION, "prep": prep(batch, "tree:" + tree, context, tree, "", "-")}
+
+
+def upgrade(data_b64, port, token):
+    data = base64.b64decode(data_b64, validate=True)
+    compile(data, "agent.py.new", "exec")
+    with lease_guard(getattr(_lease_local, "fence", None)):
+        with _rpc_gate_lock, _ownership_lock():
+            if upgrade_busy():
+                return {"ok": False, "error": "owned_upgrade_blocked"}
+            (ROOT / "owned-upgrading").write_text(VERSION)
+        (ROOT / "agent.py.new").write_bytes(data)
+        os.replace(ROOT / "agent.py.new", ROOT / "agent.py")
+        fence = getattr(_lease_local, "fence", None)
+        extra = [base64.b64encode(json.dumps(fence).encode()).decode()] if fence else []
+        subprocess.Popen([sys.executable, "-c", "import subprocess,sys,time; time.sleep(0.5); subprocess.run([sys.executable, sys.argv[1], 'start-daemon', *sys.argv[2:]])",
+                          str(ROOT / "agent.py"), str(port), token, *extra], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return {"ok": True, "from": VERSION, "to": hashlib.sha256(data).hexdigest()[:12]}
+
+
+def rpc_dispatch(cmd, args, token_owner=None, cli=False):
+    args = list(args)
+    fence = None
+    if args and isinstance(args[-1], dict) and set(args[-1]) == {"_lease"}:
+        fence = args.pop()["_lease"]
+    if cmd == "lease":
+        op, payload = args
+        if token_owner is not None and op != "who" and payload.get("owner") != token_owner:
+            return {"ok": False, "stale": True}
+        return lease(op, payload)
+    if token_owner is not None and isinstance(fence, dict) and fence.get("owner") != token_owner:
+        return {"ok": False, "stale": True}
+    commands = {"tick": tick, "vtick": vtick, "kill": kill, "killitem": kill_item,
+                "cancelitem": cancelitem, "prep": prep, "collect": collect, "cacheout": cacheout,
+                "cachein": cachein, "serve": serve, "owned_rpc": owned_rpc,
+                "itemlogs": itemlogs, "logs": logs_tar, "start-daemon": start_daemon,
+                "begin": begin, "upgrade": upgrade, "tree": make_tree, "verify": verify_tree,
+                "have": lambda keys: {"missing": have(keys)}, "pull": pull, "pullcache": pullcache,
+                "ping": lambda: {"ok": True, "version": VERSION, "boot": _lease_boot(),
+                    "cpus": os.cpu_count(), "load": os.getloadavg()[0], "disk": clean_disk(), "lease": lease("who")}}
+    if cmd not in commands:
+        raise ValueError("unsupported RPC command: " + str(cmd))
+    try:
+        # Strict dispatch takes rpc_gate_lock internally; preserve global order
+        # lease -> rpc gate -> owned-items, including concurrent upgrades.
+        with _lease_request(fence), (lease_lock() if cmd == "owned_rpc" else contextlib.nullcontext()):
+            if not cli and cmd == "cacheout" and len(args) > 2 and args[2] == "tar":
+                return cache_tar(args[0], args[1])
+            if not cli and cmd in ("tick", "vtick"):
+                msg = args[-1]
+                if any((s.get("spec", s)).get("strict_once") is True for s in msg.get("start", [])):
+                    return {"ok": False, "error": "owned_rpc_required"}
+            return commands[cmd](*args)
+    except LeaseStale:
+        return {"ok": False, "stale": True}
+
+
+def itemlogs(batch, name):
+    j = batch_dir(batch) / "jobs" / name
+    if not _owner_readable(j):
+        return {"ok": False, "stale": True}
+    return {f: (j / f).read_bytes()[-cap:].decode("utf-8", "replace") if (j / f).exists() else ""
+            for f, cap in (("out", 400_000), ("err", 100_000))}
 
 
 # ------------------------------------------------------------------------------------------------------- the daemon
@@ -1916,7 +2394,7 @@ def daemon(port: str):
     # (SIGPIPE ignored: the CLI's default action would kill the whole daemon when a client goes away mid-answer, a
     # scheduler handing off or boat's relay dropping a connection; ignored, that's one request's BrokenPipeError)
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-    token = (ROOT / "token").read_text().strip()
+    token = (ROOT / "token").read_text().strip() if (ROOT / "token").exists() else ""
     boot = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip() if pathlib.Path("/proc/sys/kernel/random/boot_id").exists() else ""
 
     with _ownership_lock():
@@ -1939,7 +2417,10 @@ def daemon(port: str):
             pass
 
         def _ok(self, health: bool = False) -> bool:
-            if not Access().allows(health, hmac.compare_digest(self.headers.get("X-SC-Token", ""), token)):
+            supplied = self.headers.get("X-SC-Token", "")
+            self.client_owner = _token_owner(supplied)
+            accepted = self.client_owner is not None or (not _lease_enabled() and bool(token) and hmac.compare_digest(supplied, token))
+            if not Access().allows(health, accepted):
                 self._send(403, {"error": "token"})
                 return False
             return True
@@ -1961,7 +2442,7 @@ def daemon(port: str):
             if not self._ok(health):
                 return
             if health:
-                return self._send(200, {"ok": True})
+                return self._send(200, {"ok": True, "version": VERSION, "lease": _lease_who()})
             self._send(404, {"error": "GET /health, POST /rpc /put"})
 
         def do_POST(self):
@@ -1982,70 +2463,8 @@ def daemon(port: str):
                     return self._send(200, cachein(q["name"][0], q["key"][0], str(tmp)))
                 msg = json.loads(body or b"{}")
                 cmd, a = msg.get("cmd"), msg.get("args", [])
-                if cmd == "begin":  # [client version, batch, tree id, context]: the version, and the batch prepared if the tree is here
-                    if a[0] != VERSION:
-                        return self._send(200, {"ok": False, "version": VERSION})
-                    tr = make_tree(a[2], None, None)
-                    if not tr.get("ok"):
-                        return self._send(200, {"ok": False, "version": VERSION, "need": "manifest"})
-                    pr = prep(a[1], f"tree:{a[2]}", a[3], a[2], "", "-")
-                    if not pr.get("ok") and "isn't on this VM" in str(pr.get("err")):  # (collected meanwhile: its manifest asked for, B6)
-                        return self._send(200, {"ok": False, "version": VERSION, "need": "manifest"})
-                    return self._send(200, {"ok": True, "version": VERSION, "prep": pr})
-                if cmd == "ping":
-                    dk = {}
-                    with _quiet():
-                        dk = clean_disk()  # (an idle VM's disk asked by ping: no starts, no reports)
-                    return self._send(200, {"ok": True, "version": VERSION, "boot": boot, "cpus": os.cpu_count(), "load": os.getloadavg()[0], "disk": dk})
-                if cmd == "have":
-                    return self._send(200, {"missing": have(a[0])})
-                if cmd == "verify":  # [tree id, {path: git blob id}]: the files of the tree that aren't the blobs named
-                    return self._send(200, verify_tree(a[0], a[1]))
-                if cmd == "tree":
-                    return self._send(200, make_tree(a[0], a[1], a[2]))
-                if cmd == "prep":
-                    return self._send(200, prep(*a))
-                if cmd == "tick":
-                    if any(st.get("strict_once") is True for st in a[1].get("start", [])):
-                        return self._send(200, {"ok": False, "error": "owned_rpc_required"})
-                    return self._send(200, tick(a[0], a[1]))
-                if cmd == "kill":
-                    return self._send(200, kill(a[0]))
-                if cmd == "itemlogs":  # [batch, name]: one item's out and err (their tails), for the scheduler to keep
-                    j = batch_dir(a[0]) / "jobs" / a[1]
-                    out = {f: (lambda p, cap: p.read_bytes()[-cap:].decode("utf-8", "replace") if p.exists() else "")(j / f, c) for f, c in (("out", 400_000), ("err", 100_000))}
-                    return self._send(200, out)
-                if cmd == "owned_rpc":
-                    return self._send(200, owned_rpc(a[0]))
-                if cmd == "upgrade":  # idle is decided atomically against ALL starts
-                    data = base64.b64decode(a[0], validate=True)
-                    compile(data, "agent.py.new", "exec")
-                    with _rpc_gate_lock, _ownership_lock():
-                        if upgrade_busy():
-                            return self._send(200, {"ok": False, "error": "owned_upgrade_blocked"})
-                        (ROOT / "owned-upgrading").write_text(VERSION)
-                    (ROOT / "agent.py.new").write_bytes(data)
-                    os.replace(ROOT / "agent.py.new", ROOT / "agent.py")
-                    subprocess.Popen([sys.executable, "-c", "import subprocess,sys,time; time.sleep(0.5); subprocess.run([sys.executable, sys.argv[1], 'start-daemon', sys.argv[2], sys.argv[3]])",
-                                      str(ROOT / "agent.py"), a[1], a[2]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                    return self._send(200, {"ok": True, "from": VERSION, "to": hashlib.sha256(data).hexdigest()[:12]})
-                if cmd == "pull":  # [peer url, peer token, keys]: blobs from a peer VM
-                    return self._send(200, pull(a[0], a[1], a[2]))
-                if cmd == "pullcache":  # [peer url, peer token, name, key]
-                    return self._send(200, pullcache(a[0], a[1], a[2], a[3]))
-                if cmd == "cancelitem":
-                    return self._send(200, cancelitem(*a))
-                if cmd == "killitem":
-                    return self._send(200, kill_item(a[0], a[1]))
-                if cmd == "vtick":
-                    if any(st.get("spec", {}).get("strict_once") is True for st in a[0].get("start", [])):
-                        return self._send(200, {"ok": False, "error": "owned_rpc_required"})
-                    return self._send(200, vtick(a[0]))
-                if cmd == "logs":
-                    return self._send(200, raw=logs_tar(a[0]))
-                if cmd == "cacheout":
-                    return self._send(200, raw=cache_tar(a[0], a[1])) if len(a) > 2 and a[2] == "tar" else self._send(200, {"names": cache_names(a[0], a[1])})
-                return self._send(400, {"error": f"no command {cmd}"})
+                result = rpc_dispatch(cmd, a, token_owner=self.client_owner)
+                return self._send(200, raw=result) if isinstance(result, bytes) else self._send(200, result)
             except Exception as e:
                 return self._send(500, {"error": repr(e)[-2000:]})
 
@@ -2066,13 +2485,13 @@ def answers(port: str) -> bool:
         return False
 
 
-def start_daemon(port: str, token: str) -> dict:
+def _start_daemon(port: str, token: str) -> dict:
     """The warm agent, started (or kept: one already answering with this version and token stays)."""
     ROOT.mkdir(parents=True, exist_ok=True)
     old = (ROOT / "token").read_text().strip() if (ROOT / "token").exists() else ""
     pid = int((ROOT / "daemon.pid").read_text()) if (ROOT / "daemon.pid").exists() else 0
     same_version = (ROOT / "daemon.version").exists() and (ROOT / "daemon.version").read_text() == VERSION
-    what = Access().keep_daemon(bool(pid) and alive(pid) and answers(port), old == token, same_version)  # (Access.keep_daemon; a daemon alive but not answering is replaced: B2)
+    what = Access().keep_daemon(bool(pid) and alive(pid) and answers(port), True, same_version)  # (Access.keep_daemon; a daemon alive but not answering is replaced: B2)
     if what == "keep":
         return {"ok": True, "again": True}
     with _ownership_lock():
@@ -2102,6 +2521,8 @@ def start_daemon(port: str, token: str) -> dict:
     (ROOT / "daemon.version").write_text(VERSION)
     subprocess.Popen([sys.executable, str(ROOT / "agent.py"), "daemon", port], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=open(ROOT / "daemon.err", "w"), start_new_session=True, close_fds=True)
+    if _lease_enabled():
+        return {"ok": True, "starting": True}  # health takes lease.lock; parent releases before readiness
     for _ in range(50):
         try:
             import urllib.request
@@ -2110,6 +2531,18 @@ def start_daemon(port: str, token: str) -> dict:
         except Exception:
             time.sleep(0.1)
     return {"ok": False, "err": (ROOT / "daemon.err").read_text()[-500:]}
+
+
+def start_daemon(port: str, token: str, fence_b64=None) -> dict:
+    fence = (json.loads(base64.b64decode(fence_b64, validate=True)) if fence_b64
+             else getattr(_lease_local, "fence", None))
+    try:
+        with _lease_request(fence), lease_guard(fence):
+            owner = fence["owner"] if fence else "legacy-" + hashlib.sha256(token.encode()).hexdigest()[:24]
+            keys_add(owner, token)
+            return _start_daemon(port, token)
+    except LeaseStale:
+        return {"ok": False, "stale": True}
 
 
 if __name__ == "__main__":
@@ -2126,10 +2559,23 @@ if __name__ == "__main__":
     elif cmd == "ingest":
         ingest(pathlib.Path(rest[0]), rest[1])
     else:
-        out = {"prep": lambda *a: prep(*a),
-               "cachein": lambda n, k, t: cachein(n, k, t),
-               "tick": lambda b, *p: tick(b, json.loads(base64.b64decode("".join(p))) if p and p[0] != "-" else {}),
-               "kill": kill, "collect": collect, "cacheout": cacheout,
-               "serve": lambda d, p: serve(d, int(p)),
-               "start-daemon": start_daemon}[cmd](*rest)
+        try:
+            if cmd == "lease":
+                out = lease(rest[0], json.loads(base64.b64decode(rest[1], validate=True)) if len(rest) > 1 else {})
+            elif cmd == "keys":
+                if rest[0] != "add":
+                    raise ValueError("keys add <owner> <token>")
+                out = keys_add(*rest[1:])
+            elif cmd == "rpc":
+                request = json.loads(base64.b64decode("".join(rest), validate=True))
+                out = rpc_dispatch(request["cmd"], request.get("args", []), cli=True)
+            else:
+                out = {"prep": prep, "cachein": cachein,
+                       "tick": lambda b, *p: tick(b, json.loads(base64.b64decode("".join(p))) if p and p[0] != "-" else {}),
+                       "kill": kill, "killitem": kill_item, "cancelitem": cancelitem,
+                       "collect": collect, "cacheout": cacheout,
+                       "serve": lambda d, p: serve(d, int(p)),
+                       "start-daemon": start_daemon}[cmd](*rest)
+        except LeaseStale:
+            out = {"ok": False, "stale": True}
         print(json.dumps(out))
