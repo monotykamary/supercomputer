@@ -76,6 +76,20 @@ def handoff_pool_ready(covered: bool, authority_lost: bool) -> bool:
     return covered and not authority_lost
 
 
+# gdp: law unoffered registry VMs never delay a handoff: not handoff or offered or not result
+# gdp: law every offered VM remains eligible for fenced takeover: not offered or result
+# gdp: law a cold restart retains registry takeover: handoff or result
+def handoff_registry_vm(handoff: bool, offered: bool) -> bool:
+    return not handoff or offered
+
+
+# gdp: law pending extras are not new handoff orphans: not deferred or acquired or not result
+# gdp: law required VMs remain covered by orphan checks: deferred or result
+# gdp: law an extra once acquired is covered by orphan checks: not acquired or result
+def handoff_orphan_scope(deferred: bool, acquired: bool) -> bool:
+    return not deferred or acquired
+
+
 # gdp: law a running or unresolved item always requires its VM: not occupied or result
 # gdp: law an empty unavailable VM never blocks handoff: occupied or not unavailable or not result
 # gdp: law a usable VM is still required: unavailable or result

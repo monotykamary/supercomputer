@@ -1,5 +1,14 @@
 """Regressions refused by the same hot-update laws."""
 
+# gdp: law unoffered registry VMs never delay a handoff: not handoff or offered or not result
+def acquire_extra_before_ack(handoff: bool, offered: bool) -> bool:
+    return True
+
+# gdp: law required VMs remain covered by orphan checks: deferred or result
+def ignore_required_orphan(deferred: bool, acquired: bool) -> bool:
+    return acquired
+
+
 # gdp: law a live guarded parent keeps its old-readable journals: not guarded or not parent_alive or not result
 def compact_before_parent_commit(parent_alive: bool, guarded: bool, blocked: bool) -> bool:
     return not blocked

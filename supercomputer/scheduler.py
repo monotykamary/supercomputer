@@ -907,7 +907,8 @@ class Scheduler:
         (rules.take_over), each held here at once, ready, as the handoff's snapshot (or the registry and the hold
         clocks) says; its items joined to it by re-attach's first pass at once (it holds the VM), then checked against
         its agent's word (_reconcile_taken). A handoff's old scheduler is told what was taken (handoff.ack): it exits
-        only when this one holds every VM it held (rules.handoff_done)."""
+        only when this one holds every VM it held (rules.handoff_done). Unoffered registry extras wait
+        for ordinary post-commit adoption; their provider latency is not a readiness dependency."""
         now, me, host = time.time(), os.getpid(), socket.gethostname()
         snap = {}
         with contextlib.suppress(Exception):  # (a handoff's snapshot only while its writer lives, waiting for this one's word: an
@@ -947,7 +948,7 @@ class Scheduler:
         # hand-back here would race its recovery and spawn two replacements.
         self._recovery_decision = ("alert", why) if what and snap.get("admission_guard") else (what, why)
 
-        taken, missing, reg, starting = [], [], {}, []
+        taken, missing, reg, starting, deferred_extras = [], [], {}, [], []
         retired = self.retired()
         registry_started = time.monotonic()
         with Registry().locked() as d:
@@ -960,6 +961,9 @@ class Scheduler:
                     continue
                 if vid not in info and v.get("state") not in boat.RUNNING:
                     continue  # (a lease left on a VM boat had stopped: nothing to hold)
+                if not rules.handoff_registry_vm(bool(snap), vid in info):
+                    deferred_extras.append(vid)
+                    continue  # Leave its registry lease and agent untouched until post-commit adoption.
                 v["lease"] = {**l, "pid": me, "host": host, "batch": "scheduler", "since": now, "label": "scheduler (taken over)"}
                 taken.append(vid)
                 reg[vid] = dict(v)
@@ -1078,7 +1082,7 @@ class Scheduler:
                 with concurrent.futures.ThreadPoolExecutor(16) as ex:
                     list(ex.map(one, vms))
             threading.Thread(target=extend, daemon=True).start()
-        self._handoff = {"t": now, "from_pid": old, "held": sorted(info), "taken": taken, "missing": missing, "snapshot": bool(snap), "checks": 0}
+        self._handoff = {"t": now, "from_pid": old, "held": sorted(info), "taken": taken, "missing": missing, "snapshot": bool(snap), "checks": 0, "deferred_extras": sorted(deferred_extras)}
         if snap:
             self._handoff_ack = {"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing,
                                  "admissions": self.recovery, "items_ready": items_ready,
@@ -1209,6 +1213,8 @@ class Scheduler:
         me, host, orphans = os.getpid(), socket.gethostname(), 0
         with contextlib.suppress(Exception):
             for vid, v in Registry().read().get("vms", {}).items():
+                if not rules.handoff_orphan_scope(vid in h.get("deferred_extras", ()), vid in self.vms):
+                    continue  # A pre-existing unoffered hold is not an orphan created by this handoff.
                 l = v.get("lease") or {}
                 pid = int(l.get("pid") or 0)
                 if l.get("batch") == "scheduler" and l.get("host") == host and pid and pid != me and not boat.pid_alive(pid, host) \
@@ -4899,6 +4905,13 @@ class Scheduler:
         """Ask the VM, not our registry. Unheld VMs expire by TTL, never by us."""
         try:
             if getattr(self, "recovery_blocked", False):
+                return
+            handoff = getattr(self, "_handoff", {})
+            guarded = bool(handoff.get("snapshot"))
+            while not rules.handoff_activate(guarded and boat.pid_alive(handoff["from_pid"], socket.gethostname()), guarded):
+                if self.stop.wait(0.05):
+                    return
+            if self.stop.is_set():
                 return
             live = boat.sandboxes()
             now = time.time()

@@ -1243,6 +1243,59 @@ def handoff_stopped_holds(code):
     return sim, {'extra': extra}
 
 
+@scenario("hot reload blocked extra", ["lost", "strikes", "modal", "clients", "threads", "orphans"], 1800,
+          "an unoffered stale idle registry VM blocks exec for 120s; the required pool commits first and extras are adopted afterward")
+def handoff_blocked_extra(code):
+    import socket
+    from tests.sim.harness import items, IMAGE
+    from tests.sim.world import Agent
+    sim = _sim(code, policy={"max_vms": 4})
+    _warm(sim, 4)
+    sim.scheduler()
+    sim.at(10, lambda: sim.batch("extra-gate", "gate", items("g", 128, 90)))
+    observed = {"execs": []}
+    original_exec = sim.w.cli_exec
+    def blocked_exec(args):
+        if args[1] == observed.get("extra"):
+            observed["execs"].append({"t": sim.k.now - sim.k.t0,
+                                      "parent_alive": sim.B.pid_alive(observed["parent"], socket.gethostname())})
+            sim.k.sleep(120)
+        return original_exec(args)
+    sim.w.cli_exec = blocked_exec
+    def deploy():
+        proc, s = sim.w.live_sched()
+        def offer():
+            with s.lock:
+                v = sim.w.warm_vm(IMAGE)
+                lease = sim.B.read_agent(v.id)["lease"]
+                Agent(sim.w, v).c_lease("release", lease)
+                with sim.B.Registry().locked() as d:
+                    d["vms"][v.id]["state"] = "idle"
+                observed.update(extra=v.id, parent=proc.pid, offered=sorted(s.vms))
+                sim.w.install("extra-deferred")
+                s.handoff()
+        sim.k.start(proc, offer, name="offer with blocked extra")
+    sim.at(150, deploy)
+    def extra(sim, m):
+        current = sim.w.live_sched()
+        state = json.loads((pathlib.Path(sim.tmp) / "scheduler/canary.json").read_text())
+        h = getattr(current[1], "_handoff", {}) if current else {}
+        off = next((t for t, _, msg in sim.w.log_lines if "handing the pool over" in msg), None)
+        on = next((t for t, _, msg in sim.w.log_lines if off is not None and t >= off and "took over" in msg), None)
+        m["blocked_extra"] = {**observed, "handoff": h, "gap_s": None if on is None else on-off,
+                              "canary": state, "log_tail": sim.w.log_lines[-12:]}
+        return {"new_code_serves": bool(current) and current[0].env["code"] == "extra-deferred",
+                "offered_pool_unchanged": set(h.get("taken", [])) == set(observed.get("offered", [])),
+                "extra_not_required": observed.get("extra") not in h.get("held", []) and
+                                      observed.get("extra") in h.get("deferred_extras", []),
+                "blocked_exec_after_commit": bool(observed["execs"]) and all(not e["parent_alive"] for e in observed["execs"]),
+                "no_readiness_timeout": not any("readiness deadline" in msg for _, _, msg in sim.w.log_lines),
+                "handoff_under_5s": off is not None and on is not None and on-off < 5,
+                "canary_passed": "extra-deferred" in state.get("passed", []),
+                "every_item_runs_once": all(x["runs"] == 1 for x in sim.w.items.values())}
+    return sim, {"extra": extra}
+
+
 @scenario("hot reload blocked", ["lost", "strikes", "modal", "clients", "threads"], 1800,
           "both candidate and saved-code boots fail under load; the old scheduler resumes its loops and files, then accepts another update")
 def blocked_handoff_under_load(code):
