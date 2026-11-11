@@ -23,6 +23,7 @@ standard library), so boat is their mirror.
 import argparse
 import base64
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -167,6 +169,7 @@ os.chdir(sys.argv[2])
 http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 """
 CHUNK = 4 << 20  # a ranged request's size (boat's front has cut long responses: each range is resumed where it stopped)
+METADATA_CHUNK = 256 << 10  # keep JSON transport pages well below one-megabyte fronts
 
 
 def serve(name: str, minutes: int = 30) -> str:
@@ -180,8 +183,7 @@ def serve(name: str, minutes: int = 30) -> str:
     h = boat.bj("host", vm, "8766", "--localhost", "--private")
     u = urllib.parse.urlparse(h["url"])
     url = urllib.parse.urlunparse(u._replace(path=f"/{tok}/"))
-    (STORE / "serving").mkdir(parents=True, exist_ok=True)
-    (STORE / "serving" / f"{vm}.json").write_text(json.dumps({"vm": vm, "name": name, "until": time.time() + minutes * 60}))
+    _publish_serving({"vm": vm, "name": name, "until": time.time() + minutes * 60})
     log(f"{name}: served from {vm} for {minutes} minutes (the URL is a secret: boat's token and ours); `unserve` deletes it")
     print(url)
     return url
@@ -194,6 +196,7 @@ def pull(name: str, dest: str, url: str, cache: pathlib.Path = CACHE, workers: i
     pull the same way."""
     import concurrent.futures
     import http.cookiejar
+    import re
     jar = http.cookiejar.CookieJar()
     u = urllib.parse.urlparse(url)
 
@@ -203,7 +206,7 @@ def pull(name: str, dest: str, url: str, cache: pathlib.Path = CACHE, workers: i
     def full(path: str) -> str:
         return urllib.parse.urlunparse(u._replace(path=u.path.rstrip("/") + "/" + urllib.parse.quote(path)))
 
-    def get_range(path: str, a: int, b: int, out: pathlib.Path):
+    def get_range(path: str, a: int, b: int, out: pathlib.Path, metadata_size: int | None = None):
         """Bytes a..b of a file into out at offset a, resumed until all are there."""
         pos, fetch = a, RangeFetch(b - a + 1, 8)  # (RangeFetch: resumed where it stopped, given up past 8 failures in a row)
         with open(out, "r+b") as f:
@@ -212,12 +215,19 @@ def pull(name: str, dest: str, url: str, cache: pathlib.Path = CACHE, workers: i
                 try:
                     req = urllib.request.Request(full(path), headers={"Range": f"bytes={pos}-{b}"})
                     with opener().open(req, timeout=300) as r:
+                        response_end = b
+                        if metadata_size is not None:
+                            span = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", r.headers.get("Content-Range", ""))
+                            if (r.status != 206 or span is None or int(span[1]) != pos or
+                                    not pos <= int(span[2]) <= b or int(span[3]) != metadata_size):
+                                raise ValueError(f"{path}: invalid or changed metadata range")
+                            response_end = int(span[2])
                         f.seek(pos)
                         for blk in iter(lambda: r.read(1 << 16), b""):
-                            blk = blk[:b + 1 - pos]
+                            blk = blk[:response_end + 1 - pos]
                             f.write(blk)
                             pos += len(blk)
-                            if pos > b:
+                            if pos > response_end:
                                 break
                 except Exception as e:
                     err = e
@@ -229,11 +239,41 @@ def pull(name: str, dest: str, url: str, cache: pathlib.Path = CACHE, workers: i
                         raise RuntimeError(f"{path} bytes {pos}-{b}: {err or 'no bytes'}")
                     time.sleep(min(10, fetch.fails))
 
-    with opener().open(full("manifest.json"), timeout=300) as r:  # (small: the first answer also sets boat's cookie)
-        m = json.loads(r.read())
-    links = {}
-    with contextlib.suppress(Exception), opener().open(full("links.json"), timeout=120) as r:
-        links = json.loads(r.read())
+    def read_json(path: str):
+        # Discover size with a one-byte range; no single large JSON result crosses
+        # the front. Reuse the file range retry/cursor rules for every bounded page.
+        req = urllib.request.Request(full(path), headers={"Range": "bytes=0-0"})
+        with opener().open(req, timeout=300) as r, tempfile.TemporaryFile() as stream:
+            if r.status == 200:
+                # Old servers without ranges still work, without an unbounded read.
+                copied = 0
+                for block in iter(lambda: r.read(1 << 16), b""):
+                    stream.write(block)
+                    copied += len(block)
+                length = r.headers.get("Content-Length")
+                if length is not None and copied != int(length):
+                    raise RuntimeError(f"{path}: truncated metadata from a server without ranges")
+                stream.seek(0)
+                return json.load(stream)
+            span = re.fullmatch(r"bytes 0-0/(\d+)", r.headers.get("Content-Range", ""))
+            if r.status != 206 or span is None or int(span[1]) < 1:
+                raise ValueError(f"{path}: invalid metadata size response")
+            size = int(span[1])
+        with tempfile.NamedTemporaryFile(prefix="sc-store-metadata-") as stream:
+            stream.truncate(size)
+            for start in range(0, size, METADATA_CHUNK):
+                get_range(path, start, min(start + METADATA_CHUNK, size) - 1,
+                          pathlib.Path(stream.name), metadata_size=size)
+            stream.seek(0)
+            return json.load(stream)
+
+    m = read_json("manifest.json")
+    try:
+        links = read_json("links.json")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        links = {}
     if only:  # (a glob: these files only)
         import fnmatch
         m = {k: v for k, v in m.items() if fnmatch.fnmatch(k, only)}
@@ -283,13 +323,89 @@ def inside(d: pathlib.Path, path: str) -> bool:
     return not os.path.isabs(path) and os.path.normpath(path) != ".." and not os.path.normpath(path).startswith("../") and not os.path.normpath(path).startswith("/")
 
 
+@contextlib.contextmanager
+def _serving_lock(f: pathlib.Path):
+    """One persistent inode per record, shared by publishers and removers."""
+    f.parent.mkdir(parents=True, exist_ok=True)
+    # Never unlink these files: a waiter must not lock an obsolete inode.
+    with f.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _publish_serving(record: dict):
+    f = STORE / "serving" / f"{record['vm']}.json"
+    with _serving_lock(f):
+        # Hidden, non-json temporary files cannot be selected by unserve (or
+        # older clients). Readers see either the whole record or no record.
+        with tempfile.NamedTemporaryFile(mode="w", dir=f.parent, prefix=f".{f.stem}.", suffix=".tmp", delete=False) as tmp:
+            temp = pathlib.Path(tmp.name)
+            try:
+                json.dump(record, tmp)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                os.replace(temp, f)
+            finally:
+                temp.unlink(missing_ok=True)
+
+
+def _delete_serving_vm(vm: str):
+    try:
+        boat.boat("delete", vm, "--yes", "--json", check=True, timeout=300)
+    except RuntimeError as exc:
+        # Verified with the installed CLI against a loopback DELETE fixture.
+        # boat.boat prefixes (and may truncate) JSON errors; accept only the
+        # complete, specific sandbox-absent envelope, never a generic 404.
+        prefix = "boat delete failed (1): "
+        text = str(exc)
+        if text.startswith(prefix):
+            with contextlib.suppress(ValueError):
+                error = json.loads(text[len(prefix):])
+                if (isinstance(error, dict) and error.get("event") == "error"
+                        and error.get("status") == 404
+                        and error.get("code") == "Sandbox not found"
+                        and error.get("error") == "Sandbox not found (404)"):
+                    return  # a crash after delete may have left this record
+        raise
+
+
 def unserve(name: str = "", all_: bool = False):
-    """Deletes the VMs `serve` started (of a name, or those past their minutes, or all)."""
-    for f in sorted((STORE / "serving").glob("*.json")) if (STORE / "serving").exists() else []:
-        s = json.loads(f.read_text())
-        if Serving().unserve(all_, s["name"] == name, s["until"] < time.time()):
-            boat.boat("delete", s["vm"], "--yes", "--json", check=False, timeout=300)
-            f.unlink()
+    """Deletes selected serving VMs once; failed deletes retain their records."""
+    for f in sorted((STORE / "serving").glob("*.json")):
+        with _serving_lock(f):
+            try:
+                raw = f.read_text()
+            except FileNotFoundError:  # another client already removed it
+                continue
+            except UnicodeError:
+                log(f"{f.name}: invalid serving record retained")
+                continue
+            try:
+                s = json.loads(raw)
+                valid = (isinstance(s, dict) and s.get("vm") == f.stem
+                         and f.stem not in ("", "self", "current")
+                         and not f.stem.startswith("-")
+                         and isinstance(s.get("name"), str)
+                         and isinstance(s.get("until"), (int, float)))
+            except (ValueError, UnicodeError):
+                valid = False
+            if not valid:
+                log(f"{f.name}: invalid serving record retained")
+                continue
+            if not Serving().unserve(all_, s["name"] == name, s["until"] < time.time()):
+                continue
+            # Errors/timeouts retain the record unless the VM is definitively absent.
+            # Hold the per-record lock across the remote delete, not a global
+            # registry lock that would block deletions of unrelated VMs.
+            _delete_serving_vm(s["vm"])
+            with contextlib.suppress(FileNotFoundError):
+                # Tolerate old-client unlinks and already-visible replacements.
+                # The read/unlink pair is atomic only for cooperating writers.
+                if f.read_text() == raw:
+                    f.unlink(missing_ok=True)
             log(f"{s['name']}: {s['vm']} deleted")
 
 

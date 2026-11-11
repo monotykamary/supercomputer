@@ -44,6 +44,26 @@ as before (a tarball from a seed VM's URL) and gets its agent for the next batch
 Measured on gdp-wired (two trivial jobs, a large VM already up): 36.3 and 39.2 s a batch before (boat API calls,
 the tree as a tarball over ssh, exec ticks), 2.4 to 2.8 s with a warm agent; a resumed VM still costs about a minute.
 
+## Durable store transport and teardown
+
+`store pull` sizes `manifest.json` and optional `links.json` with a one-byte range,
+then fetches them in pages of at most 256 KiB. Each page uses the existing
+resumable range cursor and retry budget, so a cut response resumes at its first
+missing byte. Metadata is spooled to a temporary file before parsing; there is
+no total manifest-size cap. Range offsets and total size must stay consistent.
+Older servers that ignore ranges are read as 64 KiB streaming blocks; an
+incomplete stream with a known content length is rejected. Only a missing
+`links.json` (HTTP 404) means that no links were recorded; malformed or truncated
+link metadata is not silently discarded.
+
+`store unserve` serializes each serving record with a persistent per-record OS
+lock; unrelated VMs can still be deleted concurrently. Publication uses an
+atomic rename under the same lock. Successful deletion or the CLI's exact
+structured sandbox-not-found response retires the record; other failures and
+timeouts retain it for retry. Missing records are harmless. Lock files remain
+to prevent two processes from locking different inodes. These guarantees apply
+to updated cooperating clients; old clients do not take the lock.
+
 ## Local blob cache
 
 `live/scheduler/blobs` is a disposable content-addressed cache, not an evidence archive. Every five minutes, maintenance evicts least-recently-used cold blobs toward the default 8 GiB target, and expires unreferenced blobs after seven days. Queued/running manifests (including cached tree IDs) pin their contents. Completed admissions release their pins with a generation-scoped marker, without deleting results; older queue records without a generation remain conservatively pinned until closed. Uploads and reads renew a one-hour grace period; writes, admission and pruning share an OS lock across processes. Unreadable queue state prevents deletion. Active/recent data may exceed the target; the report exposes that excess rather than deleting required inputs. Remote clients revalidate even known tree IDs and re-upload evicted files.
