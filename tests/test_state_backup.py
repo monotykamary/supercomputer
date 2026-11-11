@@ -164,7 +164,7 @@ class StateFiles(unittest.TestCase):
     def test_archive_exception_closes_every_pinned_descriptor(self):
         (self.q / "a.json").write_text("{}")
         entries = []
-        def broken(xs):
+        def broken(xs, **kwargs):
             entries.extend(xs)
             raise OSError("archive failed")
         with mock.patch.object(B, "archive", side_effect=broken):
@@ -239,12 +239,13 @@ class HTTPIsolation(unittest.TestCase):
             started, release, admitted = threading.Event(), threading.Event(), threading.Event()
             count = []
             original = B.archive
-            def archive(entries):
+            def archive(entries, **kwargs):
+                self.assertTrue(kwargs.get("file_backed"))
                 count.append(1)
                 started.set()
                 if not release.wait(3):
                     raise TimeoutError("test archive not released")
-                return original(entries)
+                return original(entries, **kwargs)
             class Server(http.server.ThreadingHTTPServer):
                 request_queue_size = 64
                 daemon_threads = True

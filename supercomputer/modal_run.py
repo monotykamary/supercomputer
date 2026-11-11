@@ -15,7 +15,7 @@ from . import config
 
 LOCAL = modal.is_local()
 if LOCAL:
-    P = config.project() if config._current else config.use(os.environ.get("SUPERCOMPUTER_ROOT") or os.getcwd())
+    P = config.project() if config._current else config.use(os.environ.get("SUPERCOMPUTER_ROOT") or None)
     NAME, PREFIX = P.name, P.prefix
 else:  # (in the container: the tree is at /src/<name>, named by the image's environment)
     P = None

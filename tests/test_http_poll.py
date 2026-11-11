@@ -80,7 +80,7 @@ class PollTests(unittest.TestCase):
                 conn.request("POST", "/poll", body=json.dumps({"batch":"b", "wait":1e9}), headers={"X-SC-Token":"t"})
                 response = conn.getresponse()
                 self.assertEqual(response.status, 200)
-                self.assertEqual(json.loads(response.read()), {"rows":[], "done":False, "running":0, "queued":1})
+                self.assertEqual(json.loads(response.read()), {"rows":[], "done":False, "next_since":0, "running":0, "queued":1})
                 self.assertLess(time.monotonic() - begin, 1)
         self.health.record_error.assert_not_called()
 

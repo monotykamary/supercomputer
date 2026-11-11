@@ -255,8 +255,12 @@ class World:
             B.Registry.locked = locked
         def prepare(pkg):
             self.note("snapshot_prepared", code=pkg.parent.name)
-            return {"python": "sim", "cache_tag": "sim", "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1}
+            return {"python": "sim", "cache_tag": "sim", "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
+                    "durable_distinct_vm_group": True, "result_files_protocol": True}
         S.prepare_snapshot = prepare
+        if hasattr(S, "memorypressure"):
+            # Host cgroups are not virtual controller state; sensor behavior has dedicated tests.
+            S.memorypressure.Sampler = lambda: types.SimpleNamespace(sample=lambda: {"known": False})
         S.code_hash = lambda pkg=None: self.code_installed
         S.own_code = lambda: self.k.current_proc().env.get("code", code.label)
         S.log = lambda *a: self.sched_log(" ".join(str(x) for x in a))
@@ -539,6 +543,32 @@ class World:
             tok = argv[-1]
             r = self.start_daemon(v, b64, tok)
             return json.dumps({"exitCode": 0, "stdout": json.dumps(r) + "\n", "stderr": "", "success": True})
+        if argv[:2] == ['python3', '-c'] and 'result relay: ' in argv[2]:
+            # Model only transport/files; agent_dispatch still runs the real protocol rules.
+            op, path = argv[3:5]
+            out = ''
+            if op == 'clean':
+                for p in argv[4:]:
+                    v.files.pop(p, None)
+            elif op == 'stage':
+                offset, chunk = int(argv[5]), argv[6]
+                assert len(v.files.get(path, '')) == offset
+                assert offset or path not in v.files
+                v.files[path] = v.files.get(path, '') + chunk
+            elif op == 'post':
+                arg = argv[5]
+                encoded = v.files[arg[1:]] if arg.startswith('@') else arg
+                status, data = self.agent_dispatch(v, '/rpc', base64.b64decode(encoded), float(argv[8]))
+                assert path not in v.files
+                v.files[path] = data
+                out = json.dumps({'path': path, 'bytes': len(data), 'status': status})
+            elif op == 'read':
+                size, offset, count = map(int, argv[5:8])
+                assert len(v.files[path]) == size and 0 <= offset <= size and 0 <= count <= 65536
+                out = base64.b64encode(v.files[path][offset:offset + count]).decode()
+            else:
+                raise AssertionError('unknown result relay operation')
+            return json.dumps({'exitCode': 0, 'stdout': out + '\n', 'stderr': '', 'success': True})
         if argv[:2] == ["python3", "-c"] and len(argv) >= 4:  # (an agent call over boat exec)
             if v.daemon != "up":
                 return json.dumps({"exitCode": 1, "stdout": "", "stderr": "urlopen error [Errno 111] Connection refused", "success": False})
@@ -1213,9 +1243,13 @@ def _src(fn) -> str:
 class FakeResp:
     def __init__(self, status, data, ctype):
         self.status, self._data, self._ctype = status, data, ctype
+        self._offset = 0
 
-    def read(self):
-        return self._data
+    def read(self, size=-1):
+        end = len(self._data) if size < 0 else self._offset + size
+        data = self._data[self._offset:end]
+        self._offset += len(data)
+        return data
 
     def getheaders(self):
         return [("Content-Type", self._ctype)]

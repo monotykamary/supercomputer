@@ -71,7 +71,7 @@ def _remote_queue(a):
         raise SystemExit("the controller doesn't answer: `supercomputer queue` needs it (or SUPERCOMPUTER_CONTROLLER=0 for this machine's)")
     if a.qcmd == "add":
         spec = json.loads(pathlib.Path(a.jobs).read_text())
-        root = config.git_root(pathlib.Path(a.tree).resolve())
+        root = config.select_root(a.tree)
         tar = boat.tree_tarball(root)
         name = a.name or f"{root.name}-{pathlib.Path(a.jobs).stem}-{time.strftime('%m%d-%H%M%S')}"
         import hashlib
@@ -238,7 +238,7 @@ def main(argv=None):
     qs = q.add_subparsers(dest="qcmd", required=True)
     qa = qs.add_parser("add")
     qa.add_argument("jobs")
-    qa.add_argument("--tree", default=".")
+    qa.add_argument("--tree", default=None)
     qa.add_argument("--name", default="")
     qa.add_argument("--meta", action="append", default=[], help="k=v: extra metadata kept with the submission")
     qs.add_parser("ls")

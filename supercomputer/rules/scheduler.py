@@ -1032,6 +1032,7 @@ class Delivery:
 
     # gdp: law rows are delivered only for items done: rows <= finished
     # gdp: law no more items are done than the batch has: finished <= items
+    # gdp: law clients never hold undelivered rows: read <= rows
 
     def __init__(self, items: int):
         if items < 0:
@@ -1059,6 +1060,16 @@ class Delivery:
         self.read = self.rows
         return self.read == self.items
 
+
+    # gdp: law paged done requires every row read: not result or read == items
+    # gdp: law a page never reads beyond delivered rows: read <= rows
+    # gdp: law a valid page advances by its bounded count: since < 0 or since > rows or count < 0 or read == since + min(count, rows - since)
+    def poll_page(self, since: int, count: int) -> bool:
+        """A byte-limited page acknowledges only the rows actually returned."""
+        if since < 0 or since > self.rows or count < 0:
+            return False
+        self.read = since + min(count, self.rows - since)
+        return self.read == self.items
 
 
 # gdp: law the plan waits for re-attach's first pass at most 60 s: not result or waited_s < 60

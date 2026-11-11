@@ -88,7 +88,10 @@ def bundle(repo: pathlib.Path, refs: list[str]) -> bytes:
 # Each service bounded (systemd), so the controller's own work can never starve sshd and boat's health checks (the
 # 2026-10-31 incident: a small VM at 100% with 22 VMs coming up, 70 failed /health checks in a row). The scheduler's
 # watchdog sheds (no starts) well before these bite.
-LIMITS = {"scheduler": "CPUQuota=250%\nMemoryHigh=4G\nMemoryMax=5G\nTasksMax=1500\nNice=5\nLimitNOFILE=524288:524288",
+# Percentages are relative to physical RAM (systemd.resource-control(5)), not
+# the old fixed 4G/5G caps that throttled a healthy larger controller.
+SCHEDULER_MEMORY_LIMITS = "MemoryHigh=70%\nMemoryMax=82%"
+LIMITS = {"scheduler": f"CPUQuota=250%\n{SCHEDULER_MEMORY_LIMITS}\nTasksMax=1500\nNice=5\nLimitNOFILE=524288:524288",
           "treadmill": "CPUQuota=100%\nMemoryHigh=1536M\nMemoryMax=2G\nTasksMax=400\nNice=10"}
 
 
@@ -191,6 +194,10 @@ def stage(vm: str):
     command = ("set -e; sudo install -d /etc/systemd/system/supercomputer-scheduler.service.d; "
                "printf '[Service]\nLimitNOFILE=524288:524288\n' | "
                "sudo tee /etc/systemd/system/supercomputer-scheduler.service.d/10-nofile.conf >/dev/null; "
+               # Use a fixed printf format: percentage directives are literal data.
+               f"printf '%s' '[Service]\n{SCHEDULER_MEMORY_LIMITS}\n' | "
+               "sudo tee /etc/systemd/system/supercomputer-scheduler.service.d/20-memory.conf >/dev/null; "
+               # Leave emergency /run/systemd overrides and the running service alone.
                "sudo systemctl daemon-reload; "
                f"mkdir -p {release}; tar xzf - -C {release}; "
                f"cd {release}; PYTHONPATH={release} SUPERCOMPUTER_SRC={release} "

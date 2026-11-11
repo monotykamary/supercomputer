@@ -16,10 +16,12 @@ import stat
 import tarfile
 import threading
 import time
+import tempfile
+import weakref
 
 CACHE_SECONDS = 30.0
 WAIT_SECONDS = 60.0
-_SKIP_DIRS = {"agents", "keys", "blobs", "index", "code", "controller-state", "__pycache__", "olean"}
+_SKIP_DIRS = {"agents", "keys", "blobs", "index", "code", "controller-state", "state-archives", "__pycache__", "olean"}
 _SKIP_FILES = {"token", "boat-key", "controller.json", "log", "treadmill.log"}
 _JOURNALS = {".jsonl", ".placed", ".rows", ".cancel"}
 
@@ -136,6 +138,11 @@ def capture(live: pathlib.Path, treadmill: pathlib.Path, guard=contextlib.nullco
                         continue  # orphan history is not read by admission recovery
                     if path.suffix in {".json", ".placed", ".rows", ".cancel"}:
                         _pin(path, f"live/scheduler/queue/{path.name}", entries, required=True)
+                    elif path.suffix == '.results' and not path.is_symlink():
+                        # These immutable files are required even by closed retained admissions.
+                        for payload in _paths(path):
+                            if payload.suffix == '.payload':
+                                _pin(payload, f'live/scheduler/queue/{payload.relative_to(queue).as_posix()}', entries, required=True)
                     elif path.suffix == ".logs" and path.stem not in closed and not path.is_symlink():
                         # Keep unacknowledged results, not outputs of closed batches.
                         for output in _paths(path):
@@ -161,8 +168,54 @@ def capture(live: pathlib.Path, treadmill: pathlib.Path, guard=contextlib.nullco
             entry.close()
 
 
-def archive(entries) -> bytes:
+class FilePayload:
+    """An immutable temporary archive; each consumer opens an independent stream."""
+    def __init__(self, path):
+        self.path = pathlib.Path(path)
+        self.size = self.path.stat().st_size
+        self._cleanup = weakref.finalize(self, self.path.unlink, missing_ok=True)
+
+    def __len__(self):
+        return self.size
+
+    def open(self):
+        return self.path.open('rb')
+
+
+def _prune_archives(directory):
+    """Reclaim only this cache's files left by dead processes (including os._exit)."""
+    for path in directory.glob('state-*-*.tar.gz'):
+        owner = path.name.split('-', 2)[1]
+        if not owner.isdecimal() or int(owner) < 1 or int(owner) == os.getpid():
+            continue
+        try:
+            os.kill(int(owner), 0)  # existence probe only; never signal a process
+        except ProcessLookupError:
+            with contextlib.suppress(FileNotFoundError):
+                if stat.S_ISREG(path.lstat().st_mode):
+                    path.unlink(missing_ok=True)
+        except OSError:
+            pass  # uncertain ownership or permission: preserve it
+
+
+def archive(entries, *, file_backed=False, directory=None):
+    if file_backed:
+        with tempfile.NamedTemporaryFile(prefix=f'state-{os.getpid()}-', suffix='.tar.gz', dir=directory, delete=False) as buf:
+            name = buf.name
+            try:
+                _archive(entries, buf)
+                buf.flush()
+                os.fsync(buf.fileno())
+            except BaseException:
+                os.unlink(name)
+                raise
+        return FilePayload(name)
     buf = io.BytesIO()
+    _archive(entries, buf)
+    return buf.getvalue()
+
+
+def _archive(entries, buf):
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
         for entry in entries:
             info = tarfile.TarInfo(entry.name)
@@ -175,12 +228,15 @@ def archive(entries) -> bytes:
         info = tarfile.TarInfo("backup-manifest.json")
         info.size = len(manifest)
         tf.addfile(info, io.BytesIO(manifest))
-    return buf.getvalue()
 
 
-def build(live, treadmill, guard=contextlib.nullcontext, metadata=None):
+def build(live, treadmill, guard=contextlib.nullcontext, metadata=None, *, file_backed=False):
+    directory = pathlib.Path(live) / 'scheduler' / 'state-archives'
+    if file_backed:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _prune_archives(directory)
     with capture(pathlib.Path(live), pathlib.Path(treadmill), guard) as entries:
-        data = archive(entries)
+        data = archive(entries, file_backed=file_backed, directory=directory if file_backed else None)
         if metadata is not None:
             sizes, counts = collections.Counter(), collections.Counter()
             for entry in entries:

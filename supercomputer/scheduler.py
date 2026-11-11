@@ -49,7 +49,7 @@ import threading
 import time
 import urllib.request
 
-from . import blobcache, boat, canary, config, health, rules, statebackup
+from . import blobcache, boat, canary, config, health, memorypressure, resultfiles, resultjson, rules, statebackup
 from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
 from .rules.owned_lifecycle import OwnedLifecycle, retention_supported
@@ -262,7 +262,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
     return {"python": sys.executable, "cache_tag": sys.implementation.cache_tag,
             "cpu_model_exact": capabilities.get("cpu_model_exact") is True,
             "distinct_vm_group": capabilities.get("distinct_vm_group") is True and capabilities.get("distinct_vm_group_protocol") == 1,
-            "durable_distinct_vm_group": capabilities.get("distinct_vm_group_scope") == "durable" and capabilities.get("durable_distinct_vm_group_protocol") == 1}
+            "durable_distinct_vm_group": capabilities.get("distinct_vm_group_scope") == "durable" and capabilities.get("durable_distinct_vm_group_protocol") == 1,
+            "result_files_protocol": capabilities.get("result_files_protocol") == 1}
 
 
 def stage_install() -> dict:
@@ -385,6 +386,7 @@ class Batch:
     def __init__(self, msg: dict):
         self.id = msg["batch"]
         self.strict_once = bool(msg.get("strict_once", False))
+        self.result_files_protocol = msg.get('result_files_protocol', 0)
         self.retain_journals = bool(msg.get("retain_journals", False))
         if not retention_supported(self.strict_once, self.retain_journals):
             raise ValueError("retain_journals requires strict_once ownership")
@@ -418,6 +420,7 @@ class Batch:
         self.cv = threading.Condition()
 
     def deliver(self, row: dict):
+        row = resultfiles.Store(DIR / 'queue' / f'{self.id}.results').compact_row(row)
         with self.cv:
             self.rows.append(row)
             with contextlib.suppress(Exception):
@@ -494,6 +497,8 @@ class SchedulerAgentClient:
     """Catch lease refusal on every scheduler RPC, before any fallback or kill."""
     def __init__(self, client, scheduler, vm):
         self.client, self.scheduler, self.vm_state = client, scheduler, vm
+        if isinstance(client, AgentClient):
+            client.result_store = scheduler._result_store
 
     def __getattr__(self, name):
         return getattr(self.client, name)
@@ -783,7 +788,7 @@ class Scheduler:
                 if self._valid_batch(b.id) != f.stem:
                     raise ValueError("admission id does not match its file")
                 enhanced = b.strict_once or b.retain_journals or b.admission_closed or b.has_distinct
-                rows = self._read_journal(qd / f"{b.id}.rows", enhanced)
+                rows = self._read_result_journal(qd / f"{b.id}.rows", enhanced)
                 for r in rows:
                     if r.get("name") in b.items:
                         b.items[r["name"]].state = "done"
@@ -1472,6 +1477,18 @@ class Scheduler:
         return records
 
     @staticmethod
+    def _result_store(bid):
+        Scheduler._valid_batch(bid)
+        return resultfiles.Store(DIR / 'queue' / f'{bid}.results')
+
+    @classmethod
+    def _read_result_journal(cls, path, strict):
+        if not path.exists():
+            return []
+        with path.open('rb') as stream:
+            return resultjson.load_journal(stream, cls._result_store(path.stem), strict)
+
+    @staticmethod
     def _valid_batch(bid):
         if not isinstance(bid, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,159}", bid):
             raise ValueError("invalid batch id")
@@ -1570,6 +1587,8 @@ class Scheduler:
         it.fate.delivered()
 
     def _deliver_owned(self, b, row):
+        # File publication precedes the terminal journal and worker ACK.
+        row = self._result_store(b.id).compact_row(row)
         # Callers hold self.lock: first terminal result wins without replacement.
         with b.cv:
             if any(r.get("name") == row.get("name") for r in b.rows):
@@ -1584,6 +1603,9 @@ class Scheduler:
                 "submit_flags": ["strict_once", "retain_journals"],
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
+                "result_files_protocol": 1, "output_files_protocol": 1,
+                "result_inline_bytes": resultfiles.INLINE_BYTES,
+                "poll_max_bytes": resultfiles.POLL_BYTES + 2048,
                 "retention_requires_strict_once": True,
                 "paths": ["/cancel", "/snapshot", "/capabilities", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"],
                 "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
@@ -1711,6 +1733,7 @@ class Scheduler:
             return {"ok": False, "error": "recovery quarantined; ownership held"}
         self._full_now = True
         self._validate_submission(msg)
+        msg = {**msg, 'result_files_protocol': 1}
         b = Batch(msg)
         if not hasattr(self, "_durably_closed"):
             self._durably_closed = self._scheduled_closes()
@@ -1788,13 +1811,17 @@ class Scheduler:
                     break
                 b.cv.wait(min(remaining, HTTP_POLL_PEER_CHECK_S))
                 names = {r.get("name") for r in b.rows} & set(b.items)
-            rows = b.rows[since:]
+            rows = resultfiles.page(b.rows, since) if since >= 0 else []
             d = rules.Delivery(len(b.items))
             d.finished = len(b.items) - b.left()
             d.rows = min(len(names), d.finished)
-            done = since <= len(b.rows) and d.poll(min(since, d.rows))  # (this poll gives the client every row there is)
+            done = d.poll_page(since, len(rows))
         running = sum(1 for it in b.items.values() if it.state in ("starting", "running"))
-        return {"rows": rows, "done": done, "running": running, "queued": sum(1 for it in b.items.values() if it.state == "queued")}
+        return {"rows": rows, "done": done, "next_since": since + len(rows), "running": running, "queued": sum(1 for it in b.items.values() if it.state == "queued")}
+
+    def result_part(self, bid, ref, offset=0, length=resultfiles.CHUNK_BYTES):
+        """Authenticated, bounded reads from controller-owned immutable files."""
+        return self._result_store(bid).read(ref, offset, length)
 
     @staticmethod
     def batch_of(m) -> str | None:
@@ -1821,6 +1848,7 @@ class Scheduler:
                         f.unlink(missing_ok=True)
                     import shutil as _sh
                     _sh.rmtree(DIR / "queue" / f"{bid}.logs", ignore_errors=True)
+                    _sh.rmtree(DIR / "queue" / f"{bid}.results", ignore_errors=True)
                     # Keep the reservation and item states if durable deletion fails.
                     for it in b.items.values():  # (a client that gives up: what still runs is killed, what's queued goes)
                         if it.state in ("starting", "running") and it.vm:
@@ -1854,7 +1882,7 @@ class Scheduler:
         # (an item's log is the log of the run that delivered its row: a VM's log of another run of a delivered item, a
         # first try lost there, is left out; the client maps every run of an item to its name, the last one read won)
         b = self.batches.get(bid)
-        rows = list(b.rows) if b else jlines(DIR / "queue" / f"{bid}.rows")
+        rows = list(b.rows) if b else self._read_result_journal(DIR / "queue" / f"{bid}.rows", False)
         delivered = {r.get("name"): r.get("run_name") or r.get("name") for r in rows if r.get("name")}
         with tarfile.open(fileobj=out, mode="w:gz") as tf:
             for d in sorted(kept.iterdir()) if kept.exists() else []:
@@ -1927,7 +1955,8 @@ class Scheduler:
         self._h().record_status(time.time(), time.time() - t0)
         last = getattr(self._h(), "last", None) or {}
         r["health"] = {"ok": last.get("ok"), "breached": sorted(k for k, v in last.get("targets", {}).items() if not v["ok"]),
-                       "client_4xx": self._h().client_errors(time.time()) or {"count": 0, "by_status": {}, "recent": []}}
+                       "client_4xx": self._h().client_errors(time.time()) or {"count": 0, "by_status": {}, "recent": []},
+                       "memory": self._h().memory_status(time.time())}
         return r
 
     def _status(self) -> dict:
@@ -3751,9 +3780,41 @@ class Scheduler:
             for f in ("out", "err"):
                 (d / f).write_text(lg.get(f, ""))
 
+    def _fetch_result_files(self, vm, row):
+        """Durably import complete payloads before delivery/ACK; no size refusal."""
+        store = self._result_store(row['batch'])
+        def ensure(ref):
+            resultfiles.validate_ref(ref)
+            try:
+                store.read(ref, 0, 0)
+                return
+            except FileNotFoundError:
+                pass
+            def read(offset, count):
+                part = vm.client.rpc('resultpart', row['batch'], row['name'], ref['sha256'], offset, count, timeout=120)
+                if (not isinstance(part, dict) or part.get('offset') != offset
+                        or part.get('bytes') != ref['bytes'] or part.get('sha256') != ref['sha256']):
+                    raise ValueError('invalid result chunk receipt')
+                data = base64.b64decode(part.get('data', ''), validate=True)
+                if len(data) > count:
+                    raise ValueError('oversized result chunk')
+                return data
+            store.import_ref(ref, read)
+        for key in ('row_ref', 'result_ref', 'output_files_ref'):
+            if key in row:
+                ensure(row[key])
+        if 'output_files_ref' in row:
+            with store.open(row['output_files_ref']) as source:
+                for entry in resultjson.iter_array(source):
+                    if not isinstance(entry, dict) or not isinstance(entry.get('path'), str):
+                        raise ValueError('invalid output manifest entry')
+                    ensure({k: v for k, v in entry.items() if k != 'path'})
+        return store.compact_row(row)
+
     def _finished_legacy(self, vm: VMState, row: dict):
         if getattr(self, "handing_off", False):
             return False
+        row = self._fetch_result_files(vm, row)
         # Terminal runs release capacity immediately, but remain in the
         # handoff inventory until their row is committed and safe to ACK.
         key = (row["batch"], row["name"])
@@ -3842,6 +3903,7 @@ class Scheduler:
             b = it.batch
             if b.admission_closed or it.owned.closed:
                 return False  # only a bound cancelitem receipt can release this hold
+        row = self._fetch_result_files(vm, row)
         # Owned cancellation may win during output I/O: its placement/state
         # stays held until the identity/fence-checked atomic terminal commit.
         if not row.get("preempted") and not row.get("lost"):
@@ -4112,7 +4174,14 @@ class Scheduler:
         rss = None
         with contextlib.suppress(Exception):
             rss = next(int(l.split()[1]) // 1024 for l in open("/proc/self/status") if l.startswith("VmRSS"))
-        self.load = {"load1": round(l1, 2), "cpus": ncpu, "mem_free": round(mem, 2) if mem is not None else None, "rss_mb": rss, "threads": threading.active_count(),
+        now = time.time()
+        if not hasattr(self, "_memory_sampler"):
+            self._memory_sampler = memorypressure.Sampler()
+        memory_sample = self._memory_sampler.sample()
+        self._h().record_memory(now, memory_sample)
+        for message in self._h().memory_tick(now) or []:
+            self.alert(message)
+        self.load = {"memory": memory_sample, "load1": round(l1, 2), "cpus": ncpu, "mem_free": round(mem, 2) if mem is not None else None, "rss_mb": rss, "threads": threading.active_count(),
                      "threads_by": dict(collections.Counter(re.sub(r"^Thread-\d+ \((.*)\)$", r"\1", re.sub(r"-\d+$", "", t.name)) for t in threading.enumerate()).most_common(12)),
                      "cpu_s": {k: round(v, 2) for k, v in sorted(self.__dict__.get("_cpu", {}).items(), key=lambda kv: -kv[1])[:16]},
                      "cpu_n": dict(self.__dict__.get("_cpu_n", {})), "cpu_total_s": round(_proc_cpu(), 2), "up_s": round(time.time() - getattr(self, "t_up", time.time()), 1)}
@@ -4439,6 +4508,10 @@ class Scheduler:
                 if not all(rules.distinct_history_matches(required_distinct, prepared[target].get("distinct_vm_group") is True) for target in candidates):
                     self.alert("handoff refused: live distinct VM groups require a group-aware successor")
                     return
+                required_results = any(getattr(b, 'result_files_protocol', 0) for b in self.batches.values()) or any((DIR / 'queue').glob('*.results'))
+                if required_results and not all(prepared[target].get('result_files_protocol') is True for target in candidates):
+                    self.alert('handoff refused: result-file admissions require a file-reference-aware successor')
+                    return
                 required_durable = bool(self._durable_snapshot()) or any(durable_item(it) for b in self.batches.values() for it in b.items.values())
                 if not all(rules.distinct_history_matches(required_durable, prepared[target].get("durable_distinct_vm_group") is True) for target in candidates):
                     self.alert("handoff refused: durable distinct VM groups require a durable-group-aware successor")
@@ -4724,7 +4797,7 @@ def _state_export(s) -> bytes:
                 yield {"closed": {b.id for b in s.batches.values() if b.closed}}
 
     metadata = {}
-    return s._state_archive.get(lambda: statebackup.build(config.LIVE, treadmill.use(), snapshot_guard, metadata), metadata)
+    return s._state_archive.get(lambda: statebackup.build(config.LIVE, treadmill.use(), snapshot_guard, metadata, file_backed=True), metadata)
 
 
 def raw_post(path: str, body: bytes):
@@ -4852,7 +4925,15 @@ def serve(idle_exit: float = 120, takeover: bool = False):
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(body)
+            if isinstance(body, statebackup.FilePayload):
+                with body.open() as source:
+                    while True:
+                        chunk = source.read(resultfiles.CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            else:
+                self.wfile.write(body)
 
         def _peer_closed(self):
             conn = getattr(self, "connection", None)
@@ -4881,7 +4962,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
             # write to a potentially slow client under the mutation lock.
             if isinstance(obj, (bytes, bytearray)):
                 obj, raw = None, bytes(obj)
-            return code, raw if raw is not None else json.dumps(obj).encode()
+            return code, raw if raw is not None else json.dumps(obj, separators=(',', ':')).encode()
 
         def do_POST(self):
             c0 = _cpu_now()
@@ -4905,7 +4986,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         response = self._response(408, {"error": "incomplete request body"})
                     elif not hmac.compare_digest(self.headers.get("X-SC-Token", ""), s.token):
                         response = self._response(403, {"error": "token"})
-                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/logs", "/capabilities")
+                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/logs", "/capabilities", "/results")
                                                            or self.path.split("?")[0] == "/state"):
                         response = self._post(body)
                     else:
@@ -4978,6 +5059,13 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                     except (ValueError, TypeError) as e:
                         return self._response(400, {"error": str(e)})
                     return self._response(200, result)
+                if p == '/results':
+                    try:
+                        return self._response(200, raw=s.result_part(m.get('batch'), m.get('ref'), m.get('offset', 0), m.get('length', resultfiles.CHUNK_BYTES)))
+                    except (ValueError, TypeError) as e:
+                        return self._response(400, {'error': str(e)})
+                    except FileNotFoundError:
+                        return self._response(404, {'error': 'result file not found'})
                 if p == "/submit":
                     return self._response(200, s.submit(m))
                 if p in ("/poll", "/close", "/logs") and s.batch_of(m) is None:  # (a request naming no batch: the client's, cut or old; answered, not ours)

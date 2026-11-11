@@ -19,7 +19,8 @@ the scheduler's own records (never by reading its log), and the same checks the 
 
 The scheduler records into a Health (record_*), samples it every 15 s, checks it every minute and alerts (its log,
 alerts.jsonl, status) when a target is breached in 2 checks in a row; `supercomputer health [--minutes N]` prints the
-checks (exit 1 on a breach). The records outlive a handoff (LIVE/scheduler/metrics/health.json), so a canary
+checks (exit 1 on a breach). Memory pressure is sampled/checked every 5 s, alerts on its first bad check,
+and retains at most 90 s / 64 readings; it is not a canary rollback target. The records outlive a handoff (LIVE/scheduler/metrics/health.json), so a canary
 (canary.py) judges new code against the hour before it.
 """
 import json
@@ -29,11 +30,13 @@ import re
 import threading
 import time
 
-from . import rules
+from . import rules, memorypressure
 
 KEEP_S = 3 * 3600
 CHURN_S = 1500
 ORPHAN_S = 600
+MEMORY_KEEP_S = 90
+MEMORY_MAX_SAMPLES = 64
 # (a preparation failure with no reason recorded is ours too: 11-01 11:09-12:21, 5,748 such strikes, a finished
 # preparation left marked running)
 OURS = re.compile(r"tree isn't on|isn't prepared|not reached after the restart|upgrad|re-attach|repair|its preparation failed: *$|never ended|isn't the commit's", re.I)
@@ -53,6 +56,7 @@ TARGETS = {
     "needless": ("starts made while a free VM that fits their work idled", "==", 0),
     "stray": ("slots held by runs no item owns past 2 min (a kill retried once: sooner, a kill landing), now", "==", 0),
     "disk": ("VMs held with their free disk below the threshold (min(10 GB, a tenth of the disk)), now", "==", 0),
+    "memory": ("controller memory pressure (high growth or full avg10 >= 10% or some avg10 >= 20%)", "==", 0),
     "billing": ("boat's billing blocks: starts refused or billing inactive (balances are information only)", "==", 0),
 }
 
@@ -69,7 +73,7 @@ class Health:
     def __init__(self, path: pathlib.Path | None = None):
         self.path = path
         self.lock = threading.Lock()
-        self.ev: dict[str, list] = {k: [] for k in ("start", "release", "placed", "strike", "modal", "sample", "orphan", "status", "error", "client_error", "billing", "needless", "handoff")}
+        self.ev: dict[str, list] = {k: [] for k in ("start", "release", "placed", "strike", "modal", "sample", "orphan", "status", "error", "client_error", "billing", "needless", "handoff", "memory")}
         self.streak: dict[str, int] = {}
         self.alerted: set = set()
         self.last: dict = {}
@@ -78,6 +82,8 @@ class Health:
                 d = json.loads(path.read_text())
                 for k in self.ev:
                     self.ev[k] = d.get("ev", {}).get(k, [])
+                self.ev["memory"] = [e for e in self.ev["memory"][-MEMORY_MAX_SAMPLES:]
+                                     if 0 <= time.time() - e["t"] <= MEMORY_KEEP_S]
             except Exception:
                 pass
 
@@ -150,6 +156,35 @@ class Health:
             key = str(e["status"])
             counts[key] = counts.get(key, 0) + 1
         return {"count": len(events), "by_status": counts, "recent": events[-4:]}
+
+    def record_memory(self, t: float, sample: dict):
+        """Record one sampler read; keep at most 90 seconds / 64 observations."""
+        with self.lock:
+            rows = [e for e in self.ev["memory"] if 0 <= t - e["t"] <= MEMORY_KEEP_S]
+            rows.append({"t": t, "sample": dict(sample)})
+            self.ev["memory"] = rows[-MEMORY_MAX_SAMPLES:]
+
+    def memory_status(self, now: float) -> dict:
+        """Cheap memory-only target for status; unknown/stale is not a healthy measurement."""
+        with self.lock:
+            rows = [e for e in self.ev["memory"] if 0 <= now - e["t"] <= MEMORY_KEEP_S][-MEMORY_MAX_SAMPLES:]
+        latest = dict(rows[-1]["sample"]) if rows else {"known": False}
+        bad = sum(memorypressure.breached(e["sample"]) for e in rows)
+        value = bad if bad or latest.get("known") else None
+        detail = {**latest, "sampled_at": rows[-1]["t"] if rows else None,
+                  "window_s": MEMORY_KEEP_S, "samples": len(rows), "pressure_samples": bad}
+        return {"what": TARGETS["memory"][0], "value": value, "limit": "== 0", "ok": not bad, "detail": detail}
+
+    def memory_tick(self, now: float) -> list[str]:
+        """Fast pressure-only alert check; never advances other health target streaks."""
+        v = self.memory_status(now)
+        if v["ok"]:
+            self.alerted.discard("memory")
+            return []
+        if "memory" in self.alerted:
+            return []
+        self.alerted.add("memory")
+        return [f"health: memory breached ({v['what']}): {json.dumps(v['detail'], default=str)[:800]}"]
 
     # -- the checks
     def check(self, now: float, minutes: float = 30, env: dict | None = None, released_since: float = 0.0,
@@ -231,7 +266,8 @@ class Health:
                   "waste": {"samples": n_waste, "worst": max((sum(p.get("waste", 0) for p in s["per"].values()) for s in ev["sample"]), default=0),
                             "with_waste": sum(1 for s in ev["sample"] if any(p.get("waste", 0) for p in s["per"].values()))}}
         out = {k: {"what": TARGETS[k][0], "value": vals[k], "limit": f"{TARGETS[k][1]} {TARGETS[k][2]}", "ok": _ok(TARGETS[k][1], vals[k], TARGETS[k][2]),
-                   "detail": detail[k]} for k in TARGETS}
+                   "detail": detail[k]} for k in TARGETS if k != "memory"}
+        out["memory"] = self.memory_status(now)
         out["handoff"]["hard_faults"] = max((e.get("missing", 0) + e.get("orphans", 0) for e in ev["handoff"]), default=0)
         return {"t": now, "minutes": minutes, "ok": all(v["ok"] for v in out.values()), "targets": out,
                 "client_4xx": self.client_errors(now, minutes)}
@@ -243,7 +279,7 @@ class Health:
         alerts = []
         for k, v in r["targets"].items():
             self.streak[k] = self.streak.get(k, 0) + 1 if not v["ok"] else 0
-            if self.streak[k] >= 2 and k not in self.alerted:
+            if self.streak[k] >= (1 if k == "memory" else 2) and k not in self.alerted:
                 self.alerted.add(k)
                 alerts.append(f"health: {k} breached ({v['what']}: {v['value']}, want {v['limit']}): {json.dumps(v['detail'], default=str)[:240]}")
             if v["ok"]:
@@ -265,7 +301,9 @@ class Health:
     def prune(self, now: float):
         with self.lock:
             for k in self.ev:
-                self.ev[k] = [e for e in self.ev[k] if now - e["t"] < KEEP_S]
+                self.ev[k] = [e for e in self.ev[k] if now - e["t"] < (MEMORY_KEEP_S if k == "memory" else KEEP_S)]
+                if k == "memory":
+                    self.ev[k] = self.ev[k][-MEMORY_MAX_SAMPLES:]
 
 
 def billing_problems(lim: dict) -> list[str]:
@@ -317,7 +355,7 @@ def show(r: dict) -> str:
     for k, v in r["targets"].items():
         val = "-" if v["value"] is None else v["value"]
         d = v["detail"]
-        extra = "" if v["ok"] or not d else f"   {json.dumps(d, default=str)[:200]}"
+        extra = f"   {json.dumps(d, default=str)[:800]}" if k == "memory" else ("" if v["ok"] or not d else f"   {json.dumps(d, default=str)[:200]}")
         lines.append(f"  {'ok ' if v['ok'] else 'BAD'} {k:8} {str(val):>7}  (want {v['limit']}: {v['what']}){extra}")
     clients = r.get("client_4xx", {})
     lines.append(f"  client 4xx: {clients.get('count', 0)} (informational, not a server health breach); by status {clients.get('by_status', {})}")

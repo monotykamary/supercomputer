@@ -61,6 +61,30 @@ Leave free starts for the account's other projects (the reserve), and never touc
 **Data:** volumes live on boat (`supercomputer store push|pull|ls`), named snapshots with sha256 manifests, mirrored
 to RunPod and Modal on demand, pulls cached by hash.
 
+**Explicit roots:** an explicit nested non-repository root is refused with both the requested and enclosing root
+named; it is never silently widened to the parent checkout. An omitted root keeps the usual current-repository
+selection. Submission logs show the effective root, file count and link count.
+
+**Output files (native boat jobs):** write artifacts to the reserved `$SUPERCOMPUTER_OUTPUT_DIR`, not stdout,
+base64 in JSON, `/tmp`, or the working tree (those directories are cleaned after the job). The directory is private
+to the job. Regular files, including subdirectories, are copied by SHA-256 into immutable spools before cleanup;
+symlinks and special files are not exported. There is no output-file size limit that rejects a job; available disk
+and transport capacity still apply. Example command:
+```sh
+mkdir -p "$SUPERCOMPUTER_OUTPUT_DIR/proofs"
+cp proof.bin "$SUPERCOMPUTER_OUTPUT_DIR/proofs/proof.bin"
+```
+`supercomputer run --jobs jobs.json --out runs/x` downloads files to `runs/x/JOB.files/<relative-path>`, verifies
+SHA-256 before accepting each file, and retains a manifest. `collect()` remains bounded stdout/stderr only.
+Programmatic sessions add `output_files_ref`, `output_files_manifest`, and `output_files_dir` to the result row.
+Large Python return values (>32 KiB) and rows (>64 KiB) are complete JSON files, not truncated: rows carry
+`result_ref`/`row_ref` plus downloaded `result_file`/`row_file`. Small returns are unchanged. `Session.call()` returns
+a reference/file envelope for a large return; explicitly parse that file only if your client has enough memory.
+Poll responses are paged (128 rows and about 512 KiB maximum), chunks are at most 256 KiB, and clients download
+before closing the batch. Native controller capability `output_files_protocol:1` / `result_files_protocol:1` is
+required for these features; do not assume an old controller or Modal fallback exports artifacts.
+Details and reference schema: `docs/result-files.md`.
+
 **The treadmill:** sweeps of unsolved tasks, soundness fuzz and mutants, and an idea queue:
 `supercomputer queue add jobs.json [--name N] [--meta k=v]`, `queue ls`, `queue results <name>`; `supercomputer
 digest` (VM-hours and dollars by class, starts per 100 items, waits by class, gaps between waves).

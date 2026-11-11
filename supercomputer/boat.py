@@ -853,7 +853,7 @@ class Tree:
     unchanged file isn't read again."""
 
     def __init__(self, root: pathlib.Path | None = None, tar: bytes | None = None, data: dict | None = None):
-        self.root = root or project().root
+        self.root = config.select_root(root) if root is not None else project().root
         self._tar = tar
         self.files: dict[str, str] = {}
         self.gits: dict[str, str] = {}  # (a clean tracked file's git blob id: what the VM checks the file it builds is)
@@ -1542,7 +1542,7 @@ class AgentClient:
         with contextlib.suppress(OSError):
             c.close()
 
-    def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json") -> tuple[int, bytes, str]:
+    def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json", decode=None) -> tuple[int, object, str]:
         last, retry = None, R.Retry(4)  # (4 tries, the first answer kept: rules.boat.Retry)
         while retry.outcome == "trying":
             k = retry.tries
@@ -1554,7 +1554,11 @@ class AgentClient:
             try:
                 c.request(method, self.base + path + q, body=body, headers=hdr)
                 r = c.getresponse()
-                data = r.read()
+                try:
+                    data = decode(r) if decode is not None and r.status == 200 else r.read()
+                except Exception:
+                    c.close()
+                    raise
                 for h, v in r.getheaders():
                     if h.lower() == "set-cookie":
                         with self.lock:
@@ -1581,7 +1585,14 @@ class AgentClient:
         args = [*args, {"_lease": {**self.lease, "owner": self.owner, "vm_id": self.vm}}] if cmd != "lease" else list(args)
         body = json.dumps({"cmd": cmd, "args": args}).encode()
         try:
-            code, data, _ = self._req("POST", "/rpc", body, timeout)
+            decode = None
+            store = getattr(self, 'result_store', None)
+            polling = cmd in ('tick', 'vtick') or (cmd == 'owned_rpc' and args
+                and isinstance(args[0], dict) and args[0].get('command') in ('tick', 'vtick'))
+            if store is not None and polling:
+                from . import resultjson
+                decode = lambda stream: resultjson.load_response(stream, store)
+            code, data, _ = self._req("POST", "/rpc", body, timeout, **({'decode': decode} if decode else {}))
             if code == 502 and cmd in self.EXEC_OK and len(body) < EXEC_BODY:
                 raise AgentError(f"{self.vm}: {cmd}: 502 from boat's front")
         except AgentError:
@@ -1590,12 +1601,17 @@ class AgentClient:
             # rules.boat.by_exec: only the replayable commands, under EXEC_BODY, sent in parts: B14)
             if not R.by_exec(True, cmd in self.EXEC_OK, len(body) < EXEC_BODY):
                 raise
-            code, data = self._rpc_exec(body, timeout)
+            code, data = self._rpc_exec(body, timeout, **({'decode': decode} if decode else {}))
+        if code == 200 and isinstance(data, dict):
+            return data
         if code != 200 or data[:1] not in (b"{", b"["):
             raise AgentError(f"{self.vm}: {cmd}: {code} {data[:300]!r}")
         return json.loads(data)
 
-    def _rpc_exec(self, body: bytes, timeout: float) -> tuple[int, bytes]:
+    def _rpc_exec(self, body: bytes, timeout: float, decode=None):
+        if decode is not None:
+            from . import resultrelay
+            return resultrelay.exec_response(self, body, timeout, decode)
         script = ("import base64,sys,urllib.request,os;t=sys.argv[2];a=sys.argv[1];"
                   "b=(open(a[1:]).read() if a.startswith('@') else a);a.startswith('@') and os.unlink(a[1:]);"
                   f"r=urllib.request.Request('http://127.0.0.1:{AGENT_PORT}/rpc',data=base64.b64decode(b),headers={{'X-SC-Token':t,'Content-Type':'application/json'}});"
@@ -2386,7 +2402,7 @@ class Session:
                     free -= it["weight"]
             return got
 
-        def finish(it: dict, row: dict | None, lost_reason: str = ""):
+        def finish(it: dict, row: dict | None, lost_reason: str = "", client=None):
             orig = {**it, "name": it.get("orig", it["name"])}
             try:
                 if row is None:
@@ -2395,6 +2411,7 @@ class Session:
                     else:
                         on_done(orig, {"name": orig["name"], "code": -1, "seconds": -1, "error": lost_reason})
                 else:
+                    row = self._download_results(row, lambda ref, offset, count: self._result_chunk(client, row.get('batch', self.batch), row['name'], ref, offset, count)) if client is not None else row
                     on_done(orig, {**row, "name": orig["name"]})
             finally:
                 with lock:
@@ -2494,7 +2511,7 @@ class Session:
                             lose(it, f"its runner on {vm.id} vanished")
                         else:
                             fate_of(it).done(False)
-                            finish(it, row)
+                            finish(it, row, client=vm.client)
 
         def spawn_workers():
             while not all_done.is_set() and not self.stop.is_set():
@@ -2579,14 +2596,33 @@ class Session:
         all_done.wait(5)
         self._enough = None
 
+    @staticmethod
+    def _result_chunk(client, bid, name, ref, offset, count):
+        from . import resultfiles
+        resultfiles.validate_ref(ref)
+        chunk = client.rpc('resultpart', bid, name, ref['sha256'], offset, count, timeout=120)
+        if not isinstance(chunk, dict) or chunk.get('offset') != offset or chunk.get('bytes') != ref['bytes'] or chunk.get('sha256') != ref['sha256']:
+            raise ValueError('invalid result chunk receipt')
+        data = base64.b64decode(chunk.get('data', ''), validate=True)
+        if len(data) > count:
+            raise ValueError('oversized result chunk')
+        return data
+
+    def _download_results(self, row, reader):
+        from . import clientresults
+        directory = pathlib.Path(getattr(self, 'output_dir', config.HOME / 'results' / self.batch))
+        return clientresults.download(row, reader, directory)
+
     def call(self, module: str, fn: str, args, extra: dict | None = None, limit: int = 600):
         """One function of a runner on one of the session's VMs (the first ready), its result."""
         out = {}
         self.run([{"name": f"call-{fn}-{int(time.time() * 1000)}", "kind": "py", "module": module, "fn": fn, "args": args, "limit": limit, "weight": 1, "est": 1, **(extra or {})}],
                  lambda it, row: out.update(row))
-        if "result" not in out:
-            raise RuntimeError(f"{fn} failed on boat: {str(out.get('error', out))[-2000:]}")
-        return out["result"]
+        if "result" in out:
+            return out["result"]
+        if 'result_ref' in out or 'row_ref' in out:
+            return {k: v for k, v in out.items() if k in ('result_ref', 'result_file', 'row_ref', 'row_file', 'output_files_ref', 'output_files_dir', 'output_files_manifest')}
+        raise RuntimeError(f"{fn} failed on boat: {str(out.get('error', out))[-2000:]}")
 
     # -- collecting and closing
     def collect(self) -> dict[str, dict]:
@@ -2905,6 +2941,7 @@ class Scheduled(Session):
                 raise Unavailable("scheduler lacks distinct_vm_group capability; refusing unconstrained submission")
             if any("cpu_model" in it for it in items) and caps.get("cpu_model_exact") is not True:
                 raise Unavailable("scheduler lacks exact cpu_model capability; refusing unconstrained submission")
+        log(f"submission root: {getattr(self.tree, 'root', '<prebuilt tree>')} ({len(self.tree.files)} files, {len(self.tree.links)} links)")
         self.client.push_tree(self.tree)
         self.client.push_caches(self.caches, self.proj.cache_outputs)
         by = {it["name"]: it for it in items}
@@ -2963,6 +3000,7 @@ class Scheduled(Session):
                         self.client = self.sched.ensure_running()
                 continue
             for row in r.get("rows", []):
+                row = self._download_results(row, lambda ref, offset, count: self.client.req('/results', {'batch':bid, 'ref':ref, 'offset':offset, 'length':count}, timeout=120, raw=True))
                 since += 1
                 it = by.get(row["name"])
                 if it is None or not reports.row(row["name"] in left):
@@ -3386,6 +3424,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
             given = klass or env("CLASS")  # (rules.boat.batch_class: given, else interactive when small, a submission else)
             sess = session(f"run {outdir.name}", klass=given or R.batch_class(False, "submission", small), idle=idle, teardown=teardown, vm_type=vm_type,
                            build=on_lost is None, tar=tar)
+            sess.output_dir = outdir
             sess.max_starts = max_vms
             sess.warm_only = tiny
             sess.early = not teardown

@@ -374,7 +374,7 @@ def job_key(tk: str, j: dict) -> str:
 
 def submit(jobs: str, tree: str, name: str, meta: dict | None = None):
     spec = json.loads(pathlib.Path(jobs).read_text())
-    root = config.git_root(pathlib.Path(tree).resolve())
+    root = config.select_root(tree)
     name = name or f"{root.name}-{pathlib.Path(jobs).stem}-{time.strftime('%m%d-%H%M%S')}"
     d = TM / "subs" / name
     why = rules.submit_refusal(any(j.get("image") and j["image"] not in project().images for j in spec), any(j.get("backend") == "modal" for j in spec), any(j.get("gpu") for j in spec), d.exists())

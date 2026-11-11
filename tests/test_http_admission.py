@@ -58,7 +58,8 @@ class HTTPAdmission(unittest.TestCase):
             return h._response(200, {"ok": True})
         def send(code, obj=None, raw=None):
             self.assertFalse(owner._request_lock._is_owned())
-            self.assertEqual((code, raw), (200, b'{"ok": true}'))
+            self.assertEqual(code, 200)
+            self.assertEqual(json.loads(raw), {"ok": True})
             seen.append("write")
         h._post, h._send = mutate, send
         h.do_POST()

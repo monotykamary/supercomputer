@@ -181,8 +181,10 @@ handoff receipt. No deployment was performed by this lane.
   `Type=notify`, `NotifyAccess=all`, `KillMode=process`; the old MainPID notifies
   systemd of the acknowledged successor before exiting. Controller setup no
   longer drains or restarts scheduler/treadmill for a code update. The explicit
-  `controller stage` path (`controller.py:182`) uploads code only and refuses a
-  controller lacking the hot-handoff capability.
+  `controller stage` path uploads code and persists future-start resource
+  drop-ins without restarting the service, and refuses a controller lacking
+  the hot-handoff capability. See [controller memory policy](controller-memory.md)
+  for percentage limits and preservation of emergency runtime overrides.
 * `agent.py:1823` checks unresolved strict ownership and unfinished legacy jobs
   under the same cross-process ownership lock as **all** starts. Upgrade fences
   admission before replacing source. The scheduler defers busy upgrades and

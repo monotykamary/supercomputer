@@ -50,6 +50,7 @@ import secrets
 import math
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1543,7 +1544,7 @@ def report(d: pathlib.Path) -> tuple[list, list]:
         if what == "lost":
             time.sleep(0.2)  # (the runner's done.json may be landing)
             if not dj.exists():
-                err = (j / "agent.err").read_text()[-2000:] if (j / "agent.err").exists() else ""
+                err = _read_tail(j / "agent.err", 8000).decode("utf-8", "replace")[-2000:] if (j / "agent.err").exists() else ""
                 lost = {"name": j.name, "code": -1, "seconds": -1, "lost": True, "err": err or "its process gone without a word"}
                 if identity is not None:
                     lost["launch_identity"] = identity  # a NEW failure, proven from this admission
@@ -1671,6 +1672,8 @@ def cpu_model() -> str:
 def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathlib.Path, cwd: str, argv: list[str]) -> list[str]:
     tmp = j / "tmp"
     tmp.mkdir(exist_ok=True)
+    outputs = j / "outputs"
+    outputs.mkdir(mode=0o700, exist_ok=True)
     src = f"/src/{ctx.get('name', 'repo')}"
     binds = [(str(tmp), "/tmp"), (str(work), "/work"), (str(tree), src)]
     binds += [(s, t) for t, s in spec.get("mounts", {}).items()]
@@ -1689,7 +1692,8 @@ def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathl
     # (bun's install cache in the item's own /tmp: two `bun install`s at once in one shared cache failed, silently,
     # where each Modal container has a HOME of its own)
     env = ["env", "-i", f"PATH={path}", f"HOME={HOME}", "USER=user", "LOGNAME=user", "SHELL=/bin/bash", "LANG=C.UTF-8", "BUN_INSTALL_CACHE_DIR=/tmp/.bun-install-cache",
-           *[f"{k}={v}" for k, v in {**ctx.get("env", {}), **spec.get("env", {})}.items()]]
+           *[f"{k}={v}" for k, v in {**ctx.get("env", {}), **spec.get("env", {}),
+                                      "SUPERCOMPUTER_OUTPUT_DIR": str(outputs.resolve())}.items()]]
     cpus = ",".join(map(str, json.loads((j / "taskset" if (j / "taskset").exists() else j / "cpus").read_text())))
     return ["sudo", "-n", "unshare", "-m", "--propagation", "private", "--", "sh", str(j / "ns.sh"),
             "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}", "--init-groups", "--",
@@ -1733,6 +1737,7 @@ def run(batch: str, name: str, launch_identity=None):
     tree = pathlib.Path((d / "treepath").read_text()) if (d / "treepath").exists() else d / "tree"
     work = j / "work"
     work.mkdir()
+    (j / "outputs").mkdir(mode=0o700, exist_ok=True)
     row: dict = {"name": name}
     if spec.get("strict_once") is True:
         identity = _strict_job_identity(j)
@@ -1778,12 +1783,16 @@ def run(batch: str, name: str, launch_identity=None):
                 with open(j / "err", "a") as err:
                     err.write(f"\nout of memory: killed by the kernel's OOM killer (exit {p.returncode}) on a VM of {mem_total_mb()} MB\n")
             if (j / "result.json").exists():
-                row["result"] = json.loads((j / "result.json").read_text())
+                _read_result(j, row)
             else:
-                row["error"] = ((j / "err").read_bytes()[-3000:].decode("utf-8", "replace") or f"exit {p.returncode}")
+                row["error"] = (_read_tail(j / "err", 3000).decode("utf-8", "replace") or f"exit {p.returncode}")
     except Exception as e:
-        row.update(code=-1, seconds=-1, error=repr(e))
+        row.update(code=-1, seconds=-1, error=repr(e)[-2000:])
     finally:
+        try:
+            _collect_outputs(j, row)
+        except Exception as e:
+            row.update(code=-1, error="output collection failed: " + repr(e)[-1800:])
         sudo("rm", "-rf", str(work), str(j / "tmp"), *map(str, j.glob("ov*")), check=False)
         write_json(j / "done.json", row)
 
@@ -1794,7 +1803,185 @@ def call(module: str, fn: str, args_file: str, out_file: str):
     mod = import_runner(module)
     args = json.loads(pathlib.Path(args_file).read_text())
     res = getattr(mod, fn)(*args) if isinstance(args, list) else getattr(mod, fn)(**args)
-    pathlib.Path(out_file).write_text(json.dumps(res))
+    with open(out_file, "w") as f:
+        json.dump(res, f)
+
+
+RESULT_INLINE_BYTES = 32768
+RESULT_CHUNK_BYTES = 262144
+
+
+def _read_tail(path, cap):
+    """Read only the existing log policy's tail, not a potentially enormous log."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - cap))
+        return f.read(cap)
+
+
+def _read_result(j, row):
+    """Publish a Python result before its done row; never parse oversized JSON.
+
+    Keep result.json intact. A private copy makes the content-addressed payload
+    independent of any writer retaining the result inode. Memory is one chunk.
+    """
+    fd = os.open(j / "result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("result must be a regular file")
+        if info.st_size <= RESULT_INLINE_BYTES:
+            raw = source.read(RESULT_INLINE_BYTES + 1)
+            if len(raw) <= RESULT_INLINE_BYTES:
+                row["result"] = json.loads(raw.decode("utf-8"))
+                row.pop("result_ref", None)
+                return
+            source.seek(0)  # grew past the boundary: offload, do not parse
+        row["result_ref"] = _publish_payload(j, source, "json")
+        row.pop("result", None)
+
+
+def _publish_payload(j, source, format):
+    """Copy a byte stream to an atomic, durable, read-only content-addressed file."""
+    tmp = j / (".result-" + secrets.token_hex(16) + ".tmp")
+    digest, size = hashlib.sha256(), 0
+    try:
+        outfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(outfd, "wb") as out:
+            while chunk := source.read(RESULT_CHUNK_BYTES):
+                digest.update(chunk)
+                size += len(chunk)
+                out.write(chunk)
+            out.flush()
+            os.fchmod(out.fileno(), 0o444)
+            os.fsync(out.fileno())
+        sha = digest.hexdigest()
+        payload = j / (sha + ".payload")
+        try:
+            os.link(tmp, payload, follow_symlinks=False)
+        except FileExistsError:
+            # Repeated publication must not replace an immutable payload.
+            existing = os.open(payload, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(existing, "rb") as old:
+                check = hashlib.sha256()
+                if not stat.S_ISREG(os.fstat(old.fileno()).st_mode):
+                    raise ValueError("invalid existing result payload")
+                while chunk := old.read(RESULT_CHUNK_BYTES):
+                    check.update(chunk)
+                if old.tell() != size or check.hexdigest() != sha:
+                    raise ValueError("existing result payload differs")
+        tmp.unlink()
+        dirfd = os.open(j, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+        return {"version": 1, "sha256": sha, "bytes": size, "format": format}
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _collect_outputs(j, row):
+    """Stream regular output files and their manifest; never traverse symlinks.
+
+    Directory-relative nofollow opens protect against an entry replaced during
+    traversal. Each file is privately copied, never linked to a writer's inode.
+    """
+    def entries(dirfd, prefix=""):
+        with os.scandir(dirfd) as scan:
+            for entry in scan:
+                relative = prefix + entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd)
+                    try:
+                        yield from entries(child, relative + "/")
+                    finally:
+                        os.close(child)
+                elif entry.is_file(follow_symlinks=False):
+                    fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+                    with os.fdopen(fd, "rb") as source:
+                        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                            continue
+                        yield {"path": relative, **_publish_payload(j, source, "file")}
+
+    try:
+        directory = os.open(j / "outputs", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    manifest = j / (".outputs-" + secrets.token_hex(16) + ".tmp")
+    count = 0
+    try:
+        fd = os.open(manifest, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w+", encoding="utf-8") as out:
+            out.write("[")
+            for descriptor in entries(directory):
+                if count:
+                    out.write(",")
+                json.dump(descriptor, out)
+                count += 1
+            out.write("]")
+            out.flush()
+        if count:
+            with manifest.open("rb") as source:
+                row["output_files_ref"] = _publish_payload(j, source, "json")
+    finally:
+        os.close(directory)
+        manifest.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def _result_job_fd(batch, name):
+    """Resolve each directory without following symlinks, including job parents."""
+    fd = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in ("b", batch, "jobs", name):
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def resultpart(batch, name, sha, offset, length):
+    """Owner-bound, bounded reads until ACK. Hash once on publish, not per chunk."""
+    try:
+        if type(batch) is not str or type(name) is not str:
+            raise ValueError("invalid identifiers")
+        _item_ids(batch, name)
+        if type(sha) is not str or not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise ValueError("invalid sha256")
+        if type(offset) is not int or offset < 0 or type(length) is not int or length < 0:
+            raise ValueError("invalid range")
+        j = batch_dir(batch) / "jobs" / name
+        if not _owner_readable(j):
+            return {"ok": False, "stale": True}
+        with _result_job_fd(batch, name) as jobfd:
+            try:
+                os.stat("acked.json", dir_fd=jobfd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("result already acknowledged")
+            done = os.stat("done.json", dir_fd=jobfd, follow_symlinks=False)
+            if not stat.S_ISREG(done.st_mode):
+                raise ValueError("result not terminal")
+            fd = os.open(sha + ".payload", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=jobfd)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("invalid result payload")
+                size = info.st_size
+                # Clamp before seek as well: arbitrary-size JSON integers are safe.
+                source.seek(min(offset, size))
+                data = source.read(min(length, RESULT_CHUNK_BYTES, max(0, size - offset)))
+                if os.fstat(source.fileno()).st_size != size:
+                    raise ValueError("result payload changed")
+        return {"data": base64.b64encode(data).decode("ascii"), "offset": offset,
+                "bytes": size, "sha256": sha, "eof": offset + len(data) >= size}
+    except (OSError, ValueError, TypeError, OverflowError):
+        # Do not echo attacker-controlled arguments or file contents in errors.
+        return {"ok": False, "error": "result unavailable or invalid request"}
 
 
 # -------------------------------------------------------------------------------------------------------------- collect
@@ -1808,8 +1995,7 @@ def logs_tar(batch: str) -> bytes:
             for f, cap in (("out", 400_000), ("err", 100_000)):
                 p = j / f
                 if p.exists():
-                    data = p.read_bytes()
-                    data = data[-cap:] if len(data) > cap else data
+                    data = _read_tail(p, cap)
                     ti = tarfile.TarInfo(f"{j.name}/{f}")
                     ti.size = len(data)
                     tf.addfile(ti, io.BytesIO(data))
@@ -2357,7 +2543,7 @@ def rpc_dispatch(cmd, args, token_owner=None, cli=False):
     commands = {"tick": tick, "vtick": vtick, "kill": kill, "killitem": kill_item,
                 "cancelitem": cancelitem, "prep": prep, "collect": collect, "cacheout": cacheout,
                 "cachein": cachein, "serve": serve, "owned_rpc": owned_rpc,
-                "itemlogs": itemlogs, "logs": logs_tar, "start-daemon": start_daemon,
+                "itemlogs": itemlogs, "resultpart": resultpart, "logs": logs_tar, "start-daemon": start_daemon,
                 "begin": begin, "upgrade": upgrade, "tree": make_tree, "verify": verify_tree,
                 "have": lambda keys: {"missing": have(keys)}, "pull": pull, "pullcache": pullcache,
                 "ping": lambda: {"ok": True, "version": VERSION, "boot": _lease_boot(),
@@ -2383,7 +2569,7 @@ def itemlogs(batch, name):
     j = batch_dir(batch) / "jobs" / name
     if not _owner_readable(j):
         return {"ok": False, "stale": True}
-    return {f: (j / f).read_bytes()[-cap:].decode("utf-8", "replace") if (j / f).exists() else ""
+    return {f: _read_tail(j / f, cap).decode("utf-8", "replace") if (j / f).exists() else ""
             for f, cap in (("out", 400_000), ("err", 100_000))}
 
 

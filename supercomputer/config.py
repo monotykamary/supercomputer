@@ -79,6 +79,28 @@ def git_root(d: pathlib.Path) -> pathlib.Path:
         return d.resolve()
 
 
+def select_root(root: pathlib.Path | str | None = None) -> pathlib.Path:
+    """Implicit CWD means its git root; an explicit boundary must never be widened.
+
+    A nested directory without its own repository is refused rather than shipping
+    its enclosing checkout. Standalone directories remain exact (callers that need
+    git may reject them separately). Git worktrees' .git files are supported.
+    """
+    if root is None:
+        return git_root(pathlib.Path(os.getcwd()))
+    requested = pathlib.Path(root).resolve()
+    if (requested / ".git").exists():
+        return requested  # own repository/worktree boundary; no git fork on cached trees
+    enclosing = git_root(requested).resolve()
+    if enclosing != requested:
+        raise ValueError(
+            f"explicit tree root {requested} is inside enclosing git root {enclosing}; "
+            "refusing to widen the submitted tree. Use a repository rooted at the "
+            "requested directory, or explicitly select the enclosing root."
+        )
+    return requested
+
+
 def main_checkout(d: pathlib.Path) -> pathlib.Path:
     try:
         common = subprocess.run(["git", "-C", str(d), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, check=True).stdout.strip()
@@ -172,9 +194,9 @@ _current: Project | None = None
 
 
 def use(root: pathlib.Path | str | None = None) -> Project:
-    """The project of a tree (its git root; the current directory's by default), and makes it the current one."""
+    """Select a project without silently widening an explicit tree boundary."""
     global _current
-    r = git_root(pathlib.Path(root or os.getcwd()))
+    r = select_root(root)
     p = find_config(r)
     cfg = tomllib.loads(p.read_text()) if p else {}
     _current = Project(r, cfg, p)

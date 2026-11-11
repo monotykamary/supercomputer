@@ -67,6 +67,12 @@ That's a real run on a warm VM: 11.7 s wall and no start. The same batch cold to
 included. Each job's output lands in `runs/x/<name>.log`; `runs/x/summary.tsv` has its name, exit code, seconds and
 where it ran, and `runs/x/backends.json` says why anything moved.
 
+Native jobs can also return arbitrarily large **output files**: write regular files under
+`$SUPERCOMPUTER_OUTPUT_DIR`. They are spooled by SHA-256 before job cleanup and downloaded,
+with hash verification, to `runs/x/<name>.files/<relative-path>`. Do not embed large artifacts as
+base64 in JSON or stdout. Large JSON returns are delivered as complete file references; small
+returns are unchanged. See [output-file transport and result references](docs/result-files.md).
+
 | Job field | |
 | --- | --- |
 | `name`, `cmd` | required; `cmd` runs under bash in `<repo>/<cwd>` |
