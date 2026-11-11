@@ -2805,6 +2805,13 @@ class Scheduler:
                     # Arrival order, not provider listing order, defines consecutive draws.
                     c["fruitless"] = rules.cpu_streak(c["fruitless"], model == c["cpu_model"])
                     changed = True
+                elif d["vm"] == vm_id and d["done"] and not d["model"] and model:
+                    # A late model report completes an earlier unknown observation.
+                    d["model"] = model
+                    c["observed"][vm_id] = model
+                    if model == c["cpu_model"]:
+                        c["fruitless"] = 0
+                    changed = True
         if changed:
             self._constraints_save()
 
@@ -4133,6 +4140,10 @@ class Scheduler:
                                    for b in self.batches.values() for it in b.items.values())
                 if not all(rules.cpu_handoff_allowed(required_cpu, prepared[target].get("cpu_model_exact") is True) for target in candidates):
                     self.alert("handoff refused: live CPU constraints require an exact-model capable successor")
+                    return
+                if required_cpu and (self.asking or any(self.creating.values()) or any(
+                        not v.ready and getattr(v, "cpu_constraint", "") for v in self.vms.values() if not v.dead)):
+                    log("handoff deferred until CPU draws settle; placement continues")
                     return
                 if any(it.batch.strict_once and not it.start_done.is_set()
                        for v in self.vms.values() for it in v.running.values()):

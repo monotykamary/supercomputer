@@ -171,7 +171,9 @@ rather than assuming a CPU. Draw outcomes live in a separate atomic `cpu-constra
 daily reset does not reset the scarce-model guard. Native clients require the new `cpu_model_exact` capability
 before submitting constrained jobs. Snapshot preparation reads the candidate's capability using the exact
 candidate interpreter/import. Before freezing, the parent refuses any successor/rollback candidate lacking
-exact-model support while constrained admissions remain live. No new lease or handoff protocol is required.
+exact-model support while constrained admissions remain live. In-flight CPU acquisitions settle before the
+freeze (placement continues during this deferral), so the successor cannot race the old draw accountant.
+No new lease or handoff protocol is required.
 
 Client endpoint selection now defaults to `live/controller.json`, including fail-closed behavior for an unreadable
 configuration. Only `SUPERCOMPUTER_LOCAL=1` explicitly permits a local scheduler when a controller is configured.
