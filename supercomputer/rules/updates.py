@@ -24,6 +24,14 @@ def handoff_health_streak(previous: int, fresh: bool, hard_faults: int, idle: in
         return 2
     return min(2, max(0, previous) + 1) if idle > 0 else 0
 
+# gdp: law a hard handoff fault never passes the canary: not result or not hard_fault
+# gdp: law an unconfirmed idle breach never passes the canary: not result or pending == 0
+# gdp: law the canary cannot pass before its watch ends: not result or elapsed >= watch_s
+# gdp: law a completed clean watch passes: elapsed < watch_s or pending != 0 or hard_fault or result
+def handoff_can_pass(elapsed: float, watch_s: float, pending: int, hard_fault: bool) -> bool:
+    return elapsed >= watch_s and pending == 0 and not hard_fault
+
+
 # gdp: law only HTTP 4xx responses are client faults: not result or (status >= 400 and status < 500)
 # gdp: law every HTTP 4xx response is a client fault: status < 400 or status >= 500 or result
 def http_client_fault(status: int) -> bool:

@@ -87,6 +87,9 @@ class Guards(unittest.TestCase):
         self.assertEqual(updates.handoff_health_streak(0, True, 1, 0), 2)
         self.assertEqual(updates.handoff_health_streak(0, True, 0, 1), 1)
         self.assertEqual(updates.handoff_health_streak(1, True, 0, 1), 2)
+        self.assertFalse(updates.handoff_can_pass(601, 600, 0, True))
+        self.assertFalse(updates.handoff_can_pass(601, 600, 1, False))
+        self.assertTrue(updates.handoff_can_pass(601, 600, 0, False))
 
     def test_handoff_idle_uses_grace_and_resets_on_placement_or_demand_loss(self):
         from types import SimpleNamespace

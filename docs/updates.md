@@ -55,7 +55,9 @@ The handoff target is still strict zero. The initial takeover and its +15/+30-se
 ownership checks record missing VMs and orphans; readiness still requires the exact
 admission and running-item identity sets before activation. Those hard faults have
 no idle grace and are rejected on their first sample (or refuse readiness before
-activation). No lease, listener, ACK or wire-protocol field is changed.
+activation). If saved code cannot safely take over and rollback must be refused,
+the observed hard fault still prevents later canary acceptance. No lease, listener,
+ACK or wire-protocol field is changed.
 
 Idle-only observations continue every 15 seconds during the 600-second canary.
 They use the same placement eligibility as waste, but track a conservative per-VM

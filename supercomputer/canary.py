@@ -30,6 +30,7 @@ class Canary:
         self.streak: dict = {}
         self.baseline: set | None = None
         self._handoff_checked_at: float | None = None
+        self._handoff_hard_fault = False
 
     def read(self) -> dict:
         try:
@@ -81,6 +82,7 @@ class Canary:
 
     def handing_off(self, old: str, new: str, now: float):
         self.baseline, self.streak, self._handoff_checked_at = None, {}, now
+        self._handoff_hard_fault = False
         d = self.read()
         d.update({"from": old, "to": new, "t": now, "state": "watching"})
         self.write(d)
@@ -114,6 +116,7 @@ class Canary:
         d = self.read()
         if d.get("to") != me or d.get("state") != "watching" or dropped <= 0:
             return "", ""
+        self._handoff_hard_fault = True
         frm = d.get("from")
         if not (frm and (self.dir / "code" / frm / "supercomputer").exists()):
             return "", ""
@@ -170,6 +173,7 @@ class Canary:
             if k == "waste" and breached and (v.get("detail") or {}).get("with_waste", 2) < 2:
                 breached = False  # (one measure's waste is no code's: 11-02 02:25:58, one 8-slot sample handed a tree fix back)
             if k == "handoff":
+                self._handoff_hard_fault |= v.get("hard_faults", 0) > 0
                 self.streak[k] = rules.handoff_health_streak(self.streak.get(k, 0), v["value"] is not None,
                                                              v.get("hard_faults", 0), v["value"] or 0)
             else:
@@ -184,7 +188,7 @@ class Canary:
             d["why"] = "; ".join(bad)
             self.write(d)
             return "handback", f"code {me} breached {'; '.join(bad)} within {(now - t0) / 60:.0f} min of the handoff: handed back to {d['from']}"
-        if now - t0 >= WATCH_S and not self.streak.get("handoff", 0):
+        if rules.handoff_can_pass(now - t0, WATCH_S, self.streak.get("handoff", 0), self._handoff_hard_fault):
             d["state"] = "passed"
             d["passed"] = (d.get("passed", []) + [me])[-20:]  # (the codes whose canary passed, newest last: rollback's default)
             self.write(d)

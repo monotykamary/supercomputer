@@ -11,6 +11,11 @@ def double_count_handoff(previous: int, fresh: bool, hard_faults: int, idle: int
 def ignore_missing_vm(previous: int, fresh: bool, hard_faults: int, idle: int) -> int:
     return min(2, max(0, previous) + 1) if fresh and idle > 0 else 0
 
+# gdp: law a hard handoff fault never passes the canary: not result or not hard_fault
+def accept_hard_handoff(elapsed: float, watch_s: float, pending: int, hard_fault: bool) -> bool:
+    return elapsed >= watch_s and pending == 0
+
+
 # gdp: law only HTTP 4xx responses are client faults: not result or (status >= 400 and status < 500)
 def server_fault_as_client(status: int) -> bool:
     return status >= 400

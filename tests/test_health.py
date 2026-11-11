@@ -298,6 +298,22 @@ def test_missing_or_orphan_handoff_rejects_on_first_sample_even_at_deadline():
                 assert c.rejected("new")
 
 
+def test_unsafe_rollback_never_turns_a_hard_fault_into_later_acceptance():
+    for direct in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            c, h = _watching_canary(root), health.Health()
+            (root / "code/old/supercomputer/scheduler.py").write_text("# cannot take over atomically")
+            if direct:
+                assert c.handoff_verdict("new", 1, 0, "missing VM")[0] == "alert"
+            else:
+                h.record_handoff(1055, 1, 0, 1, 0, 0)
+                assert c.tick("new", 1060, h)[0] == "watch"
+            assert c.tick("new", 1120, h)[0] == "watch"
+            assert c.tick("new", 1601, h)[0] == "watch"
+            assert c.read()["state"] != "passed"
+
+
 def test_pending_idle_at_pass_horizon_is_confirmed_before_acceptance():
     for persists in (False, True):
         with tempfile.TemporaryDirectory() as tmp:
