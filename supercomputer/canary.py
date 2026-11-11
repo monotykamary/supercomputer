@@ -1,5 +1,6 @@
 """The canary: a handoff to new code is watched for WATCH_S (10 min), and handed back to the previous code by itself
-when a target (health.py) is breached in 2 checks in a row that held in the hour before the handoff. A hand-back is a
+when a target (health.py) is breached in 2 checks in a row that held in the hour before the handoff. Handoff idle
+uses disjoint observation intervals; a missing VM/orphan is a hard fault on its first sample. A hand-back is a
 handoff: nothing let go, every VM and item taken back by the previous code's scheduler; the new code is marked
 rejected, so no scheduler hands the pool to it again until another install replaces it.
 
@@ -10,6 +11,8 @@ import json
 import pathlib
 import shutil
 import time
+
+from . import rules
 
 WATCH_S = 600.0
 BASELINE_S = 3600.0
@@ -26,6 +29,7 @@ class Canary:
         self.path = dir_ / "canary.json"
         self.streak: dict = {}
         self.baseline: set | None = None
+        self._handoff_checked_at: float | None = None
 
     def read(self) -> dict:
         try:
@@ -76,6 +80,7 @@ class Canary:
         self.write(d)
 
     def handing_off(self, old: str, new: str, now: float):
+        self.baseline, self.streak, self._handoff_checked_at = None, {}, now
         d = self.read()
         d.update({"from": old, "to": new, "t": now, "state": "watching"})
         self.write(d)
@@ -153,12 +158,9 @@ class Canary:
             b = health.check(t0, minutes)
             seen = any(e["t"] <= t0 for v in getattr(health, "ev", {}).values() for e in v)
             self.baseline = {k for k, v in b.get("targets", {}).items() if v["ok"] and v["value"] is not None and (seen or k in JUDGED_BLIND)}  # (measured and held)
-        if now - t0 >= WATCH_S:
-            d["state"] = "passed"
-            d["passed"] = (d.get("passed", []) + [me])[-20:]  # (the codes whose canary passed, newest last: rollback's default)
-            self.write(d)
-            return "passed", f"code {me}: {WATCH_S / 60:.0f} min after the handoff, every target held"
-        r = health.check(now, max(1.0, (now - t0) / 60), released_since=t0)  # (churn: of its own releases; 04:43 a hand-back for the previous code's)
+        since = max(t0, self._handoff_checked_at if self._handoff_checked_at is not None else t0)
+        r = health.check(now, max(1.0, (now - t0) / 60), released_since=t0, handoff_since=since)
+        self._handoff_checked_at = max(since, now)
         bad = []
         for k in JUDGED:
             v = r.get("targets", {}).get(k)
@@ -167,7 +169,11 @@ class Canary:
             breached = not v["ok"]
             if k == "waste" and breached and (v.get("detail") or {}).get("with_waste", 2) < 2:
                 breached = False  # (one measure's waste is no code's: 11-02 02:25:58, one 8-slot sample handed a tree fix back)
-            self.streak[k] = self.streak.get(k, 0) + 1 if breached and (k in self.baseline or k == "handoff") else 0
+            if k == "handoff":
+                self.streak[k] = rules.handoff_health_streak(self.streak.get(k, 0), v["value"] is not None,
+                                                             v.get("hard_faults", 0), v["value"] or 0)
+            else:
+                self.streak[k] = self.streak.get(k, 0) + 1 if breached and k in self.baseline else 0
             if self.streak[k] >= 2:
                 bad.append(f"{k} {v['value']} (want {v['limit']})")
         if bad and all(b.startswith("handoff") for b in bad) and not self.takes_over(d.get("from") or ""):
@@ -178,4 +184,9 @@ class Canary:
             d["why"] = "; ".join(bad)
             self.write(d)
             return "handback", f"code {me} breached {'; '.join(bad)} within {(now - t0) / 60:.0f} min of the handoff: handed back to {d['from']}"
+        if now - t0 >= WATCH_S and not self.streak.get("handoff", 0):
+            d["state"] = "passed"
+            d["passed"] = (d.get("passed", []) + [me])[-20:]  # (the codes whose canary passed, newest last: rollback's default)
+            self.write(d)
+            return "passed", f"code {me}: {WATCH_S / 60:.0f} min after the handoff, every target held"
         return "watch", ""

@@ -983,9 +983,10 @@ class Scheduler:
         self.wake.set()
 
     def _handoff_check(self, now: float):
-        """A tick and two after a take-over: the VMs of the handoff not held here, VMs of this machine's scheduler
-        leases with no live holder (orphans), and slots idle beside real work waiting past a tick; health's handoff
-        target, judged by the canary at once (any of them: handed back, before another tick)."""
+        """Strict ownership checks at +15/+30s; idle-only observations every 15s during the canary.
+        Idle counts require continuous placeable demand past SUB_PREEMPT, not a single reconciliation gap.
+        Readiness, admission/run identities and immediate missing-VM/orphan verdicts remain unchanged.
+        """
         decision = getattr(self, "_recovery_decision", None)
         if decision and decision[0]:
             self._recovery_decision = None
@@ -997,7 +998,17 @@ class Scheduler:
         if getattr(self, "recovery_blocked", False):
             return  # keep every lease and result until classification is safe
         h = getattr(self, "_handoff", None)
-        if not h or h["checks"] >= 2 or now - h["t"] < 15 * (h["checks"] + 1):
+        if not h or now - h.get("sample_at", h["t"]) < 15:
+            return
+        if now - h["t"] > canary.WATCH_S and self.canary.read().get("state") != "watching":
+            return
+        h["sample_at"] = now
+        if h["checks"] >= 2:
+            # Do not reinterpret intentional later pool releases as missing handoff VMs.
+            with self.lock:
+                live = [v for v in self.vms.values() if not v.dead]
+                idle = self._handoff_idle_slots(now, live)
+            self._h().record_handoff(now, len(h["held"]) or len(h["taken"]), len(live), 0, 0, idle)
             return
         h["checks"] += 1
         held = {vid for vid, v in self.vms.items() if not v.dead}
@@ -1012,11 +1023,9 @@ class Scheduler:
                     orphans += 1
         with self.lock:
             live = [v for v in self.vms.values() if not v.dead]
-            idle = sum(self._waste_held("handoff", now, live, grace=15.0, idle_only=True).values()) if h["checks"] >= 2 else 0  # (held a tick: the second check)
-            if h["checks"] < 2:
-                self._waste_held("handoff", now, live, grace=15.0, idle_only=True)
+            idle = self._handoff_idle_slots(now, live)
         self._h().record_handoff(now, len(h["held"]) or len(h["taken"]), len(held), len(missing), orphans, idle)
-        log(f"handoff check {h['checks']}: {len(held)} VMs held, {len(missing)} of the handoff's not held, {orphans} orphans, {idle} slots idle beside real work waiting past a tick")
+        log(f"handoff check {h['checks']}: {len(held)} VMs held, {len(missing)} of the handoff's not held, {orphans} orphans, {idle} slots persistently idle beside real work past sub_preempt_s")
         what, why = self.canary.handoff_verdict(self.code, len(missing) + orphans, idle, f"{len(missing)} VMs not taken, {orphans} orphans, {idle} slots idle beside waiting real work")
         if what == "alert":
             self.alert(why)
@@ -1024,6 +1033,27 @@ class Scheduler:
             d = self.canary.read()
             self.alert(why)
             self.handoff(back_to=d.get("from"))
+
+    def _handoff_idle_slots(self, now: float, live: list) -> int:
+        """A conservative lower bound on slots continuously idle beside eligible work for SUB_PREEMPT.
+        A placement, missing demand, or a missing VM resets its age; growing idle capacity cannot inherit age.
+        The ordinary waste sampler and its queue-age/15-second rules are unchanged.
+        """
+        cur: dict = {}
+        self._waste(now, live, grace=0.0, idle_only=True, by_vm=cur)
+        previous = self.__dict__.get("_handoff_idle_state", {})
+        state, total = {}, 0
+        for vid, (_, slots, _) in cur.items():
+            since, held, observed = previous.get(vid, (now, slots, now))
+            vm = self.vms.get(vid)
+            if vm is None or getattr(vm, "t_placed_real", 0) > observed:
+                since, held = now, slots
+            else:
+                held = min(held, slots)
+            state[vid] = (since, held, now)
+            total += rules.handoff_idle_slots(held, now - since, SUB_PREEMPT)
+        self._handoff_idle_state = state
+        return total
 
     def _handoff_vm_occupied(self, vm: VMState) -> bool:
         """Unknown ownership and unfinished output are as binding as a live run."""

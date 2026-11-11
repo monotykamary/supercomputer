@@ -234,6 +234,93 @@ def test_client_error_metadata_is_bounded_and_5xx_cannot_hide_there():
     assert h.client_errors(1010)["count"] == 1
 
 
+def _watching_canary(root, started=1000.0):
+    (root / "code/old/supercomputer").mkdir(parents=True)
+    (root / "code/old/supercomputer/scheduler.py").write_text("def _take_pool(self): pass")
+    c = canary.Canary(root)
+    c.handing_off("old", "new", started)
+    return c
+
+
+def test_exact_0554_handoff_trace_is_not_double_counted():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _watching_canary(pathlib.Path(tmp), 1794376440.6326313)
+        h = health.Health()
+        # Actual 05:54:25 idle=0, 05:54:40 idle=1; the old rolling maximum
+        # reused the same 05:54:40 event at 05:55:10 and 05:56:10.
+        h.record_handoff(1794376465.13, 128, 128, 0, 0, 0)
+        h.record_handoff(1794376480.15, 128, 128, 0, 0, 1)
+        assert c.tick("new", 1794376510, h)[0] == "watch"
+        assert c.streak["handoff"] == 1
+        assert c.tick("new", 1794376570, h)[0] == "watch"
+        assert c.streak["handoff"] == 0
+        assert h.check(1794376570)["targets"]["handoff"]["value"] == 1  # history remains visible
+        assert c.tick("new", 1794377100, h)[0] == "passed"
+        assert not c.rejected("new")
+
+
+def test_completed_handoff_and_client_events_are_never_rounded_into_future():
+    h = health.Health()
+    for stamp in (1000.004, 1000.006):
+        h.record_client_error(stamp, 400, "/poll", "1", 1, "p", "a")
+        h.record_handoff(stamp, 1, 1, 0, 0, 1)
+        r = h.check(stamp, handoff_since=stamp - 0.001)["targets"]["handoff"]
+        assert r["value"] == 1 and r["detail"][-1]["t"] == stamp
+    assert h.client_errors(1000.006)["count"] == 2
+
+
+def test_handoff_check_intervals_exclude_the_previous_boundary():
+    h = health.Health()
+    h.record_handoff(1050, 1, 1, 0, 0, 1)
+    h.record_handoff(1060, 1, 1, 0, 0, 1)
+    assert h.check(1060, handoff_since=1000)["targets"]["handoff"]["value"] == 1
+    assert h.check(1120, handoff_since=1060)["targets"]["handoff"]["value"] is None
+    assert h.check(1050, handoff_since=1000)["targets"]["handoff"]["detail"][-1]["t"] == 1050
+
+
+def test_persistent_handoff_idle_requires_two_fresh_intervals():
+    with tempfile.TemporaryDirectory() as tmp:
+        c, h = _watching_canary(pathlib.Path(tmp)), health.Health()
+        h.record_handoff(1055, 128, 128, 0, 0, 1)
+        assert c.tick("new", 1060, h)[0] == "watch"
+        h.record_handoff(1115, 128, 128, 0, 0, 1)
+        what, why = c.tick("new", 1120, h)
+        assert what == "handback" and "handoff 1" in why
+
+
+def test_missing_or_orphan_handoff_rejects_on_first_sample_even_at_deadline():
+    for missing, orphan in ((1, 0), (0, 1)):
+        for check_at in (1060, 1601):
+            with tempfile.TemporaryDirectory() as tmp:
+                c, h = _watching_canary(pathlib.Path(tmp)), health.Health()
+                h.record_handoff(check_at - 1, 128, 128 - missing, missing, orphan, 0)
+                assert c.tick("new", check_at, h)[0] == "handback"
+                assert c.rejected("new")
+
+
+def test_pending_idle_at_pass_horizon_is_confirmed_before_acceptance():
+    for persists in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            c, h = _watching_canary(pathlib.Path(tmp)), health.Health()
+            h.record_handoff(1599, 1, 1, 0, 0, 1)
+            assert c.tick("new", 1601, h)[0] == "watch"
+            if persists:
+                h.record_handoff(1659, 1, 1, 0, 0, 1)
+            assert c.tick("new", 1661, h)[0] == ("handback" if persists else "passed")
+
+
+def test_restarted_canary_cannot_make_one_idle_event_a_streak():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        c, h = _watching_canary(root), health.Health()
+        h.record_handoff(1055, 1, 1, 0, 0, 1)
+        assert c.tick("new", 1060, h)[0] == "watch"
+        restored = canary.Canary(root)
+        assert restored.tick("new", 1120, h)[0] == "watch"
+        assert restored.tick("new", 1180, h)[0] == "watch"
+        assert restored.streak["handoff"] == 0
+
+
 if __name__ == "__main__":
     n = 0
     for k, f in list(globals().items()):

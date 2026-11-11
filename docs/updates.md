@@ -49,6 +49,36 @@ baseline `file:line`, not promises that the old implementation is safe.
   lease identity and refuse incompatible protocol changes, not manufacture a
   new holder because a process PID changed.
 
+## Handoff health: ownership versus sustained idle
+
+The handoff target is still strict zero. The initial takeover and its +15/+30-second
+ownership checks record missing VMs and orphans; readiness still requires the exact
+admission and running-item identity sets before activation. Those hard faults have
+no idle grace and are rejected on their first sample (or refuse readiness before
+activation). No lease, listener, ACK or wire-protocol field is changed.
+
+Idle-only observations continue every 15 seconds during the 600-second canary.
+They use the same placement eligibility as waste, but track a conservative per-VM
+lower bound on continuously idle slots beside eligible work. A real placement,
+disappearing eligible demand or disappearing VM resets the age; newly free slots
+do not inherit an older slot's age. Only age **greater than `sub_preempt_s`** counts.
+
+The canary reads handoff samples in disjoint **`(previous check, current check]`**
+intervals. Handoff timestamps are retained exactly so rounding cannot skip a
+completed observation across the cursor. Empty or healthy intervals reset its idle streak; two fresh breached
+intervals reject. A pending first idle breach at the 600-second pass horizon waits
+for the next fresh interval rather than passing before its confirmation. A single recorded idle observation cannot be counted again at
+the next minute. The general health display retains its requested history and
+worst-check value; other canary targets retain their existing windows.
+
+The separate waste target is unchanged: eligible queued work must have waited
+`sub_preempt_s`, and per-VM wasted capacity is the lesser of two 15-second samples
+with no real placement between them. Its value is the rounded mean across the
+window; the canary also requires at least two waste-bearing samples. Handoff idle
+is **not** that mean: it has an explicit continuous-idle age and fresh-interval
+confirmation. Missing VMs, orphans, readiness and identity conservation are not
+subject to either idle tolerance.
+
 ## Target and limits
 
 Use immutable, recursively hashed code snapshots; prepare code while the old

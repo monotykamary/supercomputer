@@ -77,6 +77,64 @@ class Guards(unittest.TestCase):
         for flags in itertools.product((False, True), repeat=3):
             self.assertEqual(updates.http_mutation_allowed(*flags), not any(flags))
 
+    def test_handoff_health_rules(self):
+        self.assertFalse(updates.handoff_sample_fresh(10, 10, 20))
+        self.assertTrue(updates.handoff_sample_fresh(20, 10, 20))
+        self.assertFalse(updates.handoff_sample_fresh(21, 10, 20))
+        self.assertEqual(updates.handoff_idle_slots(1, 45, 45), 0)
+        self.assertEqual(updates.handoff_idle_slots(1, 46, 45), 1)
+        self.assertEqual(updates.handoff_health_streak(1, False, 0, 1), 0)
+        self.assertEqual(updates.handoff_health_streak(0, True, 1, 0), 2)
+        self.assertEqual(updates.handoff_health_streak(0, True, 0, 1), 1)
+        self.assertEqual(updates.handoff_health_streak(1, True, 0, 1), 2)
+
+    def test_handoff_idle_uses_grace_and_resets_on_placement_or_demand_loss(self):
+        from types import SimpleNamespace
+        s = object.__new__(scheduler.Scheduler)
+        vm = SimpleNamespace(t_placed_real=0)
+        s.vms = {"vm": vm}
+        current = {"vm": ("image", 1, "sweep w1")}
+        def waste(now, live, **kw):
+            self.assertEqual(kw["grace"], 0)
+            self.assertTrue(kw["idle_only"])
+            kw["by_vm"].update(current)
+        s._waste = waste
+        with mock.patch.object(scheduler, "SUB_PREEMPT", 45):
+            self.assertEqual([s._handoff_idle_slots(t, [vm]) for t in (25, 40, 70, 71)], [0, 0, 0, 1])
+            vm.t_placed_real = 72
+            self.assertEqual(s._handoff_idle_slots(85, [vm]), 0)
+            self.assertEqual(s._handoff_idle_slots(131, [vm]), 1)
+            current["vm"] = ("image", 2, "sweep w1")
+            self.assertEqual(s._handoff_idle_slots(132, [vm]), 1)  # new slot has no old age
+            current.clear()
+            self.assertEqual(s._handoff_idle_slots(140, [vm]), 0)
+            current["vm"] = ("image", 1, "sweep w1")
+            self.assertEqual(s._handoff_idle_slots(200, [vm]), 0)
+            self.assertEqual(s._handoff_idle_slots(246, [vm]), 1)
+
+    def test_handoff_idle_observations_continue_after_the_two_ownership_checks(self):
+        import threading
+        from types import SimpleNamespace
+        s = object.__new__(scheduler.Scheduler)
+        s.lock, s.vms, s.code = threading.RLock(), {"vm": SimpleNamespace(dead=False)}, "new"
+        s._handoff = {"t": 1000, "held": ["vm"], "taken": ["vm"], "checks": 0}
+        h = scheduler.health.Health()
+        s._h = lambda: h
+        s.canary = mock.Mock()
+        s.canary.handoff_verdict.return_value = ("", "")
+        s._handoff_idle_slots = mock.Mock(side_effect=[0, 0, 1])
+        reg = mock.Mock()
+        reg.read.return_value = {"vms": {}}
+        with mock.patch.object(scheduler, "Registry", return_value=reg), mock.patch.object(scheduler, "log"):
+            s._handoff_check(1015)
+            s._handoff_check(1030)
+            s.vms.clear()  # an intentional later release is not a failed initial takeover
+            s._handoff_check(1045)
+        self.assertEqual(len(h.ev["handoff"]), 3)
+        self.assertEqual(h.ev["handoff"][-1]["idle"], 1)
+        self.assertEqual(h.ev["handoff"][-1]["missing"], 0)
+        self.assertEqual(s.canary.handoff_verdict.call_count, 2)
+
     def test_ack_requires_every_identity(self):
         for pool, admissions, items in itertools.product((False, True), repeat=3):
             self.assertEqual(updates.handoff_ready(pool, admissions, items), pool and admissions and items)

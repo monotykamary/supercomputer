@@ -1,5 +1,29 @@
 """Hot-update guards used by the scheduler, not a model of OS/network latency."""
 
+# gdp: law an observation never belongs to two adjacent check intervals: not result or (sample > since and sample <= now)
+# gdp: law every new observation in the interval is read: sample <= since or sample > now or result
+def handoff_sample_fresh(sample: float, since: float, now: float) -> bool:
+    return since < sample <= now
+
+
+# gdp: law no transient idle slot breaches before its grace ends: age > grace or result == 0
+# gdp: law persistent idle slots breach after the grace: slots <= 0 or age <= grace or result == slots
+# gdp: law an idle observation cannot invent slots: result == 0 or result == slots
+def handoff_idle_slots(slots: int, age: float, grace: float) -> int:
+    return max(0, slots) if age > grace else 0
+
+
+# gdp: law a consumed sample never advances the handoff streak: fresh or result == 0
+# gdp: law a new missing VM or orphan rejects on the first check: not fresh or hard_faults <= 0 or result == 2
+# gdp: law one transient idle observation cannot reject: not fresh or hard_faults > 0 or previous > 0 or result < 2
+# gdp: law persistent idle across new check intervals rejects: not fresh or idle <= 0 or previous < 1 or result == 2
+def handoff_health_streak(previous: int, fresh: bool, hard_faults: int, idle: int) -> int:
+    if not fresh:
+        return 0
+    if hard_faults > 0:
+        return 2
+    return min(2, max(0, previous) + 1) if idle > 0 else 0
+
 # gdp: law only HTTP 4xx responses are client faults: not result or (status >= 400 and status < 500)
 # gdp: law every HTTP 4xx response is a client fault: status < 400 or status >= 500 or result
 def http_client_fault(status: int) -> bool:

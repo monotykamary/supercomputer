@@ -1,5 +1,16 @@
 """Regressions refused by the same hot-update laws."""
 
+# gdp: law a consumed sample never advances the handoff streak: fresh or result == 0
+def double_count_handoff(previous: int, fresh: bool, hard_faults: int, idle: int) -> int:
+    if hard_faults > 0:
+        return 2
+    return min(2, max(0, previous) + 1) if idle > 0 else 0
+
+
+# gdp: law a new missing VM or orphan rejects on the first check: not fresh or hard_faults <= 0 or result == 2
+def ignore_missing_vm(previous: int, fresh: bool, hard_faults: int, idle: int) -> int:
+    return min(2, max(0, previous) + 1) if fresh and idle > 0 else 0
+
 # gdp: law only HTTP 4xx responses are client faults: not result or (status >= 400 and status < 500)
 def server_fault_as_client(status: int) -> bool:
     return status >= 400

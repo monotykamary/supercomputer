@@ -5,7 +5,7 @@ the scheduler's own records (never by reading its log), and the same checks the 
     busy      real work's slot-time over the slot-time it could use (the held VMs' slots, at most what runs and
               what's queued of it needs), while real work of their image is queued                         >= 0.85
     handoff   across a code switch: VMs the old scheduler held not held by the new one, VMs with no live owner,
-              slots idle beside real work waiting past a tick (a tick and two after the switch)               == 0
+              slots continuously idle beside eligible work past sub_preempt_s during the canary             == 0
     waste     slots held by filler (or a sweep, against a gate) or idle while real work that could take them
               has waited past sub_preempt_s, the mean over the window's samples                            == 0
     starts    VM starts per 100 items placed                                                              <= 1
@@ -29,6 +29,8 @@ import re
 import threading
 import time
 
+from . import rules
+
 KEEP_S = 3 * 3600
 CHURN_S = 1500
 ORPHAN_S = 600
@@ -39,7 +41,7 @@ OURS = re.compile(r"tree isn't on|isn't prepared|not reached after the restart|u
 TARGETS = {
     "busy": ("real work's share of the slots it could use (held, at most its running and queued need) while real work is queued", ">=", 0.85),
     "waste": ("slots held by filler or idle while placeable real work waited past sub_preempt_s (mean over the window)", "==", 0),
-    "handoff": ("across a code switch: VMs not carried over, orphans, slots idle beside waiting real work (worst check)", "==", 0),
+    "handoff": ("across a code switch: VMs not carried over, orphans, slots persistently idle past sub_preempt_s beside waiting real work (worst check)", "==", 0),
     "starts": ("VM starts per 100 items placed", "<=", 1.0),
     "churn": ("starts within 25 min after a release of the image", "==", 0),
     "orphans": ("VMs with no live owner past 10 min", "==", 0),
@@ -81,7 +83,10 @@ class Health:
 
     def _add(self, kind: str, t: float, **kw):
         with self.lock:
-            self.ev[kind].append({"t": round(t, 2), **kw})
+            # Cursor-based handoff checks and immediate HTTP receipts must not
+            # round an already completed event into the future (or behind a cursor).
+            stamp = t if kind in ("handoff", "client_error") else round(t, 2)
+            self.ev[kind].append({"t": stamp, **kw})
             if len(self.ev[kind]) > 20000:
                 self.ev[kind] = self.ev[kind][-10000:]
 
@@ -147,7 +152,8 @@ class Health:
         return {"count": len(events), "by_status": counts, "recent": events[-4:]}
 
     # -- the checks
-    def check(self, now: float, minutes: float = 30, env: dict | None = None, released_since: float = 0.0) -> dict:
+    def check(self, now: float, minutes: float = 30, env: dict | None = None, released_since: float = 0.0,
+              handoff_since: float | None = None) -> dict:
         """The targets over the last `minutes`; churn counts starts after releases made since `released_since` (a
         canary: its own code's releases, not the previous code's)."""
         lo = now - 60 * minutes
@@ -155,6 +161,8 @@ class Health:
             ev = {k: [e for e in v if lo <= e["t"] <= now] for k, v in self.ev.items()}
             orph_all = [e for e in self.ev["orphan"] if e["t"] <= now]
             rel_all = [e for e in self.ev["release"] if released_since <= e["t"] <= now]
+        if handoff_since is not None:
+            ev["handoff"] = [e for e in ev["handoff"] if rules.handoff_sample_fresh(e["t"], handoff_since, now)]
         held = busy = n_busy = pool = 0
         waste, n_waste = 0.0, 0
         for s in ev["sample"]:
@@ -224,6 +232,7 @@ class Health:
                             "with_waste": sum(1 for s in ev["sample"] if any(p.get("waste", 0) for p in s["per"].values()))}}
         out = {k: {"what": TARGETS[k][0], "value": vals[k], "limit": f"{TARGETS[k][1]} {TARGETS[k][2]}", "ok": _ok(TARGETS[k][1], vals[k], TARGETS[k][2]),
                    "detail": detail[k]} for k in TARGETS}
+        out["handoff"]["hard_faults"] = max((e.get("missing", 0) + e.get("orphans", 0) for e in ev["handoff"]), default=0)
         return {"t": now, "minutes": minutes, "ok": all(v["ok"] for v in out.values()), "targets": out,
                 "client_4xx": self.client_errors(now, minutes)}
 
