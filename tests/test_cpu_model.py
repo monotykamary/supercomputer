@@ -105,6 +105,78 @@ def test_pending_draws_consume_remaining_guard_and_matching_resets():
     assert s._constraint_status()[0]["matching_vms"] == [a.id]
 
 
+def test_per_item_override_can_resume_a_scarce_constraint():
+    s = sched()
+    b = constrained(s, n=2, klass=2)
+    low, high = b.items.values()
+    low.spec["cpu_model_max_fruitless"] = 2
+    high.spec["cpu_model_max_fruitless"] = 5
+    c = s._constraint(b.image, b.vm_type, MODEL)
+    for i in range(2):
+        c["draws"].append({"vm": str(i), "t": 0, "model": None, "done": False})
+        s._constraint_result(str(i), OTHER)
+    plan = s._plan(S.time.time())
+    assert low.state == "done" and high.state == "queued"
+    assert b.rows[0]["constraint"]["limit"] == 2
+    assert b.rows[0]["constraint"]["models"] == {OTHER: 2}
+    assert sum(n for n, *_ in plan.values()) == 1
+    assert s._constraint_status()[0]["limit"] == 5
+    for value in (0, -1, True, 1.5, "20"):
+        spec = {"name": "a", "cpu_model": MODEL, "vm_type": "xlarge", "cpu_model_max_fruitless": value}
+        try:
+            S.Scheduler._validate_submission({"items": [spec]})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(value)
+
+
+def test_native_specs_preserve_constraints_and_refuse_old_schedulers():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    project = SimpleNamespace(images={}, hook=lambda name: None)
+    job = {"name": "pin", "cmd": "true", "cpu_model": MODEL, "vm_type": "xlarge", "cpu_model_max_fruitless": 64}
+    with patch.object(boat, "project", return_value=project):
+        its, order = boat.job_items([job], "", lambda cmd: cmd, "large", {})
+    assert its[0]["cpu_model"] == MODEL and its[0]["cpu_model_max_fruitless"] == 64
+    assert order == ["pin"]
+    project.hook = lambda name: lambda it, job: {"name": it["name"], "cmd": it["cmd"]}
+    with patch.object(boat, "project", return_value=project):
+        rebuilt, _ = boat.job_items([job], "", lambda cmd: cmd, "large", {})
+    assert rebuilt[0]["cpu_model"] == MODEL and rebuilt[0]["cpu_model_max_fruitless"] == 64
+    session = object.__new__(boat.Scheduled)
+    session.client = Mock()
+    session.client.req.return_value = {}
+    try:
+        session.run(its, lambda *a: None)
+    except boat.Unavailable:
+        pass
+    else:
+        raise AssertionError("old scheduler accepted CPU constraint")
+    session.client.push_tree.assert_not_called()
+    assert session.client.req.call_args.args[0] == "/capabilities"
+
+
+def test_handoff_refuses_pre_constraint_code_before_freezing():
+    import pathlib
+    import tempfile
+    from unittest.mock import Mock
+    s = sched()
+    constrained(s)
+    s.code = "current"
+    s.alert = Mock()
+    with tempfile.TemporaryDirectory() as d:
+        root = pathlib.Path(d)
+        for code in ("current", "legacy"):
+            (root / "code" / code / "supercomputer").mkdir(parents=True)
+        with patch.object(S, "DIR", root), patch.object(S, "prepare_snapshot", return_value={"cpu_model_exact": False}), \
+             patch.object(boat, "states", return_value={}), patch.object(S.subprocess, "Popen") as spawn:
+            s.handoff(back_to="legacy")
+        spawn.assert_not_called()
+    assert "live CPU constraints" in s.alert.call_args.args[0]
+    assert not getattr(s, "handing_off", False)
+
+
 def test_schema():
     base = {"batch": "b", "items": [{"name": "a", "cpu_model": MODEL, "vm_type": "xlarge"}]}
     S.Scheduler._validate_submission(base)

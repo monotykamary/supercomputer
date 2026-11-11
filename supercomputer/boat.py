@@ -3140,6 +3140,11 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                 if not (j.get("vm_type") or env("VM_NAMED")):
                     raise ValueError("cpu_model requires an explicit vm_type")
                 it["cpu_model"] = model
+            if "cpu_model_max_fruitless" in j:
+                limit = j["cpu_model_max_fruitless"]
+                if "cpu_model" not in j or type(limit) is not int or limit < 1:
+                    raise ValueError("cpu_model_max_fruitless requires cpu_model and a positive integer")
+                it["cpu_model_max_fruitless"] = limit
             if j.get("env"):
                 it["env"] = dict(j["env"])
             if j.get("timing") or env("TIMING") not in ("", "0"):
@@ -3167,6 +3172,10 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                 if not big:
                     raise SystemExit(f"{j['name']} asks for {cpu} vCPU and {memory} MB: no boat VM type has that usable ({MEM_OVERHEAD} MB of each is its OS's)")
                 it["vm_type"] = big
+            # Hooks may rebuild the execution spec, but cannot silently erase a user pin.
+            for field in ("cpu_model", "cpu_model_max_fruitless"):
+                if field in j:
+                    it[field] = j[field]
             items.append(it)
             order.append(j["name"])
     return items, order

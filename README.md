@@ -73,6 +73,7 @@ where it ran, and `runs/x/backends.json` says why anything moved.
 | `cwd`, `env`, `timeout` | where, with what, for how long |
 | `cpu`, `memory` | its shape; a job past 2 vCPUs gets its slots set aside on one VM |
 | `image`, `vm_type` | an image the repo's config names; a fixed VM type (for timing claims) |
+| `cpu_model` | exact agent-reported CPU model; requires `vm_type`, never falls back to other hardware |
 | `gpu` | goes to RunPod, then Modal |
 | `backend` | `boat`, `runpod` or `modal` only, no fallback |
 
@@ -86,7 +87,8 @@ where it ran, and `runs/x/backends.json` says why anything moved.
 </p>
 
 **One scheduler per pool.** Every batch goes to a scheduler on your machine (127.0.0.1:8790), started by the first
-client and gone two idle minutes after its last work. It alone holds the VMs. After a laptop sleep it renews them and
+client and gone two idle minutes after its last work. If `live/controller.json` exists, clients use that controller
+by default; `SUPERCOMPUTER_LOCAL=1` is the explicit opt-in to a local scheduler. It alone holds the VMs. After a laptop sleep it renews them and
 adopts any left without an owner.
 
 **Capacity, cheapest first:** a free slot on a warm VM, then a lower class's slot, then a free start, then a paid one.

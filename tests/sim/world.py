@@ -255,7 +255,7 @@ class World:
             B.Registry.locked = locked
         def prepare(pkg):
             self.note("snapshot_prepared", code=pkg.parent.name)
-            return {"python": "sim", "cache_tag": "sim"}
+            return {"python": "sim", "cache_tag": "sim", "cpu_model_exact": True}
         S.prepare_snapshot = prepare
         S.code_hash = lambda pkg=None: self.code_installed
         S.own_code = lambda: self.k.current_proc().env.get("code", code.label)

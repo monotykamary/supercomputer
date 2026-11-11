@@ -52,6 +52,17 @@ the tree as a tarball over ssh, exec ticks), 2.4 to 2.8 s with a warm agent; a r
 
 Untracked `.verification/` directories are excluded from implicit source trees, including with custom ignore lists. Tracked fixtures still ship. Explicit `--data DIR:DEST` still supplies required verification inputs. This avoids repeatedly storing whole generated source archives as distinct opaque blobs.
 
+## Exact CPU constraints
+
+`Item.spec.cpu_model` survives the existing admission JSON. The placement shape includes that exact string;
+slot search, reservations, preemption, waste accounting and the final placement guard all require agent equality.
+`VMState.model` is carried in the additive handoff snapshot and refreshed from `vtick`. Placements record the CPU
+immediately; late reports backfill unconstrained in-flight placements.
+
+`live/scheduler/cpu-constraints.json` atomically retains each image/type/model's observed workers, start draws,
+pending outcomes and consecutive-fruitless streak across restarts and daily metrics rotation. Status and daily
+metrics expose the constraint summary. This file is local scheduler bookkeeping, not a lease authority.
+
 ## Environment
 
 `SUPERCOMPUTER_{LIVE,CLIENT,URGENT,VM,MAX_STARTS,SHARE,RESERVE_DAY,RESERVE_HOUR,CEIL,IMAGE,WARM,VERBOSE,CONFIG,HOME,SRC}`;

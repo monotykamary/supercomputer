@@ -98,7 +98,7 @@ class Sim:
         for it in its:
             self.w.items[(bid, it["name"])] = {"klass": klass, "image": image, "submitted": None, "delivered": None, "runs": 0, "running": 0, "boat_vms": set(), "ours": 0,
                                                "finished_on": [], "est": it.get("est"), "s": it.get("sim_s"), "client": client, "timing": bool(it.get("timing")),
-                                               "machine": self.machine, "weight": int(it.get("weight", 1)), "vm_type": it.get("vm_type") or (vm_type if vm_named else None), "memory": it.get("memory")}
+                                               "machine": self.machine, "weight": int(it.get("weight", 1)), "vm_type": it.get("vm_type") or (vm_type if vm_named else None), "memory": it.get("memory"), "cpu_model": it.get("cpu_model")}
         self.w.batches[bid] = rec
         t = self.tree(tree)
 

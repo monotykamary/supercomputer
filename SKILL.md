@@ -5,12 +5,17 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
 
 **Run a jobs file** from any repo (its git root is the tree; `supercomputer.toml` says what it needs):
 - `supercomputer run --jobs jobs.json --out runs/x [--class C] [--timing] [--data DIR[:DEST]] [--env K=V]`
-- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?}]`;
+- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?}]`;
   `cmd` runs under bash in `<repo>/<cwd>`; logs in `<out>/<name>.log`, `<out>/summary.tsv` (name, exit, seconds, where).
 - The tree ships without node_modules: start a bun job with `bun install --frozen-lockfile && ...`.
 - `--timing`: each job alone on its VM; `<out>/placement.json` is the label a timing claim needs.
 - `--vm-type T` (or a job's `"vm_type"`): every job placed on type T only (a timing claim's fixed hardware); unnamed, the smallest
   free VM that fits, any type.
+- A job's `"cpu_model"` pins the exact agent-reported string and requires `"vm_type"`, e.g.
+  `"cpu_model":"AMD Ryzen 9 9950X 16-Core Processor", "vm_type":"xlarge"`. Unknown models never match;
+  no different-model or Modal fallback. `cpu_model_max_fruitless` (default 12) bounds consecutive unsuccessful
+  starts per image/type/model, not spend; a job can override it with `"cpu_model_max_fruitless": 64`.
+  Exhausted items report `unplaceable_by_constraint`, their effective limit and all observed model counts.
 
 **Classes** (`--class`, else `$SUPERCOMPUTER_CLASS`; a small batch defaults to interactive, a bigger one to submission):
 - `interactive`: quick checks; a slot at once (a filler's or sweep's item is killed and re-queued).
@@ -47,7 +52,9 @@ to RunPod and Modal on demand, pulls cached by hash.
 `supercomputer queue add jobs.json [--name N] [--meta k=v]`, `queue ls`, `queue results <name>`; `supercomputer
 digest` (VM-hours and dollars by class, starts per 100 items, waits by class, gaps between waves).
 
-**The scheduler** runs on this machine and owns the pool: one per pool (a lock), started by the first batch, and
+**The scheduler** uses the configured `live/controller.json` by default. `SUPERCOMPUTER_LOCAL=1` explicitly
+opts into this machine; an unavailable controller never silently starts a local scheduler. Without a configured
+controller it runs on this machine and owns the pool: one per pool (a lock), started by the first batch, and
 after a laptop sleep it renews its VMs and adopts any left without an owner. `supercomputer status` (the pool, the
 policy generation, code hashes, orphans), `supercomputer policy [k=v ...]` (one policy file, in force within a tick),
 `supercomputer reap`. A new install hands the pool to the new code by itself: nothing lost, no VM let go.

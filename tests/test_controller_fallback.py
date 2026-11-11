@@ -35,6 +35,13 @@ r, s = run({})  # the file alone selects the controller
 assert r.startswith("exit:") and not s, (r, s)
 r, s = run({"SUPERCOMPUTER_LOCAL": "1"})
 assert r == "local" and s == [1], (r, s)
+r, s = run({"SUPERCOMPUTER_CONTROLLER": "0"})
+assert r.startswith("exit:") and not s, (r, s)
+assert scheduler.controller()["url"] == "https://example.invalid"
+pathlib.Path(live, "controller.json").write_text("broken")
+r, s = run({})
+assert r.startswith("exit:") and not s, (r, s)
+assert not scheduler.rules.local_recovery_allowed(scheduler.controller_configured())
 pathlib.Path(live, "controller.json").unlink()
 r, s = run({})
 assert r == "local" and s == [1], (r, s)

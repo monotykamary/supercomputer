@@ -161,4 +161,23 @@ invariants. Real subprocess tests separately check listener/flock inheritance
 and boot-failure rollback, with provider calls disabled. The isolated real-socket
 case is not a real five-machine deployment or a loaded-controller benchmark.
 
+## CPU constraints and endpoint affinity (sc-cpupin)
+
+The CPU-model feature leaves lease identity, listener/flock inheritance, admission and running-item ACKs,
+passive-candidate activation, and agent wire protocol unchanged. Its fields are additive: admission specs carry
+`cpu_model` and an optional `cpu_model_max_fruitless`, handoff VM records carry `model`, and placements carry
+`cpu`. Old snapshots without a model remain loadable; constrained placement waits for the next agent report
+rather than assuming a CPU. Draw outcomes live in a separate atomic `cpu-constraints.json`, so a handoff or
+daily reset does not reset the scarce-model guard. Native clients require the new `cpu_model_exact` capability
+before submitting constrained jobs. Snapshot preparation reads the candidate's capability using the exact
+candidate interpreter/import. Before freezing, the parent refuses any successor/rollback candidate lacking
+exact-model support while constrained admissions remain live. No new lease or handoff protocol is required.
+
+Client endpoint selection now defaults to `live/controller.json`, including fail-closed behavior for an unreadable
+configuration. Only `SUPERCOMPUTER_LOCAL=1` explicitly permits a local scheduler when a controller is configured.
+The old `SUPERCOMPUTER_CONTROLLER_FALLBACK` flag is not permission. A long-lived client's recovery path does not
+resurrect a disappeared local scheduler beside a newly configured controller. **Old clients retain their imported
+functions:** staging the scheduler cannot fix those processes; the coordinator must replace/restart those clients
+or keep them explicitly on the controller. No rollout was performed by this lane.
+
 Verified 2026-11-10: a docs-only update rolled out hot to all five machines under load (canary batch and live lanes), no item killed or re-run.

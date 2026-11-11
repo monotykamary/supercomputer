@@ -217,8 +217,8 @@ re-attach before 95ec41b, churn), each asserted refuted.
 
 ## Where the scheduler runs: your machine
 
-The scheduler on this machine is the one scheduler for the pool. Clients go straight to it (the controller lookup
-is off by default; `SUPERCOMPUTER_CONTROLLER=1` and a `live/controller.json` would bring the old path back). After a
+A configured `live/controller.json` selects the controller by default; `SUPERCOMPUTER_LOCAL=1` explicitly
+selects a local owner. Without a controller, clients use this machine's scheduler. After a
 sleep it notices the time jump, renews every VM's TTL, adopts any VM left without an owner, and lets go VMs boat
 stopped meanwhile with no strike to their items.
 
@@ -226,11 +226,43 @@ Running the scheduler on a boat VM instead (`controller.py`, `supercomputer cont
 default: a small VM overloaded, and the local scheduler proved simpler. What it taught is in the policy above: one
 scheduler per pool, an agent daemon that ignores SIGPIPE, a breaker on starts, bounded bring-up, adoption.
 
-A client told to use the controller (`SUPERCOMPUTER_CONTROLLER=1` and a `live/controller.json`) never falls back
+A client with a configured controller (`live/controller.json`, or an explicit `SUPERCOMPUTER_CONTROLLER=1`) never falls back
 to this machine's scheduler when the controller doesn't answer: it stops with the reason. A second scheduler beside
 the controller adopts its VMs, and one inside a job VM (which has no boat login, so `boat forward` can't come up)
-stops its own host. Inside a boat VM, reach the controller over its http transport; `SUPERCOMPUTER_CONTROLLER_FALLBACK=1`
-falls back on purpose.
+stops its own host. Inside a boat VM, reach the controller over its http transport. Only `SUPERCOMPUTER_LOCAL=1` explicitly permits a local scheduler. `SUPERCOMPUTER_CONTROLLER=0` and the
+legacy `SUPERCOMPUTER_CONTROLLER_FALLBACK=1` do not override a configured controller. A long-lived local client
+whose scheduler disappears never resurrects it while a controller configuration exists, even if unreadable.
+
+## Exact CPU model placement
+
+A native job can pin hardware with `"cpu_model": "AMD Ryzen 9 9950X 16-Core Processor"`
+and `"vm_type": "xlarge"` (or a batch's explicit `--vm-type`). Matching is exact and case-sensitive against
+`vtick.model`, never a provider label. Blank/unknown agent models are ineligible. The constraint participates in
+slot selection, reservations, preemption and the last placement check; it never falls back to a different model
+or to Modal. The native client requires `/capabilities.cpu_model_exact == true` before submitting it and refuses
+the legacy scheduler-disabled path. Jobs without the field retain their existing placement/growth rules.
+
+Boat cannot choose the CPU behind a new VM. The same break-even and gate calculations apply to constrained
+work, crediting matching held capacity and outstanding draws, not mismatches. Starts remain under the normal
+bring-up cap, breaker, pacing and watchdog. Mismatched draws remain ordinary pool VMs: they can run ordinary
+work or filler and retire under the existing lifecycle; there is no special stop or spend budget.
+
+A job can set `"cpu_model_max_fruitless": 64` to override the policy's default. Mixed limits for the same
+constraint share observed draws; an exhausted caller is reported while a caller with a higher limit may continue.
+The report includes that item's effective limit and the model distribution across **all** draws.
+
+`cpu_model_max_fruitless` (default 12, positive; environment default
+`SUPERCOMPUTER_CPU_MODEL_MAX_FRUITLESS`) limits consecutive fruitless starts **per image/type/model**.
+Unresolved draws occupy the remaining guard room. A known matching draw resets the streak; a failed/blank or
+mismatched draw increments it in observation order. The streak and model distribution survive restart/handoff.
+At exhaustion, items without eligible matching capacity get a terminal `unplaceable_by_constraint: true` row,
+error `unplaceable-by-constraint`, and a `constraint` summary (models observed, draws, matching VMs, waiting items).
+It is not a `lost`/Modal retry. Work with matching busy capacity can still wait for it. Raising the load guard
+explicitly permits further attempts; submitting a fresh batch does not reset it.
+
+`status.constraints` and the digest show each constraint's matching VM IDs/count, waiting items, draw IDs/models,
+and fruitless streak/limit. `status.vms[].model` also exposes unknown agents. Timing still means exclusive use
+while running, **not** gang scheduling or a distinct VM across sequential jobs.
 
 ## The terms (boat's TOS-6 and TOS-10)
 

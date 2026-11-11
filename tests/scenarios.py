@@ -1452,6 +1452,8 @@ def _truth_waste(sim, every: float = 15.0) -> dict:
                     v, idle, fil, swp, slots = c
                     if v.image != it["image"] or (it.get("vm_type") and v.type != it["vm_type"]):
                         continue
+                    if it.get("cpu_model") and v.model != it["cpu_model"]:
+                        continue
                     if it.get("memory") and not B.R.fits_memory(int(it["memory"]), B.TYPES.get(v.type, (0, 0))[1], B.MEM_OVERHEAD):
                         continue
                     avail = idle + fil + (swp if it["klass"] in ("interactive", "gate") else 0)
@@ -2201,8 +2203,8 @@ def cpu_model_handoff(code):
           "an absent exact model is reported after three fruitless starts, without stopping mismatched workers specially")
 def cpu_model_absent(code):
     from tests.sim.harness import items
-    sim = _sim(code, policy={"cpu_model_max_fruitless": 3, "floor_default": 0})
-    bid = sim.batch("absent", "gate", items("p", 10, 60, cpu_model="absent-cpu", vm_type="large"))
+    sim = _sim(code, policy={"floor_default": 0})
+    bid = sim.batch("absent", "gate", items("p", 10, 60, cpu_model="absent-cpu", vm_type="large", cpu_model_max_fruitless=3))
     def extra(sim, m):
         rows = list(sim.clients[bid]["items"].values())
         ds = [d for _, s in sim.w.sched_procs if s for c in getattr(s, "cpu_constraints", {}).values() for d in c["draws"]]

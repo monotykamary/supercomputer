@@ -244,7 +244,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
         [sys.executable, "-P", "-m", "compileall", "-q", str(pkg)],
         [sys.executable, "-P", "-c",
          "import pathlib, sys, supercomputer.scheduler as s; "
-         "assert pathlib.Path(s.__file__).resolve() == pathlib.Path(sys.argv[1]).resolve()",
+         "assert pathlib.Path(s.__file__).resolve() == pathlib.Path(sys.argv[1]).resolve(); "
+         "import json; print(json.dumps(s.Scheduler.capabilities() if hasattr(s, 'Scheduler') and hasattr(s.Scheduler, 'capabilities') else {}))",
          str(pkg / "scheduler.py")],
     ]
     for command in commands:
@@ -252,7 +253,9 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
                                 capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             raise RuntimeError(f"snapshot compile/import failed: {(result.stderr or result.stdout)[-1000:]}")
-    return {"python": sys.executable, "cache_tag": sys.implementation.cache_tag}
+    capabilities = json.loads(result.stdout.strip().splitlines()[-1])
+    return {"python": sys.executable, "cache_tag": sys.implementation.cache_tag,
+            "cpu_model_exact": capabilities.get("cpu_model_exact") is True}
 
 
 def stage_install() -> dict:
@@ -1277,6 +1280,10 @@ class Scheduler:
             if not isinstance(spec, dict):
                 raise ValueError("item must be an object")
             name = spec.get("name")
+            if "cpu_model_max_fruitless" in spec:
+                limit = spec["cpu_model_max_fruitless"]
+                if "cpu_model" not in spec or type(limit) is not int or limit < 1:
+                    raise ValueError("cpu_model_max_fruitless requires cpu_model and a positive integer")
             if "cpu_model" in spec:
                 if not isinstance(spec["cpu_model"], str) or not spec["cpu_model"].strip():
                     raise ValueError("cpu_model must be a nonblank exact model string")
@@ -2569,14 +2576,14 @@ class Scheduler:
                 unresolved = sum(not v.ready and getattr(v, "cpu_constraint", "") == model
                                  and v.image == image and v.type == vm_type for v in live)
                 coming += max(pending, unresolved)
-                limit = int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS))
-                if draw["fruitless"] >= limit and not coming:
+                if not coming:
                     for it in its:
-                        if not any(vm_fits(fit_shape(it), v, self.retired()) for v in held):
+                        if draw["fruitless"] >= self._constraint_limit(it) and not any(vm_fits(fit_shape(it), v, self.retired()) for v in held):
                             self._constraint_refused(it, draw)
                     its = [it for it in its if it.state == "queued"]
                     if not its:
                         continue
+                limit = max(self._constraint_limit(it) for it in its)
             real = [it for it in its if it.batch.klass <= 4]
             if not real:
                 continue
@@ -2743,6 +2750,10 @@ class Scheduler:
                 if n > earned and free_fit:
                     self._h().record_needless(now, n - earned, image, vm_type)
             tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "break_even_s": B, "growth_source": "legacy override" if BREAK_EVEN_OVERRIDE_S else "economics", "why": ""}
+            if model:
+                n = rules.cpu_draws(n, draw["fruitless"], coming, limit)
+                tgt["cpu_model"] = model
+                tgt["fruitless"] = draw["fruitless"]
             if n > 0:
                 tgt["why"] = "breaker" if now < pool.open_until else "probe" if pool.half else ""
                 if self.shed:
@@ -2757,10 +2768,6 @@ class Scheduler:
                             log(f"growth held at the ceiling of {MAX_VMS} VMs ({n} wanted)")
                         tgt["why"] = "max VMs" if at_max else "bring-up cap"
                     n = got
-            if model:
-                n = rules.cpu_draws(n, draw["fruitless"], coming, limit)
-                tgt["cpu_model"] = model
-                tgt["fruitless"] = draw["fruitless"]
             self.target[f"{image}/{vm_type}" + (f"/{model}" if model else "")] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
             if n <= 0:
                 continue
@@ -2824,6 +2831,9 @@ class Scheduler:
             if changed:
                 self._constraints_save()
 
+    def _constraint_limit(self, it):
+        return it.spec.get("cpu_model_max_fruitless", int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS)))
+
     def _constraint_status(self):
         out = []
         for c in getattr(self, "cpu_constraints", {}).values():
@@ -2831,13 +2841,14 @@ class Scheduler:
             for d in c["draws"]:
                 label = d["model"] or ("unknown" if d["done"] else "pending")
                 models[label] = models.get(label, 0) + 1
+            waiting = [it for b in self.batches.values() if b.image == c["image"] for it in b.items.values()
+                       if it.state == "queued" and it.spec.get("vm_type") == c["vm_type"] and it.spec.get("cpu_model") == c["cpu_model"]]
             out.append({**c, "models": models,
-                        "limit": int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS)),
+                        "limit": max((self._constraint_limit(it) for it in waiting), default=int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS))),
+                        "requested_limits": sorted({self._constraint_limit(it) for it in waiting}),
                         "matching_vms": [v.id for v in self.vms.values() if v.ready and not v.dead and v.image == c["image"]
                                          and v.type == c["vm_type"] and v.model == c["cpu_model"]],
-                        "waiting_items": sum(it.state == "queued" and b.image == c["image"]
-                                             and it.spec.get("vm_type") == c["vm_type"] and it.spec.get("cpu_model") == c["cpu_model"]
-                                             for b in self.batches.values() for it in b.items.values())})
+                        "waiting_items": len(waiting)})
         return out
 
     def _constraint_refused(self, it, c):
@@ -2847,6 +2858,8 @@ class Scheduler:
                "error": "unplaceable-by-constraint: consecutive fruitless CPU draws exhausted",
                "constraint": next(x for x in self._constraint_status() if x["image"] == c["image"]
                                   and x["vm_type"] == c["vm_type"] and x["cpu_model"] == c["cpu_model"])}
+        row["constraint"] = json.loads(json.dumps(row["constraint"]))  # freeze the refusal receipt
+        row["constraint"]["limit"] = self._constraint_limit(it)
         if it.batch.strict_once:
             self._deliver_owned(it.batch, row)
         else:
@@ -4103,8 +4116,7 @@ class Scheduler:
             # Warm the exact immutable packages with the interpreter that will
             # spawn them, before pausing placement (also repairs old cold snapshots).
             try:
-                for target in candidates:
-                    prepare_snapshot(DIR / "code" / target / "supercomputer")
+                prepared = {target: prepare_snapshot(DIR / "code" / target / "supercomputer") for target in candidates}
             except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
                 self.alert(f"handoff refused: snapshot preparation failed: {error}")
                 return
@@ -4117,6 +4129,11 @@ class Scheduler:
             # Imports, source copies and provider observation happened while placement continued.
             request_lock = getattr(self, "_request_lock", self.lock)
             with request_lock, self.lock:
+                required_cpu = any(it.spec.get("cpu_model") and it.state != "done"
+                                   for b in self.batches.values() for it in b.items.values())
+                if not all(rules.cpu_handoff_allowed(required_cpu, prepared[target].get("cpu_model_exact") is True) for target in candidates):
+                    self.alert("handoff refused: live CPU constraints require an exact-model capable successor")
+                    return
                 if any(it.batch.strict_once and not it.start_done.is_set()
                        for v in self.vms.values() for it in v.running.values()):
                     log("handoff deferred until in-flight strict launches settle; placement continues")

@@ -1,5 +1,9 @@
 """The pre-constraint placement bug: every ready worker was eligible."""
 
+# gdp: law a handoff cannot discard live CPU constraints: not result or not required or supported
+def unsafe_handoff(required: bool, supported: bool) -> bool:
+    return True
+
 # gdp: law constrained placement has the exact model: not result or requested == "" or actual == requested
 # gdp: law an unknown model cannot take constrained work: requested == "" or actual != "" or not result
 def mismatched_placement(requested: str, actual: str) -> bool:
