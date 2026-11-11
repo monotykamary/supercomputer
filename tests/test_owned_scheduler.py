@@ -287,7 +287,9 @@ class OwnedSchedulerTests(unittest.TestCase):
         self.place_without_thread()
         self.vm.client.rpc.return_value = {**self.good_receipt(), "identity": "wrong"}
         self.s._kill(self.vm, self.it)
-        self.assertEqual(self.it.state, "cancel_pending")
+        self.assertEqual(self.it.state, "done")
+        self.assertEqual(self.b.rows[-1]["status"], "LOST")
+        self.assertFalse(self.b.rows[-1]["cleanup_complete"])
         self.assertIn((self.b.id, self.it.run_name), self.vm.running)
         self.assertEqual(self.vm.client.rpc.call_args.args[0], "cancelitem")
         self.assertFalse(self.it.owned.reaped)

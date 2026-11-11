@@ -154,6 +154,9 @@ class Disk:
         self.birth = {}
         self.free_mb, self.total_mb = 100_000, 150_000  # (its disk: an agent since 11-02 reports it with each vtick)
         self.scratch: list = []  # [(mtime, mb)]: a job's leftovers in the home (anvil's state), its agent's to clean
+        # Independent agent ownership, outside batch directories (like owned-items/).
+        self.owned: dict[tuple, dict] = {}
+        self.owned_nonces: set[str] = set()
         self.partial_first = False  # (the first tree verified here lacks files: a tree left short, its ready mark kept)
         self.partial: set = set()
 
@@ -199,6 +202,9 @@ class World:
         self.log_lines: list[tuple] = []
         self.status_ms: list[float] = []
         self.client_errors: list[str] = []
+        self.client_disconnects: list[tuple] = []  # (batch, from, until), absolute virtual times
+        self.lose_submit_ack: set[str] = set()  # one-shot, only after real admission
+        self.strict_batches: set[str] = set()
         self.next_id = 0
         code.label = getattr(code, "label", "c0")
         self.codes = {code.label: code}  # (each code loaded, by the hash the sim gives it)
@@ -676,7 +682,8 @@ class World:
             return
         bd = v.disk.batches.get(bid)
         if bd is None or bd.tid not in v.disk.trees:  # (agent.run: the batch's tree gone from this VM: lost, Outcome.code)
-            job.done = {"name": name, "code": -1, "seconds": -1, "lost": True, "err": f"the batch's tree isn't on {v.id}"}
+            job.done = {"name": name, "code": -1, "seconds": -1, "lost": True, "err": f"the batch's tree isn't on {v.id}",
+                        **({"launch_identity": spec["launch_identity"]} if spec.get("strict_once") else {})}
             p["alive"] = False
             job.mtime = self.k.now
             self.note("tree_missing", vm=v.id, batch=bid, item=orig)
@@ -711,7 +718,11 @@ class World:
             return
         job.out += f"done code {int(spec.get('sim_code', 0))}\n"
         p["alive"] = False
-        job.done = {"name": name, "code": int(spec.get("sim_code", 0)), "seconds": round(self.k.now - t0 + 0.5, 2)}
+        job.done = {"name": name, "code": int(spec.get("sim_code", 0)), "seconds": round(self.k.now - t0 + 0.5, 2),
+                    **({"launch_identity": spec["launch_identity"]} if spec.get("strict_once") else {})}
+        owned = v.disk.owned.get((bid, name))
+        if owned is not None and owned.get("job") is job:
+            owned["reaped"] = True
         job.mtime = self.k.now
         if it is not None:
             it["finished_on"].append(v.id)
@@ -970,6 +981,104 @@ class Agent:
             return {"error": f"no command {cmd}"}
         return fn(*a) if cmd != "vtick" else self.c_vtick(a[0], timeout)
 
+    def c_owned_rpc(self, request):
+        """Emulate the agent dispatcher, not OwnedAgentClient's validation.
+
+        Features model this isolated backend's exact-process containment; they are
+        not a claim about host Linux support. Requests still pass the production
+        gate and the production client validates every reply's source and nonce.
+        """
+        if not isinstance(request, dict):
+            return {"ok": False, "error": "owned_protocol_refused"}
+        nonce = request.get("nonce")
+        features = {"pidfd": True, "private_pid_namespace": "verified-before-payload"}
+        fresh = (isinstance(nonce, str) and re.fullmatch("[0-9a-f]{32}", nonce) is not None
+                 and nonce not in self.d.owned_nonces and len(self.d.owned_nonces) < 65536)
+        allowed = self.A.owned_rpc_allowed(
+            type(request.get("protocol")) is int and request["protocol"] == 1,
+            request.get("version") == self.d.version, fresh, True, False)
+        envelope = {"protocol": 1, "version": self.d.version, "nonce": nonce, "features": features}
+        if not allowed:
+            return {**envelope, "ok": False, "error": "owned_protocol_refused"}
+        self.d.owned_nonces.add(nonce)
+        cmd, args = request.get("command"), request.get("args")
+        self.w.note("owned_rpc", vm=self.v.id, command=cmd, nonce=nonce)
+        if not isinstance(args, list):
+            return {**envelope, "ok": False, "error": "owned_arguments_refused"}
+        try:
+            if cmd == "vtick":
+                msg, = args
+                if not isinstance(msg, dict) or msg.get("wait", 0) != 0:
+                    raise ValueError("owned tick must not wait")
+                for st in msg.get("start", []):
+                    if st["spec"].get("strict_once") is not True:
+                        raise ValueError("owned RPC never launches legacy payload")
+                    self.A._A._launch_nonce(st["spec"]["launch_identity"])
+                    self.A._A._item_ids(st["batch"], st["spec"]["name"])
+                for ack in msg.get("acks", []):
+                    self.A._A._launch_nonce(ack["launch_identity"])
+                self.d.lease_renewed = self.w.k.now
+                self.owned_request = True
+                result = self.c_vtick(msg, 0)
+            elif cmd == "capabilities":
+                result = {"supported": True}
+            elif cmd == "put":
+                result = {"stored": self.put(base64.b64decode(args[0], validate=True))}
+            elif cmd == "cacheput":
+                result = {"ok": True}
+            elif cmd in ("begin", "tree", "prep", "have", "pull", "pullcache", "verify"):
+                result = getattr(self, "c_" + cmd)(*args)
+            else:
+                raise ValueError("unsupported owned command")
+            return {**envelope, "ok": True, "result": result}
+        except (ValueError, KeyError, TypeError) as error:
+            return {**envelope, "ok": False, "error": "owned_dispatch_refused", "detail": repr(error)}
+        finally:
+            self.owned_request = False
+
+    def c_cancelitem(self, bid, name, wait_seconds=10, expected_identity=None):
+        """Only a bound simulated process (or a never-started fence) proves reap.
+
+        No scheduler receipt or absence scan manufactures an attempt/identity.
+        A prior boot cannot prove containment on the current boot.
+        """
+        self.A._A._item_ids(bid, name)
+        if expected_identity is not None:
+            self.A._A._launch_nonce(expected_identity)
+        if not 0 <= float(wait_seconds) <= 60:
+            raise ValueError("invalid cancellation wait")
+        row = self.d.owned.get((bid, name))
+        bd = self.d.batches.get(bid)
+        j = bd.jobs.get(name) if bd else None
+        receipt = self.A._A._owned_receipt
+        if row is None:
+            if expected_identity is None or j is not None:
+                return receipt(bid, name, {}, "no strict ownership record")
+            row = self.d.owned[(bid, name)] = {"identity": expected_identity, "state": "never_started"}
+        if expected_identity is not None and row.get("identity") != expected_identity:
+            return {**receipt(bid, name, row, "launch identity mismatch"),
+                    "ok": False, "reaped": False, "namespace_absent": False}
+        row["cancelled"] = True
+        if row.get("state") == "launched" and not row.get("reaped"):
+            p = self.v.procs.get(row["pid"])
+            if (row["boot"] != str(self.v.boot) or p is None or p["job"] is not row["job"]
+                    or getattr(p["job"], "owner", "") != getattr(self, "caller", "")):
+                return receipt(bid, name, row, "bound process unavailable")
+            # Deterministic process teardown, not a real host signal. One exact
+            # process is the complete payload containment in this simulator.
+            p["alive"] = False
+            self.w.k.sleep(0.05)
+            row["reaped"] = True
+            j = row["job"]
+            j.done = {"name": name, "code": -1, "seconds": -1, "preempted": True,
+                      "launch_identity": row["identity"]}
+            j.mtime = self.w.k.now
+            with self.v.cv:
+                self.v.cv.notify_all()
+        out = receipt(bid, name, row)
+        self.w.note("item_cancelled", vm=self.v.id, batch=bid, item=name, receipt=out)
+        return out
+
     def c_ping(self):
         out = {"ok": True, "version": self.d.version, "boot": str(self.v.boot), "cpus": self.v.cpus, "load": 0.3,
                "agent_capabilities": dict(getattr(self.d, "agent_capabilities", getattr(self.A._A, "AGENT_CAPABILITIES", {})))}
@@ -1165,6 +1274,10 @@ class Agent:
 
     def start(self, bid, bd: BDir, spec):
         name = spec["name"]
+        strict = spec.get("strict_once") is True
+        if strict and (bid, name) in self.d.owned:
+            # Durable launch/cancellation identity forbids a second physical start.
+            return
         if name in bd.jobs:  # (a start sent again)
             return
         j = bd.jobs[name] = Job(spec, self.w.k.now, max(1, int(spec.get("cpus", 2))))
@@ -1174,8 +1287,15 @@ class Agent:
             pid += 1
         self.v.procs[pid] = {"job": j, "batch": bid, "name": spec.get("sim_name") or re.sub(r"~s\d+$", "", name), "alive": True}
         j.pid = pid
+        if strict:
+            self.d.owned[(bid, name)] = {"identity": spec["launch_identity"], "state": "launched",
+                "boot": str(self.v.boot), "pid": pid, "job": j, "reaped": False, "contained": True}
         owners = {getattr(p["job"], "owner", "") for p in self.v.procs.values() if p["alive"]}
-        self.w.note("item_started", vm=self.v.id, batch=bid, item=name, owner=j.owner)
+        # Physical truth: emitted only when this backend creates a process, never
+        # reconstructed from a scheduler placement, result, or cancellation receipt.
+        self.w.note("item_started", vm=self.v.id, batch=bid, item=name, owner=j.owner,
+                    original=self.v.procs[pid]["name"], boot_id=str(self.v.boot), pid=pid,
+                    strict_once=strict, launch_identity=spec.get("launch_identity"))
         if len(owners) > 1:
             self.w.note("mixed_owners", vm=self.v.id, owners=sorted(owners))
         self.w.k.start(self.w.k.world, self.w.run_item, (self.v, bid, name, j, pid), name=f"item {name}")
@@ -1188,7 +1308,8 @@ class Agent:
             if what == "lost":
                 self.w.k.sleep(0.2)  # (the runner's done.json may be landing)
             if what == "lost" and j.done is None:
-                j.done = {"name": name, "code": -1, "seconds": -1, "lost": True, "err": "its process gone without a word"}
+                j.done = {"name": name, "code": -1, "seconds": -1, "lost": True, "err": "its process gone without a word",
+                          **({"launch_identity": j.spec["launch_identity"]} if j.spec.get("strict_once") else {})}
                 j.mtime = self.w.k.now
                 what = "done"
             if what in ("done", "lost") and getattr(j, "owner", "") == getattr(self, "caller", ""):
@@ -1198,10 +1319,15 @@ class Agent:
         return done, running
 
     def c_vtick(self, msg, timeout):
+        if not getattr(self, "owned_request", False) and any(st["spec"].get("strict_once") for st in msg.get("start", [])):
+            return {"err": "owned_rpc_required"}
         for a in msg.get("acks", []):
             bd = self.d.batches.get(a["batch"])
             j = bd.jobs.get(a["name"]) if bd else None
-            if j is not None and getattr(j, "owner", "") == getattr(self, "caller", "") and self.A.Ticks().ack(j.done is not None):
+            bound = (j is not None and (not j.spec.get("strict_once") or
+                     (a.get("launch_identity") == j.spec.get("launch_identity") and
+                      j.done is not None and j.done.get("launch_identity") == j.spec.get("launch_identity"))))
+            if bound and getattr(j, "owner", "") == getattr(self, "caller", "") and self.A.Ticks().ack(j.done is not None):
                 j.acked, j.done = True, None
         for st in msg.get("start", []):
             bd = self.d.batches.get(st["batch"])
@@ -1306,6 +1432,14 @@ class SimSchedClient:
     def req(self, path: str, msg, timeout: float = 60, raw: bool = False, body=None):
         w = self.w
         w.k.sleep(0.002)
+        bid = msg.get("batch") if isinstance(msg, dict) else None
+        if path == "/submit" and msg.get("strict_once"):
+            w.strict_batches.add(bid)
+        if bid in w.strict_batches:
+            w.note("client_request", path=path, batch=bid)
+        if path == "/poll" and any(b == bid and start <= w.k.now < end for b, start, end in w.client_disconnects):
+            w.note("client_disconnected", path=path, batch=bid)
+            raise ConnectionResetError("simulated client transport disconnect")
         ls = w.live_sched()
         if ls is None or (w.k.now < max(w.k.frozen_until, ls[0].env.get("frozen_until", 0.0))):
             raise ConnectionRefusedError(f"[Errno 61] Connection refused ({path})")
@@ -1318,12 +1452,18 @@ class SimSchedClient:
             try:
                 if path == "/submit":
                     box["r"] = s.submit(msg)
+                    if bid in w.strict_batches:
+                        w.note("client_admitted", batch=bid, accepted=bid in s.batches)
                 elif path in ("/poll", "/close", "/logs") and hasattr(s, "batch_of") and s.batch_of(msg) is None:  # (the handler's 400)
                     box["e"] = RuntimeError(f"the scheduler: {path}: 400 no batch named")
                 elif path == "/poll":
                     box["r"] = s.poll(s.batch_of(msg) if hasattr(s, "batch_of") else msg["batch"], int(msg.get("since", 0)), float(msg.get("wait", 15)))
                 elif path == "/close":
                     box["r"] = s.close(s.batch_of(msg) if hasattr(s, "batch_of") else msg["batch"])
+                elif path == "/cancel":
+                    box["r"] = s.cancel(bid, float(msg.get("wait_seconds", 10)))
+                elif path == "/snapshot":
+                    box["r"] = s.snapshot(bid)
                 elif path == "/hint":
                     box["r"] = s.hint(msg)
                 elif path == "/status":
@@ -1361,6 +1501,12 @@ class SimSchedClient:
         if "r" not in box:  # (its handler died with the scheduler)
             raise ConnectionResetError(f"[Errno 54] Connection reset by peer ({path})")
         r = box.get("r")
+        if path == "/submit" and bid in w.lose_submit_ack and bid in s.batches:
+            w.lose_submit_ack.remove(bid)
+            w.note("submit_ack_lost", batch=bid)
+            raise ConnectionResetError("simulated lost submit ACK after admission")
+        if path == "/poll" and bid in w.strict_batches:
+            w.note("client_poll_returned", batch=bid)
         if raw:
             return r if isinstance(r, bytes) else json.dumps(r).encode()
         return json.loads(json.dumps(r))

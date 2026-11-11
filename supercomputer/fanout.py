@@ -131,11 +131,14 @@ class ModalCtx:
 
 # ----------------------------------------------------------------------------------------------------- a jobs file
 def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend: str = "modal", vms: int = 0, idle: int | None = None, teardown: bool = False,
-             durations: str = "", vm_type: str = "large", max_vms: int = 0, max_wait: int = 120, tar: bytes | None = None, gpu_modal=None):
+             durations: str = "", vm_type: str = "large", max_vms: int = 0, max_wait: int = 120, tar: bytes | None = None, gpu_modal=None, strict_once: bool = False, max_attempts: int = 1):
     """A jobs file's batch on its backend. modal_jobs(jobs, on_done) runs jobs on Modal (inside the running app) and
     returns {name: {code, seconds, out, err}}. Writes <out>/<name>.log and <out>/summary.tsv (name, exit, seconds,
     backend) and prints the final line, with where the jobs ran and why any moved. A job that declares a GPU ("gpu":
     a type or true) runs on a RunPod pod (one for all of them), else on Modal (runpod.py, gpu_jobs)."""
+    boat._validate_strict_options(strict_once, max_attempts)
+    if strict_once:
+        _strict_native(spec, backend)
     if backend not in ("modal", "auto", "boat", "runpod"):
         raise SystemExit(f"--backend is modal, auto, boat or runpod, not {backend}")
     outdir = pathlib.Path(out)
@@ -181,21 +184,24 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
         # batch boat couldn't take now (its preflight, Unavailable: an image, a tree, the scheduler) and every other job
         # boat didn't return run again on boat, 3 passes a minute apart, then fail with why: never Modal for those)
         mine = [j for j in spec_cpu if j not in own]
-        for k in range(3):
+        for k in range(1 if strict_once else 3):
             if not mine:
                 break
             if k:
                 log(f"{len(mine)} jobs boat didn't run, not for 3 boat failures ({'; '.join(sorted({str(moved.get(j['name'], ''))[:80] for j in mine})[:2])}): again on boat in 60 s")
                 time.sleep(60)
-            if fallback.preflight_on(backend, _sch.enabled(), bool(_sch.enabled() and _sch.controller())):
+            if not strict_once and fallback.preflight_on(backend, _sch.enabled(), bool(_sch.enabled() and _sch.controller())):
                 reason, info = boat.preflight3(1, vm_type, starts=not _sch.enabled())
             else:
                 reason, info = None, {}
             if reason is None:
                 try:
                     got, bsum = boat.boat_jobs(mine, out, pre, cmd, vms=vms, idle=idle, teardown=teardown, durations=durations, vm_type=vm_type, max_vms=max_vms,
-                                               on_lost=lambda n, why: moved.__setitem__(n, why), max_wait=max_wait if backend == "auto" else 0, on_done=printer, tar=tar)
+                                               on_lost=None if strict_once else lambda n, why: moved.__setitem__(n, why), max_wait=max_wait if backend == "auto" else 0, on_done=printer, tar=tar,
+                                               **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
                 except boat.Unavailable as e:
+                    if strict_once:
+                        raise
                     got = {}
                     moved.update({j["name"]: str(e) for j in mine})
                 rows.update(got)
@@ -203,14 +209,15 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
             else:
                 moved.update({j["name"]: reason for j in mine})
                 log(f"boat can't take this batch now ({reason})")
-            mine = [j for j in mine if j["name"] not in rows and fallback.lost_route(False, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto") == "boat"]
+            mine = [] if strict_once else [j for j in mine if j["name"] not in rows and fallback.lost_route(False, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto") == "boat"]
         todo = []
         for j in [j for j in spec_cpu if j["name"] not in rows]:
-            r = "failed" if "cpu_model" in j or "distinct_vm_group" in j or j.get("required_agent_capabilities") else fallback.lost_route(j in own, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto")
+            r = "failed" if strict_once or "cpu_model" in j or "distinct_vm_group" in j or j.get("required_agent_capabilities") else fallback.lost_route(j in own, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto")
             if r == "modal":
                 todo.append(j)
             else:  # (boat failed it 3 times under --backend boat, or boat couldn't run it at all: failed, with why)
-                rows[j["name"]] = {"code": -1, "seconds": -1, "out": "", "err": moved.get(j["name"], "never ran")}
+                rows[j["name"]] = {"code": -1, "seconds": -1, "out": "", "err": moved.get(j["name"], "never ran"),
+                                   **({"strict_once": True, "status": "LOST", "terminal": True, "identity_unavailable": True} if strict_once else {})}
                 where[j["name"]] = "boat"
     if todo:
         with ModalCtx(app):
@@ -237,6 +244,17 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
     if bsum:
         print(boat.summary_line(bsum))
     (outdir / "backends.json").write_text(json.dumps({"backend": backend, "wall_s": wall, "where": count(where), "fallbacks": why, "boat": bsum}, indent=1))
+
+
+def _strict_native(spec: list[dict], backend: str):
+    """Refuse routes that cannot honor the native scheduler's ownership contract."""
+    if backend not in ("auto", "boat"):
+        raise ValueError("strict_once requires a native boat CPU batch; no Modal or RunPod fallback")
+    images = project().images
+    for job in spec:
+        if (job.get("gpu") or job.get("backend") not in (None, "boat")
+                or (job.get("image") and job["image"] not in images)):
+            raise ValueError("strict_once requires native boat CPU jobs and images; no provider fallback")
 
 
 def boat_order(spec):
@@ -298,7 +316,9 @@ class BoatEx:
     backend = "boat"
 
     def __init__(self, runner: str, vms: int = 0, idle: int | None = None, teardown: bool = False, vm_type: str = "large", max_vms: int = 0, durations: str = "",
-                 limit: int = 3600, build: bool = True, max_wait: int = 0):
+                 limit: int = 3600, build: bool = True, max_wait: int = 0, strict_once: bool = False, max_attempts: int = 1):
+        boat._validate_strict_options(strict_once, max_attempts)
+        self.strict_once = strict_once
         from . import agent
         self.boat = boat
         root = project().root
@@ -313,7 +333,8 @@ class BoatEx:
                 with contextlib.suppress(Exception):
                     r = json.loads(l)
                     self.past[(r.get("tool"), r.get("task"))] = float(r.get("seconds", 0))
-        self.sess = boat.session(pathlib.Path(runner).name, idle=idle, teardown=teardown, vm_type=vm_type, build=build, oleans=False)
+        self.sess = boat.session(pathlib.Path(runner).name, idle=idle, teardown=teardown, vm_type=vm_type, build=build, oleans=False,
+                                 **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
         self.sess.max_starts = max_vms
         self.n = 0
         self.calls = 0
@@ -364,7 +385,7 @@ class BoatEx:
 
         def go():
             try:
-                self.sess.run(items, done, on_lost=(lambda it, why: on_lost(it["args"], why)) if on_lost else None, max_wait=self.max_wait)
+                self.sess.run(items, done, on_lost=(lambda it, why: on_lost(it["args"], why)) if on_lost and not self.strict_once else None, max_wait=self.max_wait)
             except BaseException as e:
                 q.put(e if isinstance(e, Exception) else RuntimeError(repr(e)))
             finally:
@@ -397,13 +418,16 @@ class AutoEx:
     failed 3 times (the scheduler's count: a VM lost, a row missing, no VM ready)."""
 
     backend = "auto"
+    strict_once = False  # Preserve legacy/unpickled instances that predate the opt-in field.
 
     def __init__(self, runner: str, app, max_wait: int = 120, **opts):
+        self.strict_once = opts.get("strict_once", False)
+        boat._validate_strict_options(self.strict_once, opts.get("max_attempts", 1))
         self.app, self.modal, self.bx = app, None, None
         self.where = {"boat": 0, "modal": 0}
         self.why: dict[str, int] = {}
         from . import scheduler as _sch
-        self.reason, _ = (None, {}) if _sch.enabled() and _sch.controller() else boat.preflight3(1, opts.get("vm_type", boat.VM_TYPE), starts=not _sch.enabled())
+        self.reason, _ = (None, {}) if self.strict_once or (_sch.enabled() and _sch.controller()) else boat.preflight3(1, opts.get("vm_type", boat.VM_TYPE), starts=not _sch.enabled())
         # (boat's failures of this batch's calls, a call's own failure never one: Modal takes the rest only at the
         # third; rules.fallback.AutoFallback)
         self.fb = fallback.AutoFallback(3)
@@ -412,6 +436,8 @@ class AutoEx:
             try:
                 self.bx = self._mk()
             except boat.Unavailable as e:
+                if self.strict_once:
+                    raise
                 self.reason = str(e)
         if self.reason:  # (boat can't take it now: an image, a tree, the scheduler; asked again, never Modal for it: rules.fallback.lost_route)
             log(f"boat can't take this batch now ({self.reason}): asked again")
@@ -441,6 +467,10 @@ class AutoEx:
         self.why[reason] = self.why.get(reason, 0) + k
 
     def remote(self, fn, *args):
+        if self.strict_once:
+            result = self.bx.remote(fn, *args)
+            self.where["boat"] += 1
+            return result
         tries = 0
         while self.bx or (not self.fb.on_modal and self._boat()):
             try:
@@ -477,6 +507,11 @@ class AutoEx:
         return fn.remote(*args)
 
     def starmap(self, fn, args: list, **_):
+        if self.strict_once:
+            for result in self.bx.starmap(fn, args):
+                self.where["boat"] += 1
+                yield result
+            return
         rest, to_modal = list(args), []
         for _ in range(3):  # (calls boat lost but not for 3 real boat failures: boat again, 3 passes; rules.fallback.lost_route)
             if not rest or not self._boat():
@@ -539,6 +574,8 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
     ap.add_argument("--class", dest="sc_class", default="", choices=["", *__import__("supercomputer.scheduler", fromlist=["CLASSES"]).CLASSES],
                     help="the scheduler's priority class (default $SUPERCOMPUTER_CLASS, else submission; the bar sets gate)")
     ap.add_argument("--timing", dest="sc_timing", action="store_true", help="each call alone on its VM (a timing claim; $SUPERCOMPUTER_TIMING=1)")
+    ap.add_argument("--strict-once", action="store_true", help="zero or one native attempt; no retry or provider fallback (requires a capable scheduler)")
+    ap.add_argument("--max-attempts", type=int, default=1, choices=[1], help="strict mode supports exactly one authorized physical attempt")
     params = list(inspect.signature(run).parameters.values())[1:]
     for p in params:
         flag = "--" + p.name.replace("_", "-")
@@ -549,6 +586,8 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
         else:
             ap.add_argument(flag, type=type(p.default), default=p.default, dest=p.name)
     a = ap.parse_args()
+    if a.strict_once and a.backend == "modal":
+        ap.error("--strict-once requires --backend auto or boat; Modal cannot honor it")
     if a.sc_class:
         os.environ["SUPERCOMPUTER_CLASS"] = a.sc_class
     if a.sc_timing:
@@ -562,6 +601,8 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
     for s in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, h)
     opts = dict(vms=a.vms, idle=a.idle, teardown=a.teardown, vm_type=a.vm_type, max_vms=a.max_vms, durations=a.durations)
+    if a.strict_once:
+        opts.update(strict_once=True, max_attempts=a.max_attempts)
     if a.backend == "modal":
         with ModalCtx(mod.app):
             ex = ModalEx.__new__(ModalEx)

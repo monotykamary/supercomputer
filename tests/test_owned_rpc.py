@@ -91,7 +91,7 @@ class SchedulerFence(unittest.TestCase):
         with patch.object(self.s,'_prepare') as prep,patch.object(self.s,'_repair') as repair,patch.object(self.s,'_boat_up') as boat:
             self.s._start_on(self.it,self.vm)
             prep.assert_not_called();repair.assert_not_called();boat.assert_not_called()
-        self.assertEqual(self.it.state,'owned_refused');self.assertEqual(self.it.owned.placements,1)
+        self.assertEqual(self.it.state,'done');self.assertEqual(self.it.owned.placements,1)
         self.assertIn((self.b.id,self.it.run_name),self.vm.running)
     def test_reply_binding_rejects_missing_malformed_replayed_wrong_version(self):
         for field,value in [('protocol',True),('version','old'),('nonce','replayed'),('features',{'pidfd':1,'private_pid_namespace':'verified-before-payload'}),('result',None),('ok',1)]:
@@ -108,7 +108,7 @@ class SchedulerFence(unittest.TestCase):
         self.vm.client.rpc.side_effect=rpc
         with patch.object(self.s,'_prepare'):
             self.s._start_on(self.it,self.vm)
-        self.assertEqual(commands,['capabilities','vtick']);self.assertEqual(self.it.state,'owned_refused')
+        self.assertEqual(commands,['capabilities','vtick']);self.assertEqual(self.it.state,'done')
     def test_good_modern_start_uses_owned_rpc_only(self):
         self.place_without_thread();commands=[]
         def rpc(command,r,**kwargs):
@@ -125,7 +125,7 @@ class SchedulerFence(unittest.TestCase):
         self.vm.client.rpc.side_effect=rpc
         self.s._start_on(self.it,self.vm)
         self.assertEqual(commands,['capabilities','begin'])
-        self.assertEqual(self.it.state,'owned_refused')
+        self.assertEqual(self.it.state,'done')
     def test_mixed_ticks_keep_legacy_results_and_never_downgrade_strict(self):
         self.place_without_thread();self.s.shed=False;self.vm.t_agent=S.time.time()
         self.assertEqual(self.vm.client.lease, self.vm.lease)
@@ -146,7 +146,7 @@ class SchedulerFence(unittest.TestCase):
             self.s._tick(self.vm)
             accept.assert_called_once_with(self.vm,oldrow)
         self.assertEqual([x[0] for x in calls],['owned_rpc','vtick'])
-        self.assertEqual(self.it.state,'owned_refused');self.assertEqual(len(self.vm.acks),1)
+        self.assertEqual(self.it.state,'done');self.assertEqual(len(self.vm.acks),1)
 
     def test_stale_start_drops_without_strike_stop_or_legacy_fallback(self):
         self.place_without_thread()
@@ -159,7 +159,8 @@ class SchedulerFence(unittest.TestCase):
             prepare.assert_not_called();strike.assert_not_called();stop.assert_not_called()
         self.assertTrue(self.vm.dead)
         self.assertNotIn(self.vm.id, self.s.vms)
-        self.assertEqual(self.it.state, 'queued')
+        self.assertEqual(self.it.state, 'done')
+        self.assertEqual(self.b.rows[-1]['status'], 'LOST')
         self.assertEqual(self.it.tries, tries)
         self.assertEqual(transport.rpc.call_count, 1)
         self.assertEqual(transport.rpc.call_args.args[0], 'owned_rpc')
@@ -174,7 +175,8 @@ class SchedulerFence(unittest.TestCase):
             stop.assert_not_called()
         self.assertTrue(self.vm.dead)
         self.assertNotIn(self.vm.id, self.s.vms)
-        self.assertEqual(self.it.state, 'queued')
+        self.assertEqual(self.it.state, 'done')
+        self.assertEqual(self.b.rows[-1]['status'], 'LOST')
 
     def test_no_upgrade_or_repair_with_held_strict_placement(self):
         self.place_without_thread()

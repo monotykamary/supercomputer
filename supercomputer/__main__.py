@@ -24,7 +24,13 @@ from . import config
 
 def _run(a):
     from . import boat, controller, fanout, treadmill
-    fanout.reexec_with_modal()
+    strict_once = getattr(a, "strict_once", False)
+    if strict_once and a.backend not in ("auto", "boat"):
+        raise SystemExit("--strict-once requires the native boat backend")
+    if strict_once and getattr(a, "max_attempts", 1) != 1:
+        raise SystemExit("--strict-once requires --max-attempts 1")
+    if not strict_once:
+        fanout.reexec_with_modal()
     controller.maybe_sync()
     p = config.project()
     spec = json.loads(pathlib.Path(a.jobs).read_text())
@@ -33,7 +39,7 @@ def _run(a):
     mod = p.modal.get("module")
     app, mjobs = None, None
     from .rules import fallback
-    if fallback.needs_modal(a.backend, any(j.get("backend") == "modal" or j.get("image") and j["image"] not in p.images for j in spec)):
+    if not strict_once and fallback.needs_modal(a.backend, any(j.get("backend") == "modal" or j.get("image") and j["image"] not in p.images for j in spec)):
         try:
             if mod and (p.root / mod).exists():
                 m = treadmill.import_real(p.root / mod)
@@ -56,7 +62,8 @@ def _run(a):
         os.environ["SUPERCOMPUTER_VM_NAMED"] = a.vm_type
     a.vm_type = a.vm_type or os.environ.get("SUPERCOMPUTER_VM") or "large"
     fanout.run_jobs(app, spec, a.out, pre, cmd, mjobs, backend=a.backend, vms=a.vms, idle=None if a.idle < 0 else a.idle, teardown=a.teardown,
-                    durations=a.durations, vm_type=a.vm_type, max_vms=a.max_vms, max_wait=a.max_wait)
+                    durations=a.durations, vm_type=a.vm_type, max_vms=a.max_vms, max_wait=a.max_wait,
+                    strict_once=strict_once, max_attempts=getattr(a, "max_attempts", 1))
 
 
 def _remote_queue(a):
@@ -208,6 +215,8 @@ def main(argv=None):
     r.add_argument("--class", dest="sc_class", default="", choices=["", "interactive", "gate", "submission", "sweep", "filler"],
                    help="the scheduler's priority class (default $SUPERCOMPUTER_CLASS, else interactive for a small batch, submission for a bigger one)")
     r.add_argument("--data", action="append", default=[], help="DIR[:DEST]: a local directory shipped with the tree at DEST (default its name), like Modal's add_local_dir")
+    r.add_argument("--strict-once", action="store_true", help="at most one native physical attempt per item; no retry or fallback")
+    r.add_argument("--max-attempts", type=int, default=1, help="strict-once physical attempt cap (only 1 is supported)")
     r.add_argument("--timing", action="store_true", help="every job alone on its VM, for a timing claim (or a job's \"timing\": true); placement.json labels it")
     sub.add_parser("status")
     rb = sub.add_parser("rollback", help="hand the pool back to a saved previous code (default: the newest whose canary passed), as the canary does; the install untouched")

@@ -87,7 +87,7 @@ class Sim:
     # -- clients
     def batch(self, client: str, klass: str, its: list[dict], image: str = IMAGE, tree: str = "t", on_lost: bool = True, max_wait: int = 0,
               after: float = 0.0, label: str = "", abandon_after: float | None = None, collect: bool = False, vm_type: str = "large", vm_named: bool = False,
-              verify: bool = False) -> str:
+              verify: bool = False, strict_once: bool = False) -> str:
         """A client process submitting one batch through boat.Scheduled.run (the real client), then closing it."""
         self.batch_n += 1
         bid = f"{self.machine}-{client}-{self.batch_n}" if len(self.peers) > 1 else f"{client}-{self.batch_n}"
@@ -131,7 +131,9 @@ class Sim:
             if abandon_after is not None:  # (its user gives up: ^C, the client closes the batch with items running)
                 self.k.start(proc, lambda: (self.k.sleep(abandon_after), s.stop.set(), rec.__setitem__("abandoned", True)), name="abandon")
             try:
-                s.run([dict(it) for it in its], done, on_lost=lost if on_lost else None, max_wait=max_wait)
+                # Keep legacy simulations compatible with older code under --code.
+                flags = {"strict_once": True} if strict_once else {}
+                s.run([dict(it) for it in its], done, on_lost=lost if on_lost else None, max_wait=max_wait, **flags)
             except (K.SimKilled, K.Deadline):
                 raise
             except KeyboardInterrupt:
@@ -152,7 +154,9 @@ class Sim:
                 except Exception as e:
                     self.w.client_errors.append(f"{bid} collect: {e!r}"[:300])
             try:
-                s.close()
+                close = s.close()
+                if strict_once:
+                    rec["close"] = close
             except (K.SimKilled, K.Deadline):
                 raise
             except Exception as e:

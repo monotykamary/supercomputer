@@ -13,6 +13,7 @@ fails, and says so when it passes (then it leaves XFAIL). Exit 0 when every othe
 import argparse
 import concurrent.futures
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
@@ -153,6 +154,193 @@ def canary_holds_idle_capacity(code):
                 "native_passed": cs.get("state") == "passed" and "c1" in cs.get("passed", []) and "c1" not in cs.get("rejected", []),
                 "normal_release_resumes": bool(releases)}
     return sim, {"extra": extra}
+
+# --------------------------------------------------------- strict-once production paths, isolated backend only
+
+def _strict_evidence(sim, bid, m, loss=False):
+    """Compare controller receipts with independently created backend processes."""
+    names = sim.clients[bid]["items"]
+    starts = [e for e in sim.w.events if e["kind"] == "item_started" and e["batch"] == bid]
+    placed_path = sim.S.DIR / "queue" / f"{bid}.placed"
+    placed = [json.loads(line) for line in placed_path.read_text().splitlines() if line.strip()] if placed_path.exists() else []
+    requests = [e for e in sim.w.events if e["kind"] == "client_request" and e.get("batch") == bid]
+    counts = {name: sum(e["original"] == name for e in starts) for name in names}
+    rows = sim.clients[bid]["items"]
+    bound = True
+    for name, row in rows.items():
+        physical = [e for e in starts if e["original"] == name]
+        placements = [p for p in placed if p.get("name") == name]
+        if not isinstance(row, dict) or len(physical) != 1 or len(placements) != 1:
+            bound = False
+            continue
+        physical, placement = physical[0], placements[0]
+        receipt = row.get("placement") or {}
+        bound &= (bool(physical["launch_identity"]) and row.get("launch_identity") == physical["launch_identity"]
+                  == placement.get("identity") and receipt.get("vm") == physical["vm"] == placement.get("vm")
+                  and receipt.get("boot_id") == physical["boot_id"] == placement.get("boot_id")
+                  and receipt.get("attempt") == placement.get("attempt") == 1)
+    close = sim.clients[bid].get("close", {}).get("batches", {}).get(bid, {})
+    attempts = close.get("attempts", [])
+    cleanup_bound = len(attempts) == len(names) and all(
+        any(a.get("name") == e["original"] and a.get("vm") == e["vm"]
+            and a.get("boot_id") == e["boot_id"] and a.get("launch_identity") == e["launch_identity"]
+            and a.get("attempt") == 1 and type(a.get("cleanup_complete")) is bool for a in attempts)
+        for e in starts)
+    m["strict_once"] = {"batch": bid, "physical_starts": starts, "counts": counts,
+                        "placements": placed, "rows": rows, "requests": requests, "close": close}
+    return {"physical_starts_at_most_once": all(n <= 1 for n in counts.values()),
+            "all_items_physically_started": all(n == 1 for n in counts.values()),
+            "no_replacement_placement": len(placed) == len(names) and all(p.get("attempt") == 1 for p in placed),
+            "identity_bound_receipts": bool(bound),
+            "one_attempt_cap": all(isinstance(r, dict) and r.get("max_attempts") == 1 for r in rows.values()),
+            "identity_bound_cleanup": cleanup_bound and close.get("batch") == bid
+                and close.get("max_attempts") == 1 and type(close.get("cleanup_complete")) is bool,
+            "owned_backend_only": bool(starts) and all(e["strict_once"] for e in starts),
+            "one_submit_same_batch": sum(e["path"] == "/submit" for e in requests) == 1,
+            "no_legacy_fallback": not sim.clients[bid]["lost"] and all(isinstance(r, dict) and "lost" not in r for r in rows.values()),
+            "terminal_outcome": all(isinstance(r, dict) and
+                (r.get("status") == "LOST" and r.get("terminal") is True and r.get("strict_once") is True and r.get("code") == -1
+                 if loss else r.get("code") == 0) for r in rows.values())}
+
+
+def _strict_live(sim, bid):
+    """A snapshot of physical processes, not scheduler receipt-derived attempts."""
+    return [{"vm": v.id, "boot_id": str(v.boot), "pid": pid,
+             "launch_identity": p["job"].spec.get("launch_identity")}
+            for v in sim.w.vms.values() for pid, p in v.procs.items() if p["batch"] == bid and p["alive"]]
+
+
+@scenario("strict_once preemption", ["lost", "clients", "modal", "strikes", "threads"], 900,
+          "higher-priority interactive work preempts a strict sweep; a bound cancellation yields terminal LOST, never another worker")
+def strict_once_preemption(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 1})
+    _warm(sim, 1)
+    sim.scheduler()
+    bid = sim.batch("strict-sweep", "sweep", items("s", 1, 600, weight=4), after=10, strict_once=True)
+    before = []
+    sim.at(100, lambda: before.extend(_strict_live(sim, bid)))
+    urgent = sim.batch("urgent", "interactive", items("u", 1, 30, weight=4), after=110)
+
+    def extra(sim, m):
+        checks = _strict_evidence(sim, bid, m, loss=True)
+        cancelled = [e for e in sim.w.events if e["kind"] == "item_cancelled" and e["batch"] == bid]
+        m["strict_preemption"] = {"before": before, "cancellations": cancelled}
+        checks.update(preempted_running_item=len(before) == 1 and len(cancelled) == 1,
+                      bound_reap=len(cancelled) == 1 and cancelled[0]["receipt"].get("ok") is True
+                          and cancelled[0]["receipt"].get("reaped") is True
+                          and cancelled[0]["receipt"].get("namespace_absent") is True
+                          and bool(before) and cancelled[0]["receipt"].get("identity") == before[0]["launch_identity"],
+                      urgent_completed=all(isinstance(r, dict) and r.get("code") == 0 for r in sim.clients[urgent]["items"].values()),
+                      no_surviving_preempted_worker=not _strict_live(sim, bid),
+                      cleanup_confirmed=m["strict_once"]["close"].get("cleanup_complete") is True)
+        return checks
+    return sim, {"extra": extra}
+
+
+@scenario("strict_once VM loss", ["lost", "clients", "modal", "strikes", "threads"], 1000,
+          "a simulated provider stop destroys a strict running worker; its original identity reports terminal LOST without replacement")
+def strict_once_vm_loss(code):
+    from tests.sim.harness import items
+    sim = _sim(code)
+    _warm(sim, 2)  # spare capacity makes an accidental replacement observable
+    sim.scheduler()
+    bid = sim.batch("strict-loss", "gate", items("v", 1, 600, weight=4), after=10, strict_once=True)
+    stopped = []
+
+    def lose():
+        stopped.extend(_strict_live(sim, bid))
+        for live in stopped:
+            sim.w.stop(sim.w.vms[live["vm"]], "boat")
+    sim.at(100, lose)
+
+    def extra(sim, m):
+        checks = _strict_evidence(sim, bid, m, loss=True)
+        m["strict_vm_loss"] = stopped
+        checks.update(loss_hit_running_worker=len(stopped) == 1,
+                      no_surviving_lost_worker=not _strict_live(sim, bid),
+                      missing_vm_cleanup_not_fabricated=m["strict_once"]["close"].get("cleanup_complete") is False)
+        return checks
+    return sim, {"extra": extra}
+
+
+@scenario("strict_once controller handoff", ["lost", "clients", "modal", "strikes", "threads"], 1100,
+          "controller hot handoff preserves one strict running process, VM, boot and launch nonce through terminal delivery")
+def strict_once_handoff(code):
+    from tests.sim.harness import items
+    sim = _sim(code)
+    _warm(sim, 1)
+    sim.scheduler()
+    bid = sim.batch("strict-handoff", "gate", items("h", 1, 600, weight=4), after=10, strict_once=True)
+    observed = {}
+
+    def handoff():
+        observed["before"] = _strict_live(sim, bid)
+        sim.w.install("c1")
+
+    def restored():
+        observed["after"] = _strict_live(sim, bid)
+        live = sim.w.live_sched()
+        observed["code"] = live[0].env.get("code") if live else None
+        b = live[1].batches.get(bid) if live else None
+        observed["controller_identities"] = [it.launch_identity for it in b.items.values()] if b else []
+    sim.at(100, handoff)
+    sim.at(250, restored)
+
+    def extra(sim, m):
+        checks = _strict_evidence(sim, bid, m)
+        m["strict_handoff"] = observed
+        checks.update(hot_handoff_observed=observed.get("code") == "c1",
+                      same_physical_process=bool(observed.get("before")) and observed.get("before") == observed.get("after"),
+                      restored_same_nonce=bool(observed.get("after")) and observed.get("controller_identities") ==
+                          [x["launch_identity"] for x in observed.get("after", [])])
+        return checks
+    return sim, {"extra": extra}
+
+
+@scenario("strict_once client reconnect", ["lost", "clients", "modal", "strikes", "threads"], 900,
+          "submit ACK is lost after admission and polls disconnect; real client reconnects to the SAME batch, never submits twice")
+def strict_once_reconnect(code):
+    from tests.sim.harness import items
+    sim = _sim(code)
+    _warm(sim, 1)
+    sim.scheduler()
+    bid = sim.batch("strict-reconnect", "gate", items("r", 1, 360, weight=4), after=10, strict_once=True)
+    sim.w.lose_submit_ack.add(bid)
+    sim.w.client_disconnects.append((bid, sim.k.t0 + 10, sim.k.t0 + 70))
+    observed = {}
+    sim.at(50, lambda: observed.update(disconnected=_strict_live(sim, bid)))
+    sim.at(100, lambda: observed.update(reconnected=_strict_live(sim, bid)))
+
+    def extra(sim, m):
+        checks = _strict_evidence(sim, bid, m)
+        events = [e for e in sim.w.events if e.get("batch") == bid]
+        m["strict_reconnect"] = observed
+        checks.update(ack_lost_after_admission=sum(e["kind"] == "submit_ack_lost" for e in events) == 1
+                          and sum(e["kind"] == "client_admitted" and e.get("accepted") for e in events) == 1,
+                      poll_disconnected=any(e["kind"] == "client_disconnected" for e in events),
+                      poll_reconnected_same_batch=any(e["kind"] == "client_poll_returned" and e["t"] >= 70 for e in events),
+                      same_physical_process=bool(observed.get("disconnected")) and
+                          observed.get("disconnected") == observed.get("reconnected"))
+        for row in sim.clients[bid]["items"].values():
+            custody = (row or {}).get("custody") or {}
+            data, history = b"", []
+            try:
+                data = pathlib.Path(custody["file"]).read_bytes()
+                history = [json.loads(line) for line in data.splitlines()]
+            except (OSError, KeyError, ValueError, TypeError):
+                pass
+            reconnects = sum(e.get("event") == "reconnect" for e in history)
+            checks.update(custody_observable=custody.get("batch") == bid and custody.get("max_attempts") == 1
+                              and custody.get("reconnect_count", 0) == reconnects and reconnects > 0,
+                          ambiguity_recorded=sum(e.get("event") == "ambiguous_submit" for e in history) == 1,
+                          complete_custody_journal=bool(data) and hashlib.sha256(data).hexdigest() == custody.get("sha256")
+                              and len(history) == custody.get("event_count")
+                              and [e.get("sequence") for e in history] == list(range(1, len(history) + 1))
+                              and custody.get("events") == history[-64:])
+        return checks
+    return sim, {"extra": extra}
+
 
 # ------------------------------------------------------------------------------------------- the incidents
 @scenario("cfae955", ["modal", "strikes", "lost", "clients", "threads"], 4800,

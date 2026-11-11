@@ -41,6 +41,14 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
 VM, up to 3 times; only then does it run once on Modal. `--backend modal` stays on Modal. GPU jobs (`"gpu"`) go to
 RunPod first, then Modal.
 
+**Single attempt (native):** add `--strict-once --max-attempts 1 --backend boat` for an ordinary jobs batch,
+or use `boat.session(..., strict_once=True, max_attempts=1)`. There is at most one physical attempt per
+persisted item: no requeue/replacement/fallback on loss or preemption. Handoff observes the original attempt.
+A lost attempt returns terminal `status:"LOST"` with VM/boot/launch identity. Reconnects are recorded in
+append-only custody; strict close synchronously reaps, retains journals and reports `cleanup_complete`.
+Never interpret incomplete cleanup as success or retry LOST under a new batch ID. Zero launches are possible
+on admission/preparation failure. Full custody, hash-binding and cleanup contract: `docs/strict-once.md`.
+
 **Shell hygiene:** one background waiter per thing, killed by its exact PID; never `pkill` or `pgrep -f` loops.
 
 **Cleanup:** `supercomputer status` (the pool), `supercomputer reap` (dead clients' leases, orphaned Modal apps and

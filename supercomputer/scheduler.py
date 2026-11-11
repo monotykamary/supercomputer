@@ -54,7 +54,8 @@ from . import blobcache, boat, canary, config, health, memorypressure, resultfil
 from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
 from .agent import AGENT_CAPABILITIES as BUILD_AGENT_CAPABILITIES
-from .rules.owned_lifecycle import OwnedLifecycle, retention_supported
+from .rules.owned_lifecycle import (OwnedLifecycle, retention_supported, attempt_cap_supported,
+                                    strict_transport_attempts, requeue_after_loss)
 from .rules.agent_capabilities import (agent_capability_satisfies, agent_capabilities_match,
     agent_upgrade_allowed, normalize_agent_capabilities, required_agent_capabilities)
 
@@ -405,6 +406,9 @@ class Batch:
     def __init__(self, msg: dict):
         self.id = msg["batch"]
         self.strict_once = bool(msg.get("strict_once", False))
+        self.max_attempts = msg.get("max_attempts", 1)
+        if self.strict_once and (type(self.max_attempts) is not int or not attempt_cap_supported(True, self.max_attempts)):
+            raise ValueError("strict_once requires max_attempts=1")
         self.result_files_protocol = msg.get('result_files_protocol', 0)
         self.retain_journals = bool(msg.get("retain_journals", False))
         if not retention_supported(self.strict_once, self.retain_journals):
@@ -862,7 +866,8 @@ class Scheduler:
                     it = b.items.get(receipt.get("name"))
                     if it and receipt.get("admission_closed") is True and receipt.get("identity") == it.launch_identity:
                         it.owned.cancel()
-                        it.state = "cancel_pending"
+                        if it.state != "done":
+                            it.state = "cancel_pending"
                     if (it and it.owned.closed and
                             ((receipt.get("matched") is True and self._matching_receipt(
                                 receipt.get("receipt"), b.id, receipt.get("run_name"), it.launch_identity))
@@ -1577,6 +1582,11 @@ class Scheduler:
                 raise ValueError(f"{flag} must be boolean")
         if not retention_supported(bool(msg.get("strict_once")), bool(msg.get("retain_journals"))):
             raise ValueError("retain_journals requires strict_once ownership")
+        if "max_attempts" in msg and not msg.get("strict_once"):
+            raise ValueError("max_attempts requires strict_once")
+        cap = msg.get("max_attempts", 1)
+        if msg.get("strict_once") and (type(cap) is not int or not attempt_cap_supported(True, cap)):
+            raise ValueError("strict_once requires max_attempts=1")
         names = []
         for spec in msg.get("items", []):
             if not isinstance(spec, dict):
@@ -1605,7 +1615,7 @@ class Scheduler:
                 cls._valid_batch(name)
             if enhanced:
                 cls._valid_batch(name)
-            if "launch_identity" in spec or "strict_once" in spec:
+            if "launch_identity" in spec or "strict_once" in spec or "max_attempts" in spec:
                 raise ValueError("reserved scheduler ownership fields in item")
             names.append(name)
         grouped = any(s.get("distinct_vm_group") for s in msg.get("items", []))
@@ -1651,15 +1661,40 @@ class Scheduler:
     def _owned_failed(self, it, why):
         if it.state == "done" and any(r.get("name") == it.name for r in it.batch.rows):
             return
-        # Not 'lost': clients must not interpret an owned failure as a fallback request.
+        # `lost` is a legacy retry request. A strict LOST is terminal, never that flag.
+        evidence = durable_receipt(it)
+        if it.batch.strict_once:
+            it.owned.cancel()  # A late report must not reopen a terminal attempt.
+            placement = dict(it.last_placement or {})
+            evidence = {"status": "LOST", "terminal": True, "max_attempts": it.batch.max_attempts,
+                        "attempts": it.owned.placements, "placement": placement,
+                        "vm": placement.get("vm"), "boot_id": placement.get("boot_id"),
+                        "attempt": placement.get("attempt", 0),
+                        "cleanup_complete": it.owned.reaped,
+                        "identity_unavailable": not bool(placement.get("vm") and
+                            placement.get("boot_id") and placement.get("identity"))}
         self._deliver_owned(it.batch, {"name": it.name, "code": -1, "seconds": -1,
                           "error": why, "strict_once": it.batch.strict_once,
-                          "launch_identity": it.launch_identity, **durable_receipt(it)})
+                          "launch_identity": it.launch_identity, **evidence})
         it.state = "done"
         it.fate.delivered()
 
     def _deliver_owned(self, b, row):
         # File publication precedes the terminal journal and worker ACK.
+        if b.strict_once and row.get("name") in b.items:
+            it = b.items[row["name"]]
+            placement = dict(it.last_placement or {})
+            row = {"strict_once": True, "max_attempts": b.max_attempts,
+                   "attempts": it.owned.placements, "attempt": placement.get("attempt", 0),
+                   "launch_identity": it.launch_identity, "vm": placement.get("vm"),
+                   "boot_id": placement.get("boot_id"), "placement": placement,
+                   "terminal": True, "identity_unavailable": not bool(
+                       placement.get("vm") and placement.get("boot_id") and placement.get("identity")),
+                   "custody": {"protocol": 1, "controller_code": getattr(self, "code", None),
+                               "agent_version": placement.get("agent_version"),
+                               "max_attempts": b.max_attempts},
+                   "status": "CANCELLED" if row.get("cancelled") else ("SUCCEEDED" if row.get("code") == 0 else "FAILED"),
+                   **row}
         row = self._result_store(b.id).compact_row(row)
         # Callers hold self.lock: first terminal result wins without replacement.
         with b.cv:
@@ -1671,8 +1706,9 @@ class Scheduler:
 
     @staticmethod
     def capabilities():
-        return {"scope": "isolated-proposed", "runtime_verified": False,
-                "submit_flags": ["strict_once", "retain_journals"],
+        return {"scope": "native-single-vm", "runtime_verified": True, "code": code_hash(),
+                "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
+                "strict_once_protocol": 1, "strict_once_max_attempts": 1,
                 "required_agent_capabilities_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -1702,7 +1738,8 @@ class Scheduler:
                 exists = (DIR / "queue" / f"{bid}.json").exists()
                 return {"ok": False, "error": "admission quarantined; journals retained" if exists else "no such batch"}
             return {"ok": True, "batch": bid, "strict_once": b.strict_once,
-                    "retain_journals": b.retain_journals, "admission_closed": b.admission_closed,
+                    "max_attempts": b.max_attempts,
+                    "retain_journals": b.retain_journals or b.strict_once, "admission_closed": b.admission_closed,
                     "closed": b.closed,
                     "placements": jlines(DIR / "queue" / f"{bid}.placed"),
                     "cancellation_receipts": self._safe_snapshot(jlines(DIR / "queue" / f"{bid}.cancel")),
@@ -1779,7 +1816,7 @@ class Scheduler:
                         it.fate.delivered()
                         self._deliver_owned(b, {"name": it.name, "code": -1, "seconds": -1,
                                                 "cancelled": True, "launch_identity": identity})
-                else:
+                elif it.state != "done":
                     it.state = "cancel_pending"
         with self.lock:
             complete = all(it.owned.reaped for it in items)
@@ -1794,7 +1831,16 @@ class Scheduler:
                     b.closed = False
                     raise
             self.wake.set()
-            return {"ok": complete, "complete": complete, "admission_closed": True,
+            attempts = [{"name": it.name, "run_name": (it.last_placement or {}).get("run_name"),
+                         "attempt": (it.last_placement or {}).get("attempt", it.owned.placements),
+                         "vm": (it.last_placement or {}).get("vm"),
+                         "boot_id": (it.last_placement or {}).get("boot_id"),
+                         "launch_identity": it.launch_identity, "cleanup_complete": it.owned.reaped}
+                        for it in items if it.owned.placements]
+            return {"ok": complete, "complete": complete, "cleanup_complete": complete,
+                    "admission_closed": True, "journals_retained": True, "strict_once": True,
+                    "max_attempts": b.max_attempts, "attempts": attempts,
+                    "unlaunched": [it.name for it in items if not it.owned.placements],
                     "pending": [it.name for it in items if not it.owned.reaped], "batch": bid}
 
     def submit(self, msg: dict) -> dict:
@@ -2468,10 +2514,15 @@ class Scheduler:
         """The item placed on the VM, where its fate allows it (rules.ItemFate.place: never a VM boat reports stopped
         or one that failed it)."""
         if it.batch.admission_closed or it.owned.closed:
+            if it.batch.strict_once and any(r.get("name") == it.name for r in it.batch.rows):
+                it.state = "done"
+                it.fate.delivered()
             return False
         if getattr(vm, "upgrading", False) or not agent_capabilities_match(
                 required_agent_capabilities(it.spec), getattr(vm, "agent_capabilities", {})):
             return False
+        if it.batch.strict_once and not vm.lease.get("boot"):
+            return False  # A strict physical attempt must have an authoritative boot identity.
         if it.batch.strict_once and it.owned.placements:
             self._owned_failed(it, "strict_once: prior placement cannot be replaced")
             return False
@@ -2496,6 +2547,9 @@ class Scheduler:
             "vm": vm.id, "image": vm.image, "type": vm.type, "cpu": vm.model,
             "identity": it.launch_identity, "t": time.time(),
             "agent_version": vm.agent, "agent_capabilities": dict(vm.agent_capabilities)}
+        if it.batch.strict_once:
+            it.last_placement.update(boot_id=vm.lease.get("boot", ""),
+                                     attempt=it.owned.placements, max_attempts=it.batch.max_attempts)
         if group:
             it.last_placement.update(distinct_vm_group=group, boot_id=vm.lease.get("boot", ""))
         if durable_item(it):
@@ -2636,8 +2690,8 @@ class Scheduler:
                 return  # A stale fence already requeued without a strike.
             if b.strict_once:
                 with self.lock:
-                    it.state = "owned_refused"
-                    it.result_error = "strict protocol/launch uncertain; placement quarantined: " + str(e)[:200]
+                    it.result_error = "strict protocol/launch uncertain; cleanup retained: " + str(e)[:200]
+                    self._owned_failed(it, it.result_error)
                 self.wake.set()
                 return  # no preparation fallback, VM repair, provider probe, retry or replacement
             with self.lock:
@@ -2924,6 +2978,8 @@ class Scheduler:
             self._append_owned(b.id, "cancel", {"name": it.name, "run_name": it.run_name,
                 "identity": it.launch_identity, "admission_closed": True, "t": time.time()})
         if not it.start_done.wait(60):
+            with self.lock:
+                self._owned_failed(it, "strict_once: preempted with start still in flight; cleanup unconfirmed")
             return
         receipt = None
         try:
@@ -2937,7 +2993,8 @@ class Scheduler:
                 "identity": it.launch_identity, "matched": matched, "receipt": self._safe_snapshot(receipt), "t": time.time()})
             if it.owned.confirm(matched):
                 vm.running.pop((b.id, it.run_name), None)
-                self._owned_failed(it, "strict_once: preempted; matching namespace reap confirmed")
+            self._owned_failed(it, "strict_once: preempted; " +
+                               ("matching namespace reap confirmed" if matched else "cleanup remains unconfirmed"))
         self.wake.set()
 
     def _kill(self, vm: VMState, it: Item):
@@ -3570,10 +3627,14 @@ class Scheduler:
             for key, it in list(vm.running.items()):
                 vm.running.pop(key, None)
                 if it.batch.admission_closed or it.owned.closed:
-                    it.state = "cancel_pending"
+                    if it.state != "done":
+                        it.state = "cancel_pending"
                     continue
                 it.fate.vm_lost(vm.id, True)
-                it.state, it.vm, it.head = "queued", None, True
+                if requeue_after_loss(it.batch.strict_once):
+                    it.state, it.vm, it.head = "queued", None, True
+                else:
+                    self._owned_failed(it, "strict_once: worker lease lost; no replacement")
             vm.starts = []
         self.wake.set()
 
@@ -3739,7 +3800,8 @@ class Scheduler:
                     for st in strict_starts:
                         item = vm.running.get((st["batch"], st["spec"]["name"]))
                         if item:
-                            item.state, item.result_error = "owned_refused", str(error)
+                            item.result_error = str(error)
+                            self._owned_failed(item, "strict_once: start reply uncertain; cleanup retained: " + str(error)[:200])
                 with vm.lock:
                     vm.acks = strict_acks + vm.acks  # unknown reply never discards acknowledgements
         try:
@@ -4089,7 +4151,8 @@ class Scheduler:
         once on Modal, or reports it failed). The decision is rules.ItemFate's (one strike per VM, charged only to an
         item last placed on that VM). Under self.lock."""
         if it.batch.admission_closed or it.owned.closed:
-            it.state = "cancel_pending"
+            if it.state != "done":
+                it.state = "cancel_pending"
             return
         if it.batch.strict_once:
             self._owned_failed(it, why)
@@ -4127,11 +4190,12 @@ class Scheduler:
             slept = rules.slept_through(time.time(), getattr(self, "t_wake", 0), 900)
             for key, it in list(vm.running.items()):
                 if it.batch.admission_closed or it.owned.closed:
-                    it.state = "cancel_pending"
+                    if it.state != "done":
+                        it.state = "cancel_pending"
                     continue
                 vm.running.pop(key)
                 strike = it.fate.vm_lost(vm.id, slept)
-                if slept:
+                if slept and requeue_after_loss(it.batch.strict_once):
                     it.state, it.vm, it.head = "queued", None, True
                 else:
                     self._boat_failed(it, vm.id, f"boat VM {vm.id} lost", strike)
@@ -5387,7 +5451,9 @@ class Client:
     def req(self, path: str, msg, timeout: float = 60, raw: bool = False, body: bytes | None = None):
         data_in = body if body is not None else json.dumps(msg).encode()
         if isinstance(self.remote, AgentClient):
-            code, data, _ = self.remote._req("POST", path, data_in, timeout, "application/octet-stream" if body is not None else "application/json")
+            observer = getattr(self, "transport_event", None)
+            extra = {"transport_event": observer} if observer is not None else {}
+            code, data, _ = self.remote._req("POST", path, data_in, timeout, "application/octet-stream" if body is not None else "application/json", **extra)
             if code != 200:
                 raise RuntimeError(f"the controller: {path}: {code} {data[:300]!r}")
         else:
@@ -5399,7 +5465,12 @@ class Client:
         connection through boat's ssh costs a round trip of its own)."""
         import http.client
         last = None
-        for k in range(3):
+        strict_submit = False
+        if path == "/submit":
+            with contextlib.suppress(ValueError, TypeError, AttributeError):
+                strict_submit = json.loads(body).get("strict_once") is True
+        attempts = strict_transport_attempts(strict_submit, 3)
+        for k in range(attempts):
             c = getattr(self, "_conns", None)
             if c is None:
                 self._conns = c = []
@@ -5419,7 +5490,12 @@ class Client:
                 last = e
                 with contextlib.suppress(Exception):
                     conn.close()
-                time.sleep(0.2 * (k + 1))
+                observer = getattr(self, "transport_event", None)
+                if observer is not None:
+                    observer("transport_reconnect" if k + 1 < attempts else "transport_error",
+                             path=path, attempt=k + 1, error=type(e).__name__)
+                if k + 1 < attempts:
+                    time.sleep(0.2 * (k + 1))
         raise RuntimeError(f"the scheduler didn't answer ({last})")
 
     def _known(self) -> dict:

@@ -241,6 +241,10 @@ lock. Its additive `status_snapshot` metadata reports capture/publication time,
 age and readiness; blocked refreshes leave the last view explicitly aged. See
 [status snapshots](docs/status-snapshot.md).
 
+For an ordinary native batch with no retry or replacement, use
+`run --strict-once --max-attempts 1 --backend boat`. See the reviewed
+[single-attempt custody and cleanup contract](docs/strict-once.md).
+
 ## More
 
 - [docs/scheduling.md](docs/scheduling.md): the scheduling policy in full, growth and shrink, preemption, restarts,

@@ -70,6 +70,8 @@ from .config import env, project
 from .rules import boat as R
 
 HERE = pathlib.Path(__file__).resolve().parent
+_CLIENT_SHA256 = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
+_CUSTODY_TRANSPORT_LOCK = threading.Lock()
 BOAT = os.environ.get("BOAT_BIN") or next((p for p in [str(pathlib.Path.home() / ".ascii/bin/boat")] if os.path.exists(p)), "boat")
 ENV = {**os.environ, "BOAT_NO_UPDATE": "1", "NO_COLOR": "1"}
 SLOT_CPU, SLOT_MEM = 2, 4096  # a slot: Modal's default container
@@ -115,6 +117,10 @@ def boat_fails_of(why) -> int:
     import re as _re
     m = _re.search(r"boat failed it (\d+) times", str(why or ""))
     return int(m.group(1)) if m else 0
+
+
+class CustodyError(RuntimeError):
+    """Required client evidence could not be persisted; never a reconnect signal."""
 
 
 class Unavailable(RuntimeError):
@@ -1547,8 +1553,20 @@ class AgentClient:
         with contextlib.suppress(OSError):
             c.close()
 
-    def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json", decode=None) -> tuple[int, object, str]:
-        last, retry = None, R.Retry(4)  # (4 tries, the first answer kept: rules.boat.Retry)
+    def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json", decode=None, transport_event=None) -> tuple[int, object, str]:
+        from .rules.owned_lifecycle import strict_transport_attempts
+        strict = False
+        if method == "POST" and path == "/submit" and body:
+            with contextlib.suppress(ValueError, TypeError, UnicodeDecodeError):
+                msg = json.loads(body)
+                strict = isinstance(msg, dict) and msg.get("strict_once") is True
+        last, retry = None, R.Retry(strict_transport_attempts(strict, 4))
+        def notify(event, **details):
+            if transport_event:
+                try:
+                    transport_event(event, **details)
+                except Exception as exc:
+                    raise CustodyError("transport custody persistence failed") from exc
         while retry.outcome == "trying":
             k = retry.tries
             c = self._get(timeout)
@@ -1573,6 +1591,8 @@ class AgentClient:
                     if r.status in (401, 403):  # (boat's cookie gone stale: its token again)
                         self.cookie = ""
                     retry.attempt(False)
+                    notify("transport_reconnect" if retry.outcome == "trying" else "transport_error",
+                           path=path, attempt=k + 1, error="AuthenticationRedirect")
                     continue
                 retry.attempt(True)
                 return r.status, data, r.getheader("Content-Type", "")
@@ -1581,6 +1601,8 @@ class AgentClient:
                 with contextlib.suppress(Exception):
                     c.close()
                 retry.attempt(False)
+                notify("transport_reconnect" if retry.outcome == "trying" else "transport_error",
+                       path=path, attempt=k + 1, error=type(e).__name__)
                 time.sleep(0.2 * (k + 1))
         raise AgentError(f"{self.vm}: the warm agent didn't answer ({last})")
 
@@ -2842,6 +2864,14 @@ class Session:
 HANDOFF_QUIET = 60  # (seconds a client asks again quietly while the scheduler doesn't answer: a handoff's window)
 
 
+def _validate_strict_options(strict_once: bool, max_attempts: int):
+    from .rules.owned_lifecycle import attempt_cap_supported
+    if type(strict_once) is not bool:
+        raise ValueError("strict_once must be boolean")
+    if type(max_attempts) is not int or not attempt_cap_supported(True, max_attempts):
+        raise ValueError("max_attempts must be exactly the integer 1; only single-attempt opt-in is supported")
+
+
 def _validate_durable_item(item: dict):
     """Validate opt-in fields without adding defaults to legacy job payloads."""
     if "distinct_vm_group_scope" in item:
@@ -2910,7 +2940,15 @@ class Scheduled(Session):
 
     scheduled = True
 
-    def __init__(self, label: str, klass: str | int | None = None, **kw):
+    def __init__(self, label: str, klass: str | int | None = None, strict_once: bool = False, max_attempts: int = 1, **kw):
+        _validate_strict_options(strict_once, max_attempts)
+        self.strict_once, self.max_attempts = strict_once, max_attempts
+        self.custody = {}
+        self._custody_lock = threading.Lock()
+        self._custody_hashes = {}
+        self._admission_lock = threading.Lock()
+        self._strict_items = {}
+        self._strict_placements = {}
         super().__init__(label, **kw)
         from . import scheduler
         self.sched = scheduler
@@ -2928,16 +2966,206 @@ class Scheduled(Session):
     def lease_up(self, k: int, vm_type: str) -> int:
         return 0
 
-    def run(self, items: list[dict], on_done, on_start=None, on_lost=None, max_wait: int = 0):
+    def _custody_event(self, bid: str, event: str, **details):
+        # Full history is durable; only the last 64 events live in result rows.
+        # The digest binds ALL bytes, not just the visible tail. No payload/env/token
+        # or raw transport response is written to this journal.
+        if not bid or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for c in bid) or bid.startswith("."):
+            raise ValueError("invalid custody batch id")
+        if not hasattr(self, "_custody_lock"):
+            self._custody_lock, self._custody_hashes, self.custody = threading.Lock(), {}, {}
+        with self._custody_lock:
+            directory = config.LIVE / "custody"
+            missing_directories, parent = [], directory
+            while not parent.exists():
+                missing_directories.append(parent)
+                parent = parent.parent
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for created in reversed(missing_directories):
+                fd = os.open(created.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            path = directory / f"{bid}.jsonl"
+            journal = self.custody.get(bid)
+            if journal is None:
+                journal = {"batch": bid, "max_attempts": 1, "reconnect_count": 0,
+                           "event_count": 0, "events": [], "file": str(path)}
+                digest = hashlib.sha256()
+                if path.exists():
+                    with path.open("rb") as previous:
+                        for line in previous:
+                            old = json.loads(line)
+                            digest.update(line)
+                            journal["event_count"] += 1
+                            journal["reconnect_count"] += old["event"] in ("reconnect", "transport_reconnect")
+                            journal["events"] = (journal["events"] + [old])[-64:]
+                self.custody[bid], self._custody_hashes[bid] = journal, digest
+            record = {"event": event, "time": time.time(), "sequence": journal["event_count"] + 1, **details}
+            data = (json.dumps(record, sort_keys=True) + "\n").encode()
+            new_file = not path.exists()
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "ab") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            if new_file:
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            self._custody_hashes[bid].update(data)
+            journal["sha256"] = self._custody_hashes[bid].hexdigest()
+            journal["event_count"] += 1
+            journal["reconnect_count"] += event in ("reconnect", "transport_reconnect")
+            journal["events"] = (journal["events"] + [record])[-64:]
+            return journal
+
+    def _remember_placement(self, bid: str, placement: dict, identity=None, name=None):
+        if not isinstance(placement, dict):
+            return
+        identity = identity or placement.get("identity")
+        name = name or placement.get("name")
+        keys = ("run_name", "vm", "boot_id")
+        if (not isinstance(identity, str) or not identity or not isinstance(name, str)
+                or type(placement.get("attempt")) is not int or placement["attempt"] != 1
+                or any(not isinstance(placement.get(k), str) or not placement[k] for k in keys)):
+            return
+        if not hasattr(self, "_strict_placements"):
+            self._strict_placements = {}
+        record = {"name": name, "launch_identity": identity, "attempt": 1, **{k: placement[k] for k in keys}}
+        known = self._strict_placements.setdefault(bid, {})
+        if (placement.get("identity") is not None and placement["identity"] != identity) or (name in known and known[name] != record):
+            known[name] = {"conflict": True}
+        else:
+            known[name] = record
+
+    def _valid_close(self, bid: str, receipt, snapshot) -> bool:
+        if not isinstance(receipt, dict):
+            return False
+        if (receipt.get("batch") != bid or type(receipt.get("max_attempts")) is not int or receipt["max_attempts"] != 1
+                or any(receipt.get(k) is not True for k in ("ok", "complete", "cleanup_complete", "strict_once", "admission_closed", "journals_retained"))
+                or receipt.get("pending") != []):
+            return False
+        names = getattr(self, "_strict_items", {}).get(bid, set())
+        attempts, unlaunched = receipt.get("attempts"), receipt.get("unlaunched")
+        if not isinstance(attempts, list) or not isinstance(unlaunched, list) or not all(isinstance(n, str) for n in unlaunched):
+            return False
+        if any(not isinstance(a, dict) for a in attempts):
+            return False
+        actual = [a.get("name") for a in attempts]
+        identities = [a.get("launch_identity") for a in attempts]
+        if (not all(isinstance(n, str) for n in actual) or len(actual + unlaunched) != len(set(actual + unlaunched))
+                or set(actual + unlaunched) != names
+                or not all(isinstance(i, str) and i for i in identities) or len(identities) != len(set(identities))):
+            return False
+        snapshot_ok = (isinstance(snapshot, dict) and snapshot.get("ok") is True and snapshot.get("batch") == bid
+                       and snapshot.get("strict_once") is True and type(snapshot.get("max_attempts")) is int and snapshot["max_attempts"] == 1)
+        if snapshot_ok and (not isinstance(snapshot.get("placements"), list)
+                            or any(not isinstance(p, dict) for p in snapshot["placements"])):
+            return False
+        if snapshot_ok:
+            for placement in snapshot["placements"]:
+                self._remember_placement(bid, placement)
+        known = getattr(self, "_strict_placements", {}).get(bid, {})
+        if not snapshot_ok and any(name not in known for name in names):
+            return False
+        if any(name in known for name in unlaunched):
+            return False
+        for attempt in attempts:
+            expected = known.get(attempt["name"])
+            if (type(attempt.get("attempt")) is not int or attempt["attempt"] != 1
+                    or not expected or expected.get("conflict") or attempt.get("cleanup_complete") is not True
+                    or any(attempt.get(k) != v for k, v in expected.items())):
+                return False
+        return True
+
+    def _strict_row(self, bid: str, row: dict) -> dict:
+        # Share the bounded journal so close/reconnect evidence remains visible to
+        # Python callers holding rows; preserve controller custody independently.
+        custody = self.custody[bid]
+        self._remember_placement(bid, row.get("placement", {}), row.get("launch_identity"), row.get("name"))
+        return {**row, **({"controller_custody": row["custody"]} if "custody" in row else {}),
+                "batch": bid, "strict_once": True, "max_attempts": 1, "custody": custody}
+
+    @contextlib.contextmanager
+    def _transport_scope(self, bid: str, client=None):
+        c = self.client if client is None else client
+        with _CUSTODY_TRANSPORT_LOCK:
+            observers = vars(c).get("_custody_observers")
+            if observers is None:
+                local, previous = threading.local(), getattr(c, "transport_event", None)
+                def dispatch(event, **details):
+                    stack = getattr(local, "stack", [])
+                    callback = stack[-1] if stack else previous
+                    if callback:
+                        callback(event, **details)
+                observers = {"local": local, "dispatch": dispatch}
+                c._custody_observers = observers
+                c.transport_event = dispatch
+        def record(event, **details):
+            try:
+                return self._custody_event(bid, event, **details)
+            except Exception as exc:
+                raise CustodyError("transport custody persistence failed") from exc
+        local = observers["local"]
+        if not hasattr(local, "stack"):
+            local.stack = []
+        local.stack.append(record)
+        try:
+            yield
+        finally:
+            local.stack.pop()
+
+    def _request(self, bid: str, path: str, msg, **kw):
+        client = self.client
+        if bid in getattr(self, "custody", {}):
+            with self._transport_scope(bid, client):
+                return client.req(path, msg, **kw)
+        return client.req(path, msg, **kw)
+
+    def run(self, items: list[dict], on_done, on_start=None, on_lost=None, max_wait: int = 0, *,
+            strict_once: bool | None = None, max_attempts: int | None = None):
+        return self._run(items, on_done, on_start, on_lost, max_wait,
+                         strict_once=strict_once, max_attempts=max_attempts)
+
+    def _run(self, items: list[dict], on_done, on_start=None, on_lost=None, max_wait: int = 0, *,
+             strict_once: bool | None = None, max_attempts: int | None = None):
+        strict_once = getattr(self, "strict_once", False) if strict_once is None else strict_once
+        max_attempts = getattr(self, "max_attempts", 1) if max_attempts is None else max_attempts
+        _validate_strict_options(strict_once, max_attempts)
+        if not hasattr(self, "_admission_lock"):
+            self._admission_lock = threading.Lock()
+        if getattr(self, "stop", None) is not None and self.stop.is_set():
+            raise RuntimeError("session is closed; no new admission is permitted")
         if not items:
             return
         from .rules.agent_capabilities import required_agent_capabilities
         for it in items:
             _validate_durable_item(it)
             required_agent_capabilities(it)
+        def next_bid():
+            with self._bid_lock:  # one id per intentional run, never per reconnect
+                bid = self.batch if not self.bids else time.strftime("%Y%m%d-%H%M%S") + "-" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(6))
+                self.bids.append(bid)
+                self.batch = bid
+                return bid
+        if strict_once:
+            bid = next_bid()
+            self.client_sha256 = getattr(self, "client_sha256", _CLIENT_SHA256)
+            self._custody_event(bid, "preflight_attempt", client_sha256=self.client_sha256)
+            self.custody[bid]["client_sha256"] = self.client_sha256
         self.client = self.client or self.sched.connect()
-        if any("cpu_model" in it or "distinct_vm_group" in it or required_agent_capabilities(it) for it in items):
-            caps = self.client.req("/capabilities", {})
+        if strict_once or any("cpu_model" in it or "distinct_vm_group" in it or required_agent_capabilities(it) for it in items):
+            caps = self._request(bid, "/capabilities", {}) if strict_once else self.client.req("/capabilities", {})
+            if strict_once:
+                self.custody[bid]["controller_code"] = caps.get("code")
+                self._custody_event(bid, "preflight_complete", client_sha256=self.client_sha256, controller_code=caps.get("code"))
+            if strict_once and not (type(caps.get("strict_once_protocol")) is int and caps["strict_once_protocol"] == 1
+                                    and "strict_once" in caps.get("submit_flags", [])):
+                raise Unavailable("scheduler lacks strict_once_protocol:1; refusing a retrying submission")
             if any(required_agent_capabilities(it) for it in items) and caps.get("required_agent_capabilities_protocol") != 1:
                 raise Unavailable("scheduler lacks required_agent_capabilities_protocol:1; refusing unverified agents")
             if any(it.get("distinct_vm_group_scope") == "durable" for it in items):
@@ -2946,36 +3174,90 @@ class Scheduled(Session):
                 raise Unavailable("scheduler lacks distinct_vm_group capability; refusing unconstrained submission")
             if any("cpu_model" in it for it in items) and caps.get("cpu_model_exact") is not True:
                 raise Unavailable("scheduler lacks exact cpu_model capability; refusing unconstrained submission")
-        log(f"submission root: {getattr(self.tree, 'root', '<prebuilt tree>')} ({len(self.tree.files)} files, {len(self.tree.links)} links)")
-        self.client.push_tree(self.tree)
-        self.client.push_caches(self.caches, self.proj.cache_outputs)
         by = {it["name"]: it for it in items}
-        with self._bid_lock:  # (a fresh id per run: a session's second run under its first's id replaced that batch, 09:49)
-            bid = self.batch if not self.bids else time.strftime("%Y%m%d-%H%M%S") + "-" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(6))
-            self.bids.append(bid)
-            self.batch = bid
+        log(f"submission root: {getattr(self.tree, 'root', '<prebuilt tree>')} ({len(self.tree.files)} files, {len(self.tree.links)} links)")
+        upload_client = self.client
+        with self._transport_scope(bid, upload_client) if strict_once else contextlib.nullcontext():
+            upload_client.push_tree(self.tree)
+            upload_client.push_caches(self.caches, self.proj.cache_outputs)
+        if not strict_once:
+            bid = next_bid()
         msg = {"batch": bid, "klass": self.klass, "client": client(), "label": self.label, "image": self.image, "vm_type": self.vm_type,
-               "tree": ({"id": self.tree.id} if getattr(self.client, "remote", None) and self.tree.id in self.client._known().get("trees", [])
+               "tree": ({"id": self.tree.id} if not strict_once and getattr(self.client, "remote", None) and self.tree.id in self.client._known().get("trees", [])
                         else {"id": self.tree.id, "files": self.tree.files, "links": self.tree.links}) | {"gits": getattr(self.tree, "gits", {})}, "ctx_b64": self.ctx_b64,
                "caches": [{"name": c["name"], "key": c["key"], "local": str(cache_local(c, c["key"])), "outputs": self.proj.cache_outputs(c)} for c in self.caches],
                "on_lost": on_lost is not None, "max_wait": max_wait, "warm_only": self.warm_only, "timing": env("TIMING") not in ("", "0"),
                "vm_type_named": bool(getattr(self, "vm_named", False) or env("VM_NAMED")), "items": items}
+        if strict_once:
+            msg.update(strict_once=True, max_attempts=1, on_lost=False)
+            self._custody_event(bid, "admission_attempt")
         if any("distinct_vm_group" in it for it in items):
             msg["placement_contract"] = 1
+        def admit():
+            with self._admission_lock:
+                if self.stop.is_set():
+                    raise RuntimeError("session is closed; no new admission is permitted")
+                if not hasattr(self, "_legacy_attempted"):
+                    self._legacy_attempted = set()
+                self._legacy_attempted.add(bid)
+                self.submitted = True
+                response = self._request(bid, "/submit", msg)
+                if isinstance(response, dict) and (response.get("missing") or response.get("ok") is False):
+                    self._legacy_attempted.discard(bid)
+                    self.submitted = bool(self._legacy_attempted or getattr(self, "_strict_attempted", ()))
+                return response
         def submit():
-            r = self.client.req("/submit", msg)
+            r = admit()
             if isinstance(r, dict) and r.get("missing"):
                 self.client.push_tree(self.tree)
-                r = self.client.req("/submit", msg)
+                r = admit()
             if isinstance(r, dict) and r.get("ok") is False:
                 raise RuntimeError(f"the scheduler refused batch {bid}: {r.get('error')}")
-        try:
-            submit()
-        except Exception:
-            if "files" in msg["tree"]:
-                raise
-            msg["tree"] = {"id": self.tree.id, "files": self.tree.files, "links": self.tree.links}  # (the controller lost it: whole)
-            submit()
+        if strict_once:
+            # An unanswered submit may already have launched work. Never submit it again:
+            # reconnect/poll this admission, including after loss of the controller's reply.
+            def attempt():
+                with self._admission_lock:
+                    if self.stop.is_set():
+                        raise RuntimeError("session is closed; no new admission is permitted")
+                    if not hasattr(self, "_strict_attempted"):
+                        self._strict_attempted, self._strict_items, self._strict_placements = set(), {}, {}
+                    self._strict_attempted.add(bid)
+                    self._strict_items[bid] = set(by)
+                    self.submitted = True
+                    try:
+                        response = self._request(bid, "/submit", msg)
+                    except CustodyError:
+                        raise
+                    except Exception as exc:
+                        self._custody_event(bid, "ambiguous_submit", error=type(exc).__name__)
+                        return None
+                    if isinstance(response, dict) and (response.get("missing") or response.get("ok") is False):
+                        self._strict_attempted.discard(bid)
+                        self.submitted = bool(self._strict_attempted or getattr(self, "_legacy_attempted", ()))
+                    return response
+            r = attempt()
+            if isinstance(r, dict) and r.get("missing"):
+                # Explicit pre-admission refusal, not an ambiguous transport failure.
+                self._custody_event(bid, "missing_tree_refusal")
+                with self._transport_scope(bid):
+                    self.client.push_tree(self.tree)
+                r = attempt()
+            if isinstance(r, dict) and r.get("ok") is False:
+                self._strict_attempted.discard(bid)
+                self.submitted = bool(self._strict_attempted or getattr(self, "_legacy_attempted", ()))
+                self._custody_event(bid, "admission_refused")
+                raise RuntimeError(f"the scheduler refused batch {bid}: {r.get('error')}")
+            if isinstance(r, dict) and r.get("ok") is True:
+                self._custody_event(bid, "admission_ack")
+        else:
+            try:
+                submit()
+            except Exception:
+                if "files" in msg["tree"]:
+                    raise
+                msg["tree"] = {"id": self.tree.id, "files": self.tree.files, "links": self.tree.links}  # (the controller lost it: whole)
+                submit()
         self.submitted = True
         since, left, reread = 0, set(by), 0
         reports = R.Reports(len(left))  # (every item reported once, none dropped at the end: rules.boat.Reports)
@@ -2983,9 +3265,13 @@ class Scheduled(Session):
             if self.stop.is_set():
                 raise KeyboardInterrupt
             try:
-                r = self.client.req("/poll", {"batch": bid, "since": since, "wait": 15}, timeout=60)
+                r = self._request(bid, "/poll", {"batch": bid, "since": since, "wait": 15}, timeout=60)
                 t_err, said = None, False
+            except CustodyError:
+                raise
             except Exception as e:  # (the scheduler restarting, the forward reconnecting: asked again, for up to 15 minutes)
+                if strict_once:
+                    self._custody_event(bid, "reconnect", error=type(e).__name__)
                 t_err = locals().get("t_err") or time.time()
                 if time.time() - t_err > 900:
                     raise
@@ -2999,13 +3285,13 @@ class Scheduled(Session):
                     if getattr(self.client, "remote", None):  # (the controller's: its again, never this machine's)
                         self.sched._remote_ok.clear()
                         self.client = self.sched._remote() or self.client
-                    elif time.time() - t_err > 10 and self.sched.rules.local_recovery_allowed(self.sched.controller_configured()):
+                    elif not strict_once and time.time() - t_err > 10 and self.sched.rules.local_recovery_allowed(self.sched.controller_configured()):
                         # Recover a crashed LOCAL owner only. A controller appearing
                         # during an old client's lifetime must never revive a rival.
                         self.client = self.sched.ensure_running()
                 continue
             for row in r.get("rows", []):
-                row = self._download_results(row, lambda ref, offset, count: self.client.req('/results', {'batch':bid, 'ref':ref, 'offset':offset, 'length':count}, timeout=120, raw=True))
+                row = self._download_results(row, lambda ref, offset, count: self._request(bid, '/results', {'batch':bid, 'ref':ref, 'offset':offset, 'length':count}, timeout=120, raw=True))
                 since += 1
                 it = by.get(row["name"])
                 if it is None or not reports.row(row["name"] in left):
@@ -3014,15 +3300,17 @@ class Scheduled(Session):
                 if row.get("vm"):
                     self.vm_ids.add(row["vm"])
                     self.run_names[row.get("run_name", row["name"])] = row["name"]
-                if row.get("lost") and on_lost and not it.get("cpu_model") and not required_agent_capabilities(it) and it.get("distinct_vm_group_scope") != "durable":
+                if row.get("lost") and on_lost and not strict_once and not it.get("cpu_model") and not required_agent_capabilities(it) and it.get("distinct_vm_group_scope") != "durable":
                     on_lost(it, row.get("error", "lost"))
                 else:
-                    on_done(it, row)
+                    on_done(it, self._strict_row(bid, row) if strict_once else row)
             if r.get("done") and not r.get("rows"):
                 # (done with items unreported: their rows read again from the first, a few times, before they count as
                 # lost; a scheduler before rules.Delivery said done with a row not yet delivered)
                 if left and reread < 5:
                     reread += 1
+                    if strict_once:
+                        self._custody_event(bid, "terminal_rows_reread", attempt=reread)
                     since = 0
                     time.sleep(2)
                     continue
@@ -3031,30 +3319,42 @@ class Scheduled(Session):
         if reports.end():
             for name in sorted(left):
                 why = "the scheduler finished the batch without its row"
-                if on_lost and not required_agent_capabilities(by[name]) and by[name].get("distinct_vm_group_scope") != "durable":
+                if on_lost and not strict_once and not required_agent_capabilities(by[name]) and by[name].get("distinct_vm_group_scope") != "durable":
                     on_lost(by[name], why)
                 else:
-                    on_done(by[name], {"name": name, "code": -1, "seconds": -1, "error": why})
+                    row = {"name": name, "code": -1, "seconds": -1, "error": why}
+                    if strict_once:
+                        row.update(strict_once=True, status="LOST", terminal=True, identity_unavailable=True)
+                        row = self._strict_row(bid, row)
+                    on_done(by[name], row)
             left.clear()
 
     def collect(self) -> dict[str, dict]:
         if not self.client or not self.vm_ids:
             return self.logs
         for bid in list(self.bids) or [self.batch]:  # (every run's batch)
-            retry = R.Retry(12)  # (through a restart of the scheduler: again; rules.boat.Retry)
-            while True:
-                try:
-                    data = self.client.req("/logs", {"batch": bid, "vms": sorted(self.vm_ids)}, timeout=600, raw=True)
-                    retry.attempt(True)
-                    break
-                except Exception:
-                    if retry.attempt(False) == "failed":
+            strict_once = bid in getattr(self, "custody", {})
+            try:
+                retry = R.Retry(12)  # (through a restart of the scheduler: same admission)
+                while True:
+                    try:
+                        data = self._request(bid, "/logs", {"batch": bid, "vms": sorted(self.vm_ids)}, timeout=600, raw=True)
+                        retry.attempt(True)
+                        break
+                    except CustodyError:
                         raise
-                    time.sleep(5)
-            with tarfile.open(fileobj=io.BytesIO(data)) as tf:
-                for m in tf.getmembers():
-                    name, f = m.name.rsplit("/", 1)
-                    self.logs.setdefault(self.run_names.get(name, name), {})[f] = tf.extractfile(m).read().decode("utf-8", "replace")
+                    except Exception as exc:
+                        if strict_once:
+                            self._custody_event(bid, "reconnect", path="/logs", error=type(exc).__name__)
+                        if retry.attempt(False) == "failed":
+                            raise
+                        time.sleep(5)
+                with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+                    for m in tf.getmembers():
+                        name, f = m.name.rsplit("/", 1)
+                        self.logs.setdefault(self.run_names.get(name, name), {})[f] = tf.extractfile(m).read().decode("utf-8", "replace")
+            finally:
+                pass
         return self.logs
 
     def harvest_caches(self):
@@ -3081,9 +3381,40 @@ class Scheduled(Session):
 
     def close(self, kill: bool = True) -> dict:
         self.stop.set()
+        if not hasattr(self, "_admission_lock"):
+            self._admission_lock = threading.Lock()
+        # Fence only admission, never wait for the polling loop. A submit already
+        # in flight settles its ownership before we snapshot what must be reaped.
+        with self._admission_lock:
+            bids = list(getattr(self, "bids", None) or [self.batch])
+            attempted = set(getattr(self, "_strict_attempted", set()))
+            submitted = getattr(self, "submitted", False)
         r = {}
-        if self.client and getattr(self, "submitted", False):
-            for bid in list(getattr(self, "bids", None) or [self.batch]):  # (every run's batch)
+        strict_bids = set(getattr(self, "custody", {}))
+        strict_once = bool(strict_bids) or getattr(self, "strict_once", False)
+        receipts, validation = {}, {}
+        if self.client and submitted:
+            for bid in bids:
+                if bid in strict_bids:
+                    if bid not in attempted:
+                        continue
+                    self._custody_event(bid, "close_attempt")
+                    try:
+                        receipt = self._request(bid, "/close", {"batch": bid}, timeout=60)
+                    except Exception as exc:
+                        receipt = {"batch": bid, "complete": False, "cleanup_complete": False, "error": type(exc).__name__}
+                    receipts[bid] = receipt
+                    snapshot = None
+                    try:
+                        snapshot = self._request(bid, "/snapshot", {"batch": bid}, timeout=60)
+                    except Exception as exc:
+                        self._custody_event(bid, "snapshot_error", error=type(exc).__name__)
+                    validation[bid] = self._valid_close(bid, receipt, snapshot)
+                    self._custody_event(bid, "close_receipt" if validation[bid] else "close_failure",
+                                        cleanup_complete=validation[bid],
+                                        receipt_sha256=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest())
+                    continue
+                # Legacy cleanup retry behavior is unchanged.
                 retry = R.Retry(6)  # (rules.boat.Retry)
                 while retry.outcome == "trying":
                     try:
@@ -3097,16 +3428,27 @@ class Scheduled(Session):
                             "bring_up_s", "idle_tail_s", "kept_for_demand", "let_go_early", "unused", "tree_from_seed")}
         self.result = {**z, "vms": r.get("vms", len(self.vm_ids)), "starts": r.get("starts", 0), "preempted": r.get("preempted", 0), "scheduled": r.get("class", self.sched.NAMES[self.klass]),
                        "account_day": None, "types": [self.vm_type], "idle_s": IDLE, "project": self.proj.name}
+        if strict_once:
+            self.result.update(batches=receipts, custody=getattr(self, "custody", {}),
+                               cleanup_validation=validation,
+                               cleanup_complete=bool(receipts) and all(validation.values()))
         return self.result
 
     def dollars(self, ids=None):
         return None
 
 
-def session(label: str, klass: str | int | None = None, **kw) -> Session:
-    """A batch's session: through the scheduler (the default), or holding VMs itself (SUPERCOMPUTER_SCHEDULER=0)."""
+def session(label: str, klass: str | int | None = None, strict_once: bool = False, max_attempts: int = 1, **kw) -> Session:
+    """A batch's session; strict_once permits zero or one physical attempt, never a retry.
+
+    Strict ownership requires a capable scheduler. Without it, fail rather than
+    silently use the legacy pool or another provider.
+    """
+    _validate_strict_options(strict_once, max_attempts)
     from . import scheduler
-    return Scheduled(label, klass=klass, **kw) if scheduler.enabled() else Session(label, **kw)
+    if strict_once and not scheduler.enabled():
+        raise Unavailable("strict_once requires the scheduler; refusing the legacy retrying path")
+    return Scheduled(label, klass=klass, strict_once=strict_once, max_attempts=max_attempts, **kw) if scheduler.enabled() else Session(label, **kw)
 
 
 def scheduler_holds(image: str) -> bool:
@@ -3402,9 +3744,13 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
 
 
 def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int | None = None, teardown: bool = False, durations: str = "", vm_type: str = VM_TYPE,
-              max_vms: int = 0, on_lost=None, max_wait: int = 0, on_done=None, tar: bytes | None = None, klass: str | None = None) -> tuple[dict, dict]:
+              max_vms: int = 0, on_lost=None, max_wait: int = 0, on_done=None, tar: bytes | None = None, klass: str | None = None, strict_once: bool = False, max_attempts: int = 1) -> tuple[dict, dict]:
     """supercomputer/run.py's jobs on the pool: {name: {code, seconds, out, err}} for those that ran, and the batch's figures.
     A job lost twice (its VM died) goes to on_lost(name, reason), as does every job when boat can't serve the batch."""
+    _validate_strict_options(strict_once, max_attempts)
+    if strict_once:
+        from .fanout import _strict_native
+        _strict_native(spec, "boat")
     outdir = pathlib.Path(out)
     past = last_durations(outdir, {j["name"] for j in spec}, durations)
     items, order = job_items(spec, pre, cmd, vm_type, past)
@@ -3417,6 +3763,8 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
     small = len(items) <= TINY[0] or slot_s < TINY[1] * 60
     # (with the scheduler, a tiny batch goes to boat too, as an interactive check: Modal only after boat fails 3 times)
     sched_on = __import__("supercomputer.scheduler", fromlist=["enabled"]).enabled()
+    if strict_once and not sched_on:
+        raise Unavailable("strict_once requires the scheduler; refusing the legacy retrying path")
     if any("cpu_model" in it or "distinct_vm_group" in it or it.get("required_agent_capabilities") for it in items) and not sched_on:
         raise Unavailable("placement constraints require the scheduler; refusing the legacy unconstrained path")
     tiny = on_lost is not None and small and not sched_on
@@ -3430,7 +3778,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
             # (its class: --class or $SUPERCOMPUTER_CLASS; else a small batch is interactive, a bigger one a submission)
             given = klass or env("CLASS")  # (rules.boat.batch_class: given, else interactive when small, a submission else)
             sess = session(f"run {outdir.name}", klass=given or R.batch_class(False, "submission", small), idle=idle, teardown=teardown, vm_type=vm_type,
-                           build=on_lost is None, tar=tar)
+                           build=on_lost is None, tar=tar, **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
             sess.output_dir = outdir
             sess.max_starts = max_vms
             sess.warm_only = tiny
@@ -3460,7 +3808,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
                 if on_done:
                     on_done(it["name"], row)
             t_run = time.time()
-            sess.run(items, done, on_lost=(lambda it, why: on_lost(it["name"], why)) if on_lost else None, max_wait=max_wait)
+            sess.run(items, done, on_lost=(lambda it, why: on_lost(it["name"], why)) if on_lost and not strict_once else None, max_wait=max_wait)
             t_jobs = time.time()
             if env("VERBOSE"):
                 log("jobs done")
@@ -3478,7 +3826,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
             note_durations(rows)
             sess.phases = {"jobs_s": round(t_jobs - t_run, 1), "collect_s": round(t_logs - t_jobs, 1), "harvest_s": round(time.time() - t_logs, 1)}
     except Unavailable as e:
-        if on_lost is None or any(it.get("required_agent_capabilities") for it in items):
+        if strict_once or on_lost is None or any(it.get("required_agent_capabilities") for it in items):
             raise  # A capability refusal is never permission for a blind Modal fallback.
         for it in items:
             if it["name"] not in rows:
@@ -3496,6 +3844,17 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
             summary["dollars_so_far"] = sess.dollars() if summary.get("warm", 0) < summary.get("vms", 0) else None
             summary["batch"] = sess.batch
             summary["image"] = sess.image
+            if strict_once:
+                import shutil
+                destination = outdir / "custody"
+                destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+                for bid, journal in summary.get("custody", {}).items():
+                    copied = destination / f"{bid}.jsonl"
+                    shutil.copyfile(journal["file"], copied)
+                    copied.chmod(0o600)
+                    journal["export_file"] = str(copied)
+                with (outdir / "results.json").open("w") as output:
+                    json.dump({"rows": rows, "cleanup": summary}, output, indent=1)
     return rows, summary
 
 

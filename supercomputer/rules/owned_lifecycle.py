@@ -10,6 +10,23 @@ def retention_supported(strict: bool, retained: bool) -> bool:
     return not retained or strict
 
 
+# gdp: law strict mode accepts exactly one attempt: not strict or (result == (limit == 1))
+def attempt_cap_supported(strict: bool, limit: int) -> bool:
+    return not strict or limit == 1
+
+
+# gdp: law strict submits have one transport attempt: not strict or result == 1
+# gdp: law legacy transport retries are unchanged: strict or result == legacy_attempts
+def strict_transport_attempts(strict: bool, legacy_attempts: int) -> int:
+    return 1 if strict else legacy_attempts
+
+
+# gdp: law strict loss never requeues: not strict or not result
+# gdp: law legacy loss remains retryable: strict or result
+def requeue_after_loss(strict: bool) -> bool:
+    return not strict
+
+
 class OwnedLifecycle:
     # gdp: law strict admission permits at most one placement: not strict or placements <= 1
     # gdp: law a cancellation fence never opens: not old(closed) or closed

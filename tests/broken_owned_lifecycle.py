@@ -6,6 +6,21 @@ def accepts_retention_without_ownership(strict: bool, retained: bool) -> bool:
     return True  # broken: retained=True, strict=False cannot obtain an owned reap
 
 
+# gdp: law strict mode accepts only one attempt: not result or not strict or limit == 1
+def accepts_many_attempts(strict: bool, limit: int) -> bool:
+    return True
+
+
+# gdp: law strict submits have one transport attempt: not strict or result == 1
+def resubmits_strict(strict: bool, legacy_attempts: int) -> int:
+    return legacy_attempts
+
+
+# gdp: law strict loss never requeues: not strict or not result
+def requeues_strict_loss(strict: bool) -> bool:
+    return True
+
+
 class ResetsOnRequeue:
     # gdp: law strict items have at most one lifetime placement: placements <= 1
     def __init__(self):
