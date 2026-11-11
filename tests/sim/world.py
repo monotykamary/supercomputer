@@ -161,6 +161,7 @@ class Disk:
 class VMRec:
     def __init__(self, id, image, vm_type, cpus, t):
         self.id, self.image, self.type, self.cpus = id, image, vm_type, cpus
+        self.model = "sim-cpu"
         self.state = "starting"
         self.until = t + 900
         self.t_created = t
@@ -1191,7 +1192,7 @@ class Agent:
                 self.v.cv.wait(max(0.1, left))
             if self.v.state != RUNNING:
                 raise ConnectionResetError("[Errno 54] Connection reset by peer")
-        out = {"done": done, "running": running, "load": 0.3, "cpus": self.v.cpus, "model": "sim-cpu"}
+        out = {"done": done, "running": running, "load": 0.3, "cpus": self.v.cpus, "model": self.v.model}
         if hasattr(self.A._A, "clean_disk"):
             out["disk"] = self._disk()
         return out
@@ -1287,6 +1288,8 @@ class SimSchedClient:
                     box["r"] = s.hint(msg)
                 elif path == "/status":
                     box["r"] = s.status()
+                elif path == "/capabilities":
+                    box["r"] = s.capabilities()
                 elif path == "/logs":
                     box["r"] = s.logs(s.batch_of(msg) if hasattr(s, "batch_of") else msg["batch"], msg.get("vms", []))
                 elif path == "/rollback" and hasattr(s, "rollback"):

@@ -17,7 +17,7 @@ pathlib.Path(live, "controller.json").write_text(json.dumps({"url": "https://exa
 
 
 def run(env):
-    for k in ("SUPERCOMPUTER_CONTROLLER", "SUPERCOMPUTER_CONTROLLER_FALLBACK"):
+    for k in ("SUPERCOMPUTER_CONTROLLER", "SUPERCOMPUTER_CONTROLLER_FALLBACK", "SUPERCOMPUTER_LOCAL"):
         os.environ.pop(k, None)
     os.environ.update(env)
     started.clear()
@@ -30,7 +30,12 @@ def run(env):
 r, s = run({"SUPERCOMPUTER_CONTROLLER": "1"})
 assert r.startswith("exit: the controller on boat doesn't answer") and not s, (r, s)
 r, s = run({"SUPERCOMPUTER_CONTROLLER": "1", "SUPERCOMPUTER_CONTROLLER_FALLBACK": "1"})
+assert r.startswith("exit:") and not s, (r, s)  # old FALLBACK is no longer permission
+r, s = run({})  # the file alone selects the controller
+assert r.startswith("exit:") and not s, (r, s)
+r, s = run({"SUPERCOMPUTER_LOCAL": "1"})
 assert r == "local" and s == [1], (r, s)
-r, s = run({})  # (no controller asked for: this machine's scheduler, as before)
+pathlib.Path(live, "controller.json").unlink()
+r, s = run({})
 assert r == "local" and s == [1], (r, s)
 print("ok")

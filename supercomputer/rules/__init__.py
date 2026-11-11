@@ -9,3 +9,5 @@ laws, or I/O and why.
 from .scheduler import *  # noqa: F401,F403
 from .growth import break_even_s, economic_start, economic_vms, gate_start, gate_vms, gate_window  # noqa: F401
 from .updates import *  # noqa: F401,F403
+from .cpu import cpu_matches, cpu_draws, cpu_streak  # noqa: F401
+from .affinity import local_start_allowed, local_recovery_allowed  # noqa: F401

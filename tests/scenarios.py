@@ -2177,6 +2177,41 @@ def lease_sleep_restore(code):
     return _shared_leases(code, count=3, sleep=True, restored=True)
 
 
+@scenario("exact CPU model", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 1200,
+          "unknown and mismatched warm CPUs are bypassed; exact placements survive a hot handoff")
+def cpu_model_handoff(code):
+    from tests.sim.harness import items, IMAGE
+    sim = _sim(code, policy={"floor_default": 0})
+    wrong = sim.w.warm_vm(IMAGE)
+    wrong.model = "other-cpu"
+    unknown = sim.w.warm_vm(IMAGE)
+    unknown.model = ""
+    match = sim.w.warm_vm(IMAGE)
+    match.model = "sim-cpu"
+    bid = sim.batch("pinned", "gate", items("p", 12, 40, cpu_model="sim-cpu", vm_type="large", timing=True))
+    sim.at(100, lambda: sim.w.install("cpu-pinned"))
+    def extra(sim, m):
+        rows = list(sim.clients[bid]["items"].values())
+        return {"cpu_exact": all(r and r.get("placement", {}).get("cpu") == "sim-cpu" for r in rows),
+                "cpu_vm_exact": all(r and r.get("vm") not in (wrong.id, unknown.id) for r in rows)}
+    return sim, {"extra": extra}
+
+
+@scenario("bounded CPU draws", ["clients", "threads"], 1600,
+          "an absent exact model is reported after three fruitless starts, without stopping mismatched workers specially")
+def cpu_model_absent(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"cpu_model_max_fruitless": 3, "floor_default": 0})
+    bid = sim.batch("absent", "gate", items("p", 10, 60, cpu_model="absent-cpu", vm_type="large"))
+    def extra(sim, m):
+        rows = list(sim.clients[bid]["items"].values())
+        ds = [d for _, s in sim.w.sched_procs if s for c in getattr(s, "cpu_constraints", {}).values() for d in c["draws"]]
+        return {"cpu_refusal": all(r and r.get("unplaceable_by_constraint") for r in rows),
+                "cpu_bounded": 0 < len({d["vm"] for d in ds}) <= 3,
+                "cpu_no_placement": all(it["runs"] == 0 for it in sim.w.items.values())}
+    return sim, {"extra": extra}
+
+
 # ------------------------------------------------------------------------------------------------ running
 def run_one(name: str, code: str) -> dict:
     from tests.sim import metrics
@@ -2285,10 +2320,13 @@ def main():
     ap.add_argument("names", nargs="*")
     ap.add_argument("--code", default=str(HERE), help="the checkout whose supercomputer/ is tested")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--out", help="retain scenario jobs, logs and results in this directory")
     ap.add_argument("--one", help=argparse.SUPPRESS)
     ap.add_argument("-j", type=int, default=1)  # (here: one at a time, niced; the laptop runs light work)
     ap.add_argument("--boat", action="store_true", help="each scenario a job of one gate batch on boat (SC_SCENARIOS_OUT keeps receipts)")
     a = ap.parse_args()
+    if a.out:
+        os.environ["SC_SCENARIOS_OUT"] = str(pathlib.Path(a.out).resolve())
     if a.one:
         print(json.dumps(run_one(a.one, a.code), default=str))
         return 0
@@ -2324,6 +2362,9 @@ def main():
                     print(f"        {k}: {json.dumps(r['metrics'][mk], default=str)[:600]}")
             if r.get("err"):
                 print(f"        error: {r['err'][:600]}")
+    if a.out:
+        pathlib.Path(a.out).mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(a.out) / "results.json").write_text(json.dumps(res, default=str, indent=1))
     if a.json:
         print(json.dumps(res, default=str, indent=1))
     print(f"scenarios: {sum(1 for r in res if r['ok'])} of {len(res)} pass ({len([r for r in res if not r['ok'] and r['name'] in XFAIL])} known failures), {time.time() - t0:.0f} s")

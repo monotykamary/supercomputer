@@ -748,6 +748,11 @@ def scheduler_section(day: str) -> list[str]:
            "- by class: " + "; ".join(f"{n} {m['placed'].get(n, 0)} items, starts {m['starts'][n]['free']}+{m['starts'][n]['paid']} paid, "
                                       f"wait p50 {scheduler.pct(m['waits'].get(n, []), 0.5)} s p95 {scheduler.pct(m['waits'].get(n, []), 0.95)} s, "
                                       f"{m['preempted'].get(n, 0)} preempted" for n in scheduler.CLASSES if m["placed"].get(n) or m["preempted"].get(n))]
+    for c in m.get("constraints", []):
+        out.append(f"- CPU constraint {c['image']}/{c['vm_type']} / {c['cpu_model']}: "
+                   f"{len(c['matching_vms'])} matching VMs, {c['waiting_items']} waiting items, "
+                   f"{len(c['draws'])} starts drawn; models {json.dumps(c['models'], sort_keys=True)}; "
+                   f"fruitless {c['fruitless']}/{c['limit']}")
     with contextlib.suppress(Exception):
         out.append(f"- {boat.extra_starts()}")
     return out

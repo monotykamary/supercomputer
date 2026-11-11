@@ -23,6 +23,10 @@ if [ -z "${SC_LAWS_OUT:-${SC_CHECK_OUT:-}}" ]; then trap 'rm -rf "$out"' EXIT; f
 # on boat: a gate batch through the scheduler (the laptop runs only light work: three local CLI runs held its
 # load at 100 for 3 minutes a commit, 11-01 07:02); CHECK_LAWS_LOCAL=1 runs them here instead, one at a time, niced)
 good_files=($(ls "$here"/supercomputer/rules/*.py | grep -v "/__init__.py$")) broken_files=("$here"/tests/broken_*.py)
+# Fail closed if the CPU eligibility/load guard or controller-affinity regressions disappear.
+for rule in cpu affinity; do
+  test -f "$here/supercomputer/rules/$rule.py" && test -f "$here/tests/broken_$rule.py"
+done
 if [ -n "${CHECK_LAWS_RESULTS_ONLY:-}" ]; then
   [ -n "${SC_LAWS_OUT:-}" ] || { echo "SC_LAWS_OUT required for saved receipts" >&2; exit 1; }
   for j in "$out"/run/*.log; do

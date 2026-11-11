@@ -2738,6 +2738,10 @@ class Scheduled(Session):
         if not items:
             return
         self.client = self.client or self.sched.connect()
+        if any("cpu_model" in it for it in items):
+            caps = self.client.req("/capabilities", {})
+            if caps.get("cpu_model_exact") is not True:
+                raise Unavailable("scheduler lacks exact cpu_model capability; refusing unconstrained submission")
         self.client.push_tree(self.tree)
         self.client.push_caches(self.caches, self.proj.cache_outputs)
         by = {it["name"]: it for it in items}
@@ -2788,7 +2792,7 @@ class Scheduled(Session):
                     if getattr(self.client, "remote", None):  # (the controller's: its again, never this machine's)
                         self.sched._remote_ok.clear()
                         self.client = self.sched._remote() or self.client
-                    elif time.time() - t_err > 10 and not self.sched.controller():
+                    elif time.time() - t_err > 10 and self.sched.rules.local_recovery_allowed(self.sched.controller_configured()):
                         # Recover a crashed LOCAL owner only. A controller appearing
                         # during an old client's lifetime must never revive a rival.
                         self.client = self.sched.ensure_running()
@@ -2802,7 +2806,7 @@ class Scheduled(Session):
                 if row.get("vm"):
                     self.vm_ids.add(row["vm"])
                     self.run_names[row.get("run_name", row["name"])] = row["name"]
-                if row.get("lost") and on_lost:
+                if row.get("lost") and on_lost and not it.get("cpu_model"):
                     on_lost(it, row.get("error", "lost"))
                 else:
                     on_done(it, row)
@@ -3129,6 +3133,13 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
         for j in js:
             w = R.weight(math.ceil(cpu), math.ceil(memory))  # (rules.boat.weight: 2 vCPU and 4096 MB a slot)
             it = {"name": j["name"], "kind": "sh", "cmd": pre + cmd(j["cmd"]), "cwd": j.get("cwd", "."), "limit": timeout - 30, "weight": w, "est": past.get(j["name"], med)}
+            if "cpu_model" in j:
+                model = j["cpu_model"]
+                if not isinstance(model, str) or not model.strip():
+                    raise ValueError("cpu_model must be a nonblank exact model string")
+                if not (j.get("vm_type") or env("VM_NAMED")):
+                    raise ValueError("cpu_model requires an explicit vm_type")
+                it["cpu_model"] = model
             if j.get("env"):
                 it["env"] = dict(j["env"])
             if j.get("timing") or env("TIMING") not in ("", "0"):
@@ -3177,6 +3188,8 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
     small = len(items) <= TINY[0] or slot_s < TINY[1] * 60
     # (with the scheduler, a tiny batch goes to boat too, as an interactive check: Modal only after boat fails 3 times)
     sched_on = __import__("supercomputer.scheduler", fromlist=["enabled"]).enabled()
+    if any("cpu_model" in it for it in items) and not sched_on:
+        raise Unavailable("cpu_model requires the scheduler; refusing the legacy unconstrained path")
     tiny = on_lost is not None and small and not sched_on
     try:
         remote = bool(getattr(__import__("supercomputer.scheduler", fromlist=["controller"]), "controller")())

@@ -128,6 +128,7 @@ def _env(k: str, d):
 
 
 # The policy's knobs (README, "Scheduling policy"); $SUPERCOMPUTER_<KNOB> overrides each.
+CPU_MODEL_MAX_FRUITLESS = int(_env("CPU_MODEL_MAX_FRUITLESS", 12))  # load guard per image/type/model, not money
 BRINGUP_MAX = _env("BRINGUP", 12)  # VMs being brought up at once (the scheduler's own load guard); the rest wait their turn
 GATE_HORIZON = _env("GATE_HORIZON", 900.0)  # a gate gets the VMs that finish it within this (its items' last times)
 MAX_VMS = int(os.environ.get("SUPERCOMPUTER_MAX_VMS") or 0) or 10 ** 9  # none by default (the user: "no limit"); set, a technical ceiling
@@ -169,7 +170,7 @@ def policy_defaults() -> dict:
             "ttl_s": boat.BACKSTOP, "bringup": BRINGUP_MAX, "sub_vms": SUB_VMS, "sub_preempt_s": SUB_PREEMPT, "boat_tries": BOAT_TRIES, "classes": list(CLASSES),
             "drain_step": DRAIN_STEP, "drain_every_s": DRAIN_EVERY, "floor_always": bool(FLOOR_ALWAYS),
             "floor_default": FLOOR_DEFAULT, "floor_idle_s": FLOOR_IDLE, "floor_by_image": dict(FLOOR_BY_IMAGE),
-            "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400}
+            "cpu_model_max_fruitless": CPU_MODEL_MAX_FRUITLESS, "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400}
 
 
 def read_policy() -> dict:
@@ -197,6 +198,8 @@ def write_policy(changes: dict) -> dict:
     rules.break_even_s(float(p["hold_s"]), float(p["start_dollars"]), float(p["vm_hour_dollars"]))
     if p["blob_cache_bytes"] < 0 or p["blob_cache_grace_s"] < 60 or p["blob_cache_max_age_s"] < p["blob_cache_grace_s"]:
         raise SystemExit("blob cache requires bytes >= 0, grace >= 60s, and max age >= grace")
+    if p["cpu_model_max_fruitless"] < 1:
+        raise ValueError("cpu_model_max_fruitless must be positive")
     p["generation"] = pol.generation
     p["t"] = round(time.time(), 1)
     POLICY.parent.mkdir(parents=True, exist_ok=True)
@@ -426,13 +429,13 @@ def mem_fits(it, vm_type: str) -> bool:
 def fit_shape(it) -> tuple:
     """All a VM's fit for the item reads (rules.vm_fits): its image, class, timing, weight, VM type, avoid set, memory.
     Items of one shape fit the same VMs: a pass's memo, preemption's and health's waste group by it."""
-    return (it.batch.image, it.batch.klass, it.timing, it.weight, it.spec.get("vm_type") or "", frozenset(it.avoid) if it.avoid else None, getattr(it, "memory", 0))
+    return (it.batch.image, it.batch.klass, it.timing, it.weight, it.spec.get("vm_type") or "", frozenset(it.avoid) if it.avoid else None, getattr(it, "memory", 0), it.spec.get("cpu_model", ""))
 
 
 def vm_fits(shape: tuple, vm, retired: set) -> bool:
     """rules.vm_fits for an item of `shape` on the VM: the one test of placement, preemption and waste."""
-    image, _k, _t, _w, vtype, avoid, mem = shape
-    return rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
+    image, _k, _t, _w, vtype, avoid, mem, model = shape
+    return rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
                          bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
 
 
@@ -536,6 +539,7 @@ class Scheduler:
         from . import agent as agent_mod
         self.agent_version = agent_mod.VERSION
         # the circuit breaker, the watchdog, the plan, the day's metrics (all kept across restarts)
+        self.cpu_constraints = self._constraints_load()
         self.starts_log: list[dict] = []  # {t, vm, ok (None while coming up)}
         self.br = {"open_until": 0.0, "backoff": BREAK_BACKOFF, "half": False, "t_trip": 0.0, "reason": "", "trips": 0}
         self.shed = False
@@ -600,6 +604,7 @@ class Scheduler:
 
     def _metrics_save(self):
         self._h().save()
+        self.m["constraints"] = self._constraint_status()
         with contextlib.suppress(Exception):
             p = DIR / "metrics" / f"{self.m['day']}.json"
             tmp = p.with_suffix(".tmp")
@@ -843,6 +848,7 @@ class Scheduler:
             vm.t_real = float(i.get("t_real") or hb.get("t_real") or now)
             vm.draining = bool(i.get("draining", hb.get("draining", False)))
             vm.gen, vm.agent, vm.t_agent = int(i.get("gen", 0)), i.get("agent", ""), 0.0
+            vm.model = i.get("model", "")
             vm.ready, vm.t_ready, vm.idle_since = True, now, now
             if snap:  # (a handoff: its items exactly as the old one held them there, no record older than that)
                 for x in i.get("items", []):
@@ -1047,7 +1053,7 @@ class Scheduler:
             if (v.dead or not v.ready) and not self._handoff_vm_occupied(v):
                 continue
             vms.append({"id": v.id, "image": v.image, "type": v.type, "slots": v.slots, "prepared": sorted(v.prepared), "trees": sorted(v.trees),
-                        "caches": sorted([list(c) for c in v.caches]), "lease": v.lease, "ttl": v.ttl, "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
+                        "model": v.model, "caches": sorted([list(c) for c in v.caches]), "lease": v.lease, "ttl": v.ttl, "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
                         "items": [{"batch": it.batch.id, "name": it.name, "run_name": it.run_name,
                                    "state": "running" if it.state == "finishing" else it.state,
                                    "placement": it.last_placement, "launch_identity": it.launch_identity, "placed": it.placed}
@@ -1206,7 +1212,7 @@ class Scheduler:
                 r = cl.rpc("vtick", {"wait": 0}, timeout=30)
                 ticked = True
                 vm.slots = max(1, int(r.get("cpus") or boat.TYPES[vm.type][0]) // boat.SLOT_CPU)
-                vm.model = r.get("model", "")
+                self._model_report(vm, r.get("model", ""))
                 running = {(x["batch"], x["name"]) for x in r.get("running", [])}
                 finished = {(x["batch"], x["name"]) for x in r.get("done", []) if not x.get("preempted")}  # (a preempted row: nothing to take back; B5)
             with self.lock:
@@ -1271,6 +1277,11 @@ class Scheduler:
             if not isinstance(spec, dict):
                 raise ValueError("item must be an object")
             name = spec.get("name")
+            if "cpu_model" in spec:
+                if not isinstance(spec["cpu_model"], str) or not spec["cpu_model"].strip():
+                    raise ValueError("cpu_model must be a nonblank exact model string")
+                if not (spec.get("vm_type") or (msg.get("vm_type_named") and msg.get("vm_type"))):
+                    raise ValueError("cpu_model requires an explicit vm_type")
             if enhanced:
                 cls._valid_batch(name)
             if "launch_identity" in spec or "strict_once" in spec:
@@ -1336,6 +1347,7 @@ class Scheduler:
     def capabilities():
         return {"scope": "isolated-proposed", "runtime_verified": False,
                 "submit_flags": ["strict_once", "retain_journals"],
+                "item_constraints": ["cpu_model"], "cpu_model_exact": True,
                 "retention_requires_strict_once": True,
                 "paths": ["/cancel", "/snapshot", "/capabilities"],
                 "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
@@ -1692,9 +1704,10 @@ class Scheduler:
             items = sum(self.m["placed"].values())
             return {"pid": os.getpid(), "batches": [{"id": b.id, "class": NAMES[b.klass], "client": b.client, "left": b.left(),
                                                      "running": sum(1 for it in b.items.values() if it.state in ("starting", "running"))} for b in self.batches.values()],
-                    "vms": [{"id": v.id, "image": v.image, "type": v.type, "ready": v.ready, "used": v.used(), "slots": v.slots, "draining": v.draining, "real_ago": round(now - v.t_real), "gen": v.gen, "agent": v.agent,
+                    "vms": [{"id": v.id, "image": v.image, "type": v.type, "ready": v.ready, "model": v.model, "used": v.used(), "slots": v.slots, "draining": v.draining, "real_ago": round(now - v.t_real), "gen": v.gen, "agent": v.agent,
                              "classes": sorted({NAMES[it.batch.klass] for it in v.running.values()}), "foreign": getattr(v, "foreign", 0),
                              "runs": [{"batch": it.batch.id, "name": it.run_name, "class": NAMES[it.batch.klass]} for it in v.running.values()]} for v in live],
+                    "constraints": self._constraint_status(),
                     "classes": per,
                     "pool": {"vms": len(live), "ready": sum(1 for v in live if v.ready), "coming": sum(self.creating.values()) + sum(1 for v in live if not v.ready),
                              "target": {k: v for k, v in self.target.items()}, "max": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": {img: self.floor(img) for img in {v.image for v in live}}},
@@ -1986,11 +1999,13 @@ class Scheduler:
                         self._boat_failed(it, None, f"no boat VM ready within {int(b.max_wait)} s, a start of {b.image} failed in it", strike)
             # 4. capacity: the plan (demand-driven), within the bring-up cap, the breaker and the watchdog
             want = self._plan(now)
-        for (image, vm_type), (n, k, b, allow) in want.items():
+        for key, (n, k, b, allow) in want.items():
+            image, vm_type = key[:2]
+            constraint = key[2] if len(key) > 2 else ""
             if n > 0 and time.time() > self.backoff.get(image, 0) and image not in self.asking:
                 # (boat's API off the loop: a slow `limits` never holds up placing or preempting)
                 self.asking.add(image)
-                threading.Thread(target=self._ask, args=(image, vm_type, n, k, b, allow), daemon=True).start()
+                threading.Thread(target=self._ask, args=(image, vm_type, n, k, b, allow, constraint), daemon=True).start()
         self._release_idle()
 
     def retired(self) -> set:
@@ -2040,6 +2055,10 @@ class Scheduler:
         if it.batch.strict_once and it.owned.placements:
             self._owned_failed(it, "strict_once: prior placement cannot be replaced")
             return False
+        if not rules.cpu_matches(it.spec.get("cpu_model", ""), vm.model):
+            return False
+        if it.spec.get("cpu_model"):
+            self._constraint(it.batch.image, vm.type, it.spec["cpu_model"])
         if not it.fate.place(vm.id, vm.dead or not vm.ready or getattr(vm, "stopped", False)):
             if it.fate.state != "queued" and it.state == "queued" and not getattr(it, "_fate_alerted", False):
                 it._fate_alerted = True  # (every move of an item's state moves its fate too: this is a bug to report)
@@ -2051,7 +2070,7 @@ class Scheduler:
         it.start_done.clear()
         it.last_placement = {"name": it.name,
             "run_name": it.name if not getattr(it, "placed", 0) else f"{it.name}~s{it.placed + 1}",
-            "vm": vm.id, "image": vm.image, "type": vm.type,
+            "vm": vm.id, "image": vm.image, "type": vm.type, "cpu": vm.model,
             "identity": it.launch_identity, "t": time.time()}
         # Write-ahead admission: never launch on failure to persist the placement.
         try:
@@ -2527,7 +2546,7 @@ class Scheduler:
         out = {}
         groups: dict = {}
         for it in self._pass_queue():
-            groups.setdefault((it.batch.image, it.spec.get("vm_type") or getattr(it, "need_type", None) or it.batch.vm_type), []).append(it)
+            groups.setdefault((it.batch.image, it.spec.get("vm_type") or getattr(it, "need_type", None) or it.batch.vm_type, it.spec.get("cpu_model", "")), []).append(it)
         if rules.plan_waits(getattr(self, "reattaching", False), time.time() - getattr(self, "t_reattach", 0.0), bool(getattr(self, "_handoff", {}).get("taken")), 15.0):
             return {}
         live = [v for v in self.vms.values() if not v.dead]
@@ -2538,12 +2557,26 @@ class Scheduler:
         pool.open_until, pool.half = float(self.br["open_until"]), bool(self.br["half"])
         pool.probing = pool.half and any(s["ok"] is None for s in self.starts_log if s["t"] > self.br["t_trip"])
         self.target = {}
-        for (image, vm_type), its in groups.items():
+        for (image, vm_type, model), its in groups.items():
             # A worker can wait one full scheduling pass after becoming ready.
             S, bu = vm_slots(vm_type), max(30.0, self.bring_up) + FULL_S
             B = BREAK_EVEN_OVERRIDE_S or rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS, vm_mult(vm_type))
-            held = [v for v in live if v.image == image and v.type == vm_type]
+            held = [v for v in live if v.image == image and v.type == vm_type and rules.cpu_matches(model, v.model)]
             coming = self.creating.get((image, vm_type), 0)
+            if model:
+                draw = self._constraint(image, vm_type, model)
+                pending = self._constraint_pending(draw)
+                unresolved = sum(not v.ready and getattr(v, "cpu_constraint", "") == model
+                                 and v.image == image and v.type == vm_type for v in live)
+                coming += max(pending, unresolved)
+                limit = int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS))
+                if draw["fruitless"] >= limit and not coming:
+                    for it in its:
+                        if not any(vm_fits(fit_shape(it), v, self.retired()) for v in held):
+                            self._constraint_refused(it, draw)
+                    its = [it for it in its if it.state == "queued"]
+                    if not its:
+                        continue
             real = [it for it in its if it.batch.klass <= 4]
             if not real:
                 continue
@@ -2724,17 +2757,107 @@ class Scheduler:
                             log(f"growth held at the ceiling of {MAX_VMS} VMs ({n} wanted)")
                         tgt["why"] = "max VMs" if at_max else "bring-up cap"
                     n = got
-            self.target[f"{image}/{vm_type}"] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
+            if model:
+                n = rules.cpu_draws(n, draw["fruitless"], coming, limit)
+                tgt["cpu_model"] = model
+                tgt["fruitless"] = draw["fruitless"]
+            self.target[f"{image}/{vm_type}" + (f"/{model}" if model else "")] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
             if n <= 0:
                 continue
             first = min(real, key=lambda it: (it.batch.klass, it.batch.t0)).batch
-            out[(image, vm_type)] = (n, first.klass, first, not first.warm_only)
+            out[(image, vm_type, model) if model else (image, vm_type)] = (n, first.klass, first, not first.warm_only)
         return out
 
+    # -- CPU constraints: additive durable state; old handoff readers ignore it.
+    @staticmethod
+    def _constraints_load():
+        path = DIR / "cpu-constraints.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def _constraints_save(self):
+        path = DIR / "cpu-constraints.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.cpu_constraints))
+        tmp.replace(path)
+
+    def _constraint(self, image, vm_type, model):
+        if not hasattr(self, "cpu_constraints"):
+            self.cpu_constraints = {}
+        key = json.dumps([image, vm_type, model])
+        return self.cpu_constraints.setdefault(key, {"image": image, "vm_type": vm_type, "cpu_model": model,
+                                                    "fruitless": 0, "draws": [], "observed": {}})
+
+    def _constraint_result(self, vm_id, model):
+        changed = False
+        for c in getattr(self, "cpu_constraints", {}).values():
+            for d in c["draws"]:
+                if d["vm"] == vm_id and not d["done"]:
+                    d.update(model=model, done=True)
+                    c["observed"][vm_id] = model
+                    # Arrival order, not provider listing order, defines consecutive draws.
+                    c["fruitless"] = rules.cpu_streak(c["fruitless"], model == c["cpu_model"])
+                    changed = True
+        if changed:
+            self._constraints_save()
+
+    def _constraint_pending(self, c):
+        for d in c["draws"]:
+            if not d["done"] and time.time() - d["t"] > BREAK_READY:
+                self._constraint_result(d["vm"], "")
+        return sum(not d["done"] for d in c["draws"])
+
+    def _model_report(self, vm, model):
+        if not isinstance(model, str) or not model.strip():
+            return
+        with self.lock:
+            vm.model = model
+            for it in list(vm.running.values()) + list(vm.finishing.values()):
+                if it.last_placement and not it.last_placement.get("cpu"):
+                    it.last_placement["cpu"] = model
+            changed = False
+            for c in getattr(self, "cpu_constraints", {}).values():
+                if c["image"] == vm.image and c["vm_type"] == vm.type and c["observed"].get(vm.id) != model:
+                    c["observed"][vm.id] = model
+                    changed = True
+            self._constraint_result(vm.id, model)
+            if changed:
+                self._constraints_save()
+
+    def _constraint_status(self):
+        out = []
+        for c in getattr(self, "cpu_constraints", {}).values():
+            models = {}
+            for d in c["draws"]:
+                label = d["model"] or ("unknown" if d["done"] else "pending")
+                models[label] = models.get(label, 0) + 1
+            out.append({**c, "models": models,
+                        "limit": int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS)),
+                        "matching_vms": [v.id for v in self.vms.values() if v.ready and not v.dead and v.image == c["image"]
+                                         and v.type == c["vm_type"] and v.model == c["cpu_model"]],
+                        "waiting_items": sum(it.state == "queued" and b.image == c["image"]
+                                             and it.spec.get("vm_type") == c["vm_type"] and it.spec.get("cpu_model") == c["cpu_model"]
+                                             for b in self.batches.values() for it in b.items.values())})
+        return out
+
+    def _constraint_refused(self, it, c):
+        if it.state != "queued":
+            return
+        row = {"name": it.name, "code": -1, "seconds": -1, "unplaceable_by_constraint": True,
+               "error": "unplaceable-by-constraint: consecutive fruitless CPU draws exhausted",
+               "constraint": next(x for x in self._constraint_status() if x["image"] == c["image"]
+                                  and x["vm_type"] == c["vm_type"] and x["cpu_model"] == c["cpu_model"])}
+        if it.batch.strict_once:
+            self._deliver_owned(it.batch, row)
+        else:
+            it.batch.deliver(row)
+        it.state = "done"
+        it.fate.delivered()
+
     # -- VMs
-    def _ask(self, image, vm_type, n, k, b, allow):
+    def _ask(self, image, vm_type, n, k, b, allow, model=""):
         try:
-            if not self._acquire(image, vm_type, n, k, b, allow):
+            if not self._acquire(image, vm_type, n, k, b, allow, model):
                 self.backoff[image] = time.time() + 15  # (nothing to be had now: ask boat again in a while, not every loop)
         except Exception as e:
             log(f"acquire: {str(e)[:200]}")
@@ -2743,7 +2866,7 @@ class Scheduler:
             self.asking.discard(image)
             self.wake.set()
 
-    def _acquire(self, image: str, vm_type: str, n: int, k: int, b: Batch, allow: bool = True) -> int:
+    def _acquire(self, image: str, vm_type: str, n: int, k: int, b: Batch, allow: bool = True, model: str = "") -> int:
         """n VMs: warm free ones of the pool first (no start), then resumed or created, free starts before paid ones
         (every class may pay: the user, 10-31, a paid start and prepaid VM-hours beat Modal past about 2 minutes of
         work), paced by the StartGate (a sixth of what's left a minute, boat's minute limit), each with its warm
@@ -2755,11 +2878,12 @@ class Scheduler:
             starts = 0
         budget = min(starts, boat.budget(starts))
         mine = []
+        observed = self._constraint(image, vm_type, model)["observed"] if model else {}
         with Registry().locked() as d:
             with contextlib.suppress(Exception):
                 boat.reconcile(d, boat.sandboxes())
             now = time.time()
-            free = [i for i, v in d["vms"].items() if v["snapshot"] == image and v["type"] == vm_type and boat.lease_free(v) and i not in self.vms and i not in self.retired()]
+            free = [i for i, v in d["vms"].items() if v["snapshot"] == image and v["type"] == vm_type and boat.lease_free(v) and i not in self.vms and i not in self.retired() and (not model or i not in observed or observed[i] == model)]
             up = [i for i in free if d["vms"][i].get("state") in boat.RUNNING and d["vms"][i].get("until", 0) > now + boat.WARM_MARGIN]
             stopped = [i for i in free if i not in up and d["vms"][i].get("state") == "stopped"]
             acq = rules.Acquire()  # (rules.Acquire: warm ones first, then resumes and creations within the budget)
@@ -2771,29 +2895,33 @@ class Scheduler:
                 mine.append((i, i in up))
         create = acq.creates
         for i, warm in mine:
-            self._bring(i, image, vm_type, "warm" if warm else "resumed", k, b)
+            self._bring(i, image, vm_type, "warm" if warm else "resumed", k, b, model=model)
         if create > 0:
             with self.lock:
                 self.creating[(image, vm_type)] = self.creating.get((image, vm_type), 0) + create
-            threading.Thread(target=self._create, args=(image, vm_type, create, k, b), daemon=True).start()
+            threading.Thread(target=self._create, args=(image, vm_type, create, k, b, model), daemon=True).start()
         return len(mine) + max(0, create)
 
-    def _bring(self, i: str, image: str, vm_type: str, how: str, k: int, b: Batch, lease: dict | None = None, nonce: str = ""):
+    def _bring(self, i: str, image: str, vm_type: str, how: str, k: int, b: Batch, lease: dict | None = None, nonce: str = "", model: str = ""):
         vm = VMState(i, image, vm_type, how)
         vm.lease, vm.birth_nonce = lease or {}, nonce
+        vm.cpu_constraint = model
         with self.lock:
             if i in self.vms:  # (a VM is brought up once at a time: a second bring-up would replace its agent's token)
                 return
             self.vms[i] = vm
         threading.Thread(target=self._up, args=(vm, k, b), daemon=True).start()
 
-    def _count_start(self, k: int, b: Batch, got: int, paid: int, ids: list[str], vm_type: str = ""):
+    def _count_start(self, k: int, b: Batch, got: int, paid: int, ids: list[str], vm_type: str = "", model: str = ""):
         with self.lock:
             n = NAMES[k]
             self.m["starts"][n]["paid"] += paid
             self.m["starts"][n]["free"] += got - paid
             b.starts += got
             for i in ids:
+                if model:
+                    self._constraint(b.image, vm_type, model)["draws"].append({"vm": i, "t": time.time(), "model": None, "done": False})
+                    self._constraints_save()
                 self.starts_log.append({"t": time.time(), "vm": i, "ok": None, "image": b.image})
                 self._h().record_start(time.time(), b.image, i, vm_type or (self.vms[i].type if i in self.vms else ""))
             self.starts_log = [s for s in self.starts_log if time.time() - s["t"] < 2 * BREAK_WINDOW]
@@ -2805,6 +2933,7 @@ class Scheduler:
 
     def _start_done(self, vm_id: str, ok: bool):
         with self.lock:
+            self._constraint_result(vm_id, self.vms[vm_id].model if vm_id in self.vms and ok else "")
             for s in self.starts_log:
                 if s["vm"] == vm_id and s["ok"] is None:
                     s["ok"] = ok
@@ -2825,7 +2954,7 @@ class Scheduler:
                     vm.dead = True
                     log(f"{vm.id}: boat no longer has it; replanning on fresh capacity")
                     return
-                self._count_start(k, b, 1, paid, [vm.id])
+                self._count_start(k, b, 1, paid, [vm.id], vm.type, getattr(vm, "cpu_constraint", ""))
                 started = True
                 if "rate_limited" in out:
                     boat.note_starts(-1)
@@ -2886,8 +3015,12 @@ class Scheduler:
                 self._drop_stale(vm)
                 return
             vm.slots = max(1, int(r.get("cpus") or boat.TYPES[vm.type][0]) // boat.SLOT_CPU)
-            vm.model = r.get("model", "")
+            self._model_report(vm, r.get("model", ""))
             self._foreign(vm, r)  # (inventory before advertising this worker as usable)
+            if getattr(vm, "cpu_constraint", ""):
+                with self.lock:
+                    self._constraint(vm.image, vm.type, vm.cpu_constraint)["observed"][vm.id] = vm.model
+                    self._constraints_save()
             vm.ready = True
             vm.t_ready = vm.idle_since = vm.t_real = time.time()
             if vm.id in self.held_before:
@@ -2911,7 +3044,7 @@ class Scheduler:
         finally:
             self.wake.set()
 
-    def _create(self, image: str, vm_type: str, n: int, k: int, b: Batch):
+    def _create(self, image: str, vm_type: str, n: int, k: int, b: Batch, model: str = ""):
         try:
             got, paid = self.gate.take_split(n, self.stop)
             if got <= 0:
@@ -2933,13 +3066,13 @@ class Scheduler:
                 boat.note_starts(-(got - len(ids)))
                 if not ids:
                     self.alert(f"boat new --from {image} made no VM ({out.strip()[-200:]})")
-            self._count_start(k, b, len(ids), min(paid, len(ids)), ids, vm_type)
+            self._count_start(k, b, len(ids), min(paid, len(ids)), ids, vm_type, model)
             with Registry().locked() as d:
                 for i in ids:
                     d["vms"][i] = {"type": vm_type, "snapshot": image, "created": time.time(), "last_used": time.time(), "state": "starting",
                                    "lease": {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": time.time(), "label": f"scheduler ({NAMES[k]})"}}
             for i in ids:
-                self._bring(i, image, vm_type, "created", k, b, nonce=nonce)
+                self._bring(i, image, vm_type, "created", k, b, nonce=nonce, model=model)
         finally:
             with self.lock:
                 self.creating[(image, vm_type)] = max(0, self.creating.get((image, vm_type), 0) - n)
@@ -3176,6 +3309,7 @@ class Scheduler:
                         it.fate.requeued()
             self.wake.set()
             return 0.5
+        self._model_report(vm, r.get("model", ""))
         self._disk(vm, r.get("disk") or {})
         self._foreign(vm, r)
         for row in r.get("done", []):
@@ -3357,7 +3491,7 @@ class Scheduler:
                     self._learn(it, float(row["seconds"]))
                     b.obs_s, b.obs_est, b.obs_n = getattr(b, "obs_s", 0.0) + float(row["seconds"]), getattr(b, "obs_est", 0.0) + it.est, getattr(b, "obs_n", 0) + 1
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
-                        "placement": {"vm": vm.id, "type": vm.type, "cpu": vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
+                        "placement": {"vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
         self.wake.set()
         if it.state != "finishing":
@@ -3413,7 +3547,7 @@ class Scheduler:
                 self._owned_failed(it, "strict_once: preempted or lost placement")
             else:
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
-                        "placement": {"vm": vm.id, "type": vm.type, "cpu": vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
+                        "placement": {"vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
                 # Journal before releasing the placement, and under the same lock
                 # as cancellation. Never expose a done-without-row window.
@@ -3726,7 +3860,7 @@ class Scheduler:
         out: dict = {}
         by_id = {v.id: v for v in live}
         for shape, n in sorted(groups.items(), key=lambda g: g[0][1]):
-            image, k, timing, weight, vtype, avoid, mem = shape
+            image, k, timing, weight, vtype, avoid, mem, model = shape
             for vid, c in cap.items():
                 if n <= 0:
                     break
@@ -4775,9 +4909,14 @@ def write_private(path: pathlib.Path, obj: dict):
 _remote_ok: dict = {}
 
 
+def controller_configured() -> bool:
+    """Even unreadable controller configuration prevents an implicit local owner."""
+    return (config.LIVE / "controller.json").exists() or os.environ.get("SUPERCOMPUTER_CONTROLLER") == "1" or bool(controller())
+
+
 def controller() -> dict | None:
-    """The controller on boat (LIVE/controller.json with its URL and token), if one is set up and not turned off."""
-    if os.environ.get("SUPERCOMPUTER_CONTROLLER", "0") in ("0", ""):  # (off by default: this machine's scheduler owns the pool)
+    """A configured controller is the default; only explicit LOCAL=1 opts out."""
+    if os.environ.get("SUPERCOMPUTER_LOCAL") == "1":
         return None
     with contextlib.suppress(Exception):
         c = json.loads((config.LIVE / "controller.json").read_text())
@@ -4789,12 +4928,11 @@ def controller() -> dict | None:
 def connect() -> "Client":
     """The scheduler a batch goes to: the controller on boat when it answers (checked once a process), else this
     machine's, started if need be. A configured controller never silently falls
-    back; SUPERCOMPUTER_CONTROLLER_FALLBACK=1 is the explicit local opt-in."""
+    back; SUPERCOMPUTER_LOCAL=1 is the only explicit local opt-in."""
     r = _remote()
     if r:
         return r
-    if ((controller() or os.environ.get("SUPERCOMPUTER_CONTROLLER") == "1")
-            and os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK", "0") in ("0", "")):
+    if not rules.local_start_allowed(controller_configured(), os.environ.get("SUPERCOMPUTER_LOCAL") == "1"):
         raise SystemExit("the controller on boat doesn't answer: configured controller unavailable; not starting this machine's scheduler beside it")
     return ensure_running()
 
@@ -4812,8 +4950,6 @@ def _remote() -> "Client | None":
             cl.keep()
         except Exception as e:
             _remote_ok.pop("ok", None)  # a transient handoff is not a sticky fallback decision
-            if os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK") == "1":
-                return None  # deliberate opt-in, never a consequence of an update
             raise RuntimeError(f"configured controller unavailable; no local fallback ({str(e)[:120]})") from e
     return _remote_ok["ok"]
 
@@ -4840,8 +4976,7 @@ def current() -> "Client | None":
 
 def ensure_running() -> Client:
     """The scheduler, started (detached, its log in LIVE/scheduler/log) if no client started it yet."""
-    if ((controller() or os.environ.get("SUPERCOMPUTER_CONTROLLER") == "1")
-            and os.environ.get("SUPERCOMPUTER_CONTROLLER_FALLBACK") != "1"):
+    if not rules.local_start_allowed(controller_configured(), os.environ.get("SUPERCOMPUTER_LOCAL") == "1"):
         remote = _remote()
         if remote is None:
             raise RuntimeError("configured controller unavailable; refusing local scheduler startup")
