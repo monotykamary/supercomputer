@@ -17,6 +17,18 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `Scheduler._constraint*`, `_model_report` | rule + I/O | dispatch to CPU eligibility/draw/streak rules; persist atomic draw observations, decode agent models, backfill receipts and format status/refusal diagnostics. No provider placement/stop decision. |
 | `controller_configured`, `controller`, `prepare_snapshot` | I/O + rule | inspect local configuration and exact candidate capabilities; startup/recovery and handoff eligibility use the rules above. |
 
+## Durable cross-batch distinct VM groups
+
+| def | where | laws, or why |
+| --- | --- | --- |
+| `rules.affinity.durable_vm_allowed` | rule | placement requires an active lifetime, the admission's exact generation, and a VM not previously used by the group; all three broken omissions are refuted. |
+| `durable_groups.DurableGroups` | I/O + rule | copy-on-write registry, fsync before publication, UUID generation binding, idempotent close with immutable deadline, and write-ahead reservation call the eligibility rule; uncertain writes poison the store until restart. No pool holds or floor changes. |
+| `Scheduler._groups`, `_bind_durable`, `_attach_durable`, `group_open`, `group_get`, `group_close` | I/O | placement-lock serialized metadata API and fsynced admission generations; validate pins on cold recovery. |
+| `statebackup.capture` | I/O | pins the immutable registry inode under the same placement guard as admission/journal inodes; an export cannot mix registry and admission generations. |
+| `Scheduler._durable_snapshot`, `_take_pool`, `_handoff_snapshot`, `handoff` | I/O + rule | exact registry equality, including history with no open batches and close deadlines, checked in snapshot and ACK; durable-incapable successors refused before freeze. |
+| `distinct_key`, `distinct_live`, `distinct_used`, `fit_shape`, `_place_locked`, `_plan`, `_buy` | rule wiring | durable scope uses the shared registry for every exclusion check and reserves before worker launch; absent scope preserves batch keys and history. |
+| `boat._validate_durable_item`, `_require_durable_capability`, `distinct_group`, `distinct_groups_main` | validation / I/O | opt-in fields survive hooks; capability gated before upload; JSON metadata API never starts a local scheduler. |
+
 ## blobcache.py
 
 | def | where | laws, or why |

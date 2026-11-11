@@ -1,5 +1,49 @@
 # Multi-client scheduling
 
+## Durable distinct-VM groups
+
+Durable groups work across batches and clients connected to **one scheduler/controller**. They do not provide
+a registry shared between independent schedulers. This implemented opt-in facility is separate from the
+multi-scheduler design sketch below.
+
+A job uses `distinct_vm_group:"experiment/replicates"` plus `distinct_vm_group_scope:"durable"`. An optional
+nonblank `distinct_vm_group_generation` pins an epoch. Without scope, group behavior remains batch-scoped.
+The client preserves these fields through job hooks and submission retries, and checks
+`distinct_vm_group_scope:"durable"` plus `durable_distinct_vm_group_protocol:1` before any tree upload or
+submission. A legacy controller is refused, not silently downgraded. Durable jobs have no Modal fallback.
+
+### Lifecycle
+
+1. `python3 -m supercomputer.boat distinct-groups open GROUP` returns the current unexpired generation,
+   creating one if needed. A first unpinned admission can also create it. Save the returned generation when
+   coordinating multiple producers: put it in each job's `distinct_vm_group_generation` to fail closed if an
+   experiment epoch changes before that producer submits.
+2. `python3 -m supercomputer.boat distinct-groups get GROUP` reads the record without creating it. Replies
+   include `group`, `generation`, `closed_at`, `expires_at`, `used` (VM IDs mapped to placement receipts), and
+   `active`. Active is evaluated against the current time, not a frozen snapshot. Unknown groups return
+   `{ "ok": false, "error": "no such durable group" }`.
+3. After coordinating producers, run
+   `python3 -m supercomputer.boat distinct-groups close GROUP --generation GENERATION --ttl-s 3600`.
+   Only explicit close starts expiry; an open group lasts indefinitely. TTL must be finite and nonnegative.
+   The same generation and exact same TTL may be closed repeatedly without moving the deadline. A different
+   TTL is refused; an old generation cannot close a new one.
+4. During close's grace period, new members may still be admitted and all memberships keep constraining
+   placement until `expires_at`. Completed members continue to exclude their VMs. After expiry, a new open
+   or unpinned submission creates a fresh epoch. Expired/mismatched pinned requests are refused, and old
+   queued work never silently rebinds to a new epoch. Use a new epoch deliberately, not as a retry workaround.
+
+The lifecycle CLI uses an already running scheduler; it never starts a local daemon as a fallback. The RPCs
+are `/distinct-groups/open {group}`, `/distinct-groups/get {group}`, and
+`/distinct-groups/close {group,generation,ttl_s}`. Responses are printed as JSON, including server refusals
+(the CLI exits nonzero on refusal).
+
+Admission persists its bound generation, so restarts and handoffs retain identity and placement history.
+These generations name experiment epochs; they are **not** VM agent boot/epoch lease fencing numbers.
+The registry reserves no VM capacity: VMs still run work, release, and stop under ordinary policy. Keeping an
+open group or a long TTL is not permission to park idle compute.
+
+## Multi-scheduler design (historical sketch)
+
 A design, not yet built: how several machines (the Mac, a boat sandbox, the controller VM) each run `supercomputer`
 against one boat.dev account without taking each other's VMs or spending each other's starts. The short version:
 a VM's own agent grants it to one owner at a time, with a fencing number, and everything else the schedulers share

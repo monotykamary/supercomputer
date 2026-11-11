@@ -57,6 +57,21 @@ class StateFiles(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(entry.fd)
 
+    def test_durable_registry_and_admissions_are_pinned_at_the_same_boundary(self):
+        registry = self.live / 'scheduler/durable-groups.json'
+        registry.write_text('{"epoch":"old"}')
+        (self.q / 'batch.json').write_text('{"epoch":"old"}')
+        @contextlib.contextmanager
+        def guard():
+            tmp = registry.with_suffix('.tmp')
+            tmp.write_text('{"epoch":"new"}')
+            tmp.replace(registry)
+            (self.q / 'batch.json').write_text('{"epoch":"new"}')
+            yield
+        got = unpack(B.build(self.live, self.tm, guard))
+        self.assertEqual(got['live/scheduler/durable-groups.json'], got['live/scheduler/queue/batch.json'])
+        self.assertEqual(got['live/scheduler/durable-groups.json'], b'{"epoch":"new"}')
+
     def test_torn_external_append_is_not_exported(self):
         (self.q / "batch.json").write_text("{}")
         (self.q / "batch.rows").write_bytes(b'{"ok":1}\n{"half":')

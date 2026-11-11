@@ -50,6 +50,7 @@ import time
 import urllib.request
 
 from . import blobcache, boat, canary, config, health, rules, statebackup
+from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
 from .rules.owned_lifecycle import OwnedLifecycle, retention_supported
 
@@ -260,7 +261,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
     capabilities = json.loads(result.stdout.strip().splitlines()[-1])
     return {"python": sys.executable, "cache_tag": sys.implementation.cache_tag,
             "cpu_model_exact": capabilities.get("cpu_model_exact") is True,
-            "distinct_vm_group": capabilities.get("distinct_vm_group") is True and capabilities.get("distinct_vm_group_protocol") == 1}
+            "distinct_vm_group": capabilities.get("distinct_vm_group") is True and capabilities.get("distinct_vm_group_protocol") == 1,
+            "durable_distinct_vm_group": capabilities.get("distinct_vm_group_scope") == "durable" and capabilities.get("durable_distinct_vm_group_protocol") == 1}
 
 
 def stage_install() -> dict:
@@ -437,17 +439,54 @@ def mem_fits(it, vm_type: str) -> bool:
     return boat.R.fits_memory(getattr(it, "memory", 0), boat.TYPES.get(vm_type, (0, 1 << 30))[1], boat.MEM_OVERHEAD)
 
 
+def durable_item(it):
+    return it.spec.get("distinct_vm_group_scope") == "durable"
+
+
+def distinct_key(it):
+    name = it.spec.get("distinct_vm_group")
+    if not name:
+        return None
+    if durable_item(it):
+        return (("durable", name, it.spec.get("distinct_vm_group_generation")), name)
+    return (it.batch.id, name)
+
+
+def distinct_live(it):
+    if not durable_item(it):
+        return True
+    registry = getattr(it.batch, "durable_registry", None)
+    return registry is not None and registry.allowed(it.spec["distinct_vm_group"],
+                it.spec.get("distinct_vm_group_generation"), "", time.time())
+
+
+def distinct_used(it):
+    if not durable_item(it):
+        return it.batch.distinct_vms.get(it.spec.get("distinct_vm_group", ""), ())
+    registry = getattr(it.batch, "durable_registry", None)
+    record = registry.load().get(it.spec["distinct_vm_group"]) if registry else None
+    return record["used"] if record and record["generation"] == it.spec.get("distinct_vm_group_generation") else ()
+
+def durable_receipt(it):
+    if not durable_item(it):
+        return {}
+    placement = it.last_placement or {}
+    return {"placement": {"distinct_vm_group": it.spec["distinct_vm_group"],
+            "distinct_vm_group_scope": "durable", "distinct_vm_group_generation": it.spec.get("distinct_vm_group_generation"),
+            "vm": placement.get("vm"), "boot_id": placement.get("boot_id"), "attempt": placement.get("attempt", 0)}}
+
 def fit_shape(it) -> tuple:
     """All a VM's fit for the item reads (rules.vm_fits): its image, class, timing, weight, VM type, avoid set, memory.
     Items of one shape fit the same VMs: a pass's memo, preemption's and health's waste group by it."""
     return (it.batch.image, it.batch.klass, it.timing, it.weight, it.spec.get("vm_type") or "", frozenset(it.avoid) if it.avoid else None, getattr(it, "memory", 0), it.spec.get("cpu_model", ""),
-            (it.batch.id, it.spec["distinct_vm_group"], frozenset(it.batch.distinct_vms.get(it.spec["distinct_vm_group"], ()))) if it.spec.get("distinct_vm_group") else None)
+            ((*distinct_key(it), frozenset(distinct_used(it)), distinct_live(it)) if durable_item(it) else
+             (it.batch.id, it.spec["distinct_vm_group"], frozenset(it.batch.distinct_vms.get(it.spec["distinct_vm_group"], ())))) if it.spec.get("distinct_vm_group") else None)
 
 
 def vm_fits(shape: tuple, vm, retired: set) -> bool:
     """rules.vm_fits for an item of `shape` on the VM: the one test of placement, preemption and waste."""
     image, _k, _t, _w, vtype, avoid, mem, model, distinct = shape
-    return rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
+    return (not distinct or len(distinct) != 4 or distinct[3]) and rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
                          bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
 
 
@@ -740,6 +779,7 @@ class Scheduler:
             b = None
             try:
                 b = Batch(json.loads(f.read_text()))
+                self._attach_durable(b)
                 if self._valid_batch(b.id) != f.stem:
                     raise ValueError("admission id does not match its file")
                 enhanced = b.strict_once or b.retain_journals or b.admission_closed or b.has_distinct
@@ -760,9 +800,17 @@ class Scheduler:
                         prior.owned.placements += 1
                         prior.launch_identity = pl.get("identity")
                         prior.last_placement = pl
+                        if durable_item(prior):
+                            record = b.durable_registry.load()[prior.spec["distinct_vm_group"]]
+                            if pl.get("distinct_vm_group_generation") != prior.spec["distinct_vm_group_generation"]:
+                                raise ValueError("durable placement generation mismatch")
+                            if record["generation"] == prior.spec["distinct_vm_group_generation"]:
+                                stored = record["used"].get(pl["vm"], {})
+                                if any(stored.get(k) != pl.get(k) for k in ("identity", "vm", "boot_id", "attempt", "distinct_vm_group", "distinct_vm_group_generation")):
+                                    raise ValueError("durable membership missing or mismatched")
                         b.vms_used.add(pl["vm"])
                         group = pl.get("distinct_vm_group") or prior.spec.get("distinct_vm_group")
-                        if group:
+                        if group and not durable_item(prior):
                             b.distinct_vms.setdefault(group, set()).add(pl["vm"])
                 for it in b.items.values():
                     if b.strict_once and it.owned.placements > 1:
@@ -839,6 +887,11 @@ class Scheduler:
         if not rules.distinct_history_matches(bool(expected_groups), self._distinct_snapshot() == expected_groups):
             self.recovery["ready"] = False
             self.recovery["distinct_vm_groups"] = "history mismatch"
+        durable = self._durable_snapshot()
+        if not rules.distinct_history_matches(bool(durable) or bool(snap.get("durable_distinct_vm_groups")),
+                                             durable == snap.get("durable_distinct_vm_groups", {}) if snap else True):
+            self.recovery["ready"] = False
+            self.recovery["durable_distinct_vm_groups"] = "history mismatch"
         self.recovery_blocked = not self.recovery["ready"]
         # A guard-aware parent owns the failed-ACK rollback. Starting a second
         # hand-back here would race its recovery and spawn two replacements.
@@ -979,6 +1032,7 @@ class Scheduler:
             self._handoff_ack = {"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing,
                                  "admissions": self.recovery, "items_ready": items_ready,
                                  "distinct_vm_groups": self._distinct_snapshot(),
+                                 **({"durable_distinct_vm_groups": self._durable_snapshot()} if durable else {}),
                                  "registry_load_ms": self._registry_load_ms,
                                  "reload_ms": max(0, math.ceil((time.monotonic() - getattr(self, "_reload_started", time.monotonic())) * 1000))}
             if not os.environ.get("SUPERCOMPUTER_HANDOFF_FDS"):
@@ -1150,6 +1204,57 @@ class Scheduler:
         if pruned:
             log(f"handoff: pruned {len(pruned)} empty unavailable holds: {pruned}")
 
+    def _groups(self):
+        if not hasattr(self, "_durable_registry"):
+            self._durable_registry = DurableGroups(DIR / "durable-groups.json")
+        return self._durable_registry
+
+    def _durable_snapshot(self):
+        return self._groups().snapshot()
+
+    def _attach_durable(self, b):
+        for it in b.items.values():
+            if durable_item(it):
+                if not isinstance(it.spec.get("distinct_vm_group_generation"), str) or not it.spec["distinct_vm_group_generation"]:
+                    raise ValueError("durable admission lacks its pinned generation")
+                b.durable_registry = self._groups()
+                if not hasattr(self, "_durable_batch_ids"):
+                    self._durable_batch_ids = set()
+                self._durable_batch_ids.add(b.id)
+                if it.spec["distinct_vm_group"] not in b.durable_registry.load():
+                    raise ValueError("durable admission registry is missing")
+
+    def _bind_durable(self, msg):
+        with self.lock:
+            items = []
+            for spec in msg["items"]:
+                if spec.get("distinct_vm_group_scope") == "durable":
+                    record = self._groups().open(spec["distinct_vm_group"], time.time(), spec.get("distinct_vm_group_generation"))
+                    spec = {**spec, "distinct_vm_group_generation": record["generation"]}
+                items.append(spec)
+            return {**msg, "items": items}
+
+    def group_open(self, name):
+        with self.lock:
+            if getattr(self, "recovery_blocked", False):
+                raise ValueError("recovery quarantined")
+            record = self._groups().open(name, time.time())
+            return {"ok": True, **record, "active": durable_active(record, time.time())}
+
+    def group_get(self, name):
+        with self.lock:
+            DurableGroups.name(name)
+            record = self._durable_snapshot().get(name)
+            return {"ok": True, **record, "active": durable_active(record, time.time())} if record else {"ok": False, "error": "no such durable group"}
+
+    def group_close(self, name, generation, ttl_s):
+        with self.lock:
+            if getattr(self, "recovery_blocked", False):
+                raise ValueError("recovery quarantined")
+            record = self._groups().close(name, generation, ttl_s, time.time())
+            self.wake.set()
+            return {"ok": True, **record, "active": durable_active(record, time.time())}
+
     def _distinct_snapshot(self) -> dict:
         return {b.id: {g: sorted(ids) for g, ids in b.distinct_vms.items()}
                 for b in self.batches.values() if getattr(b, "distinct_vms", {})}
@@ -1157,6 +1262,7 @@ class Scheduler:
     def _handoff_snapshot(self) -> dict:
         """What the next scheduler takes at once: every VM held here and ready, with what it knows of it."""
         self._quarantine_closed_admissions()
+        durable = self._durable_snapshot()
         vms = []
         for v in list(self.vms.values()):
             if (v.dead or not v.ready) and not self._handoff_vm_occupied(v):
@@ -1170,6 +1276,7 @@ class Scheduler:
         return {"from_pid": os.getpid(), "t": time.time(), "from": self.code, "vms": vms,
                 "batches": sorted(set(self.batches) | set(getattr(self, "recovery_errors", {}))),
                 "distinct_vm_groups": self._distinct_snapshot(),
+                **({"durable_distinct_vm_groups": durable} if durable else {}),
                 "admission_guard": True, "unavailable": dict(getattr(self, "_handoff_pruned", {}))}
 
     def _reattach(self):
@@ -1396,6 +1503,13 @@ class Scheduler:
                     raise ValueError("cpu_model must be a nonblank exact model string")
                 if not (spec.get("vm_type") or (msg.get("vm_type_named") and msg.get("vm_type"))):
                     raise ValueError("cpu_model requires an explicit vm_type")
+            if "distinct_vm_group_scope" in spec:
+                if spec["distinct_vm_group_scope"] != "durable" or not spec.get("distinct_vm_group"):
+                    raise ValueError("distinct_vm_group_scope must be durable and requires distinct_vm_group")
+                DurableGroups.name(spec["distinct_vm_group"])
+            if "distinct_vm_group_generation" in spec and (spec.get("distinct_vm_group_scope") != "durable" or
+                    not isinstance(spec["distinct_vm_group_generation"], str) or not spec["distinct_vm_group_generation"].strip()):
+                raise ValueError("distinct_vm_group_generation requires durable scope and a nonblank generation")
             if "distinct_vm_group" in spec:
                 if not isinstance(spec["distinct_vm_group"], str) or not spec["distinct_vm_group"].strip():
                     raise ValueError("distinct_vm_group must be a nonblank string")
@@ -1451,7 +1565,7 @@ class Scheduler:
         # Not 'lost': clients must not interpret an owned failure as a fallback request.
         self._deliver_owned(it.batch, {"name": it.name, "code": -1, "seconds": -1,
                           "error": why, "strict_once": it.batch.strict_once,
-                          "launch_identity": it.launch_identity})
+                          "launch_identity": it.launch_identity, **durable_receipt(it)})
         it.state = "done"
         it.fate.delivered()
 
@@ -1468,9 +1582,10 @@ class Scheduler:
     def capabilities():
         return {"scope": "isolated-proposed", "runtime_verified": False,
                 "submit_flags": ["strict_once", "retain_journals"],
-                "item_constraints": ["cpu_model", "distinct_vm_group"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
+                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
+                "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
                 "retention_requires_strict_once": True,
-                "paths": ["/cancel", "/snapshot", "/capabilities"],
+                "paths": ["/cancel", "/snapshot", "/capabilities", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"],
                 "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
 
     @classmethod
@@ -1622,10 +1737,14 @@ class Scheduler:
             missing = [k for k in set(b.tree["files"].values()) if not (BLOBS / k).is_file()]
             if missing:
                 return {"ok": False, "error": "tree blobs evicted before admission; upload again", "missing": missing}
+            if any(durable_item(it) for it in b.items.values()):
+                msg = self._bind_durable(msg)
+                b = Batch(msg)
+                self._attach_durable(b)
             b.cache_generation = secrets.token_hex(16)
             admission = json.dumps({**msg, "t0": b.t0, "cache_generation": b.cache_generation,
                                     "cache_completed_generation": None})
-            if getattr(b, "strict_once", False) or getattr(b, "retain_journals", False):
+            if getattr(b, "strict_once", False) or getattr(b, "retain_journals", False) or any(durable_item(it) for it in b.items.values()):
                 with open(tmp, "w") as f:
                     f.write(admission)
                     f.flush()
@@ -1633,7 +1752,7 @@ class Scheduler:
             else:
                 tmp.write_text(admission)
             tmp.rename(qd / f"{b.id}.json")
-            if getattr(b, "strict_once", False) or getattr(b, "retain_journals", False):
+            if getattr(b, "strict_once", False) or getattr(b, "retain_journals", False) or any(durable_item(it) for it in b.items.values()):
                 fd = os.open(qd, os.O_RDONLY)
                 try:
                     os.fsync(fd)
@@ -2029,8 +2148,8 @@ class Scheduler:
         it again rather than sort 26,000 items three times a pass)."""
         q = getattr(self, "_q_pass", None)
         if q is None:
-            return self.queued()
-        return [it for it in q if it.state == "queued"]
+            q = self.queued()
+        return [it for it in q if it.state == "queued" and distinct_live(it)]
 
     def schedule(self, light: bool = False):
         if getattr(self, "recovery_blocked", False):
@@ -2040,6 +2159,14 @@ class Scheduler:
         with self.lock:
             if getattr(self, "handing_off", False):
                 return
+            for bid in tuple(getattr(self, "_durable_batch_ids", ())):
+                b = self.batches.get(bid)
+                if b is None:
+                    self._durable_batch_ids.discard(bid)
+                    continue
+                for it in b.items.values():
+                    if it.state == "queued" and durable_item(it) and not distinct_live(it):
+                        self._owned_failed(it, "durable group generation expired or replaced; no placement or fallback")
             if light:
                 q = [it for it in self._q_full if it.state == "queued"]
             else:
@@ -2194,7 +2321,7 @@ class Scheduler:
             self._owned_failed(it, "strict_once: prior placement cannot be replaced")
             return False
         group = it.spec.get("distinct_vm_group", "")
-        if not rules.distinct_vm_allowed(bool(group), vm.id in it.batch.distinct_vms.get(group, ())):
+        if not distinct_live(it) or not rules.distinct_vm_allowed(bool(group), vm.id in distinct_used(it)):
             return False
         if not rules.cpu_matches(it.spec.get("cpu_model", ""), vm.model):
             return False
@@ -2215,11 +2342,18 @@ class Scheduler:
             "identity": it.launch_identity, "t": time.time()}
         if group:
             it.last_placement.update(distinct_vm_group=group, boot_id=vm.lease.get("boot", ""))
+        if durable_item(it):
+            it.last_placement.update(batch=it.batch.id, distinct_vm_group_scope="durable",
+                distinct_vm_group_generation=it.spec["distinct_vm_group_generation"],
+                attempt=getattr(it, "placed", 0) + 1)
         # Write-ahead admission: never launch on failure to persist the placement.
         try:
+            if durable_item(it):
+                # A journal failure may consume a VM, but never permits reuse.
+                it.batch.durable_registry.reserve(it.last_placement, time.time())
             if it.batch.strict_once or it.batch.retain_journals or group:
                 self._append_owned(it.batch.id, "placed", it.last_placement)
-            if group:
+            if group and not durable_item(it):
                 it.batch.distinct_vms.setdefault(group, set()).add(vm.id)
         except Exception:
             it.owned.start_settled()
@@ -2691,7 +2825,7 @@ class Scheduler:
         out = {}
         groups: dict = {}
         for it in self._pass_queue():
-            group = (it.batch.id, it.spec["distinct_vm_group"]) if it.spec.get("distinct_vm_group") else None
+            group = distinct_key(it)
             groups.setdefault((it.batch.image, it.spec.get("vm_type") or getattr(it, "need_type", None) or it.batch.vm_type, it.spec.get("cpu_model", ""), group), []).append(it)
         if rules.plan_waits(getattr(self, "reattaching", False), time.time() - getattr(self, "t_reattach", 0.0), bool(getattr(self, "_handoff", {}).get("taken")), 15.0):
             return {}
@@ -2707,9 +2841,9 @@ class Scheduler:
             # A worker can wait one full scheduling pass after becoming ready.
             S, bu = vm_slots(vm_type), max(30.0, self.bring_up) + FULL_S
             B = BREAK_EVEN_OVERRIDE_S or rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS, vm_mult(vm_type))
-            distinct_used = its[0].batch.distinct_vms.get(distinct[1], set()) if distinct else set()
+            used_vms = distinct_used(its[0]) if distinct else set()
             held = [v for v in live if v.image == image and v.type == vm_type and rules.cpu_matches(model, v.model)
-                    and rules.distinct_vm_allowed(bool(distinct), v.id in distinct_used)]
+                    and rules.distinct_vm_allowed(bool(distinct), v.id in used_vms)]
             coming = self.creating.get((image, vm_type), 0)
             if model:
                 draw = self._constraint(image, vm_type, model)
@@ -2860,7 +2994,7 @@ class Scheduler:
                 retired = self.retired()
                 spare = 0  # (slots of other types' VMs this work may have: empty, or on what it may take; a larger VM's too)
                 for v in live:
-                    if not rules.distinct_vm_allowed(bool(distinct), v.id in distinct_used) or v.image != image or v.type == vm_type or not v.ready or v.dead or v.id in retired or v.failing or getattr(v, "disk_low", False) or getattr(v, "prep_fails", 0) >= 3 \
+                    if not rules.distinct_vm_allowed(bool(distinct), v.id in used_vms) or v.image != image or v.type == vm_type or not v.ready or v.dead or v.id in retired or v.failing or getattr(v, "disk_low", False) or getattr(v, "prep_fails", 0) >= 3 \
                             or v.slots < w_max or not boat.R.fits_memory(mem_max, boat.TYPES.get(v.type, (0, 0))[1], boat.MEM_OVERHEAD):
                         continue
                     spare += max(0, v.slots - sum(x.weight for x in v.running.values() if x.batch.klass not in low) - getattr(v, "foreign", 0))
@@ -2874,7 +3008,7 @@ class Scheduler:
                 low = {"filler_sweep": (5, 4), "filler": (5,), "none": ()}[rules.victims(kmin, 10 ** 9, SUB_PREEMPT)]
                 # (a VM of the image that fits one and runs only what a timing item may take (filler, sweeps) is one it
                 # gets by emptying it, never a reason to start one)
-                free_fit = sum(1 for v in live if rules.distinct_vm_allowed(bool(distinct), v.id in distinct_used) and v.image == image and v.ready and not getattr(v, "foreign", 0) and not getattr(v, "disk_low", False) and v.slots >= need and all(mem_fits(it, v.type) for it in tim[:1])
+                free_fit = sum(1 for v in live if rules.distinct_vm_allowed(bool(distinct), v.id in used_vms) and v.image == image and v.ready and not getattr(v, "foreign", 0) and not getattr(v, "disk_low", False) and v.slots >= need and all(mem_fits(it, v.type) for it in tim[:1])
                                and v.type != vm_type and all(x.batch.klass in low for x in v.running.values())
                                and (not self._held(v, None, now) or v.reserved[0] in tim))  # (set aside for one of them: theirs)
                 # (the starts this work earns: the VMs its other items fill, and one per timing item no free VM takes;
@@ -2911,7 +3045,7 @@ class Scheduler:
                     n = got
             if distinct:
                 tgt["distinct_vm_group"] = distinct[1]
-                tgt["distinct_vms_used"] = sorted(distinct_used)
+                tgt["distinct_vms_used"] = sorted(used_vms)
             self.target[f"{image}/{vm_type}" + (f"/{model}" if model else "") + (f"/{distinct[0]}/{distinct[1]}" if distinct else "")] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
             if n <= 0:
                 continue
@@ -3044,7 +3178,15 @@ class Scheduler:
         budget = min(starts, boat.budget(starts))
         mine = []
         observed = self._constraint(image, vm_type, model)["observed"] if model else {}
-        used = b.distinct_vms.get(distinct[1], set()) if distinct else set()
+        used = set()
+        if distinct:
+            if isinstance(distinct[0], tuple):
+                _, name, generation = distinct[0]
+                if not b.durable_registry.allowed(name, generation, "", time.time()):
+                    return 0
+                used = b.durable_registry.load()[name]["used"]
+            else:
+                used = b.distinct_vms.get(distinct[1], set())
         with Registry().locked() as d:
             with contextlib.suppress(Exception):
                 boat.reconcile(d, boat.sandboxes())
@@ -3657,7 +3799,7 @@ class Scheduler:
                     self._learn(it, float(row["seconds"]))
                     b.obs_s, b.obs_est, b.obs_n = getattr(b, "obs_s", 0.0) + float(row["seconds"]), getattr(b, "obs_est", 0.0) + it.est, getattr(b, "obs_n", 0) + 1
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
-                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id") if k in (it.last_placement or {})},
+                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id", "distinct_vm_group_scope", "distinct_vm_group_generation", "attempt") if k in (it.last_placement or {})},
                                       "vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
         self.wake.set()
@@ -3714,7 +3856,7 @@ class Scheduler:
                 self._owned_failed(it, "strict_once: preempted or lost placement")
             else:
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
-                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id") if k in (it.last_placement or {})},
+                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id", "distinct_vm_group_scope", "distinct_vm_group_generation", "attempt") if k in (it.last_placement or {})},
                                       "vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
                 # Journal before releasing the placement, and under the same lock
@@ -3759,6 +3901,9 @@ class Scheduler:
             log(f"{it.batch.id}: {it.name}: boat failed it ({it.fails} of {BOAT_TRIES}): {why}; again on boat")
             return
         it.state = "done"
+        if durable_item(it):
+            self._owned_failed(it, f"boat failed it {it.fails} times (last: {why}); no fallback")
+            return
         self.m["to_modal"][n] = self.m["to_modal"].get(n, 0) + 1
         self._h().record_modal(time.time(), f"{it.batch.id}/{it.name}", it.fails, len(it.avoid), BOAT_TRIES)
         log(f"{it.batch.id}: {it.name}: boat failed it {it.fails} times ({why}): back to its client" + (" for Modal" if it.batch.on_lost else ""))
@@ -4294,6 +4439,10 @@ class Scheduler:
                 if not all(rules.distinct_history_matches(required_distinct, prepared[target].get("distinct_vm_group") is True) for target in candidates):
                     self.alert("handoff refused: live distinct VM groups require a group-aware successor")
                     return
+                required_durable = bool(self._durable_snapshot()) or any(durable_item(it) for b in self.batches.values() for it in b.items.values())
+                if not all(rules.distinct_history_matches(required_durable, prepared[target].get("durable_distinct_vm_group") is True) for target in candidates):
+                    self.alert("handoff refused: durable distinct VM groups require a durable-group-aware successor")
+                    return
                 if required_cpu and (self.asking or any(self.creating.values()) or any(
                         not v.ready and getattr(v, "cpu_constraint", "") for v in self.vms.values() if not v.dead)):
                     log("handoff deferred until CPU draws settle; placement continues")
@@ -4364,7 +4513,9 @@ class Scheduler:
                             self._handoff_lease_lost),
                         ack.get("admissions", {}).get("ready") is True,
                         ack.get("items_ready") is True and rules.distinct_history_matches(bool(snap.get("distinct_vm_groups")),
-                            ack.get("distinct_vm_groups") == snap.get("distinct_vm_groups"))):
+                            ack.get("distinct_vm_groups") == snap.get("distinct_vm_groups")) and
+                        rules.distinct_history_matches(bool(snap.get("durable_distinct_vm_groups")),
+                            ack.get("durable_distinct_vm_groups") == snap.get("durable_distinct_vm_groups"))):
                     _notify_service(ack["pid"])
                     log(f"handoff: serving pid {ack['pid']} holds every VM and running identity; exiting")
                     accepted = True
@@ -4806,6 +4957,19 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                 p = self.path
                 if p == "/capabilities":
                     return self._response(200, s.capabilities())
+                if p in ("/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"):
+                    try:
+                        if not isinstance(m, dict):
+                            raise ValueError("durable group request must be an object")
+                        if p.endswith("/open"):
+                            result = s.group_open(m.get("group"))
+                        elif p.endswith("/get"):
+                            result = s.group_get(m.get("group"))
+                        else:
+                            result = s.group_close(m.get("group"), m.get("generation"), m.get("ttl_s"))
+                    except (ValueError, TypeError) as e:
+                        return self._response(400, {"error": str(e)})
+                    return self._response(200, result)
                 if p in ("/cancel", "/snapshot"):
                     bid = s.batch_of(m)
                     try:

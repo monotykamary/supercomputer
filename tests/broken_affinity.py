@@ -12,3 +12,10 @@ def forget_group_history(required: bool, identical: bool) -> bool:
 # gdp: law a lost local scheduler never resurrects beside a controller: not result or not configured
 def resurrect_local(configured: bool) -> bool:
     return True
+
+
+# gdp: law durable placement requires an active lifetime: not result or active
+# gdp: law a queued old generation cannot join a reopened campaign: not result or same_generation
+# gdp: law cross-batch VM membership is never reused: not result or not used
+def forget_durable_scope(active: bool, same_generation: bool, used: bool) -> bool:
+    return True

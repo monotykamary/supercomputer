@@ -2805,6 +2805,67 @@ class Session:
 HANDOFF_QUIET = 60  # (seconds a client asks again quietly while the scheduler doesn't answer: a handoff's window)
 
 
+def _validate_durable_item(item: dict):
+    """Validate opt-in fields without adding defaults to legacy job payloads."""
+    if "distinct_vm_group_scope" in item:
+        if item["distinct_vm_group_scope"] != "durable":
+            raise ValueError("distinct_vm_group_scope must be durable when supplied")
+        group = item.get("distinct_vm_group")
+        if not isinstance(group, str) or not group.strip():
+            raise ValueError("durable scope requires a nonblank distinct_vm_group")
+    if "distinct_vm_group_generation" in item:
+        generation = item["distinct_vm_group_generation"]
+        if item.get("distinct_vm_group_scope") != "durable":
+            raise ValueError("distinct_vm_group_generation requires durable scope")
+        if not isinstance(generation, str) or not generation.strip():
+            raise ValueError("distinct_vm_group_generation must be a nonblank string")
+
+
+def _require_durable_capability(caps: dict):
+    if not (caps.get("distinct_vm_group_scope") == "durable"
+            and caps.get("durable_distinct_vm_group_protocol") == 1):
+        raise Unavailable("scheduler lacks durable distinct_vm_group capability; refusing unconstrained submission")
+
+
+def distinct_group(operation: str, group: str, *, generation: str | None = None, ttl_s: float | None = None) -> dict:
+    """Manage durable group metadata on an existing scheduler, never starting a local daemon."""
+    if operation not in ("open", "get", "close"):
+        raise ValueError("distinct group operation must be open, get or close")
+    if not isinstance(group, str) or not group.strip():
+        raise ValueError("group must be a nonblank string")
+    msg = {"group": group}
+    if operation == "close":
+        if not isinstance(generation, str) or not generation.strip():
+            raise ValueError("close requires a nonblank generation")
+        if isinstance(ttl_s, bool) or not isinstance(ttl_s, (int, float)) or not math.isfinite(ttl_s) or ttl_s < 0:
+            raise ValueError("close requires finite ttl_s >= 0")
+        msg.update(generation=generation, ttl_s=ttl_s)
+    elif generation is not None or ttl_s is not None:
+        raise ValueError("generation and ttl_s are only valid for close")
+    from . import scheduler
+    conn = scheduler.current()
+    if conn is None:
+        raise Unavailable("no running scheduler; refusing local startup for durable group operation")
+    _require_durable_capability(conn.req("/capabilities", {}))
+    return conn.req("/distinct-groups/" + operation, msg)
+
+
+def distinct_groups_main(argv=None) -> int:
+    """JSON CLI: python3 -m supercomputer.boat distinct-groups open|get|close GROUP."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="python3 -m supercomputer.boat distinct-groups")
+    parser.add_argument("operation", choices=("open", "get", "close"))
+    parser.add_argument("group")
+    parser.add_argument("--generation")
+    parser.add_argument("--ttl-s", type=float)
+    args = parser.parse_args(argv)
+    try:
+        result = distinct_group(args.operation, args.group, generation=args.generation, ttl_s=args.ttl_s)
+    except (ValueError, Unavailable) as exc:
+        result = {"ok": False, "error": str(exc)}
+    print(json.dumps(result, sort_keys=True))
+    return 1 if result.get("ok") is False else 0
+
 class Scheduled(Session):
     """A batch through the scheduler (scheduler.py): its items submitted with a priority class, its rows back as they
     finish; the scheduler holds the VMs. The same interface as Session for its callers (boat_jobs, BoatEx, the
@@ -2833,9 +2894,13 @@ class Scheduled(Session):
     def run(self, items: list[dict], on_done, on_start=None, on_lost=None, max_wait: int = 0):
         if not items:
             return
+        for it in items:
+            _validate_durable_item(it)
         self.client = self.client or self.sched.connect()
         if any("cpu_model" in it or "distinct_vm_group" in it for it in items):
             caps = self.client.req("/capabilities", {})
+            if any(it.get("distinct_vm_group_scope") == "durable" for it in items):
+                _require_durable_capability(caps)
             if any("distinct_vm_group" in it for it in items) and not (caps.get("distinct_vm_group") is True and caps.get("distinct_vm_group_protocol") == 1):
                 raise Unavailable("scheduler lacks distinct_vm_group capability; refusing unconstrained submission")
             if any("cpu_model" in it for it in items) and caps.get("cpu_model_exact") is not True:
@@ -2906,7 +2971,7 @@ class Scheduled(Session):
                 if row.get("vm"):
                     self.vm_ids.add(row["vm"])
                     self.run_names[row.get("run_name", row["name"])] = row["name"]
-                if row.get("lost") and on_lost and not it.get("cpu_model"):
+                if row.get("lost") and on_lost and not it.get("cpu_model") and it.get("distinct_vm_group_scope") != "durable":
                     on_lost(it, row.get("error", "lost"))
                 else:
                     on_done(it, row)
@@ -2923,7 +2988,7 @@ class Scheduled(Session):
         if reports.end():
             for name in sorted(left):
                 why = "the scheduler finished the batch without its row"
-                if on_lost:
+                if on_lost and by[name].get("distinct_vm_group_scope") != "durable":
                     on_lost(by[name], why)
                 else:
                     on_done(by[name], {"name": name, "code": -1, "seconds": -1, "error": why})
@@ -3231,6 +3296,7 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
         groups.setdefault((j.get("cpu", 2.0), j.get("memory", 4096), j.get("timeout", 900)), []).append(j)
     for (cpu, memory, timeout), js in groups.items():
         for j in js:
+            _validate_durable_item(j)
             w = R.weight(math.ceil(cpu), math.ceil(memory))  # (rules.boat.weight: 2 vCPU and 4096 MB a slot)
             it = {"name": j["name"], "kind": "sh", "cmd": pre + cmd(j["cmd"]), "cwd": j.get("cwd", "."), "limit": timeout - 30, "weight": w, "est": past.get(j["name"], med)}
             if "distinct_vm_group" in j:
@@ -3238,6 +3304,9 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                 if not isinstance(group, str) or not group.strip():
                     raise ValueError("distinct_vm_group must be a nonblank string")
                 it["distinct_vm_group"] = group
+            for field in ("distinct_vm_group_scope", "distinct_vm_group_generation"):
+                if field in j:
+                    it[field] = j[field]
             if "cpu_model" in j:
                 model = j["cpu_model"]
                 if not isinstance(model, str) or not model.strip():
@@ -3278,9 +3347,10 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                     raise SystemExit(f"{j['name']} asks for {cpu} vCPU and {memory} MB: no boat VM type has that usable ({MEM_OVERHEAD} MB of each is its OS's)")
                 it["vm_type"] = big
             # Hooks may rebuild the execution spec, but cannot silently erase a user pin.
-            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group"):
+            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation"):
                 if field in j:
                     it[field] = j[field]
+            _validate_durable_item(it)
             items.append(it)
             order.append(j["name"])
     return items, order
@@ -3589,3 +3659,10 @@ def extra_starts(lim: dict | None = None) -> str:
     wal = sum(max(0.0, a - b) for a, b in zip(ws, ws[1:]))
     return (f"extra starts {'on' if kg.get('enabled') else 'off'}: ${wal + inv:.2f} today (${wal:.2f} from the wallet, now ${w:.2f}; ${inv:.2f} on the invoice), "
             f"${d:.2f} on this month's invoice (boat's cap ${kg.get('capDollars')}{', reached' if kg.get('capReached') else ''})")
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:2] != ["distinct-groups"]:
+        raise SystemExit("usage: python3 -m supercomputer.boat distinct-groups open|get|close GROUP [--generation GEN --ttl-s N]")
+    raise SystemExit(distinct_groups_main(sys.argv[2:]))

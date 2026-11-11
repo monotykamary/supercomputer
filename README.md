@@ -74,10 +74,46 @@ where it ran, and `runs/x/backends.json` says why anything moved.
 | `cpu`, `memory` | its shape; a job past 2 vCPUs gets its slots set aside on one VM |
 | `image`, `vm_type` | an image the repo's config names; a fixed VM type (for timing claims) |
 | `cpu_model` | exact agent-reported CPU model; requires `vm_type`, never falls back to other hardware |
-| `distinct_vm_group` | batch-scoped group ID; each member uses a different VM, even after earlier members finish or the scheduler restarts |
+| `distinct_vm_group` | batch-scoped group ID by default; each member uses a different VM, even after earlier members finish or the scheduler restarts |
+| `distinct_vm_group_scope` | opt in with `"durable"`: share distinct-VM history across batches and clients of the same scheduler |
+| `distinct_vm_group_generation` | optional nonblank generation from `open`/`get`; valid only with durable scope; pins this epoch and refuses expired or mismatched epochs |
 | `gpu` | goes to RunPod, then Modal |
 | `backend` | `boat`, `runpod` or `modal` only, no fallback |
 
+## Durable distinct-VM groups (opt in)
+
+For a multi-wave experiment, add a stable group name and durable scope to every member:
+
+```json
+[{"name":"rep-1","cmd":"./experiment","backend":"boat",
+  "distinct_vm_group":"experiment-42/replicates","distinct_vm_group_scope":"durable"}]
+```
+
+The scheduler binds and permanently persists a generation at admission. All clients using that scheduler
+share its VM history across batches, including completed members. Omit the scope to retain the existing
+**batch-only** behavior unchanged. Durable jobs require the exact advertised capability
+`distinct_vm_group_scope:"durable"` and `durable_distinct_vm_group_protocol:1`; the client refuses an
+older scheduler **before uploading the tree or submitting**. These jobs never fall back to Modal.
+
+Use the installed Python package to manage the lifecycle (JSON replies):
+
+```sh
+python3 -m supercomputer.boat distinct-groups open experiment-42/replicates
+python3 -m supercomputer.boat distinct-groups get experiment-42/replicates
+# Copy the returned generation exactly; optionally add it to each job as distinct_vm_group_generation.
+python3 -m supercomputer.boat distinct-groups close experiment-42/replicates --generation GENERATION --ttl-s 3600
+```
+
+`open` returns the current unexpired epoch or creates one; submitting without a generation also opens/binds
+one automatically. `get` observes without creating. Explicit `close` starts the TTL: members remain constrained
+and further admission is allowed through the grace period, until `expires_at`. Repeating close with the same
+generation and TTL is idempotent; changing the TTL cannot extend it. After expiry, open or a **new unpinned**
+submission creates a fresh generation. A pinned old request is refused; already queued work stays bound to
+its admitted generation and must not silently join the fresh one. Coordinate close with all producers.
+
+An open group has no automatic expiry. This is durable placement metadata, **not parked or reserved VMs**;
+normal busy/release rules still apply. Group generations are experiment epochs, not the agent's per-VM lease
+boot/epoch fencing pair. See [multi-client lifecycle details](docs/multi-client.md#durable-distinct-vm-groups).
 ## How it works
 
 <p>
