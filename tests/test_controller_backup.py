@@ -212,6 +212,24 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(req.call_count, 1)
         self.assertNotIn("t_success", self.record())
 
+    def test_scheduler_unit_raises_soft_limit_for_future_starts(self):
+        unit = controller.unit("scheduler", "python3 -m supercomputer scheduler serve", "/tmp/fixture", {})
+        self.assertIn("LimitNOFILE=524288:524288\n", unit)
+        self.assertNotIn("LimitNOFILESoft=", unit)  # systemd show property, not a unit directive
+
+    def test_stage_persists_nofile_without_service_restart(self):
+        with patch.object(scheduler.Client, "req", return_value={"hot_handoff": 1}), \
+             patch.object(scheduler, "code_hash", return_value="candidate"), \
+             patch.object(controller, "tool_tar", return_value=b"tar"), \
+             patch.object(controller, "ssh", return_value=(0, '{"active":"old","staged":"candidate"}')) as ssh:
+            controller.stage("fixture")
+        command = ssh.call_args.args[1]
+        self.assertIn("LimitNOFILE=524288:524288", command)
+        self.assertIn("supercomputer-scheduler.service.d/10-nofile.conf", command)
+        self.assertIn("systemctl daemon-reload", command)
+        for forbidden in ("restart", "kill", "systemctl stop", "enable --now"):
+            self.assertNotIn(forbidden, command)
+
     def test_attempt_rule_boundaries(self):
         self.assertTrue(ops.backup_attempt_due(True, False, False, 0, 0, False))
         self.assertFalse(ops.backup_attempt_due(True, False, True, 3599, 0, False))

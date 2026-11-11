@@ -25,7 +25,7 @@ for machine in mini anh-1; do
   echo "== $machine: installed / active / pending"
   reflex on "$machine" run --timeout 300 "set -e; export PATH=\$HOME/.local/bin:\$PATH; uv tool install --force --reinstall '$URL'; SUPERCOMPUTER_CONTROLLER=0 supercomputer scheduler stage"
 done
-# Only ship code to the existing controller. No setup (pool transfer), service
+# Ship code and future-start descriptor limits to the existing controller. No setup (pool transfer), service
 # restart, treadmill restart, drain, or agent checkpoint is part of an update.
 echo '== controller bx_gz4zdtbh: installed / active / pending'
 SUPERCOMPUTER_CONTROLLER=1 "$SC" controller stage

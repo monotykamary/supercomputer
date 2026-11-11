@@ -33,6 +33,15 @@ LONG = IDLE
 WARM_MARGIN = 8  # a warm VM is leased while it has this long before boat stops it
 
 
+# gdp: law expired idle HTTP sockets are not reused: idle_s < ttl or not result
+# gdp: law disconnected idle HTTP sockets are not reused: connected or not result
+# gdp: law readable idle HTTP sockets are not reused: not readable or not result
+# gdp: law healthy fresh idle HTTP sockets may be reused: result == (connected and not readable and idle_s < ttl)
+def agent_http_reusable(idle_s: float, ttl: float, connected: bool, readable: bool) -> bool:
+    """Only idle sockets: readability means EOF or unexpected input, never consume TLS/HTTP bytes to probe."""
+    return connected and not readable and idle_s < ttl
+
+
 # ------------------------------------------------------------------------------------------------- leases and holders
 # gdp: law another host's holder is never presumed dead: host == "" or host == here or result
 # gdp: law a holder of this host, or of no host (an old record), whose pid is gone is dead: not ((host == "" or host == here) and probe == "gone") or not result

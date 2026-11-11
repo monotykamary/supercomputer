@@ -40,6 +40,7 @@ import os
 import pathlib
 import re
 import secrets
+import selectors
 import socket
 import subprocess
 import sys
@@ -129,6 +130,8 @@ def _env(k: str, d):
 
 # The policy's knobs (README, "Scheduling policy"); $SUPERCOMPUTER_<KNOB> overrides each.
 HTTP_REQUEST_TIMEOUT_S = 15.0  # Slow/partial peers must not retain request threads indefinitely.
+HTTP_POLL_MAX_WAIT_S = 5.0
+HTTP_POLL_PEER_CHECK_S = 0.25
 CPU_MODEL_MAX_FRUITLESS = int(_env("CPU_MODEL_MAX_FRUITLESS", 12))  # load guard per image/type/model, not money
 BRINGUP_MAX = _env("BRINGUP", 12)  # VMs being brought up at once (the scheduler's own load guard); the rest wait their turn
 GATE_HORIZON = _env("GATE_HORIZON", 900.0)  # a gate gets the VMs that finish it within this (its items' last times)
@@ -1583,7 +1586,8 @@ class Scheduler:
         self.wake.set()
         return {"ok": True}
 
-    def poll(self, bid: str, since: int, wait: float) -> dict:
+    def poll(self, bid: str, since: int, wait: float, peer_closed=None) -> dict:
+        wait = rules.http_poll_wait(wait, HTTP_POLL_MAX_WAIT_S)
         b = self.batches.get(bid)
         if b is None:
             if getattr(self, "recovery_blocked", False) or self._unclassified(bid):
@@ -1597,8 +1601,14 @@ class Scheduler:
             # (rules.Delivery: done to the client only once every item's row is in and it has read them all; it waits
             # while a row may still come, an item done with its row not yet delivered among them)
             names = {r.get("name") for r in b.rows} & set(b.items)
-            if len(b.rows) <= since and len(names) < len(b.items):
-                b.cv.wait(wait)
+            deadline = time.monotonic() + wait
+            while len(b.rows) <= since and len(names) < len(b.items) and not self.stop.is_set():
+                if peer_closed is not None and peer_closed():
+                    raise ConnectionAbortedError("poll peer disconnected")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                b.cv.wait(min(remaining, HTTP_POLL_PEER_CHECK_S))
                 names = {r.get("name") for r in b.rows} & set(b.items)
             rows = b.rows[since:]
             d = rules.Delivery(len(b.items))
@@ -4633,6 +4643,24 @@ def serve(idle_exit: float = 120, takeover: bool = False):
             self.end_headers()
             self.wfile.write(body)
 
+        def _peer_closed(self):
+            conn = getattr(self, "connection", None)
+            if conn is None:  # handler-only fixtures have no transport
+                return False
+            try:
+                # select.select rejects valid high FDs after the NOFILE raise.
+                with selectors.DefaultSelector() as probe:
+                    probe.register(conn, selectors.EVENT_READ)
+                    readable = bool(probe.select(0))
+                closed = readable and conn.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)) == b""
+            except BlockingIOError:
+                return False
+            except (OSError, ValueError):
+                closed = True
+            if closed:
+                self.close_connection = True
+            return closed
+
         def do_GET(self):
             self._send(200, {"ok": True, "pid": os.getpid()})
 
@@ -4732,7 +4760,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                     log(f"{p}: a request naming no batch ({len(body)} bytes, keys {sorted(m)[:6] if isinstance(m, dict) else type(m).__name__}): nothing done")
                     return self._response(400, {"error": "no batch named"})
                 if p == "/poll":
-                    return self._response(200, s.poll(s.batch_of(m), int(m.get("since", 0)), float(m.get("wait", 15))))
+                    return self._response(200, s.poll(s.batch_of(m), int(m.get("since", 0)), float(m.get("wait", 15)), peer_closed=self._peer_closed))
                 if p == "/close":
                     return self._response(200, s.close(s.batch_of(m)))
                 if p == "/logs":

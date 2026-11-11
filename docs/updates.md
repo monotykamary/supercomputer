@@ -81,6 +81,26 @@ is **not** that mean: it has an explicit continuous-idle age and fresh-interval
 confirmation. Missing VMs, orphans, readiness and identity conservation are not
 subject to either idle tolerance.
 
+## Descriptor pressure and disconnected polls
+
+The controller's live soft `NOFILE` limit was 1024 (hard 524288). Three read-only
+samples on 2026-11-11 showed 767/765/771 open descriptors and only four files, but
+154/156/178 sockets in `CLOSE_WAIT`. Their remote port was 443: these were idle
+outbound agent HTTPS connections, not incoming scheduler long polls or journal
+file handles. Idle outbound connections are now pruned on checkout/return and
+by one weak-reference sweeper: closed/readable peers within five seconds, unused
+connections after 30 seconds (plus at most one five-second sweep). Checked-out
+RPC connections are never owned by that cleanup. Raising the live soft limit to
+its existing hard limit needs no restart. Future scheduler units set
+`LimitNOFILE=524288:524288` (systemd reports that soft value as `LimitNOFILESoft`).
+Normal controller staging writes a drop-in
+and runs `daemon-reload` only; it does not restart either service.
+
+Independently, scheduler long polls cap each request at five seconds and check
+for peer disconnects every quarter second. A disconnected wait releases its
+socket without acknowledging rows or changing item state; connected clients
+re-poll normally. New rows still wake the condition immediately.
+
 ## Target and limits
 
 Use immutable, recursively hashed code snapshots; prepare code while the old

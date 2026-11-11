@@ -48,6 +48,7 @@ import os
 import pathlib
 import random
 import secrets
+import selectors
 import signal
 import socket
 import subprocess
@@ -57,6 +58,7 @@ import threading
 import time
 import tempfile
 import urllib.parse
+import weakref
 
 from . import config
 from .config import env, project
@@ -1414,6 +1416,60 @@ class LeaseLost(AgentError):
     pass
 
 
+class _AgentIdlePools:
+    """One short-lived sweeper for all nonempty pools; never owns an in-flight connection.
+
+    The registry is weak so a cached client is not kept alive by cleanup itself.
+    Pool locks precede this condition; the sweeper drops the condition before taking a pool lock.
+    """
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.clients = weakref.WeakSet()
+        self.thread = None
+
+    def add(self, client):
+        with self.condition:
+            self.clients.add(client)
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._run, name="agent-http-idle", daemon=True)
+                self.thread.start()
+
+    def discard(self, client):
+        with self.condition:
+            self.clients.discard(client)
+            if not self.clients:
+                self.condition.notify()
+
+    def _run(self):
+        try:
+            while True:
+                with self.condition:
+                    if not self.clients:
+                        # Clear under the condition so add() cannot miss a restart.
+                        self.thread = None
+                        return
+                    self.condition.wait(5)
+                    clients = [weakref.ref(c) for c in self.clients]
+                for ref in clients:
+                    client = ref()
+                    try:
+                        if client is not None:
+                            client._prune_idle()
+                    except Exception:
+                        # One broken pool must not disable cleanup for every VM.
+                        pass
+                    finally:
+                        del client
+        finally:
+            with self.condition:
+                if self.thread is threading.current_thread():
+                    self.thread = None
+
+
+_AGENT_IDLE_POOLS = _AgentIdlePools()
+
+
 class AgentClient:
     """The warm agent of one VM over boat's token-gated URL: boat's token in the URL's query (its first answer sets a
     cookie and redirects; the cookie is kept with the URL, 0600, so the next process skips that round trip) and ours
@@ -1426,12 +1482,49 @@ class AgentClient:
         u = urllib.parse.urlparse(url)
         self.url, self.host, self.base, self.query = url, u.netloc, u.path.rstrip("/"), u.query
         self.cookie = cookie
-        self.idle: list[http.client.HTTPSConnection] = []
+        self.idle: list[tuple[http.client.HTTPSConnection, float]] = []
         self.lock = threading.Lock()
+
+    IDLE_TIMEOUT = 30.0  # monotonic seconds; untouched pools swept within a further 5 seconds
+
+    @staticmethod
+    def _reusable(c, idle_s):
+        sock = c.sock
+        try:
+            # Do not recv/peek: SSLSocket does not support MSG_PEEK, and reads could
+            # consume protocol bytes. Even unexpected readable data is safer retired.
+            readable = False
+            if sock is not None:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(sock, selectors.EVENT_READ)
+                    readable = bool(getattr(sock, "pending", lambda: 0)()) or bool(selector.select(0))
+            return R.agent_http_reusable(idle_s, AgentClient.IDLE_TIMEOUT, sock is not None, readable)
+        except (OSError, ValueError):  # closed/invalid descriptor
+            return False
+
+    def _prune_idle_locked(self):
+        now = time.monotonic()
+        kept = []
+        for c, returned in self.idle:
+            if self._reusable(c, now - returned):
+                kept.append((c, returned))
+            else:
+                with contextlib.suppress(OSError):
+                    c.close()
+        self.idle = kept
+        if not kept:
+            _AGENT_IDLE_POOLS.discard(self)
+
+    def _prune_idle(self):
+        with self.lock:
+            self._prune_idle_locked()
 
     def _get(self, timeout: float) -> http.client.HTTPSConnection:
         with self.lock:
-            c = self.idle.pop() if self.idle else None
+            self._prune_idle_locked()
+            c = self.idle.pop()[0] if self.idle else None
+            if not self.idle:
+                _AGENT_IDLE_POOLS.discard(self)
         if c is None:
             c = http.client.HTTPSConnection(self.host, timeout=timeout)
         c.timeout = timeout
@@ -1441,10 +1534,13 @@ class AgentClient:
 
     def _put_back(self, c):
         with self.lock:
-            if len(self.idle) < 8:
-                self.idle.append(c)
+            self._prune_idle_locked()
+            if len(self.idle) < 8 and self._reusable(c, 0):
+                self.idle.append((c, time.monotonic()))
+                _AGENT_IDLE_POOLS.add(self)
                 return
-        c.close()
+        with contextlib.suppress(OSError):
+            c.close()
 
     def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json") -> tuple[int, bytes, str]:
         last, retry = None, R.Retry(4)  # (4 tries, the first answer kept: rules.boat.Retry)

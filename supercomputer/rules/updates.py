@@ -1,5 +1,13 @@
 """Hot-update guards used by the scheduler, not a model of OS/network latency."""
 
+# gdp: law a poll wait is never negative: result >= 0
+# gdp: law a poll wait never exceeds the server bound: result <= max(0.0, limit)
+# gdp: law a poll never waits longer than the client requested: result <= max(0.0, requested)
+# gdp: law a shorter nonnegative request is preserved: requested < 0 or requested > limit or result == requested
+def http_poll_wait(requested: float, limit: float) -> float:
+    return max(0.0, min(requested, limit))
+
+
 # gdp: law an observation never belongs to two adjacent check intervals: not result or (sample > since and sample <= now)
 # gdp: law every new observation in the interval is read: sample <= since or sample > now or result
 def handoff_sample_fresh(sample: float, since: float, now: float) -> bool:

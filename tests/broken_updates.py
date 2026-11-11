@@ -1,5 +1,10 @@
 """Regressions refused by the same hot-update laws."""
 
+# gdp: law a poll wait never exceeds the server bound: result <= max(0.0, limit)
+def uncapped_poll_wait(requested: float, limit: float) -> float:
+    return max(0.0, requested)
+
+
 # gdp: law read-only exports never hold the mutation lock while building: not read_only or not result
 def archive_under_mutation_lock(read_only: bool) -> bool:
     """The old /state route compressed the entire archive under this lock."""

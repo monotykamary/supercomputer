@@ -6,6 +6,17 @@ from typing import Literal
 from supercomputer.rules.boat import Entry, Reports, Resume, RunEnd
 
 
+# gdp: law expired idle HTTP sockets are not reused: idle_s < ttl or not result
+def broken_no_age(idle_s: float, ttl: float, connected: bool, readable: bool) -> bool:
+    return connected and not readable
+
+
+# gdp: law disconnected idle HTTP sockets are not reused: connected or not result
+# gdp: law readable idle HTTP sockets are not reused: not readable or not result
+def broken_no_peer_check(idle_s: float, ttl: float, connected: bool, readable: bool) -> bool:
+    return idle_s < ttl
+
+
 # gdp: law a holder of this host, or of no host (an old record), whose pid is gone is dead: not ((host == "" or host == here) and probe == "gone") or not result
 def holder_alive_before(host: str, here: str, probe: Literal["alive", "gone", "denied"]) -> bool:
     """pid_alive before: a lease (or a ticket) that names no host was another machine's, never dead: reap's Modal

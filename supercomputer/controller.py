@@ -88,7 +88,7 @@ def bundle(repo: pathlib.Path, refs: list[str]) -> bytes:
 # Each service bounded (systemd), so the controller's own work can never starve sshd and boat's health checks (the
 # 2026-10-31 incident: a small VM at 100% with 22 VMs coming up, 70 failed /health checks in a row). The scheduler's
 # watchdog sheds (no starts) well before these bite.
-LIMITS = {"scheduler": "CPUQuota=250%\nMemoryHigh=4G\nMemoryMax=5G\nTasksMax=1500\nNice=5",
+LIMITS = {"scheduler": "CPUQuota=250%\nMemoryHigh=4G\nMemoryMax=5G\nTasksMax=1500\nNice=5\nLimitNOFILE=524288:524288",
           "treadmill": "CPUQuota=100%\nMemoryHigh=1536M\nMemoryMax=2G\nTasksMax=400\nNice=10"}
 
 
@@ -182,13 +182,17 @@ def setup(vm: str, vms: int = 40, floor: int = 8, only: str = ""):
 
 
 def stage(vm: str):
-    """Ship code only, then publish its install pointer; no service/pool changes."""
+    """Ship code and future-start limits; no service restart or pool changes."""
     current = scheduler.Client(info()).req("/status", {}, timeout=10)
     if current.get("hot_handoff") != 1:
         raise RuntimeError("controller has no hot-handoff protocol; refusing a mixed-version rollout")
     target = scheduler.code_hash(pathlib.Path(__file__).parent)
     release = f"{SC}/releases/{target}"
-    command = (f"set -e; mkdir -p {release}; tar xzf - -C {release}; "
+    command = ("set -e; sudo install -d /etc/systemd/system/supercomputer-scheduler.service.d; "
+               "printf '[Service]\nLimitNOFILE=524288:524288\n' | "
+               "sudo tee /etc/systemd/system/supercomputer-scheduler.service.d/10-nofile.conf >/dev/null; "
+               "sudo systemctl daemon-reload; "
+               f"mkdir -p {release}; tar xzf - -C {release}; "
                f"cd {release}; PYTHONPATH={release} SUPERCOMPUTER_SRC={release} "
                f"SUPERCOMPUTER_HOME={SC}/tool SUPERCOMPUTER_LIVE={SC}/live "
                "SUPERCOMPUTER_CONTROLLER=0 python3 -P -m supercomputer scheduler stage")
