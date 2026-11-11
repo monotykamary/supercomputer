@@ -54,6 +54,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import tarfile
 import threading
 import time
@@ -62,7 +63,7 @@ from typing import Literal
 ROOT = pathlib.Path.home() / ".sc"
 HOME = str(pathlib.Path.home())
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1}
+AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1, "runtime_pins_protocol": 1}
 VERSION = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]  # (its code: the scheduler upgrades a stale one in place)
 
 
@@ -1375,6 +1376,8 @@ def _legacy_start(d: pathlib.Path, spec: dict):
 
 
 def start(d: pathlib.Path, spec: dict):
+    if "runtime" in spec:
+        normalize_runtime_pins(spec["runtime"])
     if _lease_enabled():
         fence = getattr(_lease_local, "fence", None) or {}
         rule = _lease_rule(_lease_record())
@@ -1674,6 +1677,145 @@ def cpu_model() -> str:
         return ""
 
 
+# Runtime pins use the job's final namespace, cwd and environment, not the daemon's PATH.
+# Keep this pure gate identical to rules/runtime.py; the standalone agent has no package dependencies.
+class RuntimePinGate:
+    # gdp: law missing runtimes never launch: not result or present
+    # gdp: law non executable runtimes never launch: not result or executable
+    # gdp: law mismatching hashes never launch: not result or hash_ok
+    # gdp: law mismatching versions never launch: not result or version_ok
+    # gdp: law changed runtimes never launch: not result or stable
+    # gdp: law complete verification permits launch: not (present and executable and hash_ok and version_ok and stable) or result
+    def allow(self, present: bool, executable: bool, hash_ok: bool, version_ok: bool, stable: bool) -> bool:
+        return present and executable and hash_ok and version_ok and stable
+
+
+_RUNTIME_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[+.-][0-9A-Za-z.-]+)?")
+
+
+def normalize_runtime_pins(value):
+    """Strict schema shared by native clients and the standalone worker."""
+    if not isinstance(value, dict) or not value or set(value) - {"bun", "lean"}:
+        raise ValueError("runtime must be a nonempty object containing bun and/or lean pins")
+    pins = {}
+    for name, pin in value.items():
+        if not isinstance(pin, dict) or set(pin) != {"version", "sha256"}:
+            raise ValueError(f"runtime.{name} requires exactly version and sha256")
+        version, sha = pin["version"], pin["sha256"]
+        if not isinstance(version, str) or len(version) > 128 or not _RUNTIME_VERSION.fullmatch(version):
+            raise ValueError(f"runtime.{name}.version must be an exact version such as 1.4.3 or 4.26.0")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            raise ValueError(f"runtime.{name}.sha256 must contain exactly 64 hexadecimal digits")
+        pins[name] = {"version": version, "sha256": sha.lower()}
+    return pins
+
+
+def _runtime_hash(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+            raise ValueError("runtime must be a regular executable file")
+        digest = hashlib.sha256()
+        while chunk := source.read(262144):
+            digest.update(chunk)
+        after = os.fstat(source.fileno())
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode)
+        if identity(info) != identity(after):
+            raise ValueError("runtime changed while hashing")
+        return digest.hexdigest(), identity(after)
+
+
+def _runtime_probe(argv):
+    # Bound memory independently of a broken tool's output volume.
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=output,
+                                 stderr=subprocess.STDOUT, timeout=10, check=False)
+        output.seek(0)
+        raw = output.read(16385)
+    if len(raw) > 16384:
+        raise ValueError("runtime probe output exceeded 16 KiB")
+    return process.returncode, raw.decode("utf-8").strip()
+
+
+def _elan_proxy(real, digest):
+    # Elan installs hard-linked or copied tool shims as well as symlinks.
+    candidates = [real.parent / "elan", pathlib.Path.home() / ".elan" / "bin" / "elan"]
+    found = shutil.which("elan")
+    if found:
+        candidates.append(pathlib.Path(found))
+    for candidate in candidates:
+        try:
+            target = candidate.resolve(strict=True)
+            if os.path.samefile(real, target) or _runtime_hash(target)[0] == digest:
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+def verify_runtime_pins(value):
+    """Observe selected executables; never download/install a runtime or execute a hash mismatch."""
+    receipt = {"protocol": 1, "ok": False, "required": {}, "observed": {}}
+    try:
+        pins = normalize_runtime_pins(value)
+        receipt["required"] = pins
+        for name, pin in pins.items():
+            observed = receipt["observed"][name] = {}
+            selected = shutil.which(name)
+            if not selected:
+                raise ValueError(f"runtime {name} is missing from the job PATH")
+            real = pathlib.Path(selected).resolve(strict=True)
+            observed.update(path=selected, realpath=str(real))
+            # Hashing an elan proxy does not bind its selected Lean compiler.
+            if name == "lean" and real.name == "elan":
+                raise ValueError("runtime lean resolves to the elan proxy; put the actual toolchain bin directory on the job PATH")
+            digest, identity = _runtime_hash(real)
+            observed["sha256"] = digest
+            if name == "lean" and _elan_proxy(real, digest):
+                raise ValueError("runtime lean is an elan proxy, not the actual compiler")
+            hash_ok = digest == pin["sha256"]
+            version_ok = stable = False
+            if hash_ok:
+                code, text = _runtime_probe([str(real), "--version"])
+                observed["version_output"] = text[:512]
+                observed["version_exit"] = code
+                match = (_RUNTIME_VERSION.fullmatch(text) if name == "bun" else
+                         re.fullmatch(r"Lean \(version ([0-9][^,\s)]*)(?:,[^\r\n]*)?\)", text))
+                version = (match.group(0) if name == "bun" else match.group(1)) if match else None
+                observed["version"] = version
+                version_ok = code == 0 and version == pin["version"]
+                if name == "lean":
+                    prefix_code, prefix = _runtime_probe([str(real), "--print-prefix"])
+                    observed["prefix"] = prefix[:512]
+                    if prefix_code != 0 or not pathlib.Path(prefix).is_absolute() or not os.path.samefile(real, pathlib.Path(prefix) / "bin" / "lean"):
+                        raise ValueError("runtime lean does not match its compiler prefix; launcher/proxy refused")
+                again, current = _runtime_hash(real)
+                now = shutil.which(name)
+                stable = (current == identity and again == digest and now == selected
+                          and pathlib.Path(now).resolve(strict=True) == real)
+            observed.update(hash_matches=hash_ok, version_matches=version_ok, stable=stable)
+            if not RuntimePinGate().allow(True, True, hash_ok, version_ok, stable):
+                raise ValueError(f"runtime {name} verification failed (sha256={hash_ok}, version={version_ok}, stable={stable})")
+        receipt["ok"] = True
+    except Exception as exc:
+        receipt["error"] = str(exc)[:1500]
+    return receipt
+
+
+def runtime_exec(spec_file, receipt_file, argv):
+    """Inside the job namespace: verify first, then exec the unmodified payload."""
+    try:
+        spec = json.loads(pathlib.Path(spec_file).read_text())
+        receipt = verify_runtime_pins(spec.get("runtime"))
+    except Exception as exc:
+        receipt = {"protocol": 1, "ok": False, "error": str(exc)[:1500]}
+    write_json(pathlib.Path(receipt_file), receipt)
+    if not receipt["ok"] or not argv:
+        print("runtime verification refused payload: " + receipt.get("error", "missing command"), file=sys.stderr)
+        raise SystemExit(78)
+    os.execvpe(argv[0], argv, os.environ)
+
+
 # ------------------------------------------------------------------------------------------------------------------ run
 def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathlib.Path, cwd: str, argv: list[str]) -> list[str]:
     home = pwd.getpwuid(os.getuid()).pw_dir if spec.get("strict_once") is True else HOME
@@ -1710,6 +1852,10 @@ def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathl
            *[f"{k}={v}" for k, v in {**ctx.get("env", {}), **spec.get("env", {}),
                                       "SUPERCOMPUTER_OUTPUT_DIR": str(outputs.resolve())}.items()],
            *([f"HOME={home}"] if spec.get("strict_once") is True else [])]
+    if "runtime" in spec:
+        normalize_runtime_pins(spec["runtime"])
+        argv = [sys.executable, "-I", str(ROOT / "agent.py"), "runtime-exec",
+                str(j / "spec.json"), str(j / "runtime.json"), *argv]
     cpus = ",".join(map(str, json.loads((j / "taskset" if (j / "taskset").exists() else j / "cpus").read_text())))
     return ["sudo", "-n", "unshare", "-m", "--propagation", "private", "--", "sh", str(j / "ns.sh"),
             "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}", "--init-groups", "--",
@@ -1789,7 +1935,7 @@ def run(batch: str, name: str, launch_identity=None):
                 row["saved"] = saved
         else:  # py: a function of a Modal runner, its arguments and result as JSON
             (j / "args.json").write_text(json.dumps(spec["args"]))
-            argv = wrap(j, spec, ctx, work, tree, "/", ["python3", "-I", f"{ROOT}/agent.py", "call", f"/src/{repo}/{spec['module']}", spec["fn"], str(j / "args.json"), str(j / "result.json")])
+            argv = wrap(j, spec, ctx, work, tree, "/work" if "runtime" in spec else "/", ["python3", "-I", f"{ROOT}/agent.py", "call", f"/src/{repo}/{spec['module']}", spec["fn"], str(j / "args.json"), str(j / "result.json")])
             t0, oom0 = time.time(), oom_kills()
             with open(j / "out", "wb") as out, open(j / "err", "wb") as err:
                 p = subprocess.run(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
@@ -1805,6 +1951,17 @@ def run(batch: str, name: str, launch_identity=None):
     except Exception as e:
         row.update(code=-1, seconds=-1, error=repr(e)[-2000:])
     finally:
+        if "runtime" in spec:
+            try:
+                receipt = json.loads((j / "runtime.json").read_text())
+            except (OSError, ValueError):
+                receipt = {"ok": False, "error": "runtime verification did not complete", "protocol": 1}
+            row["runtime_verification"] = receipt
+            row["runtime_verified"] = receipt.get("ok") is True
+            if not row["runtime_verified"]:
+                row["runtime_error"] = "runtime_verification_failed"
+                if row.get("code") == 0:
+                    row["code"] = 78
         try:
             _collect_outputs(j, row)
         except Exception as e:
@@ -2756,6 +2913,8 @@ if __name__ == "__main__":
         ownedrun(*rest)
     elif cmd == "call":
         call(*rest)
+    elif cmd == "runtime-exec":
+        runtime_exec(rest[0], rest[1], rest[2:])
     elif cmd == "daemon":
         daemon(*rest)
     elif cmd == "ingest":

@@ -91,6 +91,7 @@ To recover a finished admission after its client exits, use
 | `distinct_vm_group` | batch-scoped group ID by default; each member uses a different VM, even after earlier members finish or the scheduler restarts |
 | `distinct_vm_group_scope` | opt in with `"durable"`: share distinct-VM history across batches and clients of the same scheduler |
 | `distinct_vm_group_generation` | optional nonblank generation from `open`/`get`; valid only with durable scope; pins this epoch and refuses expired or mismatched epochs |
+| `runtime` | exact Bun/Lean version + executable SHA-256, verified inside the job before payload; native boat only ([contract](docs/runtime-pins.md)) |
 | `gpu` | goes to RunPod, then Modal |
 | `backend` | `boat`, `runpod` or `modal` only, no fallback |
 

@@ -212,7 +212,7 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
             mine = [] if strict_once else [j for j in mine if j["name"] not in rows and fallback.lost_route(False, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto") == "boat"]
         todo = []
         for j in [j for j in spec_cpu if j["name"] not in rows]:
-            r = "failed" if strict_once or "cpu_model" in j or "distinct_vm_group" in j or j.get("required_agent_capabilities") else fallback.lost_route(j in own, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto")
+            r = "failed" if strict_once or "cpu_model" in j or "distinct_vm_group" in j or required_agent_capabilities(j) else fallback.lost_route(j in own, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto")
             if r == "modal":
                 todo.append(j)
             else:  # (boat failed it 3 times under --backend boat, or boat couldn't run it at all: failed, with why)
@@ -324,7 +324,8 @@ class BoatEx:
         root = project().root
         self.module = str(pathlib.Path(runner).resolve().relative_to(root))
         cfg = getattr(agent.import_runner(str(root / self.module)), "BOAT", {})
-        self.extra = {k: v for k, v in cfg.items() if k in ("mounts", "path", "overlays", "env")}
+        self.extra = {k: v for k, v in cfg.items() if k in ("mounts", "path", "overlays", "env", "runtime", "required_agent_capabilities")}
+        required_agent_capabilities(self.extra)
         self.weight = int(cfg.get("weight", 1))  # slots a call takes (a runner whose calls need more than 4 GB says 2)
         self.vms, self.max_vms, self.limit, self.max_wait = vms, max_vms, limit, max_wait
         self.past = {}
@@ -423,11 +424,14 @@ class AutoEx:
     def __init__(self, runner: str, app, max_wait: int = 120, **opts):
         self.strict_once = opts.get("strict_once", False)
         boat._validate_strict_options(self.strict_once, opts.get("max_attempts", 1))
+        from . import agent
+        cfg = {} if self.strict_once else getattr(agent.import_runner(str(pathlib.Path(runner).resolve())), "BOAT", {})
+        self.no_fallback = self.strict_once or bool(required_agent_capabilities(cfg))
         self.app, self.modal, self.bx = app, None, None
         self.where = {"boat": 0, "modal": 0}
         self.why: dict[str, int] = {}
         from . import scheduler as _sch
-        self.reason, _ = (None, {}) if self.strict_once or (_sch.enabled() and _sch.controller()) else boat.preflight3(1, opts.get("vm_type", boat.VM_TYPE), starts=not _sch.enabled())
+        self.reason, _ = (None, {}) if self.no_fallback or (_sch.enabled() and _sch.controller()) else boat.preflight3(1, opts.get("vm_type", boat.VM_TYPE), starts=not _sch.enabled())
         # (boat's failures of this batch's calls, a call's own failure never one: Modal takes the rest only at the
         # third; rules.fallback.AutoFallback)
         self.fb = fallback.AutoFallback(3)
@@ -436,7 +440,7 @@ class AutoEx:
             try:
                 self.bx = self._mk()
             except boat.Unavailable as e:
-                if self.strict_once:
+                if self.no_fallback:
                     raise
                 self.reason = str(e)
         if self.reason:  # (boat can't take it now: an image, a tree, the scheduler; asked again, never Modal for it: rules.fallback.lost_route)
@@ -467,7 +471,7 @@ class AutoEx:
         self.why[reason] = self.why.get(reason, 0) + k
 
     def remote(self, fn, *args):
-        if self.strict_once:
+        if self.strict_once or getattr(self, "no_fallback", False):
             result = self.bx.remote(fn, *args)
             self.where["boat"] += 1
             return result
@@ -507,7 +511,7 @@ class AutoEx:
         return fn.remote(*args)
 
     def starmap(self, fn, args: list, **_):
-        if self.strict_once:
+        if self.strict_once or getattr(self, "no_fallback", False):
             for result in self.bx.starmap(fn, args):
                 self.where["boat"] += 1
                 yield result
@@ -604,6 +608,8 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
     if a.strict_once:
         opts.update(strict_once=True, max_attempts=a.max_attempts)
     if a.backend == "modal":
+        if required_agent_capabilities(getattr(mod, "BOAT", {})):
+            ap.error("runtime pins and agent requirements need the native boat backend; no Modal fallback")
         with ModalCtx(mod.app):
             ex = ModalEx.__new__(ModalEx)
             ex.m = contextlib.nullcontext()

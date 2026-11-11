@@ -137,6 +137,9 @@ class Batch:
     """One Session's worth of items in a thread: `vms` asked for, the session's live VMs counted while it runs."""
 
     def __init__(self, tm, label: str, chain: str, items: list[dict], vms: int, on_row, root=None, tar=None, after=None, oleans=False):
+        from .rules.agent_capabilities import required_agent_capabilities
+        for it in items:
+            required_agent_capabilities(it)
         self.tm, self.label, self.chain, self.items, self.vms = tm, label, chain, items, vms
         self.on_row, self.root, self.tar, self.after, self.oleans = on_row, root, tar, after, oleans
         self.sess, self.done, self.failed, self.t0 = None, False, False, time.time()
@@ -231,6 +234,15 @@ class Batch:
             if self.sess:
                 summary = self.sess.close()
         todo = [it for it in self.items if it["name"] not in got]
+        # Even exception/preflight paths must not strip requirements by moving
+        # an unreported item to Modal. Mixed batches may still move plain items.
+        from .rules.agent_capabilities import required_agent_capabilities
+        constrained = [it for it in todo if required_agent_capabilities(it)]
+        for it in constrained:
+            self.failed = True
+            row(it, {"code": -1, "seconds": -1,
+                     "error": lost.get(it["name"], "native boat did not return a row; no fallback")})
+        todo = [it for it in todo if it not in constrained]
         # (Modal only for items boat failed 3 times: the scheduler's lost rows; a batch boat's API failed whole runs
         # again on boat later, however small: rules.treadmill.BatchFate)
         route = self.fate.boat_ended(len(todo), boat_err, bool(self.tm.modal))
@@ -291,7 +303,7 @@ def py_item(name: str, module: str, fn: str, args: list, limit: int, est: float,
         _boat_cfg[(root, module)] = getattr(agent.import_runner(str(root / module)), "BOAT", {})
     cfg = _boat_cfg[(root, module)]
     return {"name": name, "kind": "py", "module": module, "fn": fn, "args": args, "limit": limit, "est": est,
-            "weight": max(weight, int(cfg.get("weight", 1))), **{k: v for k, v in cfg.items() if k in ("mounts", "path", "overlays", "env")}}
+            "weight": max(weight, int(cfg.get("weight", 1))), **{k: v for k, v in cfg.items() if k in ("mounts", "path", "overlays", "env", "runtime", "required_agent_capabilities")}}
 
 
 def sh_item(name: str, cmd: str, cwd: str, limit: int, est: float, weight: int = 1) -> dict:
@@ -333,6 +345,9 @@ def modal_app(app):
 def on_modal(items: list[dict], root: pathlib.Path, on_row) -> dict:
     """Items boat couldn't run, on Modal: a runner's function through the runner's own app, shell items through the
     repo's Modal module (else the supercomputer's own app); each row to on_row, and the shell items' logs back."""
+    from .rules.agent_capabilities import required_agent_capabilities
+    if any(required_agent_capabilities(it) for it in items):
+        raise ValueError("agent requirements need native boat; no Modal fallback")
     logs: dict = {}
     for module in sorted({it["module"] for it in items if it["kind"] == "py"}):
         mod = import_real(root / module)

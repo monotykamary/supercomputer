@@ -5,7 +5,7 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
 
 **Run a jobs file** from any repo (its git root is the tree; `supercomputer.toml` says what it needs):
 - `supercomputer run --jobs jobs.json --out runs/x [--class C] [--timing] [--data DIR[:DEST]] [--env K=V]`
-- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?, "distinct_vm_group"?, "distinct_vm_group_scope"?, "distinct_vm_group_generation"?, "required_agent_capabilities"?}]`;
+- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?, "distinct_vm_group"?, "distinct_vm_group_scope"?, "distinct_vm_group_generation"?, "required_agent_capabilities"?, "runtime"?}]`;
   `cmd` runs under bash in `<repo>/<cwd>`; logs in `<out>/<name>.log`, `<out>/summary.tsv` (name, exit, seconds, where).
 - The tree ships without node_modules: start a bun job with `bun install --frozen-lockfile && ...`.
 - `--timing`: each job alone on its VM; `<out>/placement.json` is the label a timing claim needs.
@@ -29,6 +29,12 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
   `expires_at`; afterward new unpinned work/open creates a fresh epoch, but pinned old requests are refused
   and old queued work never silently rebinds. Open groups do not expire automatically. Coordinate close
   with every producer. Durable metadata does not park or reserve VMs; ordinary release policy still applies.
+
+**Runtime pins (native):** a job may declare `"runtime":{"bun":{"version":"1.4.3","sha256":"..."},"lean":{"version":"4.34.0","sha256":"..."}}`.
+Use 64-hex digests of the selected executable files, not archives or an Elan proxy; put the actual Lean toolchain
+`bin` on the job PATH. The agent verifies inside the job namespace before payload execution and records the
+observations. Missing/mismatching tools fail closed; no installer or unsupported-provider fallback. Requires
+controller and actual worker `runtime_pins_protocol:1`. See `docs/runtime-pins.md`.
 
 **Classes** (`--class`, else `$SUPERCOMPUTER_CLASS`; a small batch defaults to interactive, a bigger one to submission):
 - `interactive`: quick checks; a slot at once (a filler's or sweep's item is killed and re-queued).

@@ -2394,6 +2394,11 @@ class Session:
         An item whose VM died (or whose runner vanished) runs again once on another VM; lost again, it goes to
         on_lost(item, reason) (else it's done with exit -1). With max_wait, if no VM is ready that many seconds after
         the start, or every VM is gone, what hasn't run goes to on_lost too."""
+        from .rules.agent_capabilities import required_agent_capabilities
+        for it in items:
+            required_agent_capabilities(it)
+            if "runtime" in it:
+                raise Unavailable("runtime pins require the scheduler; refusing the legacy unverified path")
         queue = sorted(items, key=lambda it: -it.get("est", 60))
         # (each item's fate: taken, lost and run again once with no fallback, finished exactly once: rules.boat.LocalItem)
         fates = {it.get("orig", it["name"]): R.LocalItem(on_lost is not None) for it in items}
@@ -3166,6 +3171,8 @@ class Scheduled(Session):
             if strict_once and not (type(caps.get("strict_once_protocol")) is int and caps["strict_once_protocol"] == 1
                                     and "strict_once" in caps.get("submit_flags", [])):
                 raise Unavailable("scheduler lacks strict_once_protocol:1; refusing a retrying submission")
+            if any("runtime" in it for it in items) and (type(caps.get("runtime_pins_protocol")) is not int or caps["runtime_pins_protocol"] != 1):
+                raise Unavailable("scheduler lacks runtime_pins_protocol:1; refusing unverified runtime pins")
             if any(required_agent_capabilities(it) for it in items) and caps.get("required_agent_capabilities_protocol") != 1:
                 raise Unavailable("scheduler lacks required_agent_capabilities_protocol:1; refusing unverified agents")
             if any(it.get("distinct_vm_group_scope") == "durable" for it in items):
@@ -3734,10 +3741,11 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                     raise SystemExit(f"{j['name']} asks for {cpu} vCPU and {memory} MB: no boat VM type has that usable ({MEM_OVERHEAD} MB of each is its OS's)")
                 it["vm_type"] = big
             # Hooks may rebuild the execution spec, but cannot silently erase a user pin.
-            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities"):
+            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime"):
                 if field in j:
                     it[field] = j[field]
             _validate_durable_item(it)
+            required_agent_capabilities(it)
             items.append(it)
             order.append(j["name"])
     return items, order
@@ -3765,7 +3773,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
     sched_on = __import__("supercomputer.scheduler", fromlist=["enabled"]).enabled()
     if strict_once and not sched_on:
         raise Unavailable("strict_once requires the scheduler; refusing the legacy retrying path")
-    if any("cpu_model" in it or "distinct_vm_group" in it or it.get("required_agent_capabilities") for it in items) and not sched_on:
+    if any("cpu_model" in it or "distinct_vm_group" in it or "runtime" in it or it.get("required_agent_capabilities") for it in items) and not sched_on:
         raise Unavailable("placement constraints require the scheduler; refusing the legacy unconstrained path")
     tiny = on_lost is not None and small and not sched_on
     try:
@@ -3826,7 +3834,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
             note_durations(rows)
             sess.phases = {"jobs_s": round(t_jobs - t_run, 1), "collect_s": round(t_logs - t_jobs, 1), "harvest_s": round(time.time() - t_logs, 1)}
     except Unavailable as e:
-        if strict_once or on_lost is None or any(it.get("required_agent_capabilities") for it in items):
+        if strict_once or on_lost is None or any("runtime" in it or it.get("required_agent_capabilities") for it in items):
             raise  # A capability refusal is never permission for a blind Modal fallback.
         for it in items:
             if it["name"] not in rows:

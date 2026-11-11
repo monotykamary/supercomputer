@@ -26,12 +26,21 @@ def normalize_agent_capabilities(value) -> dict[str, int]:
 
 
 def required_agent_capabilities(spec) -> dict[str, int]:
-    """Validate explicit item/job-file requirements; no command-text inference."""
+    """Validate explicit requirements and derive protocols from declared fields.
+
+    Runtime pins are never inferred from command text. Import their single schema
+    lazily so ordinary jobs do not depend on runtime inspection machinery.
+    """
     value = spec.get("required_agent_capabilities", {})
     if not isinstance(value, dict) or any(not isinstance(k, str) or not k.strip()
             or type(v) is not int or v < 1 for k, v in value.items()):
         raise ValueError("required_agent_capabilities must map nonblank names to positive integer versions")
-    return dict(value)
+    required = dict(value)
+    if "runtime" in spec:
+        from ..agent import normalize_runtime_pins
+        normalize_runtime_pins(spec["runtime"])
+        required["runtime_pins_protocol"] = max(1, required.get("runtime_pins_protocol", 0))
+    return required
 
 
 def agent_capabilities_match(required, advertised) -> bool:

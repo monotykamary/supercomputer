@@ -274,7 +274,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
             "distinct_vm_group": capabilities.get("distinct_vm_group") is True and capabilities.get("distinct_vm_group_protocol") == 1,
             "durable_distinct_vm_group": capabilities.get("distinct_vm_group_scope") == "durable" and capabilities.get("durable_distinct_vm_group_protocol") == 1,
             "result_files_protocol": capabilities.get("result_files_protocol") == 1,
-            "required_agent_capabilities_protocol": capabilities.get("required_agent_capabilities_protocol") == 1}
+            "required_agent_capabilities_protocol": capabilities.get("required_agent_capabilities_protocol") == 1,
+            "runtime_pins_protocol": type(capabilities.get("runtime_pins_protocol")) is int and capabilities["runtime_pins_protocol"] == 1}
 
 
 def stage_install() -> dict:
@@ -355,6 +356,8 @@ def pct(xs: list, q: float):
 # ------------------------------------------------------------------------------------------------------ the state
 class Item:
     def __init__(self, batch, spec: dict):
+        # Validate on construction too: recovery rebuilds Items without submit().
+        required_agent_capabilities(spec)
         self.batch, self.spec = batch, spec
         self.name = spec["name"]
         named = rules.placement_type(getattr(batch, "vm_named", False), batch.vm_type, spec.get("vm_type") or "")
@@ -1710,8 +1713,8 @@ class Scheduler:
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
                 "batch_fetch_protocol": 1,
-                "required_agent_capabilities_protocol": 1,
-                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
+                "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1,
+                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
                 "result_files_protocol": 1, "output_files_protocol": 1,
                 "result_inline_bytes": resultfiles.INLINE_BYTES,
@@ -1882,6 +1885,12 @@ class Scheduler:
             rule.exists, rule.live = old is not None, old is not None and not old.closed and old.left() > 0
             what = rule.admit(old is not None and set(old.items) == set(b.items))
         if what == "keep":
+            # Name-only idempotency must never acknowledge a newly pinned job
+            # while retaining an older, unpinned admission (or changed pins).
+            for name, item in b.items.items():
+                previous = old.items[name].spec
+                if ("runtime" in item.spec or "runtime" in previous) and item.spec.get("runtime") != previous.get("runtime"):
+                    return {"ok": False, "error": "runtime pins differ from the existing admission; use a new batch id"}
             return {"ok": True, "kept": True}
         if what == "refuse":
             log(f"{b.id} ({b.client}): a submit under the id of a batch with {old.left()} items live refused (never replaced)")
@@ -4744,6 +4753,11 @@ class Scheduler:
             # Imports, source copies and provider observation happened while placement continued.
             request_lock = getattr(self, "_request_lock", self.lock)
             with request_lock, self.lock:
+                required_runtime = any("runtime" in it.spec
+                                       for b in self.batches.values() for it in b.items.values())
+                if required_runtime and not all(prepared[target].get("runtime_pins_protocol") is True for target in candidates):
+                    self.alert("handoff refused: runtime pins require a runtime-aware successor")
+                    return
                 required_agents = any(required_agent_capabilities(it.spec) and it.state != "done"
                                       for b in self.batches.values() for it in b.items.values())
                 if required_agents and not all(prepared[target].get("required_agent_capabilities_protocol") for target in candidates):
