@@ -152,6 +152,31 @@ class Guards(unittest.TestCase):
                     self.assertFalse((root / 'live/install.json').exists())
                     client.assert_not_called()
 
+    def test_heartbeat_keeps_leases_alive_during_readiness(self):
+        import types
+        s = object.__new__(scheduler.Scheduler)
+        vm = types.SimpleNamespace(id='held', dead=False, lease={'epoch': 7}, ttl=100)
+        s.stop = mock.Mock()
+        s.stop.wait.side_effect = [False, True]
+        s.handing_off, s.vms = True, {'held': vm}
+        s._renew_lease = mock.Mock(return_value=True)
+        with mock.patch.object(scheduler.boat, 'boat') as extend:
+            s._heartbeat()
+            s._renew_lease.assert_called_once_with(vm)
+            extend.assert_called_once()
+        self.assertEqual(vm.lease, {'epoch': 7})
+
+    def test_failed_paused_renewal_vetoes_commit_without_changing_snapshot(self):
+        import types
+        s = object.__new__(scheduler.Scheduler)
+        s.handing_off, s._handoff_lease_lost = True, False
+        s._drop_stale = mock.Mock()
+        vm = types.SimpleNamespace(id='held', lease={'epoch': 7})
+        with mock.patch.object(scheduler.boat, 'lease_vm', return_value={'ok': False, 'stale': True}):
+            self.assertFalse(s._renew_lease(vm))
+        self.assertTrue(s._handoff_lease_lost)
+        s._drop_stale.assert_not_called()
+
     def test_budget_and_timeout_cooldown(self):
         self.assertEqual(updates.handoff_budget(82, 340, 1500), 31000)
         self.assertEqual(updates.handoff_budget(-1, -1, -1), 10000)

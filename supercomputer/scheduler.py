@@ -2962,17 +2962,22 @@ class Scheduler:
         self.wake.set()
 
     def _renew_lease(self, vm: VMState) -> bool:
+        def lost():
+            if getattr(self, "handing_off", False):
+                self._handoff_lease_lost = True  # keep frozen identities; the parent must not commit
+            else:
+                self._drop_stale(vm)
         if not vm.lease:
-            self._drop_stale(vm)
+            lost()
             return False
         try:
             r = boat.lease_vm(vm.id, "renew", lease=vm.lease)
         except boat.LeaseProtocolLost:
             self.alert(f"{vm.id}: lease protocol lost; old client wins, relinquished without stopping")
-            self._drop_stale(vm)
+            lost()
             return False
         if not r.get("ok") or r.get("stale"):
-            self._drop_stale(vm)
+            lost()
             return False
         vm.t_renew = time.monotonic()
         return True
@@ -3990,6 +3995,7 @@ class Scheduler:
                     previous_leases = {vid: v.get("lease") for vid, v in d["vms"].items()}
                 registry_ms = max(getattr(self, "_registry_load_ms", 0),
                                   math.ceil((time.monotonic() - registry_started) * 1000))
+                self._handoff_lease_lost = False
                 self.handing_off, quiesced = True, True
                 # A reversible pause, not stop: all existing loops stay alive.
                 self._metrics_save()
@@ -4038,7 +4044,9 @@ class Scheduler:
                         break
                     time.sleep(0.05)
                 if ack and rules.handoff_ready(
-                        held <= set(ack.get("taken", [])) and not (held & set(ack.get("missing", []))),
+                        rules.handoff_pool_ready(
+                            held <= set(ack.get("taken", [])) and not (held & set(ack.get("missing", []))),
+                            self._handoff_lease_lost),
                         ack.get("admissions", {}).get("ready") is True,
                         ack.get("items_ready") is True):
                     _notify_service(ack["pid"])
@@ -4049,11 +4057,13 @@ class Scheduler:
                 # A failed candidate must not run shutdown(), release or race rollback.
                 self._reject_handoff_candidate(proc, previous_leases)
                 active = None
+                retryable = expired or self._handoff_lease_lost
                 why = (f"handoff to {target} readiness deadline after {budget_s:.3f}s (retryable)" if expired
+                       else f"handoff to {target} lost lease authority before commit (retryable)" if self._handoff_lease_lost
                        else f"handoff to {target} failed readiness: {ack!r}")
                 self.alert(why)
                 if target != self.code:
-                    self.canary.handoff_failed(target, why, expired, time.time())
+                    self.canary.handoff_failed(target, why, retryable, time.time())
             self.alert("handoff blocked: candidate and saved code failed; resuming old scheduler")
         finally:
             try:
@@ -4179,8 +4189,8 @@ class Scheduler:
 
     def _heartbeat(self):
         while not self.stop.wait(60):
-            if getattr(self, "handing_off", False):
-                continue
+            # Readiness can outlast a lease: keep authority alive while placement
+            # and completion ACKs pause. Renewal does not change the capability.
             for v in list(self.vms.values()):
                 # _bring registers booting VMs before their first grant. An
                 # unclaimed placeholder has not lost a lease; _up owns it.

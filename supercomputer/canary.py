@@ -61,12 +61,12 @@ class Canary:
         return rules.handoff_retry_ready(now, float(d.get("retry_after", {}).get(code, 0)),
                                          code in d.get("rejected", []))
 
-    def handoff_failed(self, code: str, why: str, expired: bool, now: float):
-        """A startup deadline is a capacity observation, not a bad-code verdict."""
+    def handoff_failed(self, code: str, why: str, retryable: bool, now: float):
+        """Startup deadlines and authority loss are not bad-code verdicts."""
         from . import rules
         d = self.read()
         retry = d.setdefault("retry_after", {})
-        if rules.handoff_reject(expired):
+        if rules.handoff_reject(retryable):
             d.update(state="rejected", rejected=sorted(set(d.get("rejected", [])) | {code}))
             retry.pop(code, None)
         else:

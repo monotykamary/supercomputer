@@ -85,7 +85,9 @@ handoff receipt. No deployment was performed by this lane.
   Readiness uses a monotonic, workload-sized budget: `10s + 0.1s * VMs + 0.02s *
   running items + 4 * measured load time`, capped at 120s. Load time is the larger
   of the latest admission/pool reload and the current registry read/write. The
-  selected budget and its inputs are logged and included in the snapshot.
+  selected budget and its inputs are logged and included in the snapshot. Lease
+  heartbeat renewal remains active during this longer pause. A failed renewal
+  preserves the frozen inventory but vetoes commit and permits a later retry.
   Failure kills only the candidate PID (no release path), restores parent lease
   metadata and tries saved code on the same descriptors. A deadline is retryable
   after a 60s cooldown, not a permanent code rejection. A concrete failed ACK or

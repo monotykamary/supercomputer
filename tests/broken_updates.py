@@ -58,3 +58,8 @@ def blacklist_a_timeout(expired: bool) -> bool:
 # gdp: law a retry waits for its cooldown: now >= retry_after or not result
 def retry_without_cooldown(now: float, retry_after: float, rejected: bool) -> bool:
     return not rejected
+
+
+# gdp: law readiness never commits after observed lease loss: not result or not authority_lost
+def ignore_readiness_lease_loss(covered: bool, authority_lost: bool) -> bool:
+    return covered

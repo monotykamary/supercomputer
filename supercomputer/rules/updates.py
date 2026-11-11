@@ -7,6 +7,12 @@ def handoff_ready(pool: bool, admissions: bool, items: bool) -> bool:
     return pool and admissions and items
 
 
+# gdp: law readiness requires every offered VM: not result or covered
+# gdp: law readiness never commits after observed lease loss: not result or not authority_lost
+def handoff_pool_ready(covered: bool, authority_lost: bool) -> bool:
+    return covered and not authority_lost
+
+
 # gdp: law a running or unresolved item always requires its VM: not occupied or result
 # gdp: law an empty unavailable VM never blocks handoff: occupied or not unavailable or not result
 # gdp: law a usable VM is still required: unavailable or result
