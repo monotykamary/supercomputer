@@ -98,6 +98,11 @@ new placement. Jobs without the declaration keep legacy behavior. Never infer ca
 or assume Modal fallback exports artifacts. See `docs/agent-capabilities.md` for the complete recipe and
 `docs/result-files.md` for transport/reference formats.
 
+**Recover a finished admission:** `supercomputer batch fetch BATCH_ID --out NEW_DIRECTORY`
+fetches retained rows, logs and exported files by ID with SHA verification, without starting a scheduler,
+submitting, closing or reaping. Requires controller `batch_fetch_protocol:1`; missing/incomplete history
+fails explicitly. The same output directory resumes the same admission generation. See `docs/batch-fetch.md`.
+
 **The treadmill:** sweeps of unsolved tasks, soundness fuzz and mutants, and an idea queue:
 `supercomputer queue add jobs.json [--name N] [--meta k=v]`, `queue ls`, `queue results <name>`; `supercomputer
 digest` (VM-hours and dollars by class, starts per 100 items, waits by class, gaps between waves).

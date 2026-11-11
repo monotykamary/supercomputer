@@ -1709,6 +1709,7 @@ class Scheduler:
         return {"scope": "native-single-vm", "runtime_verified": True, "code": code_hash(),
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
+                "batch_fetch_protocol": 1,
                 "required_agent_capabilities_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -1716,7 +1717,7 @@ class Scheduler:
                 "result_inline_bytes": resultfiles.INLINE_BYTES,
                 "poll_max_bytes": resultfiles.POLL_BYTES + 2048,
                 "retention_requires_strict_once": True,
-                "paths": ["/cancel", "/snapshot", "/capabilities", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"],
+                "paths": ["/cancel", "/snapshot", "/capabilities", "/batch/info", "/batch/rows", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"],
                 "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
 
     @classmethod
@@ -1748,6 +1749,19 @@ class Scheduler:
                                "placements": it.owned.placements, "reaped": it.owned.reaped,
                                "start_inflight": it.owned.inflight, "admission_closed": it.owned.closed,
                                "result_error": getattr(it, "result_error", None)} for it in b.items.values()]}
+
+    def batch_info(self, bid):
+        """Bounded, read-only admission metadata for fetching completed results."""
+        self._valid_batch(bid)
+        with self.lock:
+            b = self.batches.get(bid)
+            if b is None:
+                return {"ok": False, "batch": bid, "error": "no such batch"}
+            return {"ok": True, "batch": bid, "generation": b.cache_generation,
+                    "admitted_at": b.t0, "items": len(b.items), "rows": len(b.rows),
+                    "complete": b.left() == 0, "closed": b.closed,
+                    "strict_once": b.strict_once, "admission_closed": b.admission_closed,
+                    "journals_retained": b.retain_journals or b.strict_once}
 
     @staticmethod
     def _matching_receipt(receipt, bid, name, identity):
@@ -1906,7 +1920,14 @@ class Scheduler:
         self.wake.set()
         return {"ok": True}
 
-    def poll(self, bid: str, since: int, wait: float, peer_closed=None) -> dict:
+    def batch_rows(self, bid: str, since: int) -> dict:
+        """Read a page without renewing the admission heartbeat or waiting."""
+        self._valid_batch(bid)
+        if type(since) is not int or since < 0:
+            raise ValueError("result cursor must be a nonnegative integer")
+        return self.poll(bid, since, 0, touch=False)
+
+    def poll(self, bid: str, since: int, wait: float, peer_closed=None, *, touch=True) -> dict:
         wait = rules.http_poll_wait(wait, HTTP_POLL_MAX_WAIT_S)
         b = self.batches.get(bid)
         if b is None:
@@ -1916,7 +1937,8 @@ class Scheduler:
                 self.stop.wait(min(max(wait, 0), 1.0))
                 return {"rows": [], "done": False, "running": 0, "queued": 0, "recovering": True}
             return {"rows": [], "done": True, "err": "no such batch"}
-        b.t_poll = time.time()
+        if touch:
+            b.t_poll = time.time()
         with b.cv:
             # (rules.Delivery: done to the client only once every item's row is in and it has read them all; it waits
             # while a row may still come, an item done with its row not yet delivered among them)
@@ -1992,17 +2014,28 @@ class Scheduler:
         self.wake.set()
         return s
 
-    def logs(self, bid: str, vms: list[str]) -> bytes:
+    def logs(self, bid: str, vms: list[str], *, require_complete: bool = False) -> bytes:
         """The batch's logs: each item's, kept here as it finished (they outlive a restart), and the VMs' for any
         not kept, merged (one tar.gz)."""
         out = io.BytesIO()
         kept = DIR / "queue" / f"{bid}.logs"
-        have = set()
+        have, included = set(), set()
         # (an item's log is the log of the run that delivered its row: a VM's log of another run of a delivered item, a
         # first try lost there, is left out; the client maps every run of an item to its name, the last one read won)
         b = self.batches.get(bid)
         rows = list(b.rows) if b else self._read_result_journal(DIR / "queue" / f"{bid}.rows", False)
         delivered = {r.get("name"): r.get("run_name") or r.get("name") for r in rows if r.get("name")}
+        if require_complete:
+            if b is None or vms:
+                raise ValueError("complete retained logs require an existing admission and no worker fallback")
+            expected = {r.get("run_name") or r.get("name") for r in rows if r.get("vm") or r.get("run_name")}
+            for name in expected:
+                if not isinstance(name, str) or not name or name in (".", "..") or any(c in name for c in ("/", "\\", "\0")):
+                    raise ValueError("invalid retained log run name")
+                for stream in ("out", "err"):
+                    path = kept / name / stream
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError(f"retained logs incomplete: {name}/{stream}")
         with tarfile.open(fileobj=out, mode="w:gz") as tf:
             for d in sorted(kept.iterdir()) if kept.exists() else []:
                 for f in ("out", "err"):
@@ -2011,6 +2044,7 @@ class Scheduler:
                         ti = tarfile.TarInfo(f"{d.name}/{f}")
                         ti.size = len(data)
                         tf.addfile(ti, io.BytesIO(data))
+                        included.add((d.name, f))
                 have.add(d.name)
             for v in vms:
                 vm = self.vms.get(v)
@@ -2025,6 +2059,8 @@ class Scheduler:
                             base = rn.rsplit("~s", 1)[0]
                             if rn not in have and delivered.get(base, rn) == rn:
                                 tf.addfile(m, src.extractfile(m))
+        if require_complete and any((name, stream) not in included for name in expected for stream in ("out", "err")):
+            raise ValueError("retained logs changed during snapshot")
         return out.getvalue()
 
     def hint(self, msg: dict) -> dict:
@@ -5186,6 +5222,8 @@ def serve(idle_exit: float = 120, takeover: bool = False):
             body = raw if raw is not None else json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Length", str(len(body)))
+            if code == 200 and self.path.partition("?")[0] in ("/logs", "/batch/rows"):
+                self.send_header("X-SC-Content-SHA256", hashlib.sha256(body).hexdigest())
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -5250,7 +5288,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         response = self._response(408, {"error": "incomplete request body"})
                     elif not hmac.compare_digest(self.headers.get("X-SC-Token", ""), s.token):
                         response = self._response(403, {"error": "token"})
-                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/logs", "/capabilities", "/results")
+                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/logs", "/capabilities", "/results", "/batch/info", "/batch/rows")
                                                            or self.path.split("?")[0] == "/state"):
                         response = self._post(body)
                     else:
@@ -5315,6 +5353,16 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                     except (ValueError, TypeError) as e:
                         return self._response(400, {"error": str(e)})
                     return self._response(200, result)
+                if p == "/batch/info":
+                    try:
+                        return self._response(200, s.batch_info(s.batch_of(m)))
+                    except (ValueError, TypeError) as e:
+                        return self._response(400, {"error": str(e)})
+                if p == "/batch/rows":
+                    try:
+                        return self._response(200, s.batch_rows(s.batch_of(m), m.get("since", 0)))
+                    except (ValueError, TypeError) as e:
+                        return self._response(400, {"error": str(e)})
                 if p in ("/cancel", "/snapshot"):
                     bid = s.batch_of(m)
                     try:
@@ -5340,6 +5388,11 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                 if p == "/close":
                     return self._response(200, s.close(s.batch_of(m)))
                 if p == "/logs":
+                    if m.get("require_complete") is True:
+                        try:
+                            return self._response(200, raw=s.logs(s.batch_of(m), m.get("vms", []), require_complete=True))
+                        except (ValueError, OSError) as e:
+                            return self._response(409, {"error": str(e)})
                     return self._response(200, raw=s.logs(s.batch_of(m), m.get("vms", [])))
                 if p == "/hint":
                     return self._response(200, s.hint(m))
@@ -5448,19 +5501,20 @@ class Client:
         else:
             self.token = (DIR / "token").read_text().strip()
 
-    def req(self, path: str, msg, timeout: float = 60, raw: bool = False, body: bytes | None = None):
+    def req(self, path: str, msg, timeout: float = 60, raw: bool = False, body: bytes | None = None, decode=None):
         data_in = body if body is not None else json.dumps(msg).encode()
         if isinstance(self.remote, AgentClient):
             observer = getattr(self, "transport_event", None)
             extra = {"transport_event": observer} if observer is not None else {}
-            code, data, _ = self.remote._req("POST", path, data_in, timeout, "application/octet-stream" if body is not None else "application/json", **extra)
+            code, data, _ = self.remote._req("POST", path, data_in, timeout, "application/octet-stream" if body is not None else "application/json",
+                                             **({"decode": decode} if decode is not None else {}), **extra)
             if code != 200:
                 raise RuntimeError(f"the controller: {path}: {code} {data[:300]!r}")
         else:
-            data = self._local(path, data_in, timeout)
-        return data if raw else json.loads(data)
+            data = self._local(path, data_in, timeout, **({"decode": decode} if decode is not None else {}))
+        return data if raw or decode is not None else json.loads(data)
 
-    def _local(self, path: str, body: bytes, timeout: float) -> bytes:
+    def _local(self, path: str, body: bytes, timeout: float, decode=None):
         """A request over a kept-alive connection (to this machine's scheduler, or through the forward: a new
         connection through boat's ssh costs a round trip of its own)."""
         import http.client
@@ -5481,7 +5535,11 @@ class Client:
             try:
                 conn.request("POST", path, body=body, headers={"X-SC-Token": self.token, "Content-Type": "application/json"})
                 r = conn.getresponse()
-                data = r.read()
+                try:
+                    data = decode(r) if decode is not None and r.status == 200 else r.read()
+                except BaseException:
+                    conn.close()
+                    raise
                 c.append(conn)
                 if r.status != 200:
                     raise RuntimeError(f"the scheduler: {path}: {r.status} {data[:300]!r}")

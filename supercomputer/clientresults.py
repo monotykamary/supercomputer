@@ -93,7 +93,7 @@ def _copy_file(store, ref, directory, parts):
                 pass
 
 
-def download(row: dict, read: callable, directory: Path) -> dict:
+def download(row: dict, read: callable, directory: Path, *, verify_cached: bool = False) -> dict:
     """Import verified references and materialize an optional output manifest.
 
     Large result/row JSON remains on disk, never decoded here. The manifest is
@@ -112,6 +112,14 @@ def download(row: dict, read: callable, directory: Path) -> dict:
     def import_ref(ref):
         ref = dict(resultfiles.validate_ref(ref))
         store.import_ref(ref, lambda offset, count: read(ref, offset, count))
+        if verify_cached:
+            digest, size = hashlib.sha256(), 0
+            with store.open(ref) as source:
+                while chunk := source.read(CHUNK_BYTES):
+                    digest.update(chunk)
+                    size += len(chunk)
+            if size != ref['bytes'] or digest.hexdigest() != ref['sha256']:
+                raise ValueError('cached result payload size or SHA-256 mismatch')
         return ref, store.root / (ref['sha256'] + '.payload')
 
     for key, target in (('result_ref', 'result_file'), ('row_ref', 'row_file')):

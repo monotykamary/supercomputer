@@ -6,6 +6,7 @@
     supercomputer status | starts [--since 24h] | reap | cold | teardown [--all] | image [--build] | usage <since>
     supercomputer demand <client> [--for 300] [--pid P] [--done]
     supercomputer queue add <jobs.json> [--tree DIR] [--name N] | ls | results <name>
+    supercomputer batch fetch <id> --out <dir>
     supercomputer treadmill run [...]  |  digest [--day D]
     supercomputer store push|serve|pull|verify|ls|unserve ...
     supercomputer volumes inventory|copy|verify|ls ...
@@ -268,6 +269,12 @@ def main(argv=None):
     sub.add_parser("migrate", help="move a repo's old pool directory (gdp-wired's supercomputer/.live) into the shared one")
     ct = sub.add_parser("controller", help="the scheduler and the treadmill on a boat VM: setup, status, sync, logs, restart, stop")
     ct.add_argument("args", nargs=argparse.REMAINDER)
+    batch = sub.add_parser("batch", help="read retained ordinary-batch results without closing")
+    batch_commands = batch.add_subparsers(dest="batch_cmd", required=True)
+    fetch = batch_commands.add_parser("fetch", help="download a finished batch by ID; never submit or close")
+    fetch.add_argument("id")
+    fetch.add_argument("--out", required=True)
+    fetch.add_argument("--timeout", type=float, default=120, help="per-request timeout in seconds")
     sc = sub.add_parser("scheduler", help="the scheduler: serve (started by clients on demand), status, stop")
     sc.add_argument("args", nargs=argparse.REMAINDER)
     a = ap.parse_args(argv)
@@ -275,6 +282,13 @@ def main(argv=None):
     from . import boat
     if a.cmd == "run":
         _run(a)
+    elif a.cmd == "batch":
+        from . import batchfetch
+        try:
+            result = batchfetch.fetch(a.id, a.out, timeout=a.timeout)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise SystemExit(f"batch fetch: {exc}") from exc
+        print(json.dumps(result, indent=2))
     elif a.cmd == "status":
         boat.status()
     elif a.cmd == "health":

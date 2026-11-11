@@ -77,6 +77,9 @@ Native jobs can also return arbitrarily large **output files**: write regular fi
 with hash verification, to `runs/x/<name>.files/<relative-path>`. Do not embed large artifacts as
 base64 in JSON or stdout. Large JSON returns are delivered as complete file references; small
 returns are unchanged. See [output-file transport and result references](docs/result-files.md).
+To recover a finished admission after its client exits, use
+`supercomputer batch fetch BATCH_ID --out NEW_DIRECTORY` without closing it; see
+[read-only batch recovery](docs/batch-fetch.md).
 
 | Job field | |
 | --- | --- |
