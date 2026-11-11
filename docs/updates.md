@@ -173,7 +173,13 @@ before submitting constrained jobs. Snapshot preparation reads the candidate's c
 candidate interpreter/import. Before freezing, the parent refuses any successor/rollback candidate lacking
 exact-model support while constrained admissions remain live. In-flight CPU acquisitions settle before the
 freeze (placement continues during this deferral), so the successor cannot race the old draw accountant.
-No new lease or handoff protocol is required.
+No new lease protocol is required.
+
+Distinct-VM groups add `distinct_vm_groups` to the snapshot and ACK, including VM IDs consumed by completed
+placements. A group placement is journaled and fsynced under the placement lock before launching. Reload
+replays all placement records (not only unfinished work). The parent only commits an exact history ACK; a
+missing/mismatched history leaves the candidate unready and resumes the parent. Preparation refuses a
+group-unaware candidate/rollback while grouped work remains live. Old snapshots with no groups still work.
 
 Client endpoint selection now defaults to `live/controller.json`, including fail-closed behavior for an unreadable
 configuration. Only `SUPERCOMPUTER_LOCAL=1` explicitly permits a local scheduler when a controller is configured.

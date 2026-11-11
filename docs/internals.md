@@ -63,6 +63,13 @@ immediately; late reports backfill unconstrained in-flight placements.
 pending outcomes and consecutive-fruitless streak across restarts and daily metrics rotation. Status and daily
 metrics expose the constraint summary. This file is local scheduler bookkeeping, not a lease authority.
 
+`distinct_vm_group` consumes VM IDs in a batch-scoped set, atomically with an fsynced `.placed` record
+before launch. Restart replays every record, including completed members. The full `distinct_vm_groups` map
+is carried in hot-handoff snapshots and ACKs; a mismatch prevents commit. `distinct_vm_group_protocol: 1`
+advertises this contract. The client probes deployed capabilities; grouped admissions require the explicit
+integer `placement_contract: 1`, rejecting old clients before dispatch. Placement receipts include the group,
+VM and the agent lease boot ID if available. No agent or lease protocol changes are needed.
+
 ## Environment
 
 `SUPERCOMPUTER_{LIVE,CLIENT,URGENT,VM,MAX_STARTS,SHARE,RESERVE_DAY,RESERVE_HOUR,CEIL,IMAGE,WARM,VERBOSE,CONFIG,HOME,SRC}`;

@@ -5,7 +5,7 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
 
 **Run a jobs file** from any repo (its git root is the tree; `supercomputer.toml` says what it needs):
 - `supercomputer run --jobs jobs.json --out runs/x [--class C] [--timing] [--data DIR[:DEST]] [--env K=V]`
-- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?}]`;
+- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?, "distinct_vm_group"?}]`;
   `cmd` runs under bash in `<repo>/<cwd>`; logs in `<out>/<name>.log`, `<out>/summary.tsv` (name, exit, seconds, where).
 - The tree ships without node_modules: start a bun job with `bun install --frozen-lockfile && ...`.
 - `--timing`: each job alone on its VM; `<out>/placement.json` is the label a timing claim needs.
@@ -16,6 +16,9 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
   no different-model or Modal fallback. `cpu_model_max_fruitless` (default 12) bounds consecutive unsuccessful
   starts per image/type/model, not spend; a job can override it with `"cpu_model_max_fruitless": 64`.
   Exhausted items report `unplaceable_by_constraint`, their effective limit and all observed model counts.
+- `"distinct_vm_group":"run/stage/case/rep"`: each member uses a different VM for this batch's lifetime,
+  including after completion, restart or hot handoff. Combines with `cpu_model`; no fallback. Receipts include
+  the group, VM ID and agent boot ID when available. Jobs start as their VMs are ready, with no global barrier.
 
 **Classes** (`--class`, else `$SUPERCOMPUTER_CLASS`; a small batch defaults to interactive, a bigger one to submission):
 - `interactive`: quick checks; a slot at once (a filler's or sweep's item is killed and re-queued).

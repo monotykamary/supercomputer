@@ -74,6 +74,7 @@ where it ran, and `runs/x/backends.json` says why anything moved.
 | `cpu`, `memory` | its shape; a job past 2 vCPUs gets its slots set aside on one VM |
 | `image`, `vm_type` | an image the repo's config names; a fixed VM type (for timing claims) |
 | `cpu_model` | exact agent-reported CPU model; requires `vm_type`, never falls back to other hardware |
+| `distinct_vm_group` | batch-scoped group ID; each member uses a different VM, even after earlier members finish or the scheduler restarts |
 | `gpu` | goes to RunPod, then Modal |
 | `backend` | `boat`, `runpod` or `modal` only, no fallback |
 

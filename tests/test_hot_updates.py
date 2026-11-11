@@ -263,7 +263,7 @@ class Guards(unittest.TestCase):
 
 
 class RealSocketHandoff(unittest.TestCase):
-    def exercise(self, rejected, blocked=False, slow=False):
+    def exercise(self, rejected, blocked=False, slow=False, grouped=False):
         if os.environ.get('OWNED_LIFECYCLE_BOAT_TEST') != '1':
             self.fail('run this regression on Boat with OWNED_LIFECYCLE_BOAT_TEST=1')
         with tempfile.TemporaryDirectory(prefix='sc-hot-') as tmp:
@@ -277,7 +277,8 @@ class RealSocketHandoff(unittest.TestCase):
             if blocked:
                 with (tool / "supercomputer/scheduler.py").open("a") as f:
                     delay = "        time.sleep(180)\n" if blocked == "timeout" else ""
-                    f.write("\n_publish_ack_ok = Scheduler._publish_handoff_ack\ndef _bad_ack(self):\n    if getattr(self, '_handoff_ack', None):\n" + delay + "        self._handoff_ack['items_ready'] = False\n    _publish_ack_ok(self)\nScheduler._publish_handoff_ack = _bad_ack\n")
+                    mutation = "        self._handoff_ack['distinct_vm_groups'] = {}\n" if blocked == "groups" else "        self._handoff_ack['items_ready'] = False\n"
+                    f.write("\n_publish_ack_ok = Scheduler._publish_handoff_ack\ndef _bad_ack(self):\n    if getattr(self, '_handoff_ack', None):\n" + delay + mutation + "    _publish_ack_ok(self)\nScheduler._publish_handoff_ack = _bad_ack\n")
             with socket.socket() as reserve:
                 reserve.bind(('127.0.0.1', 0))
                 port = reserve.getsockname()[1]
@@ -287,6 +288,16 @@ class RealSocketHandoff(unittest.TestCase):
                    'BOAT_BIN': '/bin/false'}  # never call the live provider, even if adoption wakes
             env.pop('NOTIFY_SOCKET', None)
             env.pop('SUPERCOMPUTER_HANDOFF_FDS', None)
+            if grouped:
+                qd = root / "live/scheduler/queue"
+                qd.mkdir(parents=True)
+                record = {"batch": "completed-group", "klass": 2, "image": "image", "ctx_b64": "",
+                          "tree": {"id": "tree", "files": {}, "links": {}},
+                          "items": [{"name": "done", "distinct_vm_group": "run/stage/case/rep"}], "placement_contract": 1}
+                (qd / "completed-group.json").write_text(json.dumps(record))
+                (qd / "completed-group.rows").write_text(json.dumps({"name": "done", "code": 0}) + "\n")
+                (qd / "completed-group.placed").write_text(json.dumps({"name": "done", "run_name": "done",
+                    "vm": "finished-vm", "image": "image", "distinct_vm_group": "run/stage/case/rep"}) + "\n")
             pids = set()
             proc = None
             log = (root / 'process.log').open('w')
@@ -365,6 +376,10 @@ class RealSocketHandoff(unittest.TestCase):
                     ack = json.loads(ack_path.read_text())
                     self.assertTrue(ack['items_ready'])
                     self.assertTrue(ack['admissions']['ready'])
+                    if grouped:
+                        expected = {"completed-group": {"run/stage/case/rep": ["finished-vm"]}}
+                        self.assertEqual(ack["distinct_vm_groups"], expected)
+                        self.assertEqual(json.loads((root / "live/scheduler/handoff.used.json").read_text())["distinct_vm_groups"], expected)
                     self.assertTrue(list((root / "live/scheduler/code" / state["code"]).rglob("scheduler.*.pyc")))
                     if slow:
                         self.assertGreater(time.monotonic() - began, 5)
@@ -402,6 +417,12 @@ class RealSocketHandoff(unittest.TestCase):
 
     def test_successful_socket_handoff(self):
         self.exercise(False)
+
+    def test_completed_group_history_is_carried_in_snapshot_and_ack(self):
+        self.exercise(False, grouped=True)
+
+    def test_missing_group_history_ack_keeps_original_owner(self):
+        self.exercise(False, blocked="groups", grouped=True)
 
     def test_rejected_candidate_rolls_back_on_same_socket(self):
         self.exercise(True)

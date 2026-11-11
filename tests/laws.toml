@@ -1,6 +1,7 @@
 # The law gate's batch on boat (tests/check_laws.sh): this checkout shipped as is, gdp-wired-cli by bunx on the pool's
 # image ($SUPERCOMPUTER_IMAGE, the one its VMs run: bun on it), nothing built.
-# rules/cpu.py and rules/affinity.py are included by check_laws.sh alongside their broken variants.
+# rules/cpu.py and rules/affinity.py cover exact models, distinct VM history/ACKs, and endpoint affinity,
+# alongside their broken variants in check_laws.sh.
 name = "supercomputer"
 
 [boat]

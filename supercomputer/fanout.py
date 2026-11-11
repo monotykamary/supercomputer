@@ -151,9 +151,9 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
             print(f"{name:40} exit {row.get('code', -1):>3}  {row.get('seconds', -1):>8} s", flush=True)
 
     for j in spec:
-        if "cpu_model" in j and (backend not in ("auto", "boat") or j.get("gpu") or j.get("backend") not in (None, "boat")
+        if ("cpu_model" in j or "distinct_vm_group" in j) and (backend not in ("auto", "boat") or j.get("gpu") or j.get("backend") not in (None, "boat")
                                  or (j.get("image") and j["image"] not in project().images)):
-            raise ValueError("cpu_model requires a boat CPU job and a boat image; no fallback is permitted")
+            raise ValueError("placement constraints require a boat CPU job and a boat image; no fallback is permitted")
     gpu = [j for j in spec if j.get("gpu")]
     if gpu:
         from . import runpod
@@ -204,7 +204,7 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
             mine = [j for j in mine if j["name"] not in rows and fallback.lost_route(False, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto") == "boat"]
         todo = []
         for j in [j for j in spec_cpu if j["name"] not in rows]:
-            r = "failed" if "cpu_model" in j else fallback.lost_route(j in own, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto")
+            r = "failed" if "cpu_model" in j or "distinct_vm_group" in j else fallback.lost_route(j in own, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto")
             if r == "modal":
                 todo.append(j)
             else:  # (boat failed it 3 times under --backend boat, or boat couldn't run it at all: failed, with why)

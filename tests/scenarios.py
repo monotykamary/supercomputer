@@ -1443,6 +1443,13 @@ def _truth_waste(sim, every: float = 15.0) -> dict:
             any_real = any(it["klass"] in real and it["submitted"] is not None and it["delivered"] is None and it["running"] == 0
                            for it in local_items.values())
             others = lambda c: any(w["klass"] in ("interactive", "gate") or (w["klass"] == "submission" and w["client"] != c and run_by.get(w["client"], 0) < sub_share) for w in waiters)
+            group_used = {}
+            for bid in {b for (b, _), item in local_items.items() if item.get("distinct_vm_group")}:
+                journal = pathlib.Path(sim.tmp) / "scheduler" / "queue" / f"{bid}.placed"
+                for line in journal.read_text().splitlines() if journal.exists() else ():
+                    p = json.loads(line)
+                    if p.get("distinct_vm_group"):
+                        group_used.setdefault((bid, p["distinct_vm_group"]), set()).add(p["vm"])
             cur: dict = {}
             for it in sorted(waiters, key=lambda it: real.index(it["klass"])):
                 need = it.get("weight", 1)
@@ -1453,6 +1460,9 @@ def _truth_waste(sim, every: float = 15.0) -> dict:
                     if v.image != it["image"] or (it.get("vm_type") and v.type != it["vm_type"]):
                         continue
                     if it.get("cpu_model") and v.model != it["cpu_model"]:
+                        continue
+                    group = it.get("distinct_vm_group")
+                    if group and vid in group_used.get((it.get("batch"), group), set()):
                         continue
                     if it.get("memory") and not B.R.fits_memory(int(it["memory"]), B.TYPES.get(v.type, (0, 0))[1], B.MEM_OVERHEAD):
                         continue
@@ -2211,6 +2221,25 @@ def cpu_model_absent(code):
         return {"cpu_refusal": all(r and r.get("unplaceable_by_constraint") for r in rows),
                 "cpu_bounded": 0 < len({d["vm"] for d in ds}) <= 3,
                 "cpu_no_placement": all(it["runs"] == 0 for it in sim.w.items.values())}
+    return sim, {"extra": extra}
+
+
+@scenario("distinct model-pinned VM groups", ["clients", "threads", "lost", "orphans"], 2400,
+          "completed group members exclude their VMs across a hot handoff; independent groups may share")
+def distinct_vm_handoff(code):
+    from tests.sim.harness import items, IMAGE
+    sim = _sim(code, policy={"floor_default": 0})
+    for _ in range(2):
+        sim.w.warm_vm(IMAGE).model = "sim-cpu"
+    bid = sim.batch("distinct", "gate", items("d", 6, 60, cpu_model="sim-cpu", vm_type="large", distinct_vm_group="run/stage/case/rep"))
+    sim.at(35, lambda: sim.w.install("distinct-groups"))
+    def extra(sim, m):
+        rows = list(sim.clients[bid]["items"].values())
+        placed = [r.get("placement", {}) if r else {} for r in rows]
+        actual = [peer["boat_vms"] for (b, _), peer in sim.w.items.items() if b == bid]
+        return {"distinct_receipts": len({p.get("vm") for p in placed}) == len(placed) and all(p.get("distinct_vm_group") == "run/stage/case/rep" for p in placed),
+                "distinct_actual": sum(len(vms) for vms in actual) == len(set().union(*actual)),
+                "distinct_cpu": all(p.get("cpu") == "sim-cpu" for p in placed)}
     return sim, {"extra": extra}
 
 

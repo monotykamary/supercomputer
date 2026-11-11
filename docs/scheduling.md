@@ -262,7 +262,20 @@ explicitly permits further attempts; submitting a fresh batch does not reset it.
 
 `status.constraints` and the digest show each constraint's matching VM IDs/count, waiting items, draw IDs/models,
 and fruitless streak/limit. `status.vms[].model` also exposes unknown agents. Timing still means exclusive use
-while running, **not** gang scheduling or a distinct VM across sequential jobs.
+while running, **not** gang scheduling. For distinct workers across sequential jobs, add a nonblank caller-chosen
+`"distinct_vm_group":"run/stage/case/rep"`. Each placement consumes its VM ID for that group for the entire
+batch, including completed, preempted or failed placements. Other groups/batches may still use that VM.
+The placement lock and an fsynced write-ahead journal make the consumption atomic; replay includes completed
+placements. Used VMs contribute no capacity to that group's normal break-even/gate growth calculation.
+This composes with exact CPU matching and never falls back to an unconstrained backend. Clients require the
+`distinct_vm_group` capability and `distinct_vm_group_protocol: 1`.
+`SUPERCOMPUTER_CONTROLLER=1 supercomputer scheduler capabilities` reads the live controller JSON without
+starting a scheduler; require `cpu_model_exact: true`, `distinct_vm_group: true` and protocol `1` for combined
+work. Native submissions include `placement_contract: 1`; grouped admissions from old clients without it
+are rejected before dispatch. Jobs start as soon as their own VM is ready; no global start barrier.
+Receipts include `placement.distinct_vm_group`, `placement.vm` and `placement.boot_id` (when the agent's
+lease exposes it). Hot-handoff snapshots and ACKs carry the complete per-batch group history; a missing or
+different history refuses commit before the old scheduler exits.
 
 ## The terms (boat's TOS-6 and TOS-10)
 

@@ -2738,9 +2738,11 @@ class Scheduled(Session):
         if not items:
             return
         self.client = self.client or self.sched.connect()
-        if any("cpu_model" in it for it in items):
+        if any("cpu_model" in it or "distinct_vm_group" in it for it in items):
             caps = self.client.req("/capabilities", {})
-            if caps.get("cpu_model_exact") is not True:
+            if any("distinct_vm_group" in it for it in items) and not (caps.get("distinct_vm_group") is True and caps.get("distinct_vm_group_protocol") == 1):
+                raise Unavailable("scheduler lacks distinct_vm_group capability; refusing unconstrained submission")
+            if any("cpu_model" in it for it in items) and caps.get("cpu_model_exact") is not True:
                 raise Unavailable("scheduler lacks exact cpu_model capability; refusing unconstrained submission")
         self.client.push_tree(self.tree)
         self.client.push_caches(self.caches, self.proj.cache_outputs)
@@ -2755,6 +2757,8 @@ class Scheduled(Session):
                "caches": [{"name": c["name"], "key": c["key"], "local": str(cache_local(c, c["key"])), "outputs": self.proj.cache_outputs(c)} for c in self.caches],
                "on_lost": on_lost is not None, "max_wait": max_wait, "warm_only": self.warm_only, "timing": env("TIMING") not in ("", "0"),
                "vm_type_named": bool(getattr(self, "vm_named", False) or env("VM_NAMED")), "items": items}
+        if any("distinct_vm_group" in it for it in items):
+            msg["placement_contract"] = 1
         def submit():
             r = self.client.req("/submit", msg)
             if isinstance(r, dict) and r.get("missing"):
@@ -3133,6 +3137,11 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
         for j in js:
             w = R.weight(math.ceil(cpu), math.ceil(memory))  # (rules.boat.weight: 2 vCPU and 4096 MB a slot)
             it = {"name": j["name"], "kind": "sh", "cmd": pre + cmd(j["cmd"]), "cwd": j.get("cwd", "."), "limit": timeout - 30, "weight": w, "est": past.get(j["name"], med)}
+            if "distinct_vm_group" in j:
+                group = j["distinct_vm_group"]
+                if not isinstance(group, str) or not group.strip():
+                    raise ValueError("distinct_vm_group must be a nonblank string")
+                it["distinct_vm_group"] = group
             if "cpu_model" in j:
                 model = j["cpu_model"]
                 if not isinstance(model, str) or not model.strip():
@@ -3173,7 +3182,7 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                     raise SystemExit(f"{j['name']} asks for {cpu} vCPU and {memory} MB: no boat VM type has that usable ({MEM_OVERHEAD} MB of each is its OS's)")
                 it["vm_type"] = big
             # Hooks may rebuild the execution spec, but cannot silently erase a user pin.
-            for field in ("cpu_model", "cpu_model_max_fruitless"):
+            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group"):
                 if field in j:
                     it[field] = j[field]
             items.append(it)
@@ -3197,8 +3206,8 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
     small = len(items) <= TINY[0] or slot_s < TINY[1] * 60
     # (with the scheduler, a tiny batch goes to boat too, as an interactive check: Modal only after boat fails 3 times)
     sched_on = __import__("supercomputer.scheduler", fromlist=["enabled"]).enabled()
-    if any("cpu_model" in it for it in items) and not sched_on:
-        raise Unavailable("cpu_model requires the scheduler; refusing the legacy unconstrained path")
+    if any("cpu_model" in it or "distinct_vm_group" in it for it in items) and not sched_on:
+        raise Unavailable("placement constraints require the scheduler; refusing the legacy unconstrained path")
     tiny = on_lost is not None and small and not sched_on
     try:
         remote = bool(getattr(__import__("supercomputer.scheduler", fromlist=["controller"]), "controller")())

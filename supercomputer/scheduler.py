@@ -255,7 +255,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
             raise RuntimeError(f"snapshot compile/import failed: {(result.stderr or result.stdout)[-1000:]}")
     capabilities = json.loads(result.stdout.strip().splitlines()[-1])
     return {"python": sys.executable, "cache_tag": sys.implementation.cache_tag,
-            "cpu_model_exact": capabilities.get("cpu_model_exact") is True}
+            "cpu_model_exact": capabilities.get("cpu_model_exact") is True,
+            "distinct_vm_group": capabilities.get("distinct_vm_group") is True and capabilities.get("distinct_vm_group_protocol") == 1}
 
 
 def stage_install() -> dict:
@@ -395,6 +396,8 @@ class Batch:
         self.warm_only = bool(msg.get("warm_only"))
         self.timing = bool(msg.get("timing"))
         self.vm_named = bool(msg.get("vm_type_named"))  # (its type named by its client: each item's placement constraint)
+        self.distinct_vms: dict[str, set[str]] = {}
+        self.has_distinct = any(s.get("distinct_vm_group") for s in msg["items"])
         self.items = {s["name"]: Item(self, s) for s in msg["items"]}
         self.rows: list[dict] = []
         self.t0 = float(msg.get("t0") or time.time())
@@ -432,13 +435,14 @@ def mem_fits(it, vm_type: str) -> bool:
 def fit_shape(it) -> tuple:
     """All a VM's fit for the item reads (rules.vm_fits): its image, class, timing, weight, VM type, avoid set, memory.
     Items of one shape fit the same VMs: a pass's memo, preemption's and health's waste group by it."""
-    return (it.batch.image, it.batch.klass, it.timing, it.weight, it.spec.get("vm_type") or "", frozenset(it.avoid) if it.avoid else None, getattr(it, "memory", 0), it.spec.get("cpu_model", ""))
+    return (it.batch.image, it.batch.klass, it.timing, it.weight, it.spec.get("vm_type") or "", frozenset(it.avoid) if it.avoid else None, getattr(it, "memory", 0), it.spec.get("cpu_model", ""),
+            (it.batch.id, it.spec["distinct_vm_group"], frozenset(it.batch.distinct_vms.get(it.spec["distinct_vm_group"], ()))) if it.spec.get("distinct_vm_group") else None)
 
 
 def vm_fits(shape: tuple, vm, retired: set) -> bool:
     """rules.vm_fits for an item of `shape` on the VM: the one test of placement, preemption and waste."""
-    image, _k, _t, _w, vtype, avoid, mem, model = shape
-    return rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
+    image, _k, _t, _w, vtype, avoid, mem, model, distinct = shape
+    return rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
                          bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
 
 
@@ -679,7 +683,7 @@ class Scheduler:
                 b = Batch(json.loads(f.read_text()))
                 if self._valid_batch(b.id) != f.stem:
                     raise ValueError("admission id does not match its file")
-                enhanced = b.strict_once or b.retain_journals or b.admission_closed
+                enhanced = b.strict_once or b.retain_journals or b.admission_closed or b.has_distinct
                 rows = self._read_journal(qd / f"{b.id}.rows", enhanced)
                 for r in rows:
                     if r.get("name") in b.items:
@@ -698,6 +702,9 @@ class Scheduler:
                         prior.launch_identity = pl.get("identity")
                         prior.last_placement = pl
                         b.vms_used.add(pl["vm"])
+                        group = pl.get("distinct_vm_group") or prior.spec.get("distinct_vm_group")
+                        if group:
+                            b.distinct_vms.setdefault(group, set()).add(pl["vm"])
                 for it in b.items.values():
                     if b.strict_once and it.owned.placements > 1:
                         raise ValueError("strict admission has multiple placements; quarantined")
@@ -769,6 +776,10 @@ class Scheduler:
             x["batch"] for v in info.values() for x in v.get("items", [])}
         self.recovery, what, why = self.canary.admissions(self.code, expected, loaded, closed, self.recovery_errors)
         self.recovery["manifest_complete"] = "batches" in snap
+        expected_groups = {bid: groups for bid, groups in snap.get("distinct_vm_groups", {}).items() if bid not in closed}
+        if not rules.distinct_history_matches(bool(expected_groups), self._distinct_snapshot() == expected_groups):
+            self.recovery["ready"] = False
+            self.recovery["distinct_vm_groups"] = "history mismatch"
         self.recovery_blocked = not self.recovery["ready"]
         # A guard-aware parent owns the failed-ACK rollback. Starting a second
         # hand-back here would race its recovery and spawn two replacements.
@@ -908,6 +919,7 @@ class Scheduler:
         if snap:
             self._handoff_ack = {"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing,
                                  "admissions": self.recovery, "items_ready": items_ready,
+                                 "distinct_vm_groups": self._distinct_snapshot(),
                                  "registry_load_ms": self._registry_load_ms,
                                  "reload_ms": max(0, math.ceil((time.monotonic() - getattr(self, "_reload_started", time.monotonic())) * 1000))}
             if not os.environ.get("SUPERCOMPUTER_HANDOFF_FDS"):
@@ -1049,6 +1061,10 @@ class Scheduler:
         if pruned:
             log(f"handoff: pruned {len(pruned)} empty unavailable holds: {pruned}")
 
+    def _distinct_snapshot(self) -> dict:
+        return {b.id: {g: sorted(ids) for g, ids in b.distinct_vms.items()}
+                for b in self.batches.values() if getattr(b, "distinct_vms", {})}
+
     def _handoff_snapshot(self) -> dict:
         """What the next scheduler takes at once: every VM held here and ready, with what it knows of it."""
         vms = []
@@ -1063,6 +1079,7 @@ class Scheduler:
                                   for it in list(v.running.values()) + list(getattr(v, "finishing", {}).values())]})
         return {"from_pid": os.getpid(), "t": time.time(), "from": self.code, "vms": vms,
                 "batches": sorted(set(self.batches) | set(getattr(self, "recovery_errors", {}))),
+                "distinct_vm_groups": self._distinct_snapshot(),
                 "admission_guard": True, "unavailable": dict(getattr(self, "_handoff_pruned", {}))}
 
     def _reattach(self):
@@ -1289,12 +1306,19 @@ class Scheduler:
                     raise ValueError("cpu_model must be a nonblank exact model string")
                 if not (spec.get("vm_type") or (msg.get("vm_type_named") and msg.get("vm_type"))):
                     raise ValueError("cpu_model requires an explicit vm_type")
+            if "distinct_vm_group" in spec:
+                if not isinstance(spec["distinct_vm_group"], str) or not spec["distinct_vm_group"].strip():
+                    raise ValueError("distinct_vm_group must be a nonblank string")
+                cls._valid_batch(name)
             if enhanced:
                 cls._valid_batch(name)
             if "launch_identity" in spec or "strict_once" in spec:
                 raise ValueError("reserved scheduler ownership fields in item")
             names.append(name)
-        if enhanced and len(names) != len(set(names)):
+        grouped = any(s.get("distinct_vm_group") for s in msg.get("items", []))
+        if grouped and (type(msg.get("placement_contract")) is not int or msg["placement_contract"] != 1):
+            raise ValueError("distinct_vm_group requires placement_contract=1 from a group-aware client")
+        if (enhanced or grouped) and len(names) != len(set(names)):
             raise ValueError("duplicate item names")
         if any(k in msg for k in ("admission_closed", "cancellation_complete", "launch_identity")):
             raise ValueError("reserved scheduler ownership fields in submission")
@@ -1354,7 +1378,7 @@ class Scheduler:
     def capabilities():
         return {"scope": "isolated-proposed", "runtime_verified": False,
                 "submit_flags": ["strict_once", "retain_journals"],
-                "item_constraints": ["cpu_model"], "cpu_model_exact": True,
+                "item_constraints": ["cpu_model", "distinct_vm_group"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "retention_requires_strict_once": True,
                 "paths": ["/cancel", "/snapshot", "/capabilities"],
                 "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
@@ -2009,10 +2033,12 @@ class Scheduler:
         for key, (n, k, b, allow) in want.items():
             image, vm_type = key[:2]
             constraint = key[2] if len(key) > 2 else ""
+            distinct = key[3] if len(key) > 3 else None
             if n > 0 and time.time() > self.backoff.get(image, 0) and image not in self.asking:
                 # (boat's API off the loop: a slow `limits` never holds up placing or preempting)
                 self.asking.add(image)
-                threading.Thread(target=self._ask, args=(image, vm_type, n, k, b, allow, constraint), daemon=True).start()
+                args = (image, vm_type, n, k, b, allow, constraint) + ((distinct,) if distinct else ())
+                threading.Thread(target=self._ask, args=args, daemon=True).start()
         self._release_idle()
 
     def retired(self) -> set:
@@ -2062,6 +2088,9 @@ class Scheduler:
         if it.batch.strict_once and it.owned.placements:
             self._owned_failed(it, "strict_once: prior placement cannot be replaced")
             return False
+        group = it.spec.get("distinct_vm_group", "")
+        if not rules.distinct_vm_allowed(bool(group), vm.id in it.batch.distinct_vms.get(group, ())):
+            return False
         if not rules.cpu_matches(it.spec.get("cpu_model", ""), vm.model):
             return False
         if it.spec.get("cpu_model"):
@@ -2079,10 +2108,14 @@ class Scheduler:
             "run_name": it.name if not getattr(it, "placed", 0) else f"{it.name}~s{it.placed + 1}",
             "vm": vm.id, "image": vm.image, "type": vm.type, "cpu": vm.model,
             "identity": it.launch_identity, "t": time.time()}
+        if group:
+            it.last_placement.update(distinct_vm_group=group, boot_id=vm.lease.get("boot", ""))
         # Write-ahead admission: never launch on failure to persist the placement.
         try:
-            if it.batch.strict_once or it.batch.retain_journals:
+            if it.batch.strict_once or it.batch.retain_journals or group:
                 self._append_owned(it.batch.id, "placed", it.last_placement)
+            if group:
+                it.batch.distinct_vms.setdefault(group, set()).add(vm.id)
         except Exception:
             it.owned.start_settled()
             it.start_done.set()
@@ -2160,7 +2193,7 @@ class Scheduler:
                     self.wake.set()
                     return
                 it.state = "running"
-            if not (b.strict_once or b.retain_journals):
+            if not (b.strict_once or b.retain_journals or it.spec.get("distinct_vm_group")):
                 # Old handoff snapshots contain only batch/name/state. Rebuild
                 # a legacy placement from the actual held run, never write null.
                 if (not isinstance(it.last_placement, dict) or it.last_placement.get("run_name") != rn
@@ -2553,7 +2586,8 @@ class Scheduler:
         out = {}
         groups: dict = {}
         for it in self._pass_queue():
-            groups.setdefault((it.batch.image, it.spec.get("vm_type") or getattr(it, "need_type", None) or it.batch.vm_type, it.spec.get("cpu_model", "")), []).append(it)
+            group = (it.batch.id, it.spec["distinct_vm_group"]) if it.spec.get("distinct_vm_group") else None
+            groups.setdefault((it.batch.image, it.spec.get("vm_type") or getattr(it, "need_type", None) or it.batch.vm_type, it.spec.get("cpu_model", ""), group), []).append(it)
         if rules.plan_waits(getattr(self, "reattaching", False), time.time() - getattr(self, "t_reattach", 0.0), bool(getattr(self, "_handoff", {}).get("taken")), 15.0):
             return {}
         live = [v for v in self.vms.values() if not v.dead]
@@ -2564,11 +2598,13 @@ class Scheduler:
         pool.open_until, pool.half = float(self.br["open_until"]), bool(self.br["half"])
         pool.probing = pool.half and any(s["ok"] is None for s in self.starts_log if s["t"] > self.br["t_trip"])
         self.target = {}
-        for (image, vm_type, model), its in groups.items():
+        for (image, vm_type, model, distinct), its in groups.items():
             # A worker can wait one full scheduling pass after becoming ready.
             S, bu = vm_slots(vm_type), max(30.0, self.bring_up) + FULL_S
             B = BREAK_EVEN_OVERRIDE_S or rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS, vm_mult(vm_type))
-            held = [v for v in live if v.image == image and v.type == vm_type and rules.cpu_matches(model, v.model)]
+            distinct_used = its[0].batch.distinct_vms.get(distinct[1], set()) if distinct else set()
+            held = [v for v in live if v.image == image and v.type == vm_type and rules.cpu_matches(model, v.model)
+                    and rules.distinct_vm_allowed(bool(distinct), v.id in distinct_used)]
             coming = self.creating.get((image, vm_type), 0)
             if model:
                 draw = self._constraint(image, vm_type, model)
@@ -2598,7 +2634,7 @@ class Scheduler:
                     e *= scale[b]
                 else:
                     e = self.est_of(it)
-                return (S if it.timing else it.weight) * e
+                return (S if it.timing or distinct else it.weight) * e
             work, subs = 0.0, {}
             for it in real:
                 if it.batch.klass == 3:
@@ -2622,12 +2658,12 @@ class Scheduler:
             if hi:
                 # A deadline, not a fresh horizon every tick: bringing up VMs
                 # consumes the gate's time too. Keep a feasible item-sized tail.
-                item_s = max(sz(it) / (S if it.timing else it.weight) for it in hi)
+                item_s = max(sz(it) / (S if it.timing or distinct else it.weight) for it in hi)
                 remaining = max(0.0, min(GATE_HORIZON, min(it.batch.t0 + GATE_HORIZON - now for it in hi)))
                 H = rules.gate_window(remaining, bu, item_s)
                 ready_H = max(remaining, item_s)  # a ready VM does not get the new VM's bring-up extension
                 hw = sum(sz(it) for it in hi)
-                durations = {sz(it) for it in hi} if all(not it.timing and it.weight == 1 for it in hi) else set()
+                durations = {sz(it) for it in hi} if not distinct and all(not it.timing and it.weight == 1 for it in hi) else set()
                 whole = next(iter(durations)) if len(durations) == 1 else 0.0
                 new_window = max(60.0, item_s, H - bu)  # preserve one full job despite float cancellation
                 new_capacity = S * (math.floor(new_window / whole) * whole if whole else new_window)
@@ -2719,7 +2755,7 @@ class Scheduler:
                 retired = self.retired()
                 spare = 0  # (slots of other types' VMs this work may have: empty, or on what it may take; a larger VM's too)
                 for v in live:
-                    if v.image != image or v.type == vm_type or not v.ready or v.dead or v.id in retired or v.failing or getattr(v, "disk_low", False) or getattr(v, "prep_fails", 0) >= 3 \
+                    if not rules.distinct_vm_allowed(bool(distinct), v.id in distinct_used) or v.image != image or v.type == vm_type or not v.ready or v.dead or v.id in retired or v.failing or getattr(v, "disk_low", False) or getattr(v, "prep_fails", 0) >= 3 \
                             or v.slots < w_max or not boat.R.fits_memory(mem_max, boat.TYPES.get(v.type, (0, 0))[1], boat.MEM_OVERHEAD):
                         continue
                     spare += max(0, v.slots - sum(x.weight for x in v.running.values() if x.batch.klass not in low) - getattr(v, "foreign", 0))
@@ -2733,7 +2769,7 @@ class Scheduler:
                 low = {"filler_sweep": (5, 4), "filler": (5,), "none": ()}[rules.victims(kmin, 10 ** 9, SUB_PREEMPT)]
                 # (a VM of the image that fits one and runs only what a timing item may take (filler, sweeps) is one it
                 # gets by emptying it, never a reason to start one)
-                free_fit = sum(1 for v in live if v.image == image and v.ready and not getattr(v, "foreign", 0) and not getattr(v, "disk_low", False) and v.slots >= need and all(mem_fits(it, v.type) for it in tim[:1])
+                free_fit = sum(1 for v in live if rules.distinct_vm_allowed(bool(distinct), v.id in distinct_used) and v.image == image and v.ready and not getattr(v, "foreign", 0) and not getattr(v, "disk_low", False) and v.slots >= need and all(mem_fits(it, v.type) for it in tim[:1])
                                and v.type != vm_type and all(x.batch.klass in low for x in v.running.values())
                                and (not self._held(v, None, now) or v.reserved[0] in tim))  # (set aside for one of them: theirs)
                 # (the starts this work earns: the VMs its other items fill, and one per timing item no free VM takes;
@@ -2768,11 +2804,14 @@ class Scheduler:
                             log(f"growth held at the ceiling of {MAX_VMS} VMs ({n} wanted)")
                         tgt["why"] = "max VMs" if at_max else "bring-up cap"
                     n = got
-            self.target[f"{image}/{vm_type}" + (f"/{model}" if model else "")] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
+            if distinct:
+                tgt["distinct_vm_group"] = distinct[1]
+                tgt["distinct_vms_used"] = sorted(distinct_used)
+            self.target[f"{image}/{vm_type}" + (f"/{model}" if model else "") + (f"/{distinct[0]}/{distinct[1]}" if distinct else "")] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
             if n <= 0:
                 continue
             first = min(real, key=lambda it: (it.batch.klass, it.batch.t0)).batch
-            out[(image, vm_type, model) if model else (image, vm_type)] = (n, first.klass, first, not first.warm_only)
+            out[(image, vm_type, model, distinct) if distinct else (image, vm_type, model) if model else (image, vm_type)] = (n, first.klass, first, not first.warm_only)
         return out
 
     # -- CPU constraints: additive durable state; old handoff readers ignore it.
@@ -2875,9 +2914,10 @@ class Scheduler:
         it.fate.delivered()
 
     # -- VMs
-    def _ask(self, image, vm_type, n, k, b, allow, model=""):
+    def _ask(self, image, vm_type, n, k, b, allow, model="", distinct=None):
         try:
-            if not self._acquire(image, vm_type, n, k, b, allow, model):
+            got = self._acquire(image, vm_type, n, k, b, allow, model, distinct) if distinct else self._acquire(image, vm_type, n, k, b, allow, model)
+            if not got:
                 self.backoff[image] = time.time() + 15  # (nothing to be had now: ask boat again in a while, not every loop)
         except Exception as e:
             log(f"acquire: {str(e)[:200]}")
@@ -2886,7 +2926,7 @@ class Scheduler:
             self.asking.discard(image)
             self.wake.set()
 
-    def _acquire(self, image: str, vm_type: str, n: int, k: int, b: Batch, allow: bool = True, model: str = "") -> int:
+    def _acquire(self, image: str, vm_type: str, n: int, k: int, b: Batch, allow: bool = True, model: str = "", distinct=None) -> int:
         """n VMs: warm free ones of the pool first (no start), then resumed or created, free starts before paid ones
         (every class may pay: the user, 10-31, a paid start and prepaid VM-hours beat Modal past about 2 minutes of
         work), paced by the StartGate (a sixth of what's left a minute, boat's minute limit), each with its warm
@@ -2899,11 +2939,12 @@ class Scheduler:
         budget = min(starts, boat.budget(starts))
         mine = []
         observed = self._constraint(image, vm_type, model)["observed"] if model else {}
+        used = b.distinct_vms.get(distinct[1], set()) if distinct else set()
         with Registry().locked() as d:
             with contextlib.suppress(Exception):
                 boat.reconcile(d, boat.sandboxes())
             now = time.time()
-            free = [i for i, v in d["vms"].items() if v["snapshot"] == image and v["type"] == vm_type and boat.lease_free(v) and i not in self.vms and i not in self.retired() and (not model or i not in observed or observed[i] == model)]
+            free = [i for i, v in d["vms"].items() if v["snapshot"] == image and v["type"] == vm_type and boat.lease_free(v) and i not in self.vms and i not in self.retired() and (not model or i not in observed or observed[i] == model) and rules.distinct_vm_allowed(bool(distinct), i in used)]
             up = [i for i in free if d["vms"][i].get("state") in boat.RUNNING and d["vms"][i].get("until", 0) > now + boat.WARM_MARGIN]
             stopped = [i for i in free if i not in up and d["vms"][i].get("state") == "stopped"]
             acq = rules.Acquire()  # (rules.Acquire: warm ones first, then resumes and creations within the budget)
@@ -3511,7 +3552,8 @@ class Scheduler:
                     self._learn(it, float(row["seconds"]))
                     b.obs_s, b.obs_est, b.obs_n = getattr(b, "obs_s", 0.0) + float(row["seconds"]), getattr(b, "obs_est", 0.0) + it.est, getattr(b, "obs_n", 0) + 1
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
-                        "placement": {"vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
+                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id") if k in (it.last_placement or {})},
+                                      "vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
         self.wake.set()
         if it.state != "finishing":
@@ -3567,7 +3609,8 @@ class Scheduler:
                 self._owned_failed(it, "strict_once: preempted or lost placement")
             else:
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
-                        "placement": {"vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
+                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id") if k in (it.last_placement or {})},
+                                      "vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
                 # Journal before releasing the placement, and under the same lock
                 # as cancellation. Never expose a done-without-row window.
@@ -3880,7 +3923,7 @@ class Scheduler:
         out: dict = {}
         by_id = {v.id: v for v in live}
         for shape, n in sorted(groups.items(), key=lambda g: g[0][1]):
-            image, k, timing, weight, vtype, avoid, mem, model = shape
+            image, k, timing, weight, vtype, avoid, mem, model, used = shape
             for vid, c in cap.items():
                 if n <= 0:
                     break
@@ -3900,7 +3943,7 @@ class Scheduler:
                     n -= 1
                     continue
                 avail = c[0] + c[1] + (c[2] if k <= 2 else 0)
-                m = min(n, avail // weight)
+                m = min(n, avail // weight, 1) if used is not None else min(n, avail // weight)
                 if m <= 0:
                     continue
                 need = m * weight
@@ -4141,6 +4184,11 @@ class Scheduler:
                 if not all(rules.cpu_handoff_allowed(required_cpu, prepared[target].get("cpu_model_exact") is True) for target in candidates):
                     self.alert("handoff refused: live CPU constraints require an exact-model capable successor")
                     return
+                required_distinct = any(it.spec.get("distinct_vm_group") and it.state != "done"
+                                        for b in self.batches.values() for it in b.items.values())
+                if not all(rules.distinct_history_matches(required_distinct, prepared[target].get("distinct_vm_group") is True) for target in candidates):
+                    self.alert("handoff refused: live distinct VM groups require a group-aware successor")
+                    return
                 if required_cpu and (self.asking or any(self.creating.values()) or any(
                         not v.ready and getattr(v, "cpu_constraint", "") for v in self.vms.values() if not v.dead)):
                     log("handoff deferred until CPU draws settle; placement continues")
@@ -4210,7 +4258,8 @@ class Scheduler:
                             held <= set(ack.get("taken", [])) and not (held & set(ack.get("missing", []))),
                             self._handoff_lease_lost),
                         ack.get("admissions", {}).get("ready") is True,
-                        ack.get("items_ready") is True):
+                        ack.get("items_ready") is True and rules.distinct_history_matches(bool(snap.get("distinct_vm_groups")),
+                            ack.get("distinct_vm_groups") == snap.get("distinct_vm_groups"))):
                     _notify_service(ack["pid"])
                     log(f"handoff: serving pid {ack['pid']} holds every VM and running identity; exiting")
                     accepted = True
@@ -5034,7 +5083,7 @@ def enabled() -> bool:
 def main(argv: list[str]):
     import argparse
     ap = argparse.ArgumentParser(prog="supercomputer scheduler")
-    ap.add_argument("cmd", choices=["serve", "status", "stage", "stop", "forward", "unforward"])
+    ap.add_argument("cmd", choices=["serve", "status", "capabilities", "stage", "stop", "forward", "unforward"])
     ap.add_argument("vm", nargs="?", default="")
     ap.add_argument("--idle-exit", type=float, default=120, help="seconds idle before it exits (0: never, the controller's)")
     ap.add_argument("--takeover", action="store_true", help="(a handoff: wait for the old scheduler's lock)")
@@ -5043,6 +5092,12 @@ def main(argv: list[str]):
         serve(a.idle_exit, a.takeover)
     elif a.cmd == "stage":
         print(json.dumps(stage_install(), sort_keys=True))
+    elif a.cmd == "capabilities":
+        cl = _remote() if controller_configured() and os.environ.get("SUPERCOMPUTER_LOCAL") != "1" else current()
+        # Read-only and fail closed: never start or silently probe a competing local scheduler.
+        if cl is None:
+            raise SystemExit("scheduler not running")
+        print(json.dumps(cl.req("/capabilities", {}), sort_keys=True))
     elif a.cmd == "status":
         c = controller()
         if c:

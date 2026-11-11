@@ -11,7 +11,9 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `rules.cpu.cpu_matches` | rule | exact constrained placement, no unknown CPU for a pin, unconstrained eligibility unchanged; used by the shared fit predicate and final placement guard. |
 | `rules.cpu.cpu_draws`, `cpu_streak` | rule | starts never exceed earned demand or remaining consecutive-fruitless room; a match resets the streak, a miss increments it. `_plan` uses the effective per-job guard and credits pending draws. |
 | `rules.cpu.cpu_handoff_allowed` | rule | live pinned admissions never hand off to code without exact-model support. |
+| `rules.affinity.distinct_vm_allowed`, `distinct_history_matches` | rule | a group never reuses a consumed VM; ungrouped eligibility is unchanged; a grouped handoff requires identical durable history in its ACK. Placement consumption is write-ahead/fsynced under the existing lock, replayed even for completed items. |
 | `rules.affinity.local_start_allowed`, `local_recovery_allowed` | rule | controller configuration blocks implicit local startup and any automatic local resurrection; explicit `LOCAL=1` is the only local opt-in with a controller. |
+| `Scheduler._distinct_snapshot` | I/O | serializes the batch-scoped consumed VM sets, including completed placements, for the snapshot and its exact-history ACK. |
 | `Scheduler._constraint*`, `_model_report` | rule + I/O | dispatch to CPU eligibility/draw/streak rules; persist atomic draw observations, decode agent models, backfill receipts and format status/refusal diagnostics. No provider placement/stop decision. |
 | `controller_configured`, `controller`, `prepare_snapshot` | I/O + rule | inspect local configuration and exact candidate capabilities; startup/recovery and handoff eligibility use the rules above. |
 
