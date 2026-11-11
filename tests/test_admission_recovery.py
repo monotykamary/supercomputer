@@ -225,6 +225,70 @@ def test_live_handoff_preserves_fence_without_network_renewal():
         s._worker.assert_called_once()
 
 
+def test_dead_parent_snapshot_does_not_enter_live_item_takeover():
+    s = sched()
+    b = batch(s, bid="dead-parent")
+    s.code, s.recovery_errors, s.alerts = "cold", {}, []
+    s.retired, s._read_client_closes = lambda: set(), lambda: set()
+    s._worker, s._start_on = Mock(), Mock()
+    with tempfile.TemporaryDirectory() as tmp:
+        d = pathlib.Path(tmp)
+        s.canary = canary.Canary(d)
+        snap = {"from_pid": os.getpid() + 100000, "t": time.time(), "batches": [b.id],
+                "vms": [{"id": "A", "items": [{"batch": b.id, "name": "i0", "run_name": "i0", "state": "starting"}]}]}
+        (d / "handoff.json").write_text(json.dumps(snap))
+        (d / "queue").mkdir()
+        (d / "queue" / f"{b.id}.json").write_text(json.dumps(message(b)))
+        registry = SimpleNamespace(locked=lambda: nullcontext({"vms": {}}))
+        with patch.object(S, "DIR", d), patch.object(S, "Registry", lambda: registry), \
+             patch.object(S.boat, "pid_alive", return_value=False), patch.object(S.threading, "Thread"):
+            s._take_pool()
+        assert not s._handoff["snapshot"] and not s.recovery_blocked
+        assert b.items["i0"].state == "queued" and not (d / "handoff.ack").exists()
+        s._start_on.assert_not_called()
+
+
+def test_snapshot_only_items_recover_without_placement_journal():
+    for state, run_name, count in (("starting", "i0", None), ("starting", "i0~s3", 3),
+                                   ("running", "i0~s3", None), ("running", "i0~s2", 5)):
+        s = sched()
+        b = batch(s, bid="snapshot-only")
+        it = b.items["i0"]  # Fresh admission: no .placed record has ever initialized it.
+        s.code, s.recovery_errors, s.alerts = "new", {}, []
+        s.retired, s._read_client_closes = lambda: set(), lambda: set()
+        s._worker, s._start_on = Mock(), Mock()
+        old_pid, host = os.getpid() + 100000, socket.gethostname()
+        grant = {"ok": True, "owner": "fixture-owner", "boot": "boot", "epoch": 7, "vm_id": "A"}
+        reg = {"vms": {"A": {"snapshot": "img", "type": "large", "state": "running",
+                            "lease": {"pid": old_pid, "host": host, "batch": "scheduler"}}}}
+        client = SimpleNamespace(rpc=Mock())
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            s.canary = canary.Canary(d)
+            item = {"batch": b.id, "name": it.name, "run_name": run_name, "state": state,
+                    "launch_identity": "snapshot-identity"}
+            if count is not None:
+                item["placed"] = count
+            snap = {"from_pid": old_pid, "from": "old", "t": time.time(), "batches": [b.id],
+                    "admission_guard": True, "vms": [{"id": "A", "image": "img", "type": "large", "lease": grant, "items": [item]}]}
+            (d / "handoff.json").write_text(json.dumps(snap))
+            registry = SimpleNamespace(locked=lambda: nullcontext(reg))
+            with patch.object(S, "DIR", d), patch.object(S, "Registry", lambda: registry), \
+                 patch.object(S.boat, "pid_alive", return_value=True), \
+                 patch.object(S.boat, "owner_id", return_value="fixture-owner"), \
+                 patch.object(S.boat, "agent_client", return_value=client), patch.object(S.threading, "Thread"), \
+                 patch.object(S.concurrent.futures, "ThreadPoolExecutor", lambda *a, **kw: nullcontext(SimpleNamespace(map=lambda f, xs: map(f, xs)))):
+                s._take_pool()
+            assert not s.recovery_blocked
+            assert it.placed == max(count or 0, int(run_name.rpartition("~s")[2]) if "~s" in run_name else 1)
+            assert it.run_name == run_name and it.launch_identity == "snapshot-identity"
+            assert s.vms["A"].running[(b.id, run_name)] is it
+            assert json.loads((d / "handoff.ack").read_text())["items_ready"]
+            assert not (d / "queue" / f"{b.id}.placed").exists()
+            s._worker.assert_not_called()
+            s._start_on.assert_not_called()  # Passive successor does not duplicate the in-flight launch.
+
+
 def test_manifest_keeps_queued_only_batches():
     s = sched()
     s.code = "old"

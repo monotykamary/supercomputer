@@ -128,6 +128,7 @@ def _env(k: str, d):
 
 
 # The policy's knobs (README, "Scheduling policy"); $SUPERCOMPUTER_<KNOB> overrides each.
+HTTP_REQUEST_TIMEOUT_S = 15.0  # Slow/partial peers must not retain request threads indefinitely.
 CPU_MODEL_MAX_FRUITLESS = int(_env("CPU_MODEL_MAX_FRUITLESS", 12))  # load guard per image/type/model, not money
 BRINGUP_MAX = _env("BRINGUP", 12)  # VMs being brought up at once (the scheduler's own load guard); the rest wait their turn
 GATE_HORIZON = _env("GATE_HORIZON", 900.0)  # a gate gets the VMs that finish it within this (its items' last times)
@@ -344,6 +345,7 @@ class Item:
         self.state = "queued"  # queued | starting | running | preempting | done | cancel_pending
         self.vm = None
         self.tries = 0
+        self.placed = 0  # Admission exists before any journal entry; a live snapshot may place it first.
         self.t_created = time.time()
         self.t_queued = time.time()
         self.head = False  # (preempted: back at the head of its class)
@@ -4269,8 +4271,10 @@ class Scheduler:
                 self._reject_handoff_candidate(proc, previous_leases)
                 active = None
                 retryable = expired or self._handoff_lease_lost
+                exit_code = proc.poll()
                 why = (f"handoff to {target} readiness deadline after {budget_s:.3f}s (retryable)" if expired
                        else f"handoff to {target} lost lease authority before commit (retryable)" if self._handoff_lease_lost
+                       else f"handoff to {target} exited {exit_code} before readiness ACK (stderr: {DIR / 'log'})" if ack is None and exit_code is not None
                        else f"handoff to {target} failed readiness: {ack!r}")
                 self.alert(why)
                 if target != self.code:
@@ -4579,6 +4583,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
 
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = HTTP_REQUEST_TIMEOUT_S  # StreamRequestHandler applies this before headers/body are read.
 
         def log_message(self, *a):
             pass
@@ -4595,71 +4600,98 @@ def serve(idle_exit: float = 120, takeover: bool = False):
         def do_GET(self):
             self._send(200, {"ok": True, "pid": os.getpid()})
 
+        @staticmethod
+        def _response(code, obj=None, raw=None):
+            # Freeze the response while the mutation is serialized, but never
+            # write to a potentially slow client under the mutation lock.
+            if isinstance(obj, (bytes, bytearray)):
+                obj, raw = None, bytes(obj)
+            return code, raw if raw is not None else json.dumps(obj).encode()
+
         def do_POST(self):
             c0 = _cpu_now()
             try:
-                if self.path in ("/poll", "/status", "/health", "/logs", "/capabilities"):
-                    return self._post()
-                with s._request_lock:
-                    if s.stop.is_set() or getattr(s, "handing_off", False) or getattr(s, "_handoff_deferred", None):
+                # Network input is untrusted latency, not part of a mutation.
+                try:
+                    n = int(self.headers.get("Content-Length", "0") or 0)
+                    if n < 0:
+                        raise ValueError("negative content length")
+                    body = self.rfile.read(n)
+                except TimeoutError:
+                    self.close_connection = True
+                    response = self._response(408, {"error": "request body timed out"})
+                except ValueError:
+                    self.close_connection = True
+                    response = self._response(400, {"error": "invalid content length"})
+                else:
+                    if len(body) != n:
                         self.close_connection = True
-                        return self._send(503, {"error": "scheduler handoff; retry the same endpoint"})
-                    return self._post()
+                        response = self._response(408, {"error": "incomplete request body"})
+                    elif not hmac.compare_digest(self.headers.get("X-SC-Token", ""), s.token):
+                        response = self._response(403, {"error": "token"})
+                    elif self.path in ("/poll", "/status", "/health", "/logs", "/capabilities"):
+                        response = self._post(body)
+                    else:
+                        with s._request_lock:
+                            if not rules.http_mutation_allowed(s.stop.is_set(), bool(getattr(s, "handing_off", False)),
+                                                               bool(getattr(s, "_handoff_deferred", None))):
+                                self.close_connection = True
+                                response = self._response(503, {"error": "scheduler handoff; retry the same endpoint"})
+                            else:
+                                response = self._post(body)
+                if response is not None:
+                    self._send(response[0], raw=response[1])
             finally:
                 s._cpu_add("http " + self.path.split("?")[0], c0)
 
-        def _post(self):
-            n = int(self.headers.get("Content-Length", "0") or 0)
-            body = self.rfile.read(n)
-            if not hmac.compare_digest(self.headers.get("X-SC-Token", ""), s.token):
-                return self._send(403, {"error": "token"})
+        def _post(self, body):
             raw_paths = {"/blobs/put", "/cache/put", "/queue/add", "/git", "/state"}
             if self.path.split("?")[0] in raw_paths:
                 try:
-                    return self._send(200, *raw_post(self.path, body))
+                    return self._response(200, *raw_post(self.path, body))
                 except Exception as e:
-                    return self._send(500, {"error": repr(e)[-800:]})
+                    return self._response(500, {"error": repr(e)[-800:]})
             try:
                 m = json.loads(body or b"{}")
                 p = self.path
                 if p == "/capabilities":
-                    return self._send(200, s.capabilities())
+                    return self._response(200, s.capabilities())
                 if p in ("/cancel", "/snapshot"):
                     bid = s.batch_of(m)
                     try:
                         s._valid_batch(bid)
                         result = s.snapshot(bid) if p == "/snapshot" else s.cancel(bid, m.get("wait_seconds", 10))
                     except (ValueError, TypeError) as e:
-                        return self._send(400, {"error": str(e)})
-                    return self._send(200, result)
+                        return self._response(400, {"error": str(e)})
+                    return self._response(200, result)
                 if p == "/submit":
-                    return self._send(200, s.submit(m))
+                    return self._response(200, s.submit(m))
                 if p in ("/poll", "/close", "/logs") and s.batch_of(m) is None:  # (a request naming no batch: the client's, cut or old; answered, not ours)
-                    log(f"{p}: a request naming no batch ({len(body)} of {n} bytes, keys {sorted(m)[:6] if isinstance(m, dict) else type(m).__name__}): nothing done")
-                    return self._send(400, {"error": "no batch named"})
+                    log(f"{p}: a request naming no batch ({len(body)} bytes, keys {sorted(m)[:6] if isinstance(m, dict) else type(m).__name__}): nothing done")
+                    return self._response(400, {"error": "no batch named"})
                 if p == "/poll":
-                    return self._send(200, s.poll(s.batch_of(m), int(m.get("since", 0)), float(m.get("wait", 15))))
+                    return self._response(200, s.poll(s.batch_of(m), int(m.get("since", 0)), float(m.get("wait", 15))))
                 if p == "/close":
-                    return self._send(200, s.close(s.batch_of(m)))
+                    return self._response(200, s.close(s.batch_of(m)))
                 if p == "/logs":
-                    return self._send(200, raw=s.logs(s.batch_of(m), m.get("vms", [])))
+                    return self._response(200, raw=s.logs(s.batch_of(m), m.get("vms", [])))
                 if p == "/hint":
-                    return self._send(200, s.hint(m))
+                    return self._response(200, s.hint(m))
                 if p == "/status":
-                    return self._send(200, s.status())
+                    return self._response(200, s.status())
                 if p == "/health":
-                    return self._send(200, s.health_check(float(m.get("minutes", 30))))
+                    return self._response(200, s.health_check(float(m.get("minutes", 30))))
                 if p == "/rollback":
-                    return self._send(200, s.rollback(m.get("code") or None))
+                    return self._response(200, s.rollback(m.get("code") or None))
                 if p == "/reload":
                     threading.Thread(target=s.handoff, daemon=True).start()
-                    return self._send(200, {"ok": True, "code": s.code, "installed": code_hash()})
+                    return self._response(200, {"ok": True, "code": s.code, "installed": code_hash()})
                 if p == "/blobs/have":  # (a remote client: which of its tree's files the controller lacks)
-                    return self._send(200, {"missing": blobcache.have(BLOBS, m["keys"])})
+                    return self._response(200, {"missing": blobcache.have(BLOBS, m["keys"])})
                 if p == "/drain":  # (a deploy: no new item placed; what runs goes on, and comes back after the restart)
                     s.draining = bool(m.get("on", True))
                     running = sum(len(v.running) for v in s.vms.values())
-                    return self._send(200, {"draining": s.draining, "running": running})
+                    return self._response(200, {"draining": s.draining, "running": running})
                 if p == "/tree/put":  # (a tree's manifest, kept by id: later batches of it send the id alone)
                     (DIR / "trees").mkdir(parents=True, exist_ok=True)
                     with blobcache.locked(BLOBS):
@@ -4667,27 +4699,27 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         tmp = dest.with_suffix(f".{threading.get_ident()}.tmp")
                         tmp.write_text(json.dumps(m["tree"]))
                         os.replace(tmp, dest)
-                    return self._send(200, {"ok": True})
+                    return self._response(200, {"ok": True})
                 if p == "/cache/have":
                     d = config.LIVE / m["name"] / m["key"]
-                    return self._send(200, {"names": sorted(f.name for f in d.iterdir()) if d.exists() else []})
+                    return self._response(200, {"names": sorted(f.name for f in d.iterdir()) if d.exists() else []})
                 if p == "/queue/ls":
-                    return self._send(200, queue_ls())
+                    return self._response(200, queue_ls())
                 if p == "/queue/results":
-                    return self._send(200, queue_results(m["name"]))
+                    return self._response(200, queue_results(m["name"]))
                 if p == "/ledger":
                     lp = config.LIVE / "boat-starts.jsonl"
                     lines = lp.read_text().splitlines()[-int(m.get("n", 2000)):] if lp.exists() else []
-                    return self._send(200, {"lines": lines})
+                    return self._response(200, {"lines": lines})
                 if p == "/can":  # can an interactive batch of this image start now, with no start? (a VM held or warm)
                     held = any(v.ready and not v.dead and v.image == m["image"] for v in s.vms.values())
-                    return self._send(200, {"held": held})
-                return self._send(404, {"error": p})
+                    return self._response(200, {"held": held})
+                return self._response(404, {"error": p})
             except Exception as e:
                 if health.client_gone(e):  # (its client gone mid-answer: nothing to answer, no error of ours; 02:38 a canary handed back for one)
                     return
                 s._h().record_error(time.time(), f"{self.path}: {e!r}")
-                return self._send(500, {"error": repr(e)[-800:]})
+                return self._response(500, {"error": repr(e)[-800:]})
 
     class Srv(http.server.ThreadingHTTPServer):
         daemon_threads = True

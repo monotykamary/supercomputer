@@ -20,7 +20,62 @@ from supercomputer import agent, scheduler, controller
 from supercomputer.rules import updates
 
 
+# This code is appended only to the isolated copy used by the real socket test.
+# No provider calls: a synthetic held VM carries a legacy in-flight placement
+# which exists in the live snapshot but not in the placement journal.
+SNAPSHOT_ONLY_FIXTURE = r'''
+class _FixtureAgent:
+    def rpc(self, op, msg=None, **kw):
+        return {"running": [{"batch": "snapshot-only", "name": "work~s3"}], "done": [], "cpus": 8, "model": "fixture-cpu"}
+boat.owner_id = lambda: "fixture-owner"
+boat.agent_client = lambda vid: _FixtureAgent()
+boat.states = lambda *a, **kw: {}
+boat.sandboxes = lambda *a, **kw: {}
+boat.boat = lambda *a, **kw: ""
+Scheduler._worker = lambda *a: None
+Scheduler._start_on = lambda *a: None
+Scheduler._adopt = lambda *a: None
+_fixture_init = Scheduler.__init__
+def _init_with_snapshot_only(self, *args, **kw):
+    _fixture_init(self, *args, **kw)
+    if os.environ.get("SUPERCOMPUTER_HANDOFF_FDS"):
+        return
+    msg = {"batch": "snapshot-only", "klass": 2, "image": "fixture-image", "ctx_b64": "",
+           "tree": {"id": "fixture-tree", "files": {}, "links": {}}, "items": [{"name": "work", "cmd": "true"}]}
+    qd = DIR / "queue"
+    qd.mkdir(parents=True, exist_ok=True)
+    (qd / "snapshot-only.json").write_text(json.dumps(msg))
+    b = Batch(msg)
+    it = b.items["work"]
+    v = VMState("fixture-vm", b.image, "large", "warm")
+    v.client, v.ready, v.model = _FixtureAgent(), True, "fixture-cpu"
+    v.lease = {"ok": True, "owner": "fixture-owner", "holder": "fixture-owner", "boot": "fixture-boot", "epoch": 7, "vm_id": v.id}
+    it.state, it.vm, it.run_name, it.placed = "starting", v, "work~s3", 3
+    it.launch_identity = "fixture-launch"
+    it.last_placement = {"name": it.name, "run_name": it.run_name, "vm": v.id, "image": v.image, "identity": it.launch_identity}
+    it.fate.reloaded(v.id)
+    it.fate.reattached(v.id)
+    v.running[(b.id, it.run_name)] = it
+    self.batches[b.id], self.vms[v.id] = b, v
+    with Registry().locked() as d:
+        d["vms"][v.id] = {"snapshot": b.image, "type": "large", "state": "running",
+            "lease": {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler"}}
+Scheduler.__init__ = _init_with_snapshot_only
+_fixture_status = Scheduler._status_read
+def _status_with_snapshot_only(self):
+    result = _fixture_status(self)
+    it = self.batches["snapshot-only"].items["work"]
+    result["snapshot_fixture"] = {"placed": it.placed, "run_name": it.run_name, "identity": it.launch_identity}
+    return result
+Scheduler._status_read = _status_with_snapshot_only
+'''
+
+
 class Guards(unittest.TestCase):
+    def test_mutation_guard_requires_an_active_unfrozen_owner(self):
+        for flags in itertools.product((False, True), repeat=3):
+            self.assertEqual(updates.http_mutation_allowed(*flags), not any(flags))
+
     def test_ack_requires_every_identity(self):
         for pool, admissions, items in itertools.product((False, True), repeat=3):
             self.assertEqual(updates.handoff_ready(pool, admissions, items), pool and admissions and items)
@@ -263,7 +318,7 @@ class Guards(unittest.TestCase):
 
 
 class RealSocketHandoff(unittest.TestCase):
-    def exercise(self, rejected, blocked=False, slow=False, grouped=False):
+    def exercise(self, rejected, blocked=False, slow=False, grouped=False, snapshot_only=False, http_io=False):
         if os.environ.get('OWNED_LIFECYCLE_BOAT_TEST') != '1':
             self.fail('run this regression on Boat with OWNED_LIFECYCLE_BOAT_TEST=1')
         with tempfile.TemporaryDirectory(prefix='sc-hot-') as tmp:
@@ -271,6 +326,12 @@ class RealSocketHandoff(unittest.TestCase):
             tool = root / 'tool'
             shutil.copytree(pathlib.Path(scheduler.__file__).parent, tool / 'supercomputer',
                             ignore=shutil.ignore_patterns('__pycache__'))
+            if http_io:
+                with (tool / "supercomputer/scheduler.py").open("a") as f:
+                    f.write("\nHTTP_REQUEST_TIMEOUT_S = 1.0\ndef _large_http_reply(self, msg):\n    (DIR / 'slow-reply.ready').touch()\n    return b'x' * (8 * 1024 * 1024)\nScheduler.hint = _large_http_reply\n")
+            if snapshot_only:
+                with (tool / "supercomputer/scheduler.py").open("a") as f:
+                    f.write(SNAPSHOT_ONLY_FIXTURE)
             if slow:
                 with (tool / "supercomputer/scheduler.py").open("a") as f:
                     f.write("\n_publish_fast = Scheduler._publish_handoff_ack\ndef _slow_ack(self):\n    if getattr(self, '_handoff_ack', None):\n        time.sleep(5)\n    _publish_fast(self)\nScheduler._publish_handoff_ack = _slow_ack\n")
@@ -323,6 +384,8 @@ class RealSocketHandoff(unittest.TestCase):
                             self.fail('initial boot failed: ' + (root / 'process.log').read_text())
                         time.sleep(.02)
                 old = initial['code']
+                if http_io:
+                    self.check_slow_http_clients(port, token, req, root)
                 source = tool / 'supercomputer' / 'scheduler.py'
                 with source.open('a') as f:
                     f.write('\n# update test candidate\n')
@@ -376,6 +439,11 @@ class RealSocketHandoff(unittest.TestCase):
                     ack = json.loads(ack_path.read_text())
                     self.assertTrue(ack['items_ready'])
                     self.assertTrue(ack['admissions']['ready'])
+                    if snapshot_only:
+                        self.assertEqual(state["snapshot_fixture"], {"placed": 3, "run_name": "work~s3", "identity": "fixture-launch"})
+                        offered = json.loads((root / "live/scheduler/handoff.used.json").read_text())
+                        self.assertEqual(offered["vms"][0]["items"][0]["placed"], 3)
+                        self.assertFalse((root / "live/scheduler/queue/snapshot-only.placed").exists())
                     if grouped:
                         expected = {"completed-group": {"run/stage/case/rep": ["finished-vm"]}}
                         self.assertEqual(ack["distinct_vm_groups"], expected)
@@ -390,6 +458,7 @@ class RealSocketHandoff(unittest.TestCase):
                         fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 if rejected:
                     self.assertEqual(json.loads((root / 'live/scheduler/canary.json').read_text())['state'], 'rejected')
+                    self.assertIn("exited 1 before readiness ACK", (root / "process.log").read_text())
                 print(json.dumps({'socket_handoff': 'blocked-resumed' if blocked else 'rollback' if rejected else 'success',
                                   'max_response_gap_s': round(largest_gap, 3), 'code': state['code']}))
             finally:
@@ -406,6 +475,43 @@ class RealSocketHandoff(unittest.TestCase):
                     proc.wait(timeout=5)
                 log.close()
 
+    def check_slow_http_clients(self, port, token, req, root):
+        def request(path, body, sent=None, receive_buffer=None):
+            sock = socket.socket()
+            if receive_buffer:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+            sock.settimeout(3)
+            sock.connect(("127.0.0.1", port))
+            header = (f"POST {path} HTTP/1.1\r\nHost: localhost\r\nX-SC-Token: {token}\r\n"
+                      f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
+            sock.sendall(header + (body if sent is None else body[:sent]))
+            return sock
+
+        with request("/drain", b'{"on":false}', sent=5) as partial:
+            time.sleep(.05)  # let the partial reader begin before the competing mutation
+            began = time.monotonic()
+            req("/drain")
+            read_gap = time.monotonic() - began
+            self.assertLess(read_gap, .35, "partial body serialized an unrelated mutation")
+            response = partial.recv(4096)
+            self.assertTrue(not response or b" 408 " in response, response)
+
+        with request("/hint", b'{}', receive_buffer=1024):
+            deadline = time.monotonic() + 2
+            while not (root / "live/scheduler/slow-reply.ready").exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            time.sleep(.05)  # the 8 MiB response cannot fit in this client's receive window
+            began = time.monotonic()
+            req("/drain")
+            write_gap = time.monotonic() - began
+            self.assertLess(write_gap, .35, "stalled response serialized an unrelated mutation")
+        print(json.dumps({"partial_body_mutation_s": round(read_gap, 4),
+                          "stalled_response_mutation_s": round(write_gap, 4)}))
+
+    def test_slow_http_clients_do_not_serialize_mutations(self):
+        self.exercise(False, http_io=True)
+
     def test_slow_cold_candidate_gets_more_than_four_seconds(self):
         self.exercise(False, slow=True)
 
@@ -417,6 +523,9 @@ class RealSocketHandoff(unittest.TestCase):
 
     def test_successful_socket_handoff(self):
         self.exercise(False)
+
+    def test_snapshot_only_inflight_item_without_placement_journal(self):
+        self.exercise(False, snapshot_only=True)
 
     def test_completed_group_history_is_carried_in_snapshot_and_ack(self):
         self.exercise(False, grouped=True)

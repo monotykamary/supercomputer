@@ -1,5 +1,10 @@
 """Regressions refused by the same hot-update laws."""
 
+# gdp: law frozen or stopped schedulers never begin a mutation: not result or (not stopping and not handing_off and not passive)
+def mutate_while_frozen(stopping: bool, handing_off: bool, passive: bool) -> bool:
+    return not stopping
+
+
 # gdp: law an update never discards an unacknowledged running identity: not result or items
 def handoff_ready(pool: bool, admissions: bool, items: bool) -> bool:
     return pool and admissions

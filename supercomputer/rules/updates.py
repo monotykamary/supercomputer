@@ -1,5 +1,11 @@
 """Hot-update guards used by the scheduler, not a model of OS/network latency."""
 
+# gdp: law frozen or stopped schedulers never begin a mutation: not result or (not stopping and not handing_off and not passive)
+# gdp: law an active unfrozen scheduler admits mutations: stopping or handing_off or passive or result
+def http_mutation_allowed(stopping: bool, handing_off: bool, passive: bool) -> bool:
+    return not stopping and not handing_off and not passive
+
+
 # gdp: law an update never discards an unacknowledged running identity: not result or items
 # gdp: law an update never loses a held VM: not result or pool
 # gdp: law an update never loses an admission: not result or admissions

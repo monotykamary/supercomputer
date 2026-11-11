@@ -78,6 +78,13 @@ handoff receipt. No deployment was performed by this lane.
   mutations, keeps the old server answering health/status, and passes both
   listener and flock to the child. The old process does not unlock. The child
   does not rebind. Mutating requests retry the same endpoint until committed.
+  Request bodies are fully read before entering the mutation lock, with a 15s
+  socket timeout (incomplete or timed-out bodies receive 408 or close). Only
+  dispatch and response serialization hold the lock; response writes happen
+  after release. The frozen/passive/stopped guard is checked under that lock
+  after the body arrives, so an earlier-started mutation completes before the
+  snapshot while a later one retries without partially committing. A slow
+  upload or an unread response cannot block unrelated mutations or handoff.
 * The readiness receipt covers every required held VM, admissions and all
   running `(vm, batch, item, run_name, launch_identity)` entries. On the real
   socket path it is published only after the successor serves. Both snapshots
@@ -180,6 +187,18 @@ placements. A group placement is journaled and fsynced under the placement lock 
 replays all placement records (not only unfinished work). The parent only commits an exact history ACK; a
 missing/mismatched history leaves the candidate unready and resumes the parent. Preparation refuses a
 group-unaware candidate/rollback while grouped work remains live. Old snapshots with no groups still work.
+
+### A live snapshot can lead the placement journal
+
+Legacy (non-strict, ungrouped) placement is journaled after preparation, but the live handoff snapshot can
+already contain that `starting` item. Admission replay creates a fresh `Item` before overlaying the live
+snapshot, so `Item.placed` must start at zero even when no `.placed` record exists. The overlay takes the
+maximum of the replayed count, snapshot count and run-name suffix, retaining launch identity. Previously
+this path raised `AttributeError` before the candidate wrote an ACK; even the saved code failed on the same
+snapshot. The healthy parent resumes in that case. A normal dead-parent cold start ignores the stale live
+snapshot (its writer must still be alive and under ten minutes old), so this exception was not an inevitable
+cold-start crash loop. Do not restart as a repair: install/stage the fixed new hash and let the live parent
+hand over. A startup crash rejects that specific hash; a new fixed hash does not require editing canary state.
 
 Client endpoint selection now defaults to `live/controller.json`, including fail-closed behavior for an unreadable
 configuration. Only `SUPERCOMPUTER_LOCAL=1` explicitly permits a local scheduler when a controller is configured.
