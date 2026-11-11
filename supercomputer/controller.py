@@ -19,6 +19,7 @@ Durability: the state lives on the VM's disk, which a stop, a resume and a recov
 `queue` at most hourly) also copies it here (LIVE/controller-state/, the last five), without secrets or blobs.
 """
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -26,6 +27,7 @@ import pathlib
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 
 from . import boat, config, scheduler
@@ -315,19 +317,71 @@ def sync_git(vm: str | None = None):
         print(f"controller: {p.name} main at {head[:12]}", file=sys.stderr)
 
 
+# Bound the entire download, including client setup, retries and slow-drip reads.
+# A socket timeout alone cannot do that; the isolated child is killed and reaped
+# by subprocess.run on expiry. The parent keeps the single-flight lock throughout.
+BACKUP_TIMEOUT = 30
+_BACKUP_REQUEST_CODE = """
+import json, signal, sys
+c, timeout = json.load(sys.stdin)
+# Also bound an orphan if the short-lived command exits with its daemon thread.
+signal.setitimer(signal.ITIMER_REAL, timeout)
+sys.path.insert(0, sys.argv[1])
+from supercomputer import scheduler
+data = scheduler.Client(c).req('/state', None, timeout=timeout, raw=True, body=b'')
+sys.stdout.buffer.write(data)
+"""
+
+
+def _backup_request(c: dict, lock_fd: int | None = None) -> bytes:
+    # No credentials in argv or logs; even a transport exception's stderr stays
+    # captured. Use this package's source, not an unrelated installed version.
+    return subprocess.run(
+        [sys.executable, "-c", _BACKUP_REQUEST_CODE, str(pathlib.Path(__file__).resolve().parent.parent)],
+        input=json.dumps([c, BACKUP_TIMEOUT]).encode(), capture_output=True,
+        timeout=BACKUP_TIMEOUT, check=True,
+        # Keep single-flight protection if the parent command exits first.
+        pass_fds=() if lock_fd is None else (lock_fd,),
+    ).stdout
+
+
 def backup(force: bool = False):
-    """A copy of the controller's state here (no secrets, no blobs): at most hourly, the last five kept."""
-    c = info()
-    if not ops.Cadence(float(c.get("t_backup", 0)), float(c.get("t_check", 0))).backup_due(time.time(), force, bool(c.get("url"))):
-        return
+    """Best-effort single-flight backup; failures consume the hourly attempt too.
+
+    Keep the lock through download and retention. Forced sync bypasses cooldown,
+    never an in-flight backup. A separate record avoids racing controller metadata.
+    """
     with contextlib.suppress(Exception):
-        data = scheduler.Client(c).req("/state", None, timeout=600, raw=True, body=b"")
-        d = config.LIVE / "controller-state"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / time.strftime("%Y%m%d-%H%M%S.tgz")).write_bytes(data)
-        for old in sorted(d.glob("*.tgz"))[:-5]:
-            old.unlink()
-        scheduler.write_private(config.LIVE / "controller.json", {**info(), "t_backup": time.time()})
+        config.LIVE.mkdir(parents=True, exist_ok=True)
+        with config.private_umask():
+            lock = (config.LIVE / "controller-backup.lock").open("a")
+        with lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            c = info()
+            record = config.LIVE / "controller-backup.json"
+            previous = json.loads(record.read_text()) if record.exists() else {}
+            # Respect the old success timestamp when upgrading, but a missing
+            # timestamp is not a real attempt at epoch zero.
+            last = previous.get("t_attempt", c.get("t_backup") or None)
+            now = time.time()
+            if not ops.backup_attempt_due(bool(c.get("url")), False, last is not None,
+                                          now, float(last or 0), force):
+                return
+            attempt = {**previous, "t_attempt": now}
+            scheduler.write_private(record, attempt)
+            data = _backup_request(c, lock.fileno())
+            d = config.LIVE / "controller-state"
+            d.mkdir(parents=True, exist_ok=True)
+            # Unique even for two explicit syncs within one second.
+            name = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns():020d}.tgz"
+            with config.private_umask():
+                (d / name).write_bytes(data)
+            for old in sorted(d.glob("*.tgz"))[:-5]:
+                old.unlink()
+            scheduler.write_private(record, {**attempt, "t_success": time.time()})
 
 
 def maybe_sync():
@@ -346,7 +400,9 @@ def maybe_sync():
             if not boat_ok(info()["vm"]):
                 print("controller: its boat key is gone (a restart): rekeyed", file=sys.stderr)
                 rekey(info()["vm"])
-    backup()
+    # Only backup becomes asynchronous: sync and key-check cadence are unchanged.
+    with contextlib.suppress(Exception):
+        threading.Thread(target=backup, name="controller-backup", daemon=True).start()
 
 
 def main(argv: list[str]):

@@ -82,6 +82,13 @@ class PendingByPosition(PendingSlots):
         self.need -= first_slots
 
 
+# gdp: law a recorded attempt consumes the hour even if it failed: not result or force or not has_attempt or now - last_attempt >= 3600
+def backup_only_success_throttled(has_url: bool, in_flight: bool, has_attempt: bool,
+                                  now: float, last_attempt: float, force: bool) -> bool:
+    """Old failed downloads left no success timestamp, so every caller tried again."""
+    return has_url and not in_flight
+
+
 class CheckOnBackup(Cadence):
     """controller.maybe_sync before: the key check keyed to the last backup's time, which a failing backup never
     records: the key checked (ssh, up to 120 s) before every command while backups fail."""

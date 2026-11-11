@@ -70,6 +70,47 @@ advertises this contract. The client probes deployed capabilities; grouped admis
 integer `placement_contract: 1`, rejecting old clients before dispatch. Placement receipts include the group,
 VM and the agent lease boot ID if available. No agent or lease protocol changes are needed.
 
+## Nonblocking controller backups
+
+`run` and remote queue commands schedule the optional controller backup on a daemon
+thread; they do not wait for `/state`. A nonblocking `controller-backup.lock` flock
+admits one downloader per client state directory. `controller-backup.json` records
+`t_attempt` **before** the request, so failures also consume the one-hour cadence.
+Explicit `controller sync` bypasses that cadence, not the in-flight lock. The
+whole-request subprocess deadline is 30 seconds, covering setup, retries and
+slow reads; the newest five
+archives remain in `controller-state/`. Backup metadata does not overwrite the
+controller's connection or git-sync metadata. A command exiting may abandon its
+optional daemon backup; a later hourly attempt or explicit sync can retry.
+
+The server retains the old binary `/state` response and accepts old callers. A
+single-flight cache reuses each completed archive for 30 seconds. Directory
+traversal, payload reads, gzip level 1, and socket writes are outside the mutation
+lock. The short queue snapshot guard pins open file descriptors and lengths under
+the request/placement locks, not file contents: atomic replacements keep their
+captured inode; append journals keep only the complete prefix captured then.
+Unlinking or appending after capture cannot change that export. Other atomic state
+records are pinned without the scheduler locks; this is not a cross-process
+transaction with the independently running treadmill.
+
+This is a **controller control-plane recovery** archive, not a disk image or a
+scientific-results archive. It keeps admissions, ownership/group/cancel journals,
+explicit close receipts and accounting, referenced source-tree manifests, pending
+treadmill submissions (including their source archive), result-cache metadata,
+and unacknowledged job output. Reinstallation supplies scheduler code; credentials
+must be recreated; content-addressed inputs are recovered from surviving workers
+or their original sources. A simultaneous loss of those inputs needs a separate
+durable data backup.
+
+Regenerable commit workspaces, unreferenced tree manifests, build caches, saved
+code, closed/orphan job output, diagnostic logs and previous backups are excluded
+**from the archive only**. No controller file is deleted. Historical experimental
+results remain on disk and have their own retention policy. There is no byte or
+file-count cap that discards required state or fails a large backup. The
+`state_backup` status field reports compressed/source bytes, file counts, contents
+by path, exclusions, build/cache-hit counts, age and last error so growth is visible.
+Backup construction/cache failures do not change admission, leases, or handoff.
+
 ## Environment
 
 `SUPERCOMPUTER_{LIVE,CLIENT,URGENT,VM,MAX_STARTS,SHARE,RESERVE_DAY,RESERVE_HOUR,CEIL,IMAGE,WARM,VERBOSE,CONFIG,HOME,SRC}`;

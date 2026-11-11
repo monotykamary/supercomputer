@@ -48,7 +48,7 @@ import threading
 import time
 import urllib.request
 
-from . import blobcache, boat, canary, config, health, rules
+from . import blobcache, boat, canary, config, health, rules, statebackup
 from .boat import AgentClient, AgentError, Registry
 from .rules.owned_lifecycle import OwnedLifecycle, retention_supported
 
@@ -1733,6 +1733,8 @@ class Scheduler:
         r["recovery"] = getattr(self, "recovery", {"errors": getattr(self, "recovery_errors", {})})
         r["recovery_blocked"] = getattr(self, "recovery_blocked", False)
         r["blob_cache"] = blobcache.last_report(BLOBS)
+        cache = getattr(self, "_state_archive", None)
+        r["state_backup"] = cache.status() if cache is not None else {}
         self._h().record_status(time.time(), time.time() - t0)
         last = getattr(self._h(), "last", None) or {}
         r["health"] = {"ok": last.get("ok"), "breached": sorted(k for k, v in last.get("targets", {}).items() if not v["ok"]),
@@ -4489,6 +4491,21 @@ def store_blobs(tree) -> int:
 
 
 # --------------------------------------------------------------------------------------- a remote client's uploads
+def _state_export(s) -> bytes:
+    from . import treadmill
+
+    @contextlib.contextmanager
+    def snapshot_guard():
+        # Only pin queue generations and complete journal prefixes here. Directory
+        # traversal, file payload reads, gzip and delivery all run outside these locks.
+        with s._request_lock:
+            with s.lock:
+                yield {"closed": {b.id for b in s.batches.values() if b.closed}}
+
+    metadata = {}
+    return s._state_archive.get(lambda: statebackup.build(config.LIVE, treadmill.use(), snapshot_guard, metadata), metadata)
+
+
 def raw_post(path: str, body: bytes):
     """The controller's uploads: blobs (a tar named by key), a cache's files, a queue submission, the repos' git."""
     from urllib.parse import parse_qs, urlparse
@@ -4534,21 +4551,6 @@ def raw_post(path: str, body: bytes):
         finally:
             b.unlink(missing_ok=True)
         return ({"ok": True},)
-    if p == "/state":  # (a copy of the durable state for the client to keep: no secrets, no blobs)
-        from . import treadmill
-        tm = treadmill.use()
-        buf = io.BytesIO()
-        skip = ("agents", "keys", "blobs", "index", "token", "boat-key")
-        with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tf:
-            for f in sorted(config.LIVE.rglob("*")):
-                rel = f.relative_to(config.LIVE)
-                if f.is_file() and not any(part in skip for part in rel.parts) and not f.name.endswith(".lock") and f.stat().st_size < 50 << 20:
-                    tf.add(f, arcname=f"live/{rel}")
-            for f in sorted(tm.rglob("*")) if tm.exists() else []:
-                rel = f.relative_to(tm)
-                if f.is_file() and rel.parts[0] not in ("trees", "unpacked") and not f.name.endswith(".tar.gz"):
-                    tf.add(f, arcname=f"treadmill/{rel}")
-        return (None, buf.getvalue())
     raise ValueError(p)
 
 
@@ -4606,6 +4608,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
         s._publish_handoff_ack()
         return  # no worker, placement or release under uncertain ownership
     s._request_lock = threading.RLock()
+    s._state_archive = statebackup.ArchiveCache()
     if (DIR / "token").exists() and (DIR / "token").read_text().strip():  # (the same token across restarts: clients keep theirs)
         s.token = (DIR / "token").read_text().strip()
     with config.private_umask():
@@ -4663,7 +4666,8 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         response = self._response(408, {"error": "incomplete request body"})
                     elif not hmac.compare_digest(self.headers.get("X-SC-Token", ""), s.token):
                         response = self._response(403, {"error": "token"})
-                    elif self.path in ("/poll", "/status", "/health", "/logs", "/capabilities"):
+                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/logs", "/capabilities")
+                                                           or self.path.split("?")[0] == "/state"):
                         response = self._post(body)
                     else:
                         with s._request_lock:
@@ -4691,7 +4695,12 @@ def serve(idle_exit: float = 120, takeover: bool = False):
             log(f"{path}: client HTTP {status} (read {read!r}, Content-Length {declared!r}, peer {peer!r}, user-agent {agent!r})")
 
         def _post(self, body):
-            raw_paths = {"/blobs/put", "/cache/put", "/queue/add", "/git", "/state"}
+            if self.path.split("?")[0] == "/state":  # legacy binary/empty bodies are deliberately ignored
+                try:
+                    return self._response(200, raw=_state_export(s))
+                except Exception as e:
+                    return self._response(500, {"error": repr(e)[-800:]})
+            raw_paths = {"/blobs/put", "/cache/put", "/queue/add", "/git"}
             if self.path.split("?")[0] in raw_paths:
                 try:
                     return self._response(200, *raw_post(self.path, body))

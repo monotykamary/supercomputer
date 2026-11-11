@@ -31,6 +31,16 @@ def reap_modal(pid_gone: bool) -> bool:
     return not ticket_alive(True, pid_gone)
 
 
+# gdp: law an in-flight backup is never duplicated even when forced: not result or not in_flight
+# gdp: law a recorded attempt consumes the hour even if it failed: not result or force or not has_attempt or now - last_attempt >= 3600
+# gdp: law the first backup is not delayed by epoch zero: result or not has_url or in_flight or has_attempt
+# gdp: law an unconfigured controller is never backed up: not result or has_url
+def backup_attempt_due(has_url: bool, in_flight: bool, has_attempt: bool,
+                       now: float, last_attempt: float, force: bool) -> bool:
+    """Called under the client's nonblocking flock; an attempt, not success, starts cooldown."""
+    return has_url and not in_flight and (force or not has_attempt or now - last_attempt >= 3600)
+
+
 class Cadence:
     """The controller's upkeep before a command (controller.maybe_sync, backup): a copy of its state at most hourly
     (unless forced), and its boat key checked at most hourly, whether the backups succeed or not."""

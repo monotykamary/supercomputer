@@ -1,5 +1,11 @@
 """Regressions refused by the same hot-update laws."""
 
+# gdp: law read-only exports never hold the mutation lock while building: not read_only or not result
+def archive_under_mutation_lock(read_only: bool) -> bool:
+    """The old /state route compressed the entire archive under this lock."""
+    return True
+
+
 # gdp: law a consumed sample never advances the handoff streak: fresh or result == 0
 def double_count_handoff(previous: int, fresh: bool, hard_faults: int, idle: int) -> int:
     if hard_faults > 0:

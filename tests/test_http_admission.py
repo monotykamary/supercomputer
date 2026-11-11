@@ -176,13 +176,26 @@ class HTTPAdmission(unittest.TestCase):
         health.record_client_error.assert_not_called()
 
     def test_raw_endpoints_do_not_decode_json(self):
-        h, owner, health, replies = self.dispatch("/state", b'\x00\xff')
+        h, owner, health, replies = self.dispatch("/queue/add", b'\x00\xff')
         raw_post = Mock(return_value=({"fixture": True},))
         h._post.__globals__["raw_post"] = raw_post
         h.do_POST()
         self.assertEqual(replies, [(200, {"fixture": True})])
-        raw_post.assert_called_once_with("/state", b'\x00\xff')
+        raw_post.assert_called_once_with("/queue/add", b'\x00\xff')
         health.record_error.assert_not_called()
+
+    def test_state_preserves_legacy_binary_body_without_the_mutation_lock(self):
+        for body in (b'', b'{}', b'\x00\xff'):
+            h, owner = self.make_handler("/state", body)
+            replies = []
+            def export(s):
+                self.assertIs(s, owner)
+                self.assertFalse(owner._request_lock._is_owned())
+                return b"archive"
+            h._post.__globals__["_state_export"] = export
+            h._send = lambda code, **kw: replies.append((code, kw["raw"]))
+            h.do_POST()
+            self.assertEqual(replies, [(200, b"archive")])
 
     def test_request_socket_has_a_finite_timeout(self):
         h, _ = self.make_handler()

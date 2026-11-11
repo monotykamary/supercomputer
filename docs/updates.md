@@ -220,6 +220,22 @@ replays all placement records (not only unfinished work). The parent only commit
 missing/mismatched history leaves the candidate unready and resumes the parent. Preparation refuses a
 group-unaware candidate/rollback while grouped work remains live. Old snapshots with no groups still work.
 
+### State export cannot serialize intake
+
+`/state` is now a read-only route. Its legacy binary body/response contract is
+unchanged, including callers already running old `maybe_sync` code. A brief queue
+file-generation snapshot still serializes with mutations, but archive traversal,
+reads, compression and delivery do not. One archive build serves concurrent
+callers, with a 30-second completed-result cache. New clients additionally make
+hourly backups single-flight and asynchronous, with the attempt persisted before
+network I/O. Existing client processes keep their imported code until they exit;
+the server isolation/cache protects their repeated requests in the meantime.
+
+This update changes no lease/listener/ACK protocol and requires no controller
+restart. Stage the compatible update through the normal rollout; let the current
+scheduler perform the hot handoff. Do not cancel active proof batches to install
+this fix.
+
 ### Client input errors do not judge server code
 
 The JSON decoder preserves the old wire contract: an empty body means `{}`, legacy `id` and current `batch`

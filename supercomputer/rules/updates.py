@@ -37,6 +37,12 @@ def handoff_can_pass(elapsed: float, watch_s: float, pending: int, hard_fault: b
 def http_client_fault(status: int) -> bool:
     return status >= 400 and status < 500
 
+
+# gdp: law read-only exports never hold the mutation lock while building: not read_only or not result
+# gdp: law mutations remain serialized: read_only or result
+def http_request_serialized(read_only: bool) -> bool:
+    return not read_only
+
 # gdp: law frozen or stopped schedulers never begin a mutation: not result or (not stopping and not handing_off and not passive)
 # gdp: law an active unfrozen scheduler admits mutations: stopping or handing_off or passive or result
 def http_mutation_allowed(stopping: bool, handing_off: bool, passive: bool) -> bool:
