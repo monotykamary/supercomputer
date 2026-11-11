@@ -45,6 +45,7 @@ import io
 import json
 import os
 import pathlib
+import pwd
 import re
 import secrets
 import math
@@ -1308,16 +1309,20 @@ def _reap_children():
 
 
 def _owned_argv(batch, spec):
+    home = pwd.getpwuid(os.getuid()).pw_dir
     return ["sudo", "-n", "unshare", "--mount", "--propagation", "private", "--pid", "--fork",
             "--kill-child=KILL", "--mount-proc", "--", "setpriv", f"--reuid={os.getuid()}",
-            f"--regid={os.getgid()}", "--init-groups", "--", sys.executable, str(ROOT / "agent.py"),
+            f"--regid={os.getgid()}", "--init-groups", "--", "env", f"HOME={home}", f"PATH={os.environ.get('PATH', BASE_PATH)}",
+            sys.executable, str(ROOT / "agent.py"),
             "ownedrun", batch, spec["name"], str(ROOT), spec["launch_identity"]]
 
 
 def ownedrun(batch, name, root, identity):
     """Internal namespace PID1. No payload until the parent verifies and opens our pidfd."""
-    global ROOT
+    global ROOT, HOME
     ROOT = pathlib.Path(root)
+    HOME = pwd.getpwuid(os.getuid()).pw_dir
+    os.environ["HOME"] = HOME
     _item_ids(batch, name)
     _launch_nonce(identity)
     if os.getpid() != 1:
@@ -1671,6 +1676,7 @@ def cpu_model() -> str:
 
 # ------------------------------------------------------------------------------------------------------------------ run
 def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathlib.Path, cwd: str, argv: list[str]) -> list[str]:
+    home = pwd.getpwuid(os.getuid()).pw_dir if spec.get("strict_once") is True else HOME
     tmp = j / "tmp"
     tmp.mkdir(exist_ok=True)
     outputs = j / "outputs"
@@ -1686,15 +1692,24 @@ def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathl
         ov.mkdir(parents=True, exist_ok=True)
         lines += [f"mount -t tmpfs tmpfs {ov}", f"mkdir -p {ov}/up {ov}/work", f"mount -t overlay overlay -o lowerdir={o},upperdir={ov}/up,workdir={ov}/work {o}"]
     lines.append(f"mount -o remount,bind,ro {src}")
+    if spec.get("strict_once") is True:
+        # sudo resets HOME before ownedrun imports this module unless _owned_argv
+        # restores it. Expose the same installed tools as ordinary jobs, read-only.
+        for installed in dict.fromkeys((pathlib.Path(home) / ".bun", pathlib.Path(home) / ".elan",
+                                        ROOT / "agent.py", pathlib.Path(home) / ".sc" / "agent.py")):
+            if installed.exists():
+                quoted = json.dumps(str(installed))
+                lines += [f"mount --bind {quoted} {quoted}", f"mount -o remount,bind,ro {quoted}"]
     lines.append(f"cd {json.dumps(cwd)}")
     lines.append('exec "$@"')
     (j / "ns.sh").write_text("\n".join(lines) + "\n")
-    path = ":".join([*spec.get("path", []), *[p.replace("$HOME", HOME) for p in ctx.get("path", [])], BASE_PATH])
+    path = ":".join([*spec.get("path", []), *[p.replace("$HOME", home) for p in ctx.get("path", [])], BASE_PATH])
     # (bun's install cache in the item's own /tmp: two `bun install`s at once in one shared cache failed, silently,
     # where each Modal container has a HOME of its own)
-    env = ["env", "-i", f"PATH={path}", f"HOME={HOME}", "USER=user", "LOGNAME=user", "SHELL=/bin/bash", "LANG=C.UTF-8", "BUN_INSTALL_CACHE_DIR=/tmp/.bun-install-cache",
+    env = ["env", "-i", f"PATH={path}", f"HOME={home}", "USER=user", "LOGNAME=user", "SHELL=/bin/bash", "LANG=C.UTF-8", "BUN_INSTALL_CACHE_DIR=/tmp/.bun-install-cache",
            *[f"{k}={v}" for k, v in {**ctx.get("env", {}), **spec.get("env", {}),
-                                      "SUPERCOMPUTER_OUTPUT_DIR": str(outputs.resolve())}.items()]]
+                                      "SUPERCOMPUTER_OUTPUT_DIR": str(outputs.resolve())}.items()],
+           *([f"HOME={home}"] if spec.get("strict_once") is True else [])]
     cpus = ",".join(map(str, json.loads((j / "taskset" if (j / "taskset").exists() else j / "cpus").read_text())))
     return ["sudo", "-n", "unshare", "-m", "--propagation", "private", "--", "sh", str(j / "ns.sh"),
             "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}", "--init-groups", "--",
