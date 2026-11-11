@@ -100,7 +100,9 @@ class SubprocessProxy:
         if "scheduler" in argv and "serve" in argv:
             pp = str((k.get("env") or {}).get("PYTHONPATH", ""))
             label = pp.rsplit("/code/", 1)[1].split("/")[0] if "/code/" in pp else self._w.code_installed
-            proc = self._w.spawn_scheduler(takeover="--takeover" in argv, after=1.0, code=self._w.codes.get(label), label=label)
+            delay = self._w.cfg.get("scheduler_start_s_by_code", {}).get(label, self._w.cfg.get("scheduler_start_s", 1.0))
+            self._w.note("scheduler_spawn", code=label, delay=delay)
+            proc = self._w.spawn_scheduler(takeover="--takeover" in argv, after=delay, code=self._w.codes.get(label), label=label)
 
             class P:
                 pid = proc.pid
@@ -250,6 +252,10 @@ class World:
                     tmp.write_text(json.dumps(d))
                     tmp.rename(reg.path)
             B.Registry.locked = locked
+        def prepare(pkg):
+            self.note("snapshot_prepared", code=pkg.parent.name)
+            return {"python": "sim", "cache_tag": "sim"}
+        S.prepare_snapshot = prepare
         S.code_hash = lambda pkg=None: self.code_installed
         S.own_code = lambda: self.k.current_proc().env.get("code", code.label)
         S.log = lambda *a: self.sched_log(" ".join(str(x) for x in a))

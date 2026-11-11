@@ -66,8 +66,10 @@ handoff receipt. No deployment was performed by this lane.
 ## Implemented update protocol
 
 * `scheduler.py:216` reads the explicit install pointer. `scheduler stage`
-  snapshots the newly installed source, publishes that pointer atomically and
-  reports installed/active hashes without starting a scheduler. This addresses
+  snapshots the newly installed source, compiles it with the same interpreter
+  that starts the successor, and verifies an import from that exact snapshot.
+  Only then does it publish the pointer and report installed/active hashes,
+  without starting a scheduler. This addresses
   processes whose original import directory differs from the new installation.
   Recursive source hashing includes `rules/`. Ordinary in-place installs are
   still discovered at the pointed source path.
@@ -78,9 +80,17 @@ handoff receipt. No deployment was performed by this lane.
   does not rebind. Mutating requests retry the same endpoint until committed.
 * The readiness receipt covers every required held VM, admissions and all
   running `(vm, batch, item, run_name, launch_identity)` entries. On the real
-  socket path it is published only after the successor serves. Failure or a
-  four-second startup deadline kills only the candidate PID (no release path),
-  restores parent lease metadata and tries saved code on the same descriptors.
+  socket path it is published only after the successor serves. Both snapshots
+  are precompiled/import-checked before the pause, including old saved copies.
+  Readiness uses a monotonic, workload-sized budget: `10s + 0.1s * VMs + 0.02s *
+  running items + 4 * measured load time`, capped at 120s. Load time is the larger
+  of the latest admission/pool reload and the current registry read/write. The
+  selected budget and its inputs are logged and included in the snapshot.
+  Failure kills only the candidate PID (no release path), restores parent lease
+  metadata and tries saved code on the same descriptors. A deadline is retryable
+  after a 60s cooldown, not a permanent code rejection. A concrete failed ACK or
+  failed boot remains a rejection; the same installed hash automatically retries
+  after cooldown if the failure was only the readiness deadline.
   The old process exits only after a complete receipt. Before offering the pool,
   it prunes empty holds known dead, stopped/deleted/errored by a fresh provider
   observation, or ready but lacking an agent. Missing provider observations are
@@ -140,7 +150,8 @@ handled by the coordinator; subsequent compatible updates need no checkpoint.
 The sibling worktree's active script is not overwritten behind that lane's back.
 
 The GDP laws prove production ACK/deadline/rollback-owner guards plus required-VM
-selection, failed-handoff resumption and passive-candidate activation, not arbitrary
+selection, failed-handoff resumption, passive-candidate activation, bounded
+workload budgets and timeout retry eligibility, not arbitrary
 network latency, systemd behavior or semantic equivalence of two versions of
 Python code. Broken variants retain a missing-item ACK, an off-by-one deadline
 and a rollback that selects the candidate. Load scenarios test the item/VM

@@ -120,17 +120,51 @@ class Guards(unittest.TestCase):
             root = pathlib.Path(d)
             source = root / 'new-install' / 'supercomputer'
             source.mkdir(parents=True)
+            (source / '__init__.py').write_text('')
             (source / 'scheduler.py').write_text('# candidate\n')
             with mock.patch.object(scheduler, 'DIR', root / 'live'), \
                  mock.patch.object(scheduler, '__file__', str(source / 'scheduler.py')), \
                  mock.patch.object(scheduler, 'Client', side_effect=ConnectionRefusedError), \
-                 mock.patch.object(scheduler.subprocess, 'Popen') as spawn:
+                 mock.patch.object(scheduler, 'ensure_running') as spawn:
                 receipt = scheduler.stage_install()
                 self.assertEqual(scheduler.installed_source(), source.parent)
                 self.assertEqual(receipt['staged'], scheduler.code_hash(source))
                 self.assertIsNone(receipt['active'])
                 self.assertTrue((root / 'live/code' / receipt['staged'] / 'supercomputer/scheduler.py').exists())
                 spawn.assert_not_called()
+                manifest = json.loads((root / "live/install.json").read_text())
+                self.assertEqual(manifest["prepared"]["python"], sys.executable)
+                self.assertTrue(list((root / "live/code" / receipt["staged"]).rglob("scheduler.*.pyc")))
+
+    def test_stage_rejects_compile_and_import_errors_before_publication(self):
+        for source_text in ('not valid python !!', 'import nonexistent_snapshot_dependency'):
+            with self.subTest(source=source_text), tempfile.TemporaryDirectory() as d:
+                root = pathlib.Path(d)
+                source = root / 'install/supercomputer'
+                source.mkdir(parents=True)
+                (source / '__init__.py').write_text('')
+                (source / 'scheduler.py').write_text(source_text)
+                with mock.patch.object(scheduler, 'DIR', root / 'live'), \
+                     mock.patch.object(scheduler, '__file__', str(source / 'scheduler.py')), \
+                     mock.patch.object(scheduler, 'Client') as client:
+                    with self.assertRaisesRegex(RuntimeError, 'compile/import failed'):
+                        scheduler.stage_install()
+                    self.assertFalse((root / 'live/install.json').exists())
+                    client.assert_not_called()
+
+    def test_budget_and_timeout_cooldown(self):
+        self.assertEqual(updates.handoff_budget(82, 340, 1500), 31000)
+        self.assertEqual(updates.handoff_budget(-1, -1, -1), 10000)
+        self.assertEqual(updates.handoff_budget(10000, 100000, 100000), 120000)
+        with tempfile.TemporaryDirectory() as d:
+            c = scheduler.canary.Canary(pathlib.Path(d))
+            c.handoff_failed('slow', 'startup deadline', True, 100)
+            self.assertFalse(c.rejected('slow'))
+            self.assertFalse(c.retry_ready('slow', 159))
+            self.assertTrue(c.retry_ready('slow', 160))
+            c.handoff_failed('bad', 'missing identity', False, 100)
+            self.assertTrue(c.rejected('bad'))
+            self.assertFalse(c.retry_ready('bad', 10000))
 
     def test_stage_refuses_a_mismatched_snapshot(self):
         with tempfile.TemporaryDirectory() as d, \
@@ -204,7 +238,7 @@ class Guards(unittest.TestCase):
 
 
 class RealSocketHandoff(unittest.TestCase):
-    def exercise(self, rejected, blocked=False):
+    def exercise(self, rejected, blocked=False, slow=False):
         if os.environ.get('OWNED_LIFECYCLE_BOAT_TEST') != '1':
             self.fail('run this regression on Boat with OWNED_LIFECYCLE_BOAT_TEST=1')
         with tempfile.TemporaryDirectory(prefix='sc-hot-') as tmp:
@@ -212,9 +246,12 @@ class RealSocketHandoff(unittest.TestCase):
             tool = root / 'tool'
             shutil.copytree(pathlib.Path(scheduler.__file__).parent, tool / 'supercomputer',
                             ignore=shutil.ignore_patterns('__pycache__'))
+            if slow:
+                with (tool / "supercomputer/scheduler.py").open("a") as f:
+                    f.write("\n_publish_fast = Scheduler._publish_handoff_ack\ndef _slow_ack(self):\n    if getattr(self, '_handoff_ack', None):\n        time.sleep(5)\n    _publish_fast(self)\nScheduler._publish_handoff_ack = _slow_ack\n")
             if blocked:
                 with (tool / "supercomputer/scheduler.py").open("a") as f:
-                    delay = "        time.sleep(10)\n" if blocked == "timeout" else ""
+                    delay = "        time.sleep(180)\n" if blocked == "timeout" else ""
                     f.write("\n_publish_ack_ok = Scheduler._publish_handoff_ack\ndef _bad_ack(self):\n    if getattr(self, '_handoff_ack', None):\n" + delay + "        self._handoff_ack['items_ready'] = False\n    _publish_ack_ok(self)\nScheduler._publish_handoff_ack = _bad_ack\n")
             with socket.socket() as reserve:
                 reserve.bind(('127.0.0.1', 0))
@@ -261,7 +298,7 @@ class RealSocketHandoff(unittest.TestCase):
                 began = last = time.monotonic()
                 largest_gap = 0
                 switched = False
-                while time.monotonic() - began < (13 if blocked else 9):
+                while time.monotonic() - began < (45 if blocked == "timeout" else 15):
                     try:
                         current = req('/health')
                         pids.add(current['pid'])
@@ -275,6 +312,7 @@ class RealSocketHandoff(unittest.TestCase):
                         if not blocked and current['pid'] != proc.pid:
                             state = req('/status')
                             switched = state['code'] == old if rejected else state['code'] != old
+                            switched = switched and (root / "live/scheduler/handoff.ack").exists() and proc.poll() is not None
                             if switched:
                                 break
                     except Exception:
@@ -294,10 +332,17 @@ class RealSocketHandoff(unittest.TestCase):
                     time.sleep(.6)  # the original run loop must not fall into shutdown
                     self.assertEqual(req("/health")["pid"], proc.pid)
                     self.assertEqual(req("/status")["code"], old)
+                    if blocked == "timeout":
+                        canary_state = json.loads((root / "live/scheduler/canary.json").read_text())
+                        self.assertEqual(canary_state["state"], "retryable")
+                        self.assertNotIn(scheduler.code_hash(tool / "supercomputer"), canary_state.get("rejected", []))
                 else:
                     ack = json.loads(ack_path.read_text())
                     self.assertTrue(ack['items_ready'])
                     self.assertTrue(ack['admissions']['ready'])
+                    self.assertTrue(list((root / "live/scheduler/code" / state["code"]).rglob("scheduler.*.pyc")))
+                    if slow:
+                        self.assertGreater(time.monotonic() - began, 5)
                 # A contender cannot acquire the inherited flock while the child serves.
                 import fcntl
                 with (root / 'live/scheduler/serve.lock').open('a') as contender:
@@ -320,6 +365,9 @@ class RealSocketHandoff(unittest.TestCase):
                 if proc:
                     proc.wait(timeout=5)
                 log.close()
+
+    def test_slow_cold_candidate_gets_more_than_four_seconds(self):
+        self.exercise(False, slow=True)
 
     def test_both_candidates_timeout_without_blocking_health(self):
         self.exercise(False, blocked="timeout")

@@ -28,6 +28,28 @@ def handoff_activate(parent_alive: bool, guarded: bool) -> bool:
     return not guarded or not parent_alive
 
 
+# gdp: law startup always gets at least ten seconds: result >= 10000
+# gdp: law startup never holds placement beyond the two minute cap: result <= 120000
+# gdp: law VM work gets its budget up to the cap: result >= min(120000, 10000 + 100 * max(0, vms))
+# gdp: law item work gets its budget up to the cap: result >= min(120000, 10000 + 20 * max(0, items))
+# gdp: law measured load gets four times its budget up to the cap: result >= min(120000, 10000 + 4 * max(0, load_ms))
+def handoff_budget(vms: int, items: int, load_ms: int) -> int:
+    return min(120000, 10000 + 100 * max(0, vms) + 20 * max(0, items) + 4 * max(0, load_ms))
+
+
+# gdp: law a startup timeout never permanently rejects code: not expired or not result
+# gdp: law a definitive failed readiness rejects code: expired or result
+def handoff_reject(expired: bool) -> bool:
+    return not expired
+
+
+# gdp: law a permanently rejected code never retries: not rejected or not result
+# gdp: law a retry waits for its cooldown: now >= retry_after or not result
+# gdp: law eligible code retries after cooldown: rejected or now < retry_after or result
+def handoff_retry_ready(now: float, retry_after: float, rejected: bool) -> bool:
+    return not rejected and now >= retry_after
+
+
 # gdp: law a candidate cannot wait beyond its deadline: now < deadline or result
 # gdp: law a candidate is not expired before its deadline: now >= deadline or not result
 def handoff_expired(now: float, deadline: float) -> bool:

@@ -233,6 +233,25 @@ def installed_source() -> pathlib.Path:
     return config.SRC
 
 
+def prepare_snapshot(pkg: pathlib.Path) -> dict:
+    """Compile and import the exact snapshot before publishing or pausing work."""
+    pkg = pkg.resolve()
+    env = {**os.environ, "PYTHONPATH": str(pkg.parent)}
+    commands = [
+        [sys.executable, "-P", "-m", "compileall", "-q", str(pkg)],
+        [sys.executable, "-P", "-c",
+         "import pathlib, sys, supercomputer.scheduler as s; "
+         "assert pathlib.Path(s.__file__).resolve() == pathlib.Path(sys.argv[1]).resolve()",
+         str(pkg / "scheduler.py")],
+    ]
+    for command in commands:
+        result = subprocess.run(command, cwd=str(pkg.parent), env=env,
+                                capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(f"snapshot compile/import failed: {(result.stderr or result.stdout)[-1000:]}")
+    return {"python": sys.executable, "cache_tag": sys.implementation.cache_tag}
+
+
 def stage_install() -> dict:
     """Publish immutable installed code for the next safe point; starts no service."""
     DIR.mkdir(parents=True, exist_ok=True)
@@ -241,7 +260,8 @@ def stage_install() -> dict:
     saved = canary.Canary(DIR).snapshot(target, source)
     if saved is None or code_hash(saved) != target:
         raise RuntimeError("staged source changed while snapshotting; retry after install completes")
-    manifest = {"source": str(source.parent), "snapshot": str(saved.parent), "code": target}
+    prepared = prepare_snapshot(saved)
+    manifest = {"source": str(source.parent), "snapshot": str(saved.parent), "code": target, "prepared": prepared}
     tmp = DIR / f"install.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(manifest))
     tmp.replace(DIR / "install.json")
@@ -638,6 +658,7 @@ class Scheduler:
         """The queue as it was before a restart (the controller's service restarted, its VM recovered): every batch
         still open, its delivered rows kept, the rest queued again (what ran on VMs this process no longer holds runs
         again)."""
+        self._reload_started = time.monotonic()
         qd = DIR / "queue"
         self.recovery_errors = {}
         self.recovery_blocked = True
@@ -704,6 +725,7 @@ class Scheduler:
         # (its snapshot, the old one waiting for this one's word) or a restart's (its leases, their holder gone);
         # rules.take_over. Before, VM by VM: 14:33:45-14:36:54, 43 of 225 held at 14:33, 176 with no live owner)
         self._take_pool()
+        self._reload_ms = max(0, math.ceil((time.monotonic() - self._reload_started) * 1000))
         if self.batches and not self.recovery_blocked:
             self.reattaching, self.t_reattach = True, time.time()  # (no VM leased or started until the first pass took back what runs where: rules.plan_waits, one tick after a handoff, 60 s at most)
             threading.Thread(target=self._reattach, daemon=True).start()
@@ -746,6 +768,7 @@ class Scheduler:
 
         taken, missing, reg, starting = [], [], {}, []
         retired = self.retired()
+        registry_started = time.monotonic()
         with Registry().locked() as d:
             for vid, v in d["vms"].items():
                 l = v.get("lease") or {}
@@ -760,6 +783,7 @@ class Scheduler:
                 taken.append(vid)
                 reg[vid] = dict(v)
             missing = [vid for vid in info if vid not in taken]
+        self._registry_load_ms = max(0, math.ceil((time.monotonic() - registry_started) * 1000))
         def acquire(vid):
             # Do not serialize network round trips over a whole warm pool before
             # opening the scheduler port. Each VM has its own independent fence.
@@ -874,7 +898,9 @@ class Scheduler:
         self._handoff = {"t": now, "from_pid": old, "held": sorted(info), "taken": taken, "missing": missing, "snapshot": bool(snap), "checks": 0}
         if snap:
             self._handoff_ack = {"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing,
-                                 "admissions": self.recovery, "items_ready": items_ready}
+                                 "admissions": self.recovery, "items_ready": items_ready,
+                                 "registry_load_ms": self._registry_load_ms,
+                                 "reload_ms": max(0, math.ceil((time.monotonic() - getattr(self, "_reload_started", time.monotonic())) * 1000))}
             if not os.environ.get("SUPERCOMPUTER_HANDOFF_FDS"):
                 self._publish_handoff_ack()
         if taken or missing:
@@ -3764,7 +3790,7 @@ class Scheduler:
                 # written, none of a broken install)
                 h = code_hash()
                 inst = self.__dict__.setdefault("_install", rules.Install(self.code, 60))
-                ripe = h != self.code and inst.seen == h and now - inst.t_seen >= inst.stable_s and not self.canary.rejected(h)
+                ripe = h != self.code and inst.seen == h and now - inst.t_seen >= inst.stable_s and self.canary.retry_ready(h, now)
                 if inst.tick(now, h, ripe and self._imports(h)) == "handoff":
                     self.handoff()
             if now - t_adopt > 60 and not getattr(self, "adopting", False):
@@ -3935,6 +3961,14 @@ class Scheduler:
             if not all((DIR / "code" / c / "supercomputer").is_dir() for c in candidates):
                 self.alert("handoff refused: saved rollback code is missing")
                 return
+            # Warm the exact immutable packages with the interpreter that will
+            # spawn them, before pausing placement (also repairs old cold snapshots).
+            try:
+                for target in candidates:
+                    prepare_snapshot(DIR / "code" / target / "supercomputer")
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+                self.alert(f"handoff refused: snapshot preparation failed: {error}")
+                return
             # Observe provider state while the old scheduler still places work.
             # A failed/partial listing never authorizes pruning an unseen VM.
             observed = {}
@@ -3951,8 +3985,11 @@ class Scheduler:
                 self._prune_handoff_pool(observed)
                 previous_files = {name: (DIR / name).read_bytes() if (DIR / name).exists() else None
                                   for name in ("handoff.json", "handoff.used.json", "handoff.ack")}
+                registry_started = time.monotonic()
                 with Registry().locked() as d:
                     previous_leases = {vid: v.get("lease") for vid, v in d["vms"].items()}
+                registry_ms = max(getattr(self, "_registry_load_ms", 0),
+                                  math.ceil((time.monotonic() - registry_started) * 1000))
                 self.handing_off, quiesced = True, True
                 # A reversible pause, not stop: all existing loops stay alive.
                 self._metrics_save()
@@ -3965,6 +4002,11 @@ class Scheduler:
             # candidate hangs. Both processes reject mutations until committed.
             self.released_lock = True  # simulator selection only; the shared flock stays locked
             held = {v["id"] for v in snap["vms"]}
+            item_count = sum(len(v.get("items", [])) for v in snap["vms"])
+            load_ms = max(registry_ms, getattr(self, "_reload_ms", 0))
+            budget_s = rules.handoff_budget(len(held), item_count, load_ms) / 1000
+            snap["readiness_budget"] = {"seconds": budget_s, "vms": len(held),
+                                        "items": item_count, "load_ms": load_ms}
             for attempt, target in enumerate(candidates):
                 snap["t"] = time.time()
                 tmp = DIR / "handoff.json.tmp"
@@ -3983,8 +4025,10 @@ class Scheduler:
                                             start_new_session=True, close_fds=True, pass_fds=fds,
                                             env=env, cwd=str(config.HOME))
                 active = proc
-                ack, deadline = None, time.time() + 4
-                while not rules.handoff_expired(time.time(), deadline):
+                ack, deadline = None, time.monotonic() + budget_s
+                log(f"handoff to {target}: readiness budget {budget_s:.3f}s "
+                    f"({len(held)} VMs, {item_count} items, measured load {load_ms}ms)")
+                while not rules.handoff_expired(time.monotonic(), deadline):
                     with contextlib.suppress(Exception):
                         a = json.loads((DIR / "handoff.ack").read_text())
                         if a.get("of") == snap["t"]:
@@ -4001,15 +4045,15 @@ class Scheduler:
                     log(f"handoff: serving pid {ack['pid']} holds every VM and running identity; exiting")
                     accepted = True
                     os._exit(0)
+                expired = ack is None and rules.handoff_expired(time.monotonic(), deadline)
                 # A failed candidate must not run shutdown(), release or race rollback.
                 self._reject_handoff_candidate(proc, previous_leases)
                 active = None
-                why = f"handoff to {target} failed readiness: {ack!r}"
+                why = (f"handoff to {target} readiness deadline after {budget_s:.3f}s (retryable)" if expired
+                       else f"handoff to {target} failed readiness: {ack!r}")
                 self.alert(why)
                 if target != self.code:
-                    d = self.canary.read()
-                    d.update({"state": "rejected", "rejected": sorted(set(d.get("rejected", [])) | {target}), "why": why})
-                    self.canary.write(d)
+                    self.canary.handoff_failed(target, why, expired, time.time())
             self.alert("handoff blocked: candidate and saved code failed; resuming old scheduler")
         finally:
             try:

@@ -55,6 +55,26 @@ class Canary:
     def rejected(self, code: str) -> bool:
         return code in self.read().get("rejected", [])
 
+    def retry_ready(self, code: str, now: float) -> bool:
+        from . import rules
+        d = self.read()
+        return rules.handoff_retry_ready(now, float(d.get("retry_after", {}).get(code, 0)),
+                                         code in d.get("rejected", []))
+
+    def handoff_failed(self, code: str, why: str, expired: bool, now: float):
+        """A startup deadline is a capacity observation, not a bad-code verdict."""
+        from . import rules
+        d = self.read()
+        retry = d.setdefault("retry_after", {})
+        if rules.handoff_reject(expired):
+            d.update(state="rejected", rejected=sorted(set(d.get("rejected", [])) | {code}))
+            retry.pop(code, None)
+        else:
+            d["state"] = "retryable"
+            retry[code] = now + 60  # not a five-second retry storm while the controller is loaded
+        d["why"] = why
+        self.write(d)
+
     def handing_off(self, old: str, new: str, now: float):
         d = self.read()
         d.update({"from": old, "to": new, "t": now, "state": "watching"})

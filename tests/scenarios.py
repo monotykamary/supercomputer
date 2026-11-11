@@ -959,6 +959,54 @@ def deploy_full_gate(code):
     return sim, {"extra": extra}
 
 
+@scenario("cold large handoff", ["lost", "strikes", "modal", "clients", "threads"], 1000,
+          "82 held VMs and 340 items; a cold staged snapshot is prepared and seven-second rehydration beats the former four-second deadline")
+def cold_large_handoff(code):
+    from tests.sim.harness import items, IMAGE
+    sim = _sim(code, policy={"max_vms": 82, "floor_always": True, "floor_by_image": {IMAGE: 82}},
+               cfg={"scheduler_start_s": 7.0})
+    _warm(sim, 79)
+    for _ in range(3):
+        sim.w.warm_vm(IMAGE, vm_type="xlarge")  # 79*4 + 3*8 = 340 live slots
+    sim.scheduler()
+    sim.at(10, lambda: sim.batch("cold-large", "gate", items("g", 340, 300)))
+    sim.at(100, lambda: sim.w.install("cold-large"))
+    def extra(sim, m):
+        snap = json.loads((pathlib.Path(sim.tmp) / 'scheduler/handoff.used.json').read_text())
+        budget = snap.get('readiness_budget', {})
+        m['cold_handoff'] = budget
+        return {'large_pool_offered': len(snap['vms']) == 82,
+                'running_items_offered': sum(len(v['items']) for v in snap['vms']) == 340,
+                'snapshot_prepared': any(e['kind'] == 'snapshot_prepared' and e['code'] == 'cold-large' for e in sim.w.events),
+                'new_code_serves': sim.w.live_sched()[0].env['code'] == 'cold-large',
+                'work_sized_budget': 7 < budget.get('seconds', 0) <= 120,
+                'no_readiness_failure': not any('failed readiness' in msg or 'readiness deadline' in msg for _, _, msg in sim.w.log_lines),
+                'every_item_runs_once': all(x['runs'] == 1 for x in sim.w.items.values())}
+    return sim, {'extra': extra}
+
+
+@scenario("readiness retry", ["lost", "strikes", "modal", "clients", "threads"], 1800,
+          "a transient startup deadline rolls back safely then retries the identical code after cooldown without a new install")
+def readiness_timeout_retries(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 8}, cfg={"scheduler_start_s_by_code": {"slow-once": 180}})
+    _warm(sim, 8)
+    sim.scheduler()
+    sim.at(10, lambda: sim.batch("retry-gate", "gate", items("g", 128, 300)))
+    sim.at(100, lambda: sim.w.install("slow-once"))
+    sim.at(210, lambda: sim.w.cfg['scheduler_start_s_by_code'].update({'slow-once': 1}))
+    def extra(sim, m):
+        state = json.loads((pathlib.Path(sim.tmp) / 'scheduler/canary.json').read_text())
+        attempts = [e for e in sim.w.events if e['kind'] == 'scheduler_spawn' and e['code'] == 'slow-once']
+        m['startup_retry'] = {'attempts': attempts, 'canary': state}
+        return {'deadline_observed': any('readiness deadline' in msg for _, _, msg in sim.w.log_lines),
+                'same_code_retried': len(attempts) == 2 and attempts[1]['t'] - attempts[0]['t'] >= 60,
+                'timeout_not_blacklisted': 'slow-once' not in state.get('rejected', []),
+                'new_code_serves': sim.w.live_sched()[0].env['code'] == 'slow-once',
+                'every_item_runs_once': all(x['runs'] == 1 for x in sim.w.items.values())}
+    return sim, {'extra': extra}
+
+
 @scenario("hot reload stopped holds", ["lost", "strikes", "modal", "clients", "threads"], 1800,
           "three stopped VMs remain marked held and ready with no agent while a gate runs; prune only those empty holds before handing off")
 def handoff_stopped_holds(code):

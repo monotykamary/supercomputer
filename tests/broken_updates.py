@@ -38,3 +38,23 @@ def resume_after_acceptance(accepted: bool, quiesced: bool) -> bool:
 # gdp: law a guarded candidate stays passive while its parent lives: not guarded or not parent_alive or not result
 def candidate_runs_before_commit(parent_alive: bool, guarded: bool) -> bool:
     return True
+
+
+# gdp: law startup always gets at least ten seconds: result >= 10000
+def fixed_four_second_deadline(vms: int, items: int, load_ms: int) -> int:
+    return 4000
+
+
+# gdp: law startup never holds placement beyond the two minute cap: result <= 120000
+def unbounded_startup_budget(vms: int, items: int, load_ms: int) -> int:
+    return 10000 + 100 * max(0, vms) + 20 * max(0, items) + 4 * max(0, load_ms)
+
+
+# gdp: law a startup timeout never permanently rejects code: not expired or not result
+def blacklist_a_timeout(expired: bool) -> bool:
+    return True
+
+
+# gdp: law a retry waits for its cooldown: now >= retry_after or not result
+def retry_without_cooldown(now: float, retry_after: float, rejected: bool) -> bool:
+    return not rejected
