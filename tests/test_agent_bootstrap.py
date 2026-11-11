@@ -262,6 +262,107 @@ class BootstrapTransport(unittest.TestCase):
         self.assertFalse(any(self.root.glob('bootstrap-*')))
 
 
+class ResumeLifetime(unittest.TestCase):
+    """A released VM retains its 60s TTL unless resume overrides it atomically."""
+
+    def scheduler_resume(self, *, stale=False, ttl=boat.BACKSTOP):
+        instance = object.__new__(scheduler.Scheduler)
+        instance.agent_b64, instance.agent_version = 'EXACT_SOURCE', 'new-hash'
+        instance.held_before, instance.bring_up = {}, 30.0
+        instance.wake = threading.Event()
+        for name in ('_count_start', '_start_done', '_drop_stale', '_let_go',
+                     '_record_agent_ping', '_foreign', '_worker', 'alert'):
+            setattr(instance, name, Mock())
+        instance._model_report = lambda vm, model: setattr(vm, 'model', model)
+        instance.gate = types.SimpleNamespace(take_split=Mock(return_value=(1, 0)))
+        instance.stop = threading.Event()
+        vm = scheduler.VMState('resumed-vm', 'image', 'xlarge', 'resumed')
+        vm.ttl = ttl
+        clock = {'now': 0, 'expires': None}
+        grant = {'ok': not stale, 'stale': stale, 'boot': 'boot', 'epoch': 1}
+        model = 'AMD Ryzen 9 9950X 16-Core Processor'
+        client = types.SimpleNamespace(ping=lambda: {'version': 'new-hash'},
+                                       rpc=lambda *a, **kw: {'model': model, 'cpus': 16})
+        def provider(*args, **kwargs):
+            if args[0] == 'resume':
+                # This is the provider contract: omission preserves the released TTL.
+                clock['expires'] = int(args[args.index('--ttl') + 1]) if '--ttl' in args else boat.IDLE
+                return json.dumps({'id': vm.id})
+            if args[0] == 'extend':
+                self.assertLess(clock['now'], clock['expires'], 'post-bootstrap extension is too late')
+                clock['expires'] = clock['now'] + int(args[args.index('--ttl') + 1])
+                return '{}'
+            self.fail(f'unexpected provider operation: {args[0]}')
+        def running(*args):
+            clock['now'] += 20
+            return {vm.id: 20} if clock['now'] < clock['expires'] else {}
+        def bootstrap(*args, **kwargs):
+            clock['now'] += 75  # realistic upload/claim time exceeds the old 60s TTL
+            if clock['now'] >= clock['expires']:
+                raise RuntimeError('provider auto-stopped the resumed VM before first CPU inventory')
+            return grant
+        with patch.object(boat, 'boat', side_effect=provider) as commands, \
+             patch.object(boat, 'wait_running', side_effect=running), \
+             patch.object(boat, 'read_agent', return_value={}), \
+             patch.object(boat, 'owner_key', return_value='key'), \
+             patch.object(boat, 'bootstrap_agent', side_effect=bootstrap), \
+             patch.object(boat, 'remember_lease'), patch.object(boat, 'rename_leased_vm'), \
+             patch.object(boat, 'agent_client', return_value=client), \
+             patch.object(scheduler, 'SchedulerAgentClient', side_effect=lambda cl, *a: cl):
+            instance._up(vm, 3, None)
+        return instance, vm, commands
+
+    def test_scheduler_resume_survives_long_bootstrap_before_first_cpu_inventory(self):
+        for ttl in (boat.BACKSTOP, boat.BACKSTOP + 300):
+            with self.subTest(ttl=ttl):
+                instance, vm, commands = self.scheduler_resume(ttl=ttl)
+                self.assertTrue(vm.ready)
+                self.assertFalse(vm.dead)
+                self.assertEqual(vm.model, 'AMD Ryzen 9 9950X 16-Core Processor')
+                instance._worker.assert_called_once_with(vm)
+                instance._start_done.assert_called_once_with(vm.id, True)
+                instance._let_go.assert_not_called()
+                args = commands.call_args_list[0].args
+                self.assertEqual(args[args.index('--ttl') + 1], str(ttl))
+
+    def test_resume_ttl_does_not_bypass_lease_refusal(self):
+        instance, vm, commands = self.scheduler_resume(stale=True)
+        self.assertFalse(vm.ready)
+        instance._drop_stale.assert_called_once_with(vm)
+        instance._worker.assert_not_called()
+        instance._let_go.assert_not_called()
+        instance._start_done.assert_called_once_with(vm.id, False)
+        self.assertEqual([c.args[0] for c in commands.call_args_list], ['resume'])
+
+    def test_legacy_resume_sets_ttl_before_provider_wait(self):
+        instance = object.__new__(boat.Session)
+        instance.counts = {'resumed': 0, 'leased_running': 0}
+        instance.stop = threading.Event()
+        instance.gate = types.SimpleNamespace(take=Mock(return_value=1))
+        instance.enough, instance._prepare, instance._release = Mock(return_value=False), Mock(), Mock()
+        vm = boat.VM('resumed-vm', 'xlarge', 'resumed')
+        clock = {'now': 0, 'expires': None}
+        def resume(argv, **kwargs):
+            self.assertEqual(argv[:3], [boat.BOAT, 'resume', vm.id])
+            clock['expires'] = int(argv[argv.index('--ttl') + 1]) if '--ttl' in argv else boat.IDLE
+            clock['now'] += 75  # provider resume itself can wait longer than the old TTL
+            return types.SimpleNamespace(returncode=0, stdout='{}', stderr='')
+        def extend(*args, **kwargs):
+            self.assertEqual(args[0], 'extend')
+            if clock['now'] >= clock['expires']:
+                raise RuntimeError('resumed VM already auto-stopped')
+            return '{}'
+        with patch.object(boat, 'states', return_value={vm.id: {'state': 'stopped'}}), \
+             patch.object(boat, 'OLD', False), patch.object(boat.subprocess, 'run', side_effect=resume), \
+             patch.object(boat, 'boat', side_effect=extend), \
+             patch.object(boat, 'wait_running', return_value={vm.id: 75}):
+            instance._bring_up(vm, False)
+        self.assertFalse(vm.dead)
+        instance._prepare.assert_called_once_with(vm)
+        instance._release.assert_not_called()
+        self.assertEqual(instance.counts['resumed'], 1)
+
+
 class SchedulerBootstrapWiring(unittest.TestCase):
     def test_bootstraps_share_helper_but_ambiguous_upgrade_never_bootstraps(self):
         tree = ast.parse(Path(scheduler.__file__).read_text())

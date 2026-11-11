@@ -3530,7 +3530,9 @@ class Scheduler:
                 got, paid = self.gate.take_split(1, self.stop)
                 if not got:
                     raise RuntimeError("no start left")
-                out = boat.boat("resume", vm.id, "--json", check=False, timeout=300)
+                # Override the released VM's 60s TTL in the resume itself;
+                # extending after bootstrap is too late if hydration/claim takes longer.
+                out = boat.boat("resume", vm.id, "--ttl", str(vm.ttl), "--json", check=False, timeout=300)
                 if boat.R.resume_replaces(boat.resume_missing(out), False):
                     boat.note_starts(-1)
                     boat.forget_missing(vm.id, "scheduler")

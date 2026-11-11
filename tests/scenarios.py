@@ -1347,7 +1347,8 @@ def agent_capabilities_legacy_safe_point(code):
         starts = [e for e in sim.w.events if e["kind"] == "item_started" and e.get("batch") == capable]
         ordered = bool(starts) and all(any(u.get("vm") == e.get("vm") and u["t"] <= e["t"] for u in upgrades) for e in starts)
         return {**observed, "upgraded_before_capability_work": ordered,
-                "capability_receipts": bool(receipts) and all(r and r.get("placement", {}).get("agent_capabilities") == required for r in receipts),
+                # Receipts advertise actual inventory, including capabilities not requested.
+                "capability_receipts": bool(receipts) and all(r and required.items() <= r.get("placement", {}).get("agent_capabilities", {}).items() for r in receipts),
                 "old_run_not_restarted": all(x["runs"] == 1 for (bid, _), x in sim.w.items.items() if bid == legacy),
                 "required_run_once": all(x["runs"] == 1 for (bid, _), x in sim.w.items.items() if bid == capable)}
     return sim, {"extra": extra}

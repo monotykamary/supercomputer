@@ -44,6 +44,19 @@ as before (a tarball from a seed VM's URL) and gets its agent for the next batch
 Measured on gdp-wired (two trivial jobs, a large VM already up): 36.3 and 39.2 s a batch before (boat API calls,
 the tree as a tarball over ssh, exec ticks), 2.4 to 2.8 s with a warm agent; a resumed VM still costs about a minute.
 
+## Resume lifetime
+
+Released workers retain the normal 60-second idle TTL. Boat preserves that setting on
+resume unless a replacement is supplied. Both the scheduler and legacy session therefore
+pass the held-worker backstop (900 seconds) in the **resume request itself**, before
+waiting for readiness or installing/claiming the agent. An extension after those steps
+cannot rescue a worker that already auto-stopped during hydration or bootstrap.
+
+The scheduler still requires the agent's lease/boot fence, and CPU-pinned placement
+still requires a known matching model. The post-claim extension remains. This changes
+neither the 60-second release policy nor strict-once payload-attempt limits, and does not
+guarantee CPU availability.
+
 ## Durable store transport and teardown
 
 `store pull` sizes `manifest.json` and optional `links.json` with a one-byte range,

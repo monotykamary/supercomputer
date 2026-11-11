@@ -2052,7 +2052,8 @@ class Session:
                         raise RuntimeError("no boat starts left this hour or day (a resume is a start)")
                     vm.t_request = time.time()  # (billing starts at the resume, not at the wait for a start)
                     with _sem:
-                        p = subprocess.run([BOAT, "resume", vm.id, "--json"], capture_output=True, text=True, timeout=300, env=ENV)
+                        # A released VM keeps its 60s TTL unless resume replaces it atomically.
+                        p = subprocess.run([BOAT, "resume", vm.id, "--ttl", str(BACKSTOP), "--json"], capture_output=True, text=True, timeout=300, env=ENV)
                     said = p.stdout + p.stderr
                     if p.returncode != 0 and ("rate_limited" in said or '"status":429' in said):
                         note_starts(-1)  # (refused: not a start)
