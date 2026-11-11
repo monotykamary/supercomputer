@@ -25,6 +25,9 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `locked, key_path, have, put, read, pinned, last_report, main` | I/O | OS locking across clients/admission/collection; SHA-256 checked atomic writes; descriptors opened under lock; queue manifests resolve pins fail-closed; reports and CLI dispatch. |
 | `completed` | rule + I/O | `CompletionPin.release`: only a finished job of the matching admission generation releases pins. Results remain on disk; a reused batch ID cannot inherit a completion marker. |
 | `Scheduler._blob_cache_tick` | I/O | one maintenance worker at a time, checked every 300 seconds and cancelled during stop/handoff; deletion policy is `collect` above. |
+| `Scheduler.close` | I/O | queue removal and in-memory close commit take the state lock then the blob-cache lock, excluding completion-marker resurrection; a failed unlink retains the admission reservation. |
+| `rules.updates.quarantine_closed_admission` | rule | only persisted records with durable scheduled-close authority are quarantined, and all such records require quarantine. |
+| `Scheduler._scheduled_closes`, `_read_client_closes`, `_quarantine_closed_admissions` | I/O + rule | decode close receipts; reconcile before reload or snapshot under the same lock order; move records and journals to dated quarantine without replay/deletion; archive errors or contradictory held identities abort recovery. |
 
 ## 2026-11-08 unplaced exclusive gates
 

@@ -253,7 +253,8 @@ class OwnedSchedulerTests(unittest.TestCase):
         for suffix in ("json", "rows", "placed", "cancel"):
             self.assertTrue((self.root / "queue" / f"{self.b.id}.{suffix}").exists())
         restored = S.Scheduler.__new__(S.Scheduler)
-        restored.batches = {}
+        restored.batches, restored.vms = {}, {}
+        restored.lock = threading.RLock()
         restored._take_pool = Mock()
         with patch.object(S.threading, "Thread"):
             restored.reload()

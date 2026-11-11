@@ -641,8 +641,8 @@ class Scheduler:
                 f.write(json.dumps(a) + "\n")
 
     @staticmethod
-    def _read_client_closes() -> set[str]:
-        """Only scheduler close receipts, not completion guesses or canary state."""
+    def _scheduled_closes() -> set[str]:
+        """Durable scheduler close authority, independent of stray queue files."""
         closed = set()
         if boat.LEDGER.exists():
             with boat.LEDGER.open() as f:
@@ -650,14 +650,67 @@ class Scheduler:
                     try:
                         r = json.loads(line)
                         if isinstance(r, dict) and r.get("scheduled") is True and "wall_s" in r and "slot_s" in r and isinstance(r.get("batch"), str):
-                            # close removes the admission before writing this receipt.
-                            # An existing file wins over an older close of a reused ID.
-                            bid = Scheduler._valid_batch(r["batch"])
-                            if not (DIR / "queue" / f"{bid}.json").exists():
-                                closed.add(bid)
+                            closed.add(Scheduler._valid_batch(r["batch"]))
                     except (ValueError, TypeError):
                         continue  # another process may still be appending the tail
         return closed
+
+    @staticmethod
+    def _read_client_closes() -> set[str]:
+        # Until reconciliation succeeds, an extant file remains unresolved.
+        return {bid for bid in Scheduler._scheduled_closes()
+                if not (DIR / "queue" / f"{bid}.json").exists()}
+
+    def _quarantine_closed_admissions(self):
+        """Archive resurrected closes before reload or the handoff manifest.
+
+        The ledger is close authority, not a completion marker. Preserve every
+        byte; never replay a closed ID or hide an unclassified open admission.
+        """
+        with self.lock, blobcache.locked(BLOBS):
+            closed = self._scheduled_closes()
+            self._durably_closed = closed | getattr(self, "_durably_closed", set())
+            q = DIR / "queue"
+            evidence = {}
+            for path in q.iterdir() if q.exists() else ():
+                if path.suffix in (".json", ".rows", ".placed", ".cancel", ".logs"):
+                    bid = path.stem
+                    if rules.quarantine_closed_admission(True, bid in closed):
+                        evidence.setdefault(bid, []).append(path)
+            affected = set(evidence) | (set(self.batches) & closed)
+            incoming = set()
+            if affected and (DIR / "handoff.json").exists():
+                snap = json.loads((DIR / "handoff.json").read_text())
+                parent = int(snap.get("from_pid", 0))
+                if (parent and parent != os.getpid() and time.time() - float(snap.get("t", 0)) < 600
+                        and boat.pid_alive(parent, socket.gethostname())):
+                    incoming = {it["batch"] for v in snap.get("vms", []) for it in v.get("items", [])}
+            for bid in affected:
+                b = self.batches.get(bid)
+                held = any(it.batch.id == bid for v in self.vms.values()
+                           for it in list(v.running.values()) + list(getattr(v, "finishing", {}).values()))
+                if bid in incoming or held or (b is not None and not b.closed and b.left()):
+                    raise RuntimeError(f"closed admission {bid} has running or queued ownership; quarantine refused")
+            for bid in sorted(affected):
+                paths = evidence.get(bid, [])
+                if paths:
+                    parent = DIR / "quarantine"
+                    parent.mkdir(exist_ok=True)
+                    stamp = time.strftime("closed-%Y%m%dT%H%M%S", time.gmtime())
+                    archive = parent / f"{stamp}-{time.time_ns()}-{secrets.token_hex(4)}"
+                    archive.mkdir()
+                    # Admission first: even a crash midway cannot replay it.
+                    for path in sorted(paths, key=lambda p: (p.suffix != ".json", p.name)):
+                        os.replace(path, archive / path.name)
+                    for directory in (archive, parent, q, DIR):
+                        fd = os.open(directory, os.O_RDONLY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                    log(f"{bid}: quarantined durably closed admission and evidence in {archive}")
+                self.batches.pop(bid, None)
+                getattr(self, "recovery_errors", {}).pop(bid, None)
 
     def _unclassified(self, bid: str) -> bool:
         if bid in getattr(self, "recovery_errors", {}):
@@ -679,6 +732,7 @@ class Scheduler:
         qd = DIR / "queue"
         self.recovery_errors = {}
         self.recovery_blocked = True
+        self._quarantine_closed_admissions()
         self._client_closed = self._read_client_closes()
         for f in sorted(qd.glob("*.json")) if qd.exists() else []:
             if f.stem in self._client_closed:
@@ -1102,6 +1156,7 @@ class Scheduler:
 
     def _handoff_snapshot(self) -> dict:
         """What the next scheduler takes at once: every VM held here and ready, with what it knows of it."""
+        self._quarantine_closed_admissions()
         vms = []
         for v in list(self.vms.values()):
             if (v.dead or not v.ready) and not self._handoff_vm_occupied(v):
@@ -1542,6 +1597,10 @@ class Scheduler:
         self._full_now = True
         self._validate_submission(msg)
         b = Batch(msg)
+        if not hasattr(self, "_durably_closed"):
+            self._durably_closed = self._scheduled_closes()
+        if b.id in self._durably_closed:
+            return {"ok": False, "error": "durably closed batch id cannot be reused"}
         with self.lock:  # (rules.Submit: a batch with items queued or running is never replaced; the same submit again keeps it)
             old = self.batches.get(b.id)
             if old is None and (DIR / "queue" / f"{b.id}.json").exists():
@@ -1628,33 +1687,34 @@ class Scheduler:
         self._valid_batch(bid)
         if getattr(self, "recovery_blocked", False):
             return {"ok": False, "error": "recovery quarantined; ownership held"}
-        with self.lock:
-            owned = self.batches.get(bid)
-            if owned and (owned.retain_journals or owned.strict_once or owned.admission_closed):
-                retain = True
-            else:
-                retain = False
-        if retain:
-            return self.cancel(bid)
-        self._full_now = True
-        b = self.batches.get(bid)
-        if b is None:
-            return {}
         kill = []
         with self.lock:
-            for it in b.items.values():  # (a client that gives up: what still runs is killed, what's queued goes)
-                if it.state in ("starting", "running") and it.vm:
-                    kill.append((it.vm, it.run_name))
-                it.state = "done"
-                it.fate.delivered()
-            b.closed = True
-            self.batches.pop(bid, None)
+            b = self.batches.get(bid)
+            retain = b is not None and (b.retain_journals or b.strict_once or b.admission_closed)
+            if not retain:
+                self._full_now = True
+                if b is None:
+                    return {}
+                # Same lock order as submit/cancel. Completion must finish its
+                # replacement before deletion, never republish after close.
+                with blobcache.locked(BLOBS):
+                    for f in (DIR / "queue" / f"{bid}.json", DIR / "queue" / f"{bid}.rows", DIR / "queue" / f"{bid}.placed"):
+                        f.unlink(missing_ok=True)
+                    import shutil as _sh
+                    _sh.rmtree(DIR / "queue" / f"{bid}.logs", ignore_errors=True)
+                    # Keep the reservation and item states if durable deletion fails.
+                    for it in b.items.values():  # (a client that gives up: what still runs is killed, what's queued goes)
+                        if it.state in ("starting", "running") and it.vm:
+                            kill.append((it.vm, it.run_name))
+                        it.state = "done"
+                        it.fate.delivered()
+                    b.closed = True
+                    self.batches.pop(bid, None)
+                    self._durably_closed = getattr(self, "_durably_closed", set()) | {bid}
+        if retain:
+            return self.cancel(bid)
         for vm, rn in kill:  # (the kills outside the lock, in the background: status never waits on them; one lost, the VM's tick kills it later)
             threading.Thread(target=self._kill_run, args=(vm, b.id, rn), daemon=True).start()
-        for f in (DIR / "queue" / f"{bid}.json", DIR / "queue" / f"{bid}.rows", DIR / "queue" / f"{bid}.placed"):
-            f.unlink(missing_ok=True)
-        import shutil as _sh
-        _sh.rmtree(DIR / "queue" / f"{bid}.logs", ignore_errors=True)
         s = {"vms": len(b.vms_used), "starts": b.starts, "preempted": b.preempted, "class": NAMES[b.klass], "wall_s": round(time.time() - b.t0, 1)}
         first = round(b.t_first - b.t0, 1) if b.t_first else None
         placed = round(b.t_placed - b.t0, 1) if b.t_placed else None

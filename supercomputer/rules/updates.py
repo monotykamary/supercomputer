@@ -1,5 +1,11 @@
 """Hot-update guards used by the scheduler, not a model of OS/network latency."""
 
+# gdp: law no absent record is quarantined: persisted or not result
+# gdp: law no record without durable close authority is quarantined: closed or not result
+# gdp: law every persisted durably closed record is quarantined: not persisted or not closed or result
+def quarantine_closed_admission(persisted: bool, closed: bool) -> bool:
+    return persisted and closed
+
 # gdp: law a poll wait is never negative: result >= 0
 # gdp: law a poll wait never exceeds the server bound: result <= max(0.0, limit)
 # gdp: law a poll never waits longer than the client requested: result <= max(0.0, requested)

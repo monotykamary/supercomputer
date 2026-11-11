@@ -68,6 +68,20 @@ to updated cooperating clients; old clients do not take the lock.
 
 `live/scheduler/blobs` is a disposable content-addressed cache, not an evidence archive. Every five minutes, maintenance evicts least-recently-used cold blobs toward the default 8 GiB target, and expires unreferenced blobs after seven days. Queued/running manifests (including cached tree IDs) pin their contents. Completed admissions release their pins with a generation-scoped marker, without deleting results; older queue records without a generation remain conservatively pinned until closed. Uploads and reads renew a one-hour grace period; writes, admission and pruning share an OS lock across processes. Unreadable queue state prevents deletion. Active/recent data may exceed the target; the report exposes that excess rather than deleting required inputs. Remote clients revalidate even known tree IDs and re-upload evicted files.
 
+Closing a batch uses the same state-lock → blob-cache-lock order as admission and
+cancellation. Its admission file is removed before the in-memory reservation is
+retired, so a concurrent completion-marker writer cannot resurrect it.
+
+On load and before a handoff snapshot, a durable scheduled-close ledger receipt
+makes that batch ID terminal. Any remaining admission and associated journals or
+logs move, without deletion or replay, into a unique dated directory under
+`live/scheduler/quarantine/closed-<UTC timestamp>-…/`. The move is logged. Closed
+IDs cannot be submitted again; completed but still-open admissions retain their
+existing submission semantics. Archive failures and contradictions with running,
+queued or incoming handoff ownership fail closed. Admissions without a durable
+close receipt remain subject to the unchanged exact admission-set readiness
+check, including malformed or otherwise unclassified records.
+
 `supercomputer cache prune --dry-run` previews reclamation; `supercomputer cache prune` applies it; `supercomputer cache status` shows the last automatic/manual report. Policy knobs: `blob_cache_bytes`, `blob_cache_grace_s` (at least 60), and `blob_cache_max_age_s` (at least the grace). Use `supercomputer store` for durable evidence and retain its snapshot/manifest receipt.
 
 Untracked `.verification/` directories are excluded from implicit source trees, including with custom ignore lists. Tracked fixtures still ship. Explicit `--data DIR:DEST` still supplies required verification inputs. This avoids repeatedly storing whole generated source archives as distinct opaque blobs.
