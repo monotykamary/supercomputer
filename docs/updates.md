@@ -188,6 +188,23 @@ replays all placement records (not only unfinished work). The parent only commit
 missing/mismatched history leaves the candidate unready and resumes the parent. Preparation refuses a
 group-unaware candidate/rollback while grouped work remains live. Old snapshots with no groups still work.
 
+### Client input errors do not judge server code
+
+The JSON decoder preserves the old wire contract: an empty body means `{}`, legacy `id` and current `batch`
+keys work, and Python's JSON byte decoder retains UTF-8/BOM, UTF-16 and UTF-32 support. Body-independent
+readers still accept any valid JSON root. Binary upload routes are not JSON-decoded.
+
+Malformed JSON is a **400 client error**, with an explicit connection-close response. The exception handler
+surrounds only input decoding: a JSON error raised later by server work is still a 500 recorded against server
+health and the canary. Short or timed-out bodies remain 408s and cannot be dispatched as a partial request.
+
+Scheduler POST 4xx responses are counted separately in `health.client_4xx` in status and in `/health`'s
+`client_4xx` observation: `count`, `by_status`, and the last four bounded metadata records over the requested
+window (30 minutes for status). These records include path, declared/read length, peer and User-Agent, never
+body or token. A timed-out buffered read has an unknown read length, not a fabricated zero. These observations
+are not canary targets; a client-fault burst stays visible without rejecting healthy server code. Existing server
+error history is retained, not retroactively guessed away.
+
 ### A live snapshot can lead the placement journal
 
 Legacy (non-strict, ungrouped) placement is journaled after preparation, but the live handoff snapshot can

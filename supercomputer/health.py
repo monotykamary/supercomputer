@@ -67,7 +67,7 @@ class Health:
     def __init__(self, path: pathlib.Path | None = None):
         self.path = path
         self.lock = threading.Lock()
-        self.ev: dict[str, list] = {k: [] for k in ("start", "release", "placed", "strike", "modal", "sample", "orphan", "status", "error", "billing", "needless", "handoff")}
+        self.ev: dict[str, list] = {k: [] for k in ("start", "release", "placed", "strike", "modal", "sample", "orphan", "status", "error", "client_error", "billing", "needless", "handoff")}
         self.streak: dict[str, int] = {}
         self.alerted: set = set()
         self.last: dict = {}
@@ -129,6 +129,22 @@ class Health:
 
     def record_error(self, t, what):
         self._add("error", t, what=str(what)[:200])
+
+    def record_client_error(self, t, status, path, declared, read, peer, agent):
+        """Bounded, payload-free observations; never server errors or canary targets."""
+        if not 400 <= status < 500:
+            raise ValueError("not an HTTP client error")
+        self._add("client_error", t, status=status, path=str(path)[:120], declared=str(declared)[:32],
+                  read=read, peer=str(peer)[:80], agent=str(agent)[:120])
+
+    def client_errors(self, now, minutes=30):
+        with self.lock:
+            events = [dict(e) for e in self.ev["client_error"] if now - 60 * minutes <= e["t"] <= now]
+        counts = {}
+        for e in events:
+            key = str(e["status"])
+            counts[key] = counts.get(key, 0) + 1
+        return {"count": len(events), "by_status": counts, "recent": events[-4:]}
 
     # -- the checks
     def check(self, now: float, minutes: float = 30, env: dict | None = None, released_since: float = 0.0) -> dict:
@@ -208,7 +224,8 @@ class Health:
                             "with_waste": sum(1 for s in ev["sample"] if any(p.get("waste", 0) for p in s["per"].values()))}}
         out = {k: {"what": TARGETS[k][0], "value": vals[k], "limit": f"{TARGETS[k][1]} {TARGETS[k][2]}", "ok": _ok(TARGETS[k][1], vals[k], TARGETS[k][2]),
                    "detail": detail[k]} for k in TARGETS}
-        return {"t": now, "minutes": minutes, "ok": all(v["ok"] for v in out.values()), "targets": out}
+        return {"t": now, "minutes": minutes, "ok": all(v["ok"] for v in out.values()), "targets": out,
+                "client_4xx": self.client_errors(now, minutes)}
 
     def tick(self, now: float, minutes: float = 30) -> list[str]:
         """A check (every minute): the targets breached in 2 checks in a row, each said once until it clears."""
@@ -293,4 +310,6 @@ def show(r: dict) -> str:
         d = v["detail"]
         extra = "" if v["ok"] or not d else f"   {json.dumps(d, default=str)[:200]}"
         lines.append(f"  {'ok ' if v['ok'] else 'BAD'} {k:8} {str(val):>7}  (want {v['limit']}: {v['what']}){extra}")
+    clients = r.get("client_4xx", {})
+    lines.append(f"  client 4xx: {clients.get('count', 0)} (informational, not a server health breach); by status {clients.get('by_status', {})}")
     return "\n".join(lines)

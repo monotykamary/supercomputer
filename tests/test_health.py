@@ -194,6 +194,46 @@ def test_canary_hands_back_a_handoff_that_dropped_vms_at_once():
     assert h2.check(1010.0, 30)["targets"]["handoff"]["ok"]
 
 
+def test_client_4xx_visible_but_never_server_errors_or_canary_targets():
+    with tempfile.TemporaryDirectory() as tmp, patch.object(health, "env_flags", return_value=[]):
+        root = pathlib.Path(tmp)
+        (root / "code/old/supercomputer").mkdir(parents=True)
+        h = health.Health(root / "health.json")
+        c = canary.Canary(root)
+        c.handing_off("old", "new", 1000.0)
+        for code in (400, 403, 404, 408, 429):
+            for n in range(30):
+                h.record_client_error(1010 + n, code, "/poll", "1", 1, "local", "legacy")
+        report = h.check(1060)
+        assert report["ok"] and report["targets"]["errors"]["value"] == 0
+        assert report["client_4xx"]["count"] == 150
+        assert report["client_4xx"]["by_status"] == {str(code): 30 for code in (400, 403, 404, 408, 429)}
+        assert len(report["client_4xx"]["recent"]) == 4
+        assert "150" in health.show(report)
+        assert [c.tick("new", t, h)[0] for t in (1060, 1120, 1180)] == ["watch"] * 3
+        assert c.tick("new", 1601, h)[0] == "passed"
+        h.save()
+        loaded = health.Health(h.path)
+        assert loaded.client_errors(1601)["count"] == 150
+        assert loaded.client_errors(4000)["count"] == 0
+
+
+def test_client_error_metadata_is_bounded_and_5xx_cannot_hide_there():
+    h = health.Health()
+    h.record_client_error(1000, 400, "/" * 1000, "9" * 1000, 1, "p" * 1000, "a" * 1000)
+    row = h.client_errors(1010)["recent"][0]
+    assert len(row["path"]) == 120 and len(row["declared"]) == 32
+    assert len(row["peer"]) == 80 and len(row["agent"]) == 120
+    for code in (200, 302, 500, 503):
+        try:
+            h.record_client_error(1000, code, "/poll", "1", 1, "local", "legacy")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"non-client HTTP {code} hidden from server health")
+    assert h.client_errors(1010)["count"] == 1
+
+
 if __name__ == "__main__":
     n = 0
     for k, f in list(globals().items()):

@@ -124,8 +124,10 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `raw_post` | decision, same rule as rules.integrity | each blob's bytes must hash to its name: as store_blobs |
 | `queue_ls, queue_results` | I/O | the treadmill's queue listed |
 | `serve` | I/O | one scheduler per pool (a file lock), the HTTP server |
+| `rules.updates.http_client_fault` | rule | exactly HTTP 4xx, never 5xx, is classified as client input failure. |
+| `Health.record_client_error`, `Health.client_errors` | observational I/O | bounded metadata and windowed client-fault counts, separate from server-error events and all canary targets. |
 | `rules.updates.http_mutation_allowed` | rule | stopped, frozen or passive schedulers refuse mutations; active owners admit them. Evaluated under the same lock that freezes a handoff snapshot. |
-| `H.log_message, H._send, H._response, H._post, H.do_GET, H.do_POST, H.handle_error` | I/O + rule | bounded socket reads and response writes outside the mutation lock; dispatch and immutable response preparation inside it; constant-time token check. The freeze decision uses `http_mutation_allowed`; latency is exercised by mock and real-socket tests, not claimed as a timing law. |
+| `H.log_message, H._send, H._response, H._post, H._h_client_fault, H.do_GET, H.do_POST, H.handle_error` | I/O + rule | bounded socket reads and response writes outside the mutation lock; dispatch and immutable response preparation inside it; constant-time token check. The freeze decision uses `http_mutation_allowed`; latency is exercised by mock and real-socket tests, not claimed as a timing law. |
 | `Client.__init__ .. Client.keep (req, _local, _known, _know, push_tree, push_caches, keep)` | I/O | the client's requests (a kept-alive connection, three tries) |
 | `_healthy, persistent_forward, forward_supervisor, bye, forward, write_private` | I/O | the forward to the controller and its supervision |
 | `controller, connect, _remote, running, current, ensure_running, enabled` | decision, plain | which scheduler a batch goes to (the controller's when set up and answering, else this machine's, started): an ordered choice over what answers, no state of its own |

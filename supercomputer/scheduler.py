@@ -1705,7 +1705,8 @@ class Scheduler:
         r["blob_cache"] = blobcache.last_report(BLOBS)
         self._h().record_status(time.time(), time.time() - t0)
         last = getattr(self._h(), "last", None) or {}
-        r["health"] = {"ok": last.get("ok"), "breached": sorted(k for k, v in last.get("targets", {}).items() if not v["ok"])}
+        r["health"] = {"ok": last.get("ok"), "breached": sorted(k for k, v in last.get("targets", {}).items() if not v["ok"]),
+                       "client_4xx": self._h().client_errors(time.time()) or {"count": 0, "by_status": {}, "recent": []}}
         return r
 
     def _status(self) -> dict:
@@ -4594,6 +4595,8 @@ def serve(idle_exit: float = 120, takeover: bool = False):
             body = raw if raw is not None else json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Length", str(len(body)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
 
@@ -4610,6 +4613,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
 
         def do_POST(self):
             c0 = _cpu_now()
+            body = None
             try:
                 # Network input is untrusted latency, not part of a mutation.
                 try:
@@ -4640,9 +4644,21 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                             else:
                                 response = self._post(body)
                 if response is not None:
+                    if rules.http_client_fault(response[0]):
+                        path = self.path.split("?")[0][:120]
+                        peer = str(getattr(self, "client_address", ("unknown",))[0])[:80]
+                        agent = self.headers.get("User-Agent", "")[:120]
+                        declared = self.headers.get("Content-Length", "0")[:32]
+                        read = len(body) if body is not None else None
+                        self._h_client_fault(response[0], path, declared, read, peer, agent)
                     self._send(response[0], raw=response[1])
             finally:
                 s._cpu_add("http " + self.path.split("?")[0], c0)
+
+        @staticmethod
+        def _h_client_fault(status, path, declared, read, peer, agent):
+            s._h().record_client_error(time.time(), status, path, declared, read, peer, agent)
+            log(f"{path}: client HTTP {status} (read {read!r}, Content-Length {declared!r}, peer {peer!r}, user-agent {agent!r})")
 
         def _post(self, body):
             raw_paths = {"/blobs/put", "/cache/put", "/queue/add", "/git", "/state"}
@@ -4652,7 +4668,14 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                 except Exception as e:
                     return self._response(500, {"error": repr(e)[-800:]})
             try:
-                m = json.loads(body or b"{}")
+                try:
+                    m = json.loads(body or b"{}")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # Bad client input is not a scheduler failure. Keep the
+                    # catch around decoding only: an internal JSON failure in
+                    # a handler must still trip health/canary below.
+                    self.close_connection = True
+                    return self._response(400, {"error": "invalid JSON request"})
                 p = self.path
                 if p == "/capabilities":
                     return self._response(200, s.capabilities())

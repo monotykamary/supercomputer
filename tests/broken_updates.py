@@ -1,5 +1,10 @@
 """Regressions refused by the same hot-update laws."""
 
+# gdp: law only HTTP 4xx responses are client faults: not result or (status >= 400 and status < 500)
+def server_fault_as_client(status: int) -> bool:
+    return status >= 400
+
+
 # gdp: law frozen or stopped schedulers never begin a mutation: not result or (not stopping and not handing_off and not passive)
 def mutate_while_frozen(stopping: bool, handing_off: bool, passive: bool) -> bool:
     return not stopping

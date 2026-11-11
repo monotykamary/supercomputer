@@ -1,5 +1,10 @@
 """Hot-update guards used by the scheduler, not a model of OS/network latency."""
 
+# gdp: law only HTTP 4xx responses are client faults: not result or (status >= 400 and status < 500)
+# gdp: law every HTTP 4xx response is a client fault: status < 400 or status >= 500 or result
+def http_client_fault(status: int) -> bool:
+    return status >= 400 and status < 500
+
 # gdp: law frozen or stopped schedulers never begin a mutation: not result or (not stopping and not handing_off and not passive)
 # gdp: law an active unfrozen scheduler admits mutations: stopping or handing_off or passive or result
 def http_mutation_allowed(stopping: bool, handing_off: bool, passive: bool) -> bool:

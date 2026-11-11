@@ -1,5 +1,6 @@
 """Boat-only update regressions, including real inherited sockets (no provider API)."""
 import contextlib
+import http.client
 import itertools
 import json
 import os
@@ -318,7 +319,7 @@ class Guards(unittest.TestCase):
 
 
 class RealSocketHandoff(unittest.TestCase):
-    def exercise(self, rejected, blocked=False, slow=False, grouped=False, snapshot_only=False, http_io=False):
+    def exercise(self, rejected, blocked=False, slow=False, grouped=False, snapshot_only=False, http_io=False, http_shapes=False):
         if os.environ.get('OWNED_LIFECYCLE_BOAT_TEST') != '1':
             self.fail('run this regression on Boat with OWNED_LIFECYCLE_BOAT_TEST=1')
         with tempfile.TemporaryDirectory(prefix='sc-hot-') as tmp:
@@ -326,7 +327,7 @@ class RealSocketHandoff(unittest.TestCase):
             tool = root / 'tool'
             shutil.copytree(pathlib.Path(scheduler.__file__).parent, tool / 'supercomputer',
                             ignore=shutil.ignore_patterns('__pycache__'))
-            if http_io:
+            if http_io or http_shapes:
                 with (tool / "supercomputer/scheduler.py").open("a") as f:
                     f.write("\nHTTP_REQUEST_TIMEOUT_S = 1.0\ndef _large_http_reply(self, msg):\n    (DIR / 'slow-reply.ready').touch()\n    return b'x' * (8 * 1024 * 1024)\nScheduler.hint = _large_http_reply\n")
             if snapshot_only:
@@ -386,6 +387,8 @@ class RealSocketHandoff(unittest.TestCase):
                 old = initial['code']
                 if http_io:
                     self.check_slow_http_clients(port, token, req, root)
+                if http_shapes:
+                    self.check_legacy_http_bodies(port, token)
                 source = tool / 'supercomputer' / 'scheduler.py'
                 with source.open('a') as f:
                     f.write('\n# update test candidate\n')
@@ -474,6 +477,84 @@ class RealSocketHandoff(unittest.TestCase):
                 if proc:
                     proc.wait(timeout=5)
                 log.close()
+
+    def check_legacy_http_bodies(self, port, token):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        def post(path, body, expected):
+            conn.request("POST", path, body=body, headers={"X-SC-Token": token, "User-Agent": "legacy-body-fixture"})
+            response = conn.getresponse()
+            data = json.loads(response.read())
+            self.assertEqual(response.status, expected, data)
+            return data, response
+        try:
+            before, _ = post("/health", b'{}', 200)
+            for body in (b'', b'{}', b'null', b'[]', b'false', b'42', b'"text"'):
+                post("/poll", body, 400)
+                post("/capabilities", body, 200)
+            for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-32"):
+                body = json.dumps({"id": "legacy-\u00e9", "wait": 0}, ensure_ascii=False).encode(encoding)
+                post("/poll", body, 200)
+            first_socket = conn.sock
+            for key in ("id", "batch"):
+                post("/poll", json.dumps({key: "legacy", "wait": 0}).encode(), 200)
+                self.assertIs(conn.sock, first_socket)
+            for body in (b'{', b'{x', b"{'id':'legacy'}", b'{"id":"legacy"', b' ', b'\xff'):
+                _, response = post("/poll", body, 400)
+                self.assertEqual(response.getheader("Connection"), "close")
+                post("/poll", b'{"id":"legacy","wait":0}', 200)  # same client reconnects cleanly
+        finally:
+            conn.close()
+
+        def header(body, close=False, declared=None):
+            length = len(body) if declared is None else declared
+            return (f"POST /poll HTTP/1.1\r\nHost: localhost\r\nX-SC-Token: {token}\r\n"
+                    f"User-Agent: fragmented-legacy\r\nContent-Length: {length}\r\n"
+                    f"Connection: {'close' if close else 'keep-alive'}\r\n\r\n").encode()
+        body = json.dumps({"id": "split", "note": "\u00e9", "wait": 0}, ensure_ascii=False).encode()
+        second = b'{"batch":"next","wait":0}'
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+            cut = body.index(b'\xc3') + 1  # split a UTF-8 code point as well as the JSON object
+            sock.sendall(header(body) + body[:cut])
+            time.sleep(.03)
+            sock.sendall(body[cut:] + header(second, close=True) + second)
+            with sock.makefile("rb") as stream:
+                for _ in range(2):
+                    status = stream.readline()
+                    self.assertIn(b" 200 ", status)
+                    headers = {}
+                    while True:
+                        line = stream.readline()
+                        self.assertTrue(line)
+                        if line == b"\r\n":
+                            break
+                        key, value = line.decode().split(":", 1)
+                        headers[key.lower()] = value.strip()
+                    payload = json.loads(stream.read(int(headers["content-length"])))
+                    self.assertTrue(payload.get("done"), payload)
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+            sock.sendall(header(b'{', declared=20) + b'{')
+            sock.shutdown(socket.SHUT_WR)
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            response.read()
+            self.assertEqual(response.status, 408)
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            after, _ = post("/health", b'{}', 200)
+            self.assertEqual(after["targets"]["errors"]["value"], before["targets"]["errors"]["value"])
+            self.assertGreaterEqual(after["client_4xx"]["count"], 14)
+            self.assertEqual(after["client_4xx"]["recent"][-1]["read"], 1)
+            self.assertEqual(after["client_4xx"]["recent"][-1]["declared"], "20")
+            status, _ = post("/status", b'{}', 200)
+            self.assertEqual(status["health"]["client_4xx"]["count"], after["client_4xx"]["count"])
+        finally:
+            conn.close()
+        print(json.dumps({"legacy_http_bodies": "passed", "fragmented_pipelined_keepalive": "passed",
+                          "server_errors": after["targets"]["errors"]["value"], "client_4xx": after["client_4xx"]["count"]}))
+
+    def test_legacy_json_bodies_fragmentation_and_keepalive(self):
+        self.exercise(False, http_shapes=True)
 
     def check_slow_http_clients(self, port, token, req, root):
         def request(path, body, sent=None, receive_buffer=None):
