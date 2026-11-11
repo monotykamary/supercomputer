@@ -3,6 +3,8 @@
 # rules/cpu.py and rules/affinity.py cover exact models, distinct VM history/ACKs, and endpoint affinity,
 # alongside their broken variants in check_laws.sh. rules/updates.py also proves fresh handoff
 # observation intervals, sub_preempt_s idle qualification and strict first-sample hard faults.
+# rules/status.py proves honest nonnegative age and monotonic snapshot publication.
+# rules/agent_capabilities.py proves advertised requirements and idle-only upgrade ownership.
 name = "supercomputer"
 
 [boat]

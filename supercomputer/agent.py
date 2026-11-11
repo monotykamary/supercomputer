@@ -61,6 +61,7 @@ from typing import Literal
 ROOT = pathlib.Path.home() / ".sc"
 HOME = str(pathlib.Path.home())
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1}
 VERSION = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]  # (its code: the scheduler upgrades a stale one in place)
 
 
@@ -2546,7 +2547,7 @@ def rpc_dispatch(cmd, args, token_owner=None, cli=False):
                 "itemlogs": itemlogs, "resultpart": resultpart, "logs": logs_tar, "start-daemon": start_daemon,
                 "begin": begin, "upgrade": upgrade, "tree": make_tree, "verify": verify_tree,
                 "have": lambda keys: {"missing": have(keys)}, "pull": pull, "pullcache": pullcache,
-                "ping": lambda: {"ok": True, "version": VERSION, "boot": _lease_boot(),
+                "ping": lambda: {"ok": True, "version": VERSION, "agent_capabilities": dict(AGENT_CAPABILITIES), "boot": _lease_boot(),
                     "cpus": os.cpu_count(), "load": os.getloadavg()[0], "disk": clean_disk(), "lease": lease("who")}}
     if cmd not in commands:
         raise ValueError("unsupported RPC command: " + str(cmd))

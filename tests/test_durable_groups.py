@@ -181,7 +181,8 @@ class DurableGroups(unittest.TestCase):
         c, _ = group_batch(self.s, 'b', cpu=False)
         v = self.machine()
         shape = S.fit_shape(c.items['i0'])
-        self.assertEqual(shape[-1], ('b', 'run/stage/case/rep', frozenset()))
+        self.assertEqual(shape[-2], ('b', 'run/stage/case/rep', frozenset()))
+        self.assertEqual(shape[-1], ())  # no explicit agent requirements
         self.assertTrue(self.s._place(b.items['i0'], v))
         self.assertTrue(self.s._place(c.items['i0'], v))
         self.assertFalse((self.root / 'durable-groups.json').exists())

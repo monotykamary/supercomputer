@@ -29,6 +29,7 @@ import base64
 import concurrent.futures
 import collections
 import contextlib
+import copy
 import fcntl
 import hashlib
 import hmac
@@ -49,10 +50,18 @@ import threading
 import time
 import urllib.request
 
-from . import blobcache, boat, canary, config, health, memorypressure, resultfiles, resultjournal, resultjson, rules, statebackup
+from . import blobcache, boat, canary, config, health, memorypressure, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
 from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
+from .agent import AGENT_CAPABILITIES as BUILD_AGENT_CAPABILITIES
 from .rules.owned_lifecycle import OwnedLifecycle, retention_supported
+from .rules.agent_capabilities import (agent_capability_satisfies, agent_capabilities_match,
+    agent_upgrade_allowed, normalize_agent_capabilities, required_agent_capabilities)
+
+
+class AgentCapabilityError(RuntimeError):
+    """Required agent protocols could not be verified before payload launch."""
+
 
 CLASSES = {"interactive": 1, "gate": 2, "submission": 3, "sweep": 4, "filler": 5}
 NAMES = {v: k for k, v in CLASSES.items()}
@@ -263,7 +272,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
             "cpu_model_exact": capabilities.get("cpu_model_exact") is True,
             "distinct_vm_group": capabilities.get("distinct_vm_group") is True and capabilities.get("distinct_vm_group_protocol") == 1,
             "durable_distinct_vm_group": capabilities.get("distinct_vm_group_scope") == "durable" and capabilities.get("durable_distinct_vm_group_protocol") == 1,
-            "result_files_protocol": capabilities.get("result_files_protocol") == 1}
+            "result_files_protocol": capabilities.get("result_files_protocol") == 1,
+            "required_agent_capabilities_protocol": capabilities.get("required_agent_capabilities_protocol") == 1}
 
 
 def stage_install() -> dict:
@@ -492,13 +502,14 @@ def fit_shape(it) -> tuple:
     Items of one shape fit the same VMs: a pass's memo, preemption's and health's waste group by it."""
     return (it.batch.image, it.batch.klass, it.timing, it.weight, it.spec.get("vm_type") or "", frozenset(it.avoid) if it.avoid else None, getattr(it, "memory", 0), it.spec.get("cpu_model", ""),
             ((*distinct_key(it), frozenset(distinct_used(it)), distinct_live(it)) if durable_item(it) else
-             (it.batch.id, it.spec["distinct_vm_group"], frozenset(it.batch.distinct_vms.get(it.spec["distinct_vm_group"], ())))) if it.spec.get("distinct_vm_group") else None)
+             (it.batch.id, it.spec["distinct_vm_group"], frozenset(it.batch.distinct_vms.get(it.spec["distinct_vm_group"], ())))) if it.spec.get("distinct_vm_group") else None,
+            tuple(sorted(required_agent_capabilities(it.spec).items())))
 
 
 def vm_fits(shape: tuple, vm, retired: set) -> bool:
     """rules.vm_fits for an item of `shape` on the VM: the one test of placement, preemption and waste."""
-    image, _k, _t, _w, vtype, avoid, mem, model, distinct = shape
-    return (not distinct or len(distinct) != 4 or distinct[3]) and rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
+    image, _k, _t, _w, vtype, avoid, mem, model, distinct, required = shape
+    return not getattr(vm, "upgrading", False) and agent_capabilities_match(dict(required), getattr(vm, "agent_capabilities", {})) and (not distinct or len(distinct) != 4 or distinct[3]) and rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
                          bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
 
 
@@ -530,7 +541,9 @@ class SchedulerAgentClient:
         return self._call("rpc", *args, **kwargs)
 
     def ping(self, *args, **kwargs):
-        return self._call("ping", *args, **kwargs)
+        result = self._call("ping", *args, **kwargs)
+        self.scheduler._record_agent_ping(self.vm_state, result)
+        return result
 
     def put(self, *args, **kwargs):
         return self._call("put", *args, **kwargs)
@@ -570,6 +583,8 @@ class VMState:
         self.t_low = 0.0  # (low since)
         self.gen = 0  # (the policy generation it last followed)
         self.agent = ""  # its agent's code hash
+        self.agent_capabilities: dict[str, int] = {}  # actual ping inventory, never inferred from the hash
+        self.upgrading = False  # owned under Scheduler.lock; excludes admission through the whole network upgrade
         self.t_agent = 0.0
         self.busy_s = 0.0
         self.lock = threading.Lock()
@@ -629,6 +644,10 @@ class Scheduler:
         self.pol_mtime = POLICY.stat().st_mtime_ns if POLICY.exists() else 0
         log(f"code {self.code}, policy generation {self.pol['generation']}")
         self.reload()
+        self._status_view = statusview.PublishedStatus({"pid": os.getpid(), "code": self.code})
+        self._status_timings = collections.deque(maxlen=20000)
+        self._status_refresh_lock = threading.Lock()
+        self._refresh_status(blocking=True)
         if not self.batches and not self.recovery_blocked:  # no adoption while ownership is uncertain
             self.adopting = True
             threading.Thread(target=lambda: (time.sleep(5), self._adopt()), daemon=True).start()
@@ -665,9 +684,11 @@ class Scheduler:
 
     def health_check(self, minutes: float = 30) -> dict:
         """The targets over the last `minutes` (health.py), from this scheduler's records."""
+        self._flush_status_timings()
         return self._h().check(time.time(), minutes) or {}
 
     def _metrics_save(self):
+        self._flush_status_timings()
         self._h().save()
         self.m["constraints"] = self._constraint_status()
         with contextlib.suppress(Exception):
@@ -995,6 +1016,7 @@ class Scheduler:
             vm.t_real = float(i.get("t_real") or hb.get("t_real") or now)
             vm.draining = bool(i.get("draining", hb.get("draining", False)))
             vm.gen, vm.agent, vm.t_agent = int(i.get("gen", 0)), i.get("agent", ""), 0.0
+            vm.agent_capabilities = normalize_agent_capabilities(i.get("agent_capabilities"))
             vm.model = i.get("model", "")
             vm.ready, vm.t_ready, vm.idle_since = True, now, now
             if snap:  # (a handoff: its items exactly as the old one held them there, no record older than that)
@@ -1321,6 +1343,7 @@ class Scheduler:
                 continue
             vms.append({"id": v.id, "image": v.image, "type": v.type, "slots": v.slots, "prepared": sorted(v.prepared), "trees": sorted(v.trees),
                         "model": v.model, "caches": sorted([list(c) for c in v.caches]), "lease": v.lease, "ttl": v.ttl, "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
+                        "agent_capabilities": dict(v.agent_capabilities),
                         "items": [{"batch": it.batch.id, "name": it.name, "run_name": it.run_name,
                                    "state": "running" if it.state == "finishing" else it.state,
                                    "placement": it.last_placement, "launch_identity": it.launch_identity, "placed": it.placed}
@@ -1441,9 +1464,10 @@ class Scheduler:
                 return 0
             if cl:
                 cl.lease = grant
-            ok, why = False, "no agent recorded"
+            ok, why, pong = False, "no agent recorded", {}
             try:
-                ok = cl is not None and cl.ping().get("version") is not None
+                pong = cl.ping() if cl is not None else {}
+                ok = pong.get("version") is not None
             except Exception as e:
                 why = str(e)[:120]
             if not ok and cl is not None and "is stopped" not in why and self._boat_up(vid):
@@ -1451,7 +1475,8 @@ class Scheduler:
                 # running in sessions of their own, are taken back rather than run again)
                 with contextlib.suppress(Exception):
                     boat.bootstrap_agent(vid, self.agent_b64, cl.token, 60, 2, lease=grant)
-                    ok = cl.ping(timeout=15).get("version") is not None
+                    pong = cl.ping(timeout=15)
+                    ok = pong.get("version") is not None
                     if ok:
                         log(f"{vid}: its agent didn't answer after the restart: repaired in place")
             if not ok:
@@ -1475,7 +1500,7 @@ class Scheduler:
             vm = VMState(vid, pl0["image"], pl0.get("type", boat.VM_TYPE), "warm")
             cl = SchedulerAgentClient(cl, self, vm)
             vm.client, vm.lease, vm.t_renew, vm.ttl = cl, grant, time.monotonic(), ttl
-            vm.t_agent = 0.0  # (its agent's code checked at its first tick)
+            self._record_agent_ping(vm, pong)
             running, finished, ticked = set(), set(), False
             with contextlib.suppress(Exception):
                 r = cl.rpc("vtick", {"wait": 0}, timeout=30)
@@ -1557,6 +1582,7 @@ class Scheduler:
             if not isinstance(spec, dict):
                 raise ValueError("item must be an object")
             name = spec.get("name")
+            required_agent_capabilities(spec)
             if "cpu_model_max_fruitless" in spec:
                 limit = spec["cpu_model_max_fruitless"]
                 if "cpu_model" not in spec or type(limit) is not int or limit < 1:
@@ -1647,7 +1673,8 @@ class Scheduler:
     def capabilities():
         return {"scope": "isolated-proposed", "runtime_verified": False,
                 "submit_flags": ["strict_once", "retain_journals"],
-                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
+                "required_agent_capabilities_protocol": 1,
+                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
                 "result_files_protocol": 1, "output_files_protocol": 1,
                 "result_inline_bytes": resultfiles.INLINE_BYTES,
@@ -1989,34 +2016,82 @@ class Scheduler:
             d = self._drains[image] = nd
         return d
 
-    def status(self) -> dict:
-        """_status, timed from before its lock (the health target: under a second)."""
-        t0 = time.time()
-        r = self._status()
-        r["recovery"] = getattr(self, "recovery", {"errors": getattr(self, "recovery_errors", {})})
-        r["recovery_blocked"] = getattr(self, "recovery_blocked", False)
-        r["blob_cache"] = blobcache.last_report(BLOBS)
-        cache = getattr(self, "_state_archive", None)
-        r["state_backup"] = cache.status() if cache is not None else {}
-        self._h().record_status(time.time(), time.time() - t0)
-        last = getattr(self._h(), "last", None) or {}
-        r["health"] = {"ok": last.get("ok"), "breached": sorted(k for k, v in last.get("targets", {}).items() if not v["ok"]),
-                       "client_4xx": self._h().client_errors(time.time()) or {"count": 0, "by_status": {}, "recent": []},
-                       "memory": self._h().memory_status(time.time())}
-        return r
+    def status_response(self) -> bytes:
+        """The HTTP hot path: immutable bytes plus honest age; no scheduler/health/I/O locks."""
+        started = time.monotonic()
+        view = getattr(self, '_status_view', None)
+        if view is None:  # incomplete test/boot object: never build synchronously for a reader
+            view = statusview.PublishedStatus({'pid': os.getpid(), 'code': getattr(self, 'code', None)})
+        raw = view.response()
+        timings = getattr(self, '_status_timings', None)
+        if timings is not None:
+            timings.append((time.time(), time.monotonic() - started))
+        return raw
 
-    def _status(self) -> dict:
-        """The scheduler as status shows it, read without its lock (the loop holds it a while with a big queue: 02:49,
-        1.18 s under 26,000 queued items); a dict changing under the read is read again, under the lock the third time."""
-        for _ in range(3):
+    def status(self) -> dict:
+        """Compatibility for in-process callers; HTTP uses status_response directly."""
+        return json.loads(self.status_response())
+
+    def _flush_status_timings(self):
+        timings = getattr(self, '_status_timings', None)
+        if timings is None:
+            return
+        for _ in range(20000):
             try:
-                return self._status_read()
-            except RuntimeError:  # (dictionary changed size during iteration)
-                continue
-        with self.lock:
-            return self._status_read()
+                stamp, elapsed = timings.popleft()
+            except IndexError:
+                break
+            self._h().record_status(stamp, elapsed)
+
+    def _refresh_status(self, blocking=False) -> bool:
+        """One publisher, never a request: capture memory under the lock, encode off it."""
+        guard = getattr(self, '_status_refresh_lock', None)
+        if guard is None or not guard.acquire(blocking=False):
+            return False
+        try:
+            self._flush_status_timings()
+            # Filesystem work belongs to the publisher, not the response path or
+            # Scheduler.lock. A slow read leaves the last view and age intact.
+            installed = code_hash()
+            blobs = blobcache.last_report(BLOBS)
+            if not self.lock.acquire(blocking=blocking):
+                return False
+            try:
+                started_ms, captured_at = time.monotonic_ns() // 1000000, time.time()
+                self._status_installed_code = installed
+                r = copy.deepcopy(self._status_read())
+                r['recovery'] = copy.deepcopy(getattr(self, 'recovery', {'errors': getattr(self, 'recovery_errors', {})}))
+                r['recovery_blocked'] = getattr(self, 'recovery_blocked', False)
+            finally:
+                self.lock.release()
+            r['blob_cache'] = blobs
+            cache = getattr(self, '_state_archive', None)
+            r['state_backup'] = cache.status() if cache is not None else {}
+            last = getattr(self._h(), 'last', None) or {}
+            r['health'] = {'ok': last.get('ok'),
+                           'breached': sorted(k for k, v in last.get('targets', {}).items() if not v['ok']),
+                           'client_4xx': self._h().client_errors(captured_at) or {'count': 0, 'by_status': {}, 'recent': []},
+                           'memory': self._h().memory_status(captured_at)}
+            return self._status_view.publish(r, started_ms, captured_at)
+        except Exception as exc:
+            self._status_view.failed(exc)
+            return False
+        finally:
+            guard.release()
+
+    def _start_status_publisher(self):
+        if getattr(self, '_status_publisher', None) is not None:
+            return
+        def publish():
+            while not self.stop.is_set():
+                self._refresh_status()
+                if self.stop.wait(1.0):
+                    return
+        self._status_publisher = threading.Thread(target=publish, name='status-publisher', daemon=True)
+        self._status_publisher.start()
 
     def _status_read(self) -> dict:
+        """Capture live scheduler state for the publisher while Scheduler.lock is held."""
         now = time.time()
         if True:
             live = [v for v in self.vms.values() if not v.dead]
@@ -2035,6 +2110,7 @@ class Scheduler:
             return {"pid": os.getpid(), "batches": [{"id": b.id, "class": NAMES[b.klass], "client": b.client, "left": b.left(),
                                                      "running": sum(1 for it in b.items.values() if it.state in ("starting", "running"))} for b in self.batches.values()],
                     "vms": [{"id": v.id, "image": v.image, "type": v.type, "ready": v.ready, "model": v.model, "used": v.used(), "slots": v.slots, "draining": v.draining, "real_ago": round(now - v.t_real), "gen": v.gen, "agent": v.agent,
+                             "agent_capabilities": dict(getattr(v, "agent_capabilities", {})), "agent_upgrading": bool(getattr(v, "upgrading", False)),
                              "classes": sorted({NAMES[it.batch.klass] for it in v.running.values()}), "foreign": getattr(v, "foreign", 0),
                              "runs": [{"batch": it.batch.id, "name": it.run_name, "class": NAMES[it.batch.klass]} for it in v.running.values()]} for v in live],
                     "constraints": self._constraint_status(),
@@ -2047,7 +2123,7 @@ class Scheduler:
                             "breaker_trips": self.m["breaker_trips"], "not_ready": self.m["not_ready"]},
                     "breaker": {**self.br, "open": now < self.br["open_until"], "open_for_s": max(0, round(self.br["open_until"] - now))},
                     "shed": self.shed, "load": self.load, "bring_up_s": round(self.bring_up, 1), "alerts": self.alerts[-5:],
-                    "policy": self.pol, "hot_handoff": 1, "code": self.code, "code_installed": code_hash(), "agent_code": self.agent_version, "stale": self.stale(),
+                    "policy": self.pol, "hot_handoff": 1, "code": self.code, "code_installed": getattr(self, "_status_installed_code", self.code), "agent_code": self.agent_version, "stale": self.stale(),
                     "agents": {v.id: v.agent for v in live},
                     "knobs": {"bringup": BRINGUP_MAX, "break_even_override_s": BREAK_EVEN_OVERRIDE_S or None, "start_dollars": START_DOLLARS, "vm_hour_dollars": VM_HOUR_DOLLARS, "gate_horizon_s": GATE_HORIZON, "hold_s": HOLD, "sub_vms": SUB_VMS, "max_vms": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": self.pol["floor"]},
                     # (the old keys, for older clients)
@@ -2056,6 +2132,7 @@ class Scheduler:
 
     # -- the loop
     def run(self):
+        self._start_status_publisher()
         # ACK means loaded and serving, not permission to mutate the pool.
         # Until the parent exits it may reject us and resume its original state.
         while not self._activate_handoff():
@@ -2392,6 +2469,9 @@ class Scheduler:
         or one that failed it)."""
         if it.batch.admission_closed or it.owned.closed:
             return False
+        if getattr(vm, "upgrading", False) or not agent_capabilities_match(
+                required_agent_capabilities(it.spec), getattr(vm, "agent_capabilities", {})):
+            return False
         if it.batch.strict_once and it.owned.placements:
             self._owned_failed(it, "strict_once: prior placement cannot be replaced")
             return False
@@ -2414,7 +2494,8 @@ class Scheduler:
         it.last_placement = {"name": it.name,
             "run_name": it.name if not getattr(it, "placed", 0) else f"{it.name}~s{it.placed + 1}",
             "vm": vm.id, "image": vm.image, "type": vm.type, "cpu": vm.model,
-            "identity": it.launch_identity, "t": time.time()}
+            "identity": it.launch_identity, "t": time.time(),
+            "agent_version": vm.agent, "agent_capabilities": dict(vm.agent_capabilities)}
         if group:
             it.last_placement.update(distinct_vm_group=group, boot_id=vm.lease.get("boot", ""))
         if durable_item(it):
@@ -2485,6 +2566,7 @@ class Scheduler:
                 if b.admission_closed or it.owned.closed:
                     it.state = "cancel_pending"
                     return
+            self._verify_agent_capabilities(it, vm)
             if b.strict_once:
                 self._owned_client(vm).rpc("capabilities")
             self._prepare(b, vm)
@@ -2494,6 +2576,7 @@ class Scheduler:
                 spec["strict_once"] = True
             if not (b.strict_once or b.retain_journals):
                 spec.pop("launch_identity", None)
+            self._verify_agent_capabilities(it, vm)
             with self.lock:  # (its batch closed, the item preempted or moved while the batch was prepared here: never started.
                 if it.state != "starting" or it.vm is not vm or it.run_name != rn or b.closed or b.admission_closed or it.owned.closed:  # Their kill found nothing to kill: a run
                     if b.admission_closed or it.owned.closed:
@@ -2506,6 +2589,8 @@ class Scheduler:
                         it.tries -= 1
                     self.wake.set()
                     return
+                if getattr(vm, "upgrading", False) or not agent_capabilities_match(required_agent_capabilities(it.spec), vm.agent_capabilities):
+                    raise AgentCapabilityError("agent capability inventory changed before launch")
                 it.state = "running"
             if not (b.strict_once or b.retain_journals or it.spec.get("distinct_vm_group")):
                 # Old handoff snapshots contain only batch/name/state. Rebuild
@@ -2514,7 +2599,8 @@ class Scheduler:
                         or it.last_placement.get("vm") != vm.id or it.last_placement.get("name") != it.name):
                     it.last_placement = {"name": it.name, "run_name": rn, "vm": vm.id,
                                          "image": vm.image, "type": vm.type,
-                                         "identity": it.launch_identity, "t": it.t_start or time.time()}
+                                         "identity": it.launch_identity, "t": it.t_start or time.time(),
+                                         "agent_version": vm.agent, "agent_capabilities": dict(vm.agent_capabilities)}
                 with contextlib.suppress(Exception):
                     with open(DIR / "queue" / f"{b.id}.placed", "a") as f:
                         f.write(json.dumps(it.last_placement) + "\n")
@@ -2540,6 +2626,11 @@ class Scheduler:
                 raise RuntimeError(r["err"])
             for row in r.get("done", []):
                 self._accept_finished(vm, row)
+        except AgentCapabilityError as e:
+            with self.lock:
+                vm.running.pop((b.id, rn), None)
+                self._owned_failed(it, "required agent capabilities could not be verified; payload not launched: " + str(e))
+            self.wake.set()
         except Exception as e:
             if vm.dead:
                 return  # A stale fence already requeued without a strike.
@@ -2901,7 +2992,8 @@ class Scheduler:
         groups: dict = {}
         for it in self._pass_queue():
             group = distinct_key(it)
-            groups.setdefault((it.batch.image, it.spec.get("vm_type") or getattr(it, "need_type", None) or it.batch.vm_type, it.spec.get("cpu_model", ""), group), []).append(it)
+            groups.setdefault((it.batch.image, it.spec.get("vm_type") or getattr(it, "need_type", None) or it.batch.vm_type, it.spec.get("cpu_model", ""), group,
+                               tuple(sorted(required_agent_capabilities(it.spec).items()))), []).append(it)
         if rules.plan_waits(getattr(self, "reattaching", False), time.time() - getattr(self, "t_reattach", 0.0), bool(getattr(self, "_handoff", {}).get("taken")), 15.0):
             return {}
         live = [v for v in self.vms.values() if not v.dead]
@@ -2912,13 +3004,15 @@ class Scheduler:
         pool.open_until, pool.half = float(self.br["open_until"]), bool(self.br["half"])
         pool.probing = pool.half and any(s["ok"] is None for s in self.starts_log if s["t"] > self.br["t_trip"])
         self.target = {}
-        for (image, vm_type, model, distinct), its in groups.items():
+        for (image, vm_type, model, distinct, required), its in groups.items():
             # A worker can wait one full scheduling pass after becoming ready.
             S, bu = vm_slots(vm_type), max(30.0, self.bring_up) + FULL_S
             B = BREAK_EVEN_OVERRIDE_S or rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS, vm_mult(vm_type))
             used_vms = distinct_used(its[0]) if distinct else set()
             held = [v for v in live if v.image == image and v.type == vm_type and rules.cpu_matches(model, v.model)
-                    and rules.distinct_vm_allowed(bool(distinct), v.id in used_vms)]
+                    and rules.distinct_vm_allowed(bool(distinct), v.id in used_vms)
+                    and (not required or (not getattr(v, "upgrading", False)
+                         and (not v.ready or agent_capabilities_match(dict(required), v.agent_capabilities))))]
             coming = self.creating.get((image, vm_type), 0)
             if model:
                 draw = self._constraint(image, vm_type, model)
@@ -3069,6 +3163,8 @@ class Scheduler:
                 retired = self.retired()
                 spare = 0  # (slots of other types' VMs this work may have: empty, or on what it may take; a larger VM's too)
                 for v in live:
+                    if getattr(v, "upgrading", False) or not agent_capabilities_match(dict(required), v.agent_capabilities) or not rules.cpu_matches(model, v.model):
+                        continue
                     if not rules.distinct_vm_allowed(bool(distinct), v.id in used_vms) or v.image != image or v.type == vm_type or not v.ready or v.dead or v.id in retired or v.failing or getattr(v, "disk_low", False) or getattr(v, "prep_fails", 0) >= 3 \
                             or v.slots < w_max or not boat.R.fits_memory(mem_max, boat.TYPES.get(v.type, (0, 0))[1], boat.MEM_OVERHEAD):
                         continue
@@ -3083,7 +3179,7 @@ class Scheduler:
                 low = {"filler_sweep": (5, 4), "filler": (5,), "none": ()}[rules.victims(kmin, 10 ** 9, SUB_PREEMPT)]
                 # (a VM of the image that fits one and runs only what a timing item may take (filler, sweeps) is one it
                 # gets by emptying it, never a reason to start one)
-                free_fit = sum(1 for v in live if rules.distinct_vm_allowed(bool(distinct), v.id in used_vms) and v.image == image and v.ready and not getattr(v, "foreign", 0) and not getattr(v, "disk_low", False) and v.slots >= need and all(mem_fits(it, v.type) for it in tim[:1])
+                free_fit = sum(1 for v in live if not getattr(v, "upgrading", False) and agent_capabilities_match(dict(required), v.agent_capabilities) and rules.cpu_matches(model, v.model) and rules.distinct_vm_allowed(bool(distinct), v.id in used_vms) and v.image == image and v.ready and not getattr(v, "foreign", 0) and not getattr(v, "disk_low", False) and v.slots >= need and all(mem_fits(it, v.type) for it in tim[:1])
                                and v.type != vm_type and all(x.batch.klass in low for x in v.running.values())
                                and (not self._held(v, None, now) or v.reserved[0] in tim))  # (set aside for one of them: theirs)
                 # (the starts this work earns: the VMs its other items fill, and one per timing item no free VM takes;
@@ -3104,6 +3200,8 @@ class Scheduler:
                 n = rules.cpu_draws(n, draw["fruitless"], coming, limit)
                 tgt["cpu_model"] = model
                 tgt["fruitless"] = draw["fruitless"]
+            if required and not agent_capabilities_match(dict(required), BUILD_AGENT_CAPABILITIES):
+                n, tgt["why"] = 0, "required agent capabilities unavailable in this build"
             if n > 0:
                 tgt["why"] = "breaker" if now < pool.open_until else "probe" if pool.half else ""
                 if self.shed:
@@ -3368,11 +3466,12 @@ class Scheduler:
             vm.t_renew = time.monotonic()
             boat.boat("extend", vm.id, "--ttl", str(vm.ttl), "--json", check=False)
             cl = boat.agent_client(vm.id)
-            ok = False
+            ok, pong = False, {}
             if cl:
                 cl.lease = vm.lease
                 with contextlib.suppress(Exception):
-                    ok = cl.ping().get("version") == self.agent_version
+                    pong = cl.ping()
+                    ok = pong.get("version") == self.agent_version
             if not ok:
                 if not boat.wait_running([vm.id], int(BREAK_READY)):
                     raise RuntimeError("never came up")
@@ -3384,15 +3483,16 @@ class Scheduler:
                 url = old.get("url") or boat.bj("host", vm.id, str(boat.AGENT_PORT), "--localhost", "--private")["url"]
                 cl = AgentClient(vm.id, url, tok, lease=vm.lease)
                 try:
-                    cl.ping()
+                    pong = cl.ping()
                 except AgentError:
                     url = boat.bj("host", vm.id, str(boat.AGENT_PORT), "--localhost", "--private")["url"]
                     cl = AgentClient(vm.id, url, tok, lease=vm.lease)
-                    cl.ping()
+                    pong = cl.ping()
                 boat.write_agent(vm.id, {"url": url, "token": tok, "t": time.time(), "version": self.agent_version, "lease": vm.lease})
             cl = SchedulerAgentClient(cl, self, vm)
             vm.client = cl
-            vm.agent, vm.t_agent = self.agent_version, time.time()
+            self._record_agent_ping(vm, pong)
+            vm.t_agent = time.time()
             r = cl.rpc("vtick", {"wait": 0}, timeout=30)
             if r.get("stale"):
                 self._drop_stale(vm)
@@ -3608,6 +3708,11 @@ class Scheduler:
         with vm.lock:
             starts, acks = vm.starts, vm.acks
             vm.starts, vm.acks = [], []
+        if time.time() - vm.t_agent > 600 and not vm.running and not starts:
+            with contextlib.suppress(Exception):
+                self._check_agent(vm)
+        if vm.dead:
+            return None
         if not vm.running and not starts and not acks and not getattr(vm, "foreign", 0) and time.time() - getattr(vm, "t_inventory", 0) < 30:
             if vm.ready is False:
                 return None
@@ -3617,12 +3722,6 @@ class Scheduler:
                     self._disk(vm, vm.client.ping().get("disk") or {})
             return 1.0  # (nothing of ours there: no call, looked at again in a second)
         busy_queue = getattr(self, "_any_queued", True)  # (the last pass's word: no scan of every item at every tick of every VM)
-        if time.time() - vm.t_agent > 600 and not vm.running:  # (an agent's code checked, and upgraded, between items only)
-            vm.t_agent = time.time()
-            with contextlib.suppress(Exception):
-                self._check_agent(vm)
-        if vm.dead:
-            return None
         strict_starts = [st for st in starts if st.get("spec", {}).get("strict_once") is True]
         strict_acks = [ack for ack in acks if "launch_identity" in ack]
         starts = [st for st in starts if st not in strict_starts]
@@ -3906,7 +4005,7 @@ class Scheduler:
                     self._learn(it, float(row["seconds"]))
                     b.obs_s, b.obs_est, b.obs_n = getattr(b, "obs_s", 0.0) + float(row["seconds"]), getattr(b, "obs_est", 0.0) + it.est, getattr(b, "obs_n", 0) + 1
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
-                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id", "distinct_vm_group_scope", "distinct_vm_group_generation", "attempt") if k in (it.last_placement or {})},
+                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id", "distinct_vm_group_scope", "distinct_vm_group_generation", "attempt", "agent_version", "agent_capabilities") if k in (it.last_placement or {})},
                                       "vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
         self.wake.set()
@@ -3964,7 +4063,7 @@ class Scheduler:
                 self._owned_failed(it, "strict_once: preempted or lost placement")
             else:
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
-                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id", "distinct_vm_group_scope", "distinct_vm_group_generation", "attempt") if k in (it.last_placement or {})},
+                        "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id", "distinct_vm_group_scope", "distinct_vm_group_generation", "attempt", "agent_version", "agent_capabilities") if k in (it.last_placement or {})},
                                       "vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],
                                       "exclusive": it.timing, "co_tenants": it.peers}}
                 # Journal before releasing the placement, and under the same lock
@@ -4009,7 +4108,7 @@ class Scheduler:
             log(f"{it.batch.id}: {it.name}: boat failed it ({it.fails} of {BOAT_TRIES}): {why}; again on boat")
             return
         it.state = "done"
-        if durable_item(it):
+        if durable_item(it) or required_agent_capabilities(it.spec):
             self._owned_failed(it, f"boat failed it {it.fails} times (last: {why}); no fallback")
             return
         self.m["to_modal"][n] = self.m["to_modal"].get(n, 0) + 1
@@ -4288,7 +4387,7 @@ class Scheduler:
         out: dict = {}
         by_id = {v.id: v for v in live}
         for shape, n in sorted(groups.items(), key=lambda g: g[0][1]):
-            image, k, timing, weight, vtype, avoid, mem, model, used = shape
+            image, k, timing, weight, vtype, avoid, mem, model, used, required = shape
             for vid, c in cap.items():
                 if n <= 0:
                     break
@@ -4352,6 +4451,7 @@ class Scheduler:
             if getattr(self, "handing_off", False):
                 continue
             now = time.time()
+            self._flush_status_timings()
             with contextlib.suppress(Exception):
                 # (a new install, unchanged for 60 s, that imports: rules.Install; no handoff while files are being
                 # written, none of a broken install)
@@ -4544,6 +4644,14 @@ class Scheduler:
             # Imports, source copies and provider observation happened while placement continued.
             request_lock = getattr(self, "_request_lock", self.lock)
             with request_lock, self.lock:
+                required_agents = any(required_agent_capabilities(it.spec) and it.state != "done"
+                                      for b in self.batches.values() for it in b.items.values())
+                if required_agents and not all(prepared[target].get("required_agent_capabilities_protocol") for target in candidates):
+                    self.alert("handoff refused: live agent requirements need a capability-aware successor")
+                    return
+                if any(getattr(v, "upgrading", False) for v in self.vms.values()):
+                    log("handoff deferred until fenced agent upgrades settle")
+                    return
                 required_cpu = any(it.spec.get("cpu_model") and it.state != "done"
                                    for b in self.batches.values() for it in b.items.values())
                 if not all(rules.cpu_handoff_allowed(required_cpu, prepared[target].get("cpu_model_exact") is True) for target in candidates):
@@ -4739,41 +4847,87 @@ class Scheduler:
         # Busy agents keep their exact wire version until their safe-point upgrade.
         return OwnedAgentClient(vm.client, getattr(vm, "agent", "") or self.agent_version)
 
+    def _record_agent_ping(self, vm: VMState, reply: dict):
+        """Cache only what this agent actually advertised, including unknown old agents."""
+        with self.lock:
+            vm.agent = reply.get("version") if isinstance(reply.get("version"), str) else ""
+            vm.agent_capabilities = normalize_agent_capabilities(reply.get("agent_capabilities"))
+
+    def _verify_agent_capabilities(self, it: Item, vm: VMState):
+        required = required_agent_capabilities(it.spec)
+        if not required:
+            return  # Legacy jobs retain their existing preparation and launch path.
+        try:
+            reply = vm.client.ping()
+        except Exception as error:
+            raise AgentCapabilityError(f"agent ping failed: {error}") from error
+        if not reply.get("ok") or reply.get("stale"):
+            raise AgentCapabilityError("agent ping refused")
+        self._record_agent_ping(vm, reply)
+        with self.lock:
+            if (vm.dead or vm.upgrading or not vm.agent
+                    or not agent_capabilities_match(required, vm.agent_capabilities)):
+                raise AgentCapabilityError("agent did not advertise the required protocol versions")
+            placement = it.last_placement or {}
+            if placement.get("agent_version") != vm.agent:
+                raise AgentCapabilityError("agent version changed after placement")
+
     def _check_agent(self, vm: VMState):
-        """Agents follow the code: one whose hash isn't this scheduler's agent.py is upgraded in place (its items, in
-        sessions of their own, run on), through itself, else by boat exec."""
-        if vm.running or getattr(vm, "starts", []):
-            return  # Never replace an agent beneath any live or starting item.
-        if vm.dead or not self._renew_lease(vm):
+        """Atomically fence empty-agent upgrades against placement, never network under lock."""
+        with self.lock:
+            if vm.dead or not agent_upgrade_allowed(len(vm.running) + getattr(vm, "foreign", 0),
+                    len(getattr(vm, "starts", [])), getattr(vm, "upgrading", False)):
+                return
+            old = vm.agent
+        # Read-only probing does not remove a current worker from placement.
+        # A job may win during this I/O; the second atomic check then forbids upgrade.
+        if not self._renew_lease(vm):
             return
-        r = vm.client.ping()
+        r = vm.client._call("ping") if isinstance(vm.client, SchedulerAgentClient) else vm.client.ping()
         if r.get("stale"):
             self._drop_stale(vm)
             return
-        if r.get("version") != vm.agent and vm.agent:
-            self.alert(f"{vm.id}: agent changed outside holder; old client wins, relinquished")
-            self._drop_stale(vm)
-            return
-        vm.agent, vm.t_agent = str(r.get("version")), time.time()
-        if vm.agent == self.agent_version:
-            return
-        tok = vm.client.token
-        try:
-            upgraded = vm.client.rpc("upgrade", self.agent_b64, str(boat.AGENT_PORT), tok, timeout=30)
-            if upgraded.get("ok") is False:
-                vm.t_agent = 0  # retry at the next empty safe point, never bootstrap around a refusal
+        with self.lock:
+            stopped = getattr(self, "stop", None)
+            if (stopped is not None and stopped.is_set()) or getattr(self, "handing_off", False) or getattr(self, "_handoff_deferred", None):
+                return  # Read-only probing may overlap handoff; never mutate after its freeze.
+            if vm.dead or vm.agent != old:
+                return  # A newer observation already superseded this probe.
+            if r.get("version") != old and old:
+                self.alert(f"{vm.id}: agent changed outside holder; old client wins, relinquished")
+                self._drop_stale(vm)
                 return
-        except Exception:
-            vm.t_agent = 0
-            return  # an ambiguous upgrade reply never authorizes a bootstrap overwrite
-        for _ in range(30):
-            time.sleep(1)
-            with contextlib.suppress(Exception):
-                if str(vm.client.ping().get("version")) == self.agent_version:
-                    old, vm.agent = vm.agent, self.agent_version
-                    log(f"{vm.id}: agent {old} -> {vm.agent} (upgraded in place, {len(vm.running)} items running on)")
-                    boat.write_agent(vm.id, {**(boat.read_agent(vm.id) or {}), "version": self.agent_version})
+            self._record_agent_ping(vm, r)
+            vm.t_agent = time.time()
+            if vm.agent == self.agent_version:
+                return  # Matching hashes alone never populate capabilities.
+            if not agent_upgrade_allowed(len(vm.running) + getattr(vm, "foreign", 0),
+                    len(getattr(vm, "starts", [])), getattr(vm, "upgrading", False)):
+                return
+            vm.upgrading = True
+        try:
+            try:
+                upgraded = vm.client.rpc("upgrade", self.agent_b64, str(boat.AGENT_PORT), vm.client.token, timeout=30)
+                if upgraded.get("ok") is False:
+                    vm.t_agent = 0
                     return
+            except Exception:
+                vm.t_agent = 0
+                return  # Ambiguous replies never authorize bootstrap overwrite.
+            for _ in range(30):
+                time.sleep(1)
+                with contextlib.suppress(Exception):
+                    reply = vm.client.ping()
+                    if reply.get("version") == self.agent_version:
+                        self._record_agent_ping(vm, reply)
+                        log(f"{vm.id}: agent {old} -> {vm.agent} (upgraded while empty)")
+                        boat.write_agent(vm.id, {**(boat.read_agent(vm.id) or {}), "version": vm.agent})
+                        return
+            vm.t_agent = 0
+        finally:
+            with self.lock:
+                vm.upgrading = False
+            self.wake.set()
 
     def _heartbeat(self):
         while not self.stop.wait(60):
@@ -5126,7 +5280,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                 if p == "/hint":
                     return self._response(200, s.hint(m))
                 if p == "/status":
-                    return self._response(200, s.status())
+                    return self._response(200, raw=s.status_response())
                 if p == "/health":
                     return self._response(200, s.health_check(float(m.get("minutes", 30))))
                 if p == "/rollback":

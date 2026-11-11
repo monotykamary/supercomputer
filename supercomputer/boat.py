@@ -2931,11 +2931,15 @@ class Scheduled(Session):
     def run(self, items: list[dict], on_done, on_start=None, on_lost=None, max_wait: int = 0):
         if not items:
             return
+        from .rules.agent_capabilities import required_agent_capabilities
         for it in items:
             _validate_durable_item(it)
+            required_agent_capabilities(it)
         self.client = self.client or self.sched.connect()
-        if any("cpu_model" in it or "distinct_vm_group" in it for it in items):
+        if any("cpu_model" in it or "distinct_vm_group" in it or required_agent_capabilities(it) for it in items):
             caps = self.client.req("/capabilities", {})
+            if any(required_agent_capabilities(it) for it in items) and caps.get("required_agent_capabilities_protocol") != 1:
+                raise Unavailable("scheduler lacks required_agent_capabilities_protocol:1; refusing unverified agents")
             if any(it.get("distinct_vm_group_scope") == "durable" for it in items):
                 _require_durable_capability(caps)
             if any("distinct_vm_group" in it for it in items) and not (caps.get("distinct_vm_group") is True and caps.get("distinct_vm_group_protocol") == 1):
@@ -3010,7 +3014,7 @@ class Scheduled(Session):
                 if row.get("vm"):
                     self.vm_ids.add(row["vm"])
                     self.run_names[row.get("run_name", row["name"])] = row["name"]
-                if row.get("lost") and on_lost and not it.get("cpu_model") and it.get("distinct_vm_group_scope") != "durable":
+                if row.get("lost") and on_lost and not it.get("cpu_model") and not required_agent_capabilities(it) and it.get("distinct_vm_group_scope") != "durable":
                     on_lost(it, row.get("error", "lost"))
                 else:
                     on_done(it, row)
@@ -3027,7 +3031,7 @@ class Scheduled(Session):
         if reports.end():
             for name in sorted(left):
                 why = "the scheduler finished the batch without its row"
-                if on_lost and by[name].get("distinct_vm_group_scope") != "durable":
+                if on_lost and not required_agent_capabilities(by[name]) and by[name].get("distinct_vm_group_scope") != "durable":
                     on_lost(by[name], why)
                 else:
                     on_done(by[name], {"name": name, "code": -1, "seconds": -1, "error": why})
@@ -3336,6 +3340,8 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
     for (cpu, memory, timeout), js in groups.items():
         for j in js:
             _validate_durable_item(j)
+            from .rules.agent_capabilities import required_agent_capabilities
+            required_agent_capabilities(j)
             w = R.weight(math.ceil(cpu), math.ceil(memory))  # (rules.boat.weight: 2 vCPU and 4096 MB a slot)
             it = {"name": j["name"], "kind": "sh", "cmd": pre + cmd(j["cmd"]), "cwd": j.get("cwd", "."), "limit": timeout - 30, "weight": w, "est": past.get(j["name"], med)}
             if "distinct_vm_group" in j:
@@ -3386,7 +3392,7 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                     raise SystemExit(f"{j['name']} asks for {cpu} vCPU and {memory} MB: no boat VM type has that usable ({MEM_OVERHEAD} MB of each is its OS's)")
                 it["vm_type"] = big
             # Hooks may rebuild the execution spec, but cannot silently erase a user pin.
-            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation"):
+            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities"):
                 if field in j:
                     it[field] = j[field]
             _validate_durable_item(it)
@@ -3411,7 +3417,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
     small = len(items) <= TINY[0] or slot_s < TINY[1] * 60
     # (with the scheduler, a tiny batch goes to boat too, as an interactive check: Modal only after boat fails 3 times)
     sched_on = __import__("supercomputer.scheduler", fromlist=["enabled"]).enabled()
-    if any("cpu_model" in it or "distinct_vm_group" in it for it in items) and not sched_on:
+    if any("cpu_model" in it or "distinct_vm_group" in it or it.get("required_agent_capabilities") for it in items) and not sched_on:
         raise Unavailable("placement constraints require the scheduler; refusing the legacy unconstrained path")
     tiny = on_lost is not None and small and not sched_on
     try:
@@ -3472,8 +3478,8 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
             note_durations(rows)
             sess.phases = {"jobs_s": round(t_jobs - t_run, 1), "collect_s": round(t_logs - t_jobs, 1), "harvest_s": round(time.time() - t_logs, 1)}
     except Unavailable as e:
-        if on_lost is None:
-            raise
+        if on_lost is None or any(it.get("required_agent_capabilities") for it in items):
+            raise  # A capability refusal is never permission for a blind Modal fallback.
         for it in items:
             if it["name"] not in rows:
                 on_lost(it["name"], str(e))

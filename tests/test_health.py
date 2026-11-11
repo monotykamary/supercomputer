@@ -1,6 +1,6 @@
 """health.py and canary.py on their own: a client gone mid-answer is no error (02:38: a canary handed back for one
-BrokenPipe on /poll); a breach alerts after 2 checks in a row, once; the canary hands back only on a target that held
-before the handoff, passes after its 10 minutes, and rejects the code it handed back. `python3 tests/test_health.py`."""
+BrokenPipe on /poll); a breach alerts after 2 checks in a row, once; status is mandatory while other canary targets
+remain baseline-gated, passes after its 10 minutes, and rejects the code it handed back. `python3 tests/test_health.py`."""
 import os
 import pathlib
 import sys
@@ -55,17 +55,18 @@ def test_canary_hands_back_on_a_new_breach_only():
     assert c.rejected("new") and c.read()["state"] == "rejected"
 
 
-def test_canary_passes_and_ignores_old_breaches():
+def test_canary_rejects_slow_status_even_after_old_breaches():
     d = pathlib.Path(tempfile.mkdtemp())
     (d / "code" / "old" / "supercomputer").mkdir(parents=True)
     c = canary.Canary(d)
     h = health.Health()
-    h.record_status(500.0, 4.0)  # (status breached before the handoff already: not the new code's)
+    h.record_status(500.0, 4.0)  # a broken predecessor cannot excuse a broken status endpoint
     c.handing_off("old", "new", 1000.0)
     h.record_status(1010.0, 4.0)
-    for t in (1060.0, 1120.0, 1180.0):
-        assert c.tick("new", t, h)[0] == "watch"
-    assert c.tick("new", 1601.0, h)[0] == "passed" and not c.rejected("new")
+    assert c.tick("new", 1060.0, h)[0] == "watch"
+    verdict, reason = c.tick("new", 1120.0, h)
+    assert verdict == "handback" and "status" in reason
+    assert c.rejected("new")
 
 
 def test_canary_without_records_before_judges_no_load_target():
@@ -74,7 +75,7 @@ def test_canary_without_records_before_judges_no_load_target():
     c = canary.Canary(d)
     h = health.Health()  # (the previous code recorded nothing)
     c.handing_off("old", "new", 1000.0)
-    h.record_status(1010.0, 1.2)
+    h.record_status(1010.0, 0.2)  # status remains mandatory; this test isolates unknown load targets
     assert [c.tick("new", t, h)[0] for t in (1060.0, 1120.0, 1180.0)] == ["watch"] * 3
     h.record_error(1190.0, "/submit: KeyError('batch')")
     assert c.tick("new", 1240.0, h)[0] == "watch" and c.tick("new", 1300.0, h)[0] == "handback"

@@ -385,8 +385,8 @@ def canary_hands_back(code):
     shutil.copytree(pathlib.Path(code) / "supercomputer", pathlib.Path(bad_dir) / "supercomputer", ignore=shutil.ignore_patterns("__pycache__"))
     p = pathlib.Path(bad_dir) / "supercomputer" / "scheduler.py"
     src = p.read_text()
-    bad = src.replace("            live = [v for v in self.vms.values() if not v.dead]\n            per",
-                      "            time.sleep(2)  # (the bad code)\n            live = [v for v in self.vms.values() if not v.dead]\n            per", 1)
+    bad = src.replace("        raw = view.response()\n",
+                      "        time.sleep(2)  # deliberately slow response, not slow background refresh\n        raw = view.response()\n", 1)
     assert bad != src, "the bad code's injection point is gone"
     p.write_text(bad)
     sim.w.add_code(W.load_code(bad_dir, sim.tmp, name="supercomputer_bad"), "bad")
@@ -1128,6 +1128,43 @@ def failed_update_under_load(code):
     return sim, {"extra": extra}
 
 
+@scenario("agent capabilities safe point", ["lost", "strikes", "modal", "clients", "threads"], 1200,
+          "a capability job cannot preempt a busy legacy worker; the old run finishes, idle upgrade completes, and only then a capability-stamped payload launches")
+def agent_capabilities_legacy_safe_point(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 1})
+    _warm(sim, 1)
+    sim.scheduler()
+    legacy = sim.batch("legacy-agent", "gate", items("old", 1, 300), after=10)
+    required = {"output_files_protocol": 1, "result_files_protocol": 1}
+    capable = sim.batch("required-agent", "gate", items("artifact", 1, 30,
+                        required_agent_capabilities=required), after=60)
+    observed = {"busy_legacy_kept": False}
+
+    def legacy_inventory():
+        scheduler = sim.w.live_sched()[1]
+        busy = [v for v in scheduler.vms.values() if v.running]
+        for v in busy:
+            disk = sim.w.vms[v.id].disk
+            disk.version, disk.agent_capabilities = "legacy-protocol", {}
+            scheduler._record_agent_ping(v, {"ok": True, "version": disk.version})
+            v.t_agent = -10000
+            scheduler._check_agent(v)
+        observed["busy_legacy_kept"] = bool(busy) and all(not v.upgrading and v.agent == "legacy-protocol" for v in busy)
+    sim.at(40, legacy_inventory)
+
+    def extra(sim, m):
+        upgrades = [e for e in sim.w.events if e["kind"] == "upgraded"]
+        receipts = list(sim.clients[capable]["items"].values())
+        starts = [e for e in sim.w.events if e["kind"] == "item_started" and e.get("batch") == capable]
+        ordered = bool(starts) and all(any(u.get("vm") == e.get("vm") and u["t"] <= e["t"] for u in upgrades) for e in starts)
+        return {**observed, "upgraded_before_capability_work": ordered,
+                "capability_receipts": bool(receipts) and all(r and r.get("placement", {}).get("agent_capabilities") == required for r in receipts),
+                "old_run_not_restarted": all(x["runs"] == 1 for (bid, _), x in sim.w.items.items() if bid == legacy),
+                "required_run_once": all(x["runs"] == 1 for (bid, _), x in sim.w.items.items() if bid == capable)}
+    return sim, {"extra": extra}
+
+
 @scenario("agent safe point", ["lost", "strikes", "modal", "clients", "threads"], 1200,
           "agent source changes under running gate work; replacements occur only after those runs finish")
 def agent_upgrade_under_load(code):
@@ -1404,7 +1441,7 @@ def _truth_waste(sim, every: float = 15.0) -> dict:
             run_by: dict = {}
             caps: dict = {}
             started: set = set()
-            ready = {vid for vid, sv in list(getattr(sched, "vms", {}).items()) if sv.ready and not sv.dead}
+            ready = {vid for vid, sv in list(getattr(sched, "vms", {}).items()) if sv.ready and not sv.dead and not getattr(sv, "upgrading", False)}
             for v in sim.w.vms.values():
                 if v.state != W.RUNNING or v.daemon != "up" or v.id in retired or v.id not in ready:
                     continue  # (a VM still coming up, not the scheduler's yet: nothing can go there)
@@ -1460,6 +1497,10 @@ def _truth_waste(sim, every: float = 15.0) -> dict:
                     if v.image != it["image"] or (it.get("vm_type") and v.type != it["vm_type"]):
                         continue
                     if it.get("cpu_model") and v.model != it["cpu_model"]:
+                        continue
+                    advertised = getattr(v.disk, "agent_capabilities", getattr(sim.code.agent, "AGENT_CAPABILITIES", {}))
+                    if any(type(advertised.get(k)) is not int or advertised[k] < needed
+                           for k, needed in it.get("required_agent_capabilities", {}).items()):
                         continue
                     group = it.get("distinct_vm_group")
                     if group and vid in group_used.get((it.get("batch"), group), set()):

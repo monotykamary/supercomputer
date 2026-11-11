@@ -61,6 +61,7 @@ def _init_with_snapshot_only(self, *args, **kw):
     with Registry().locked() as d:
         d["vms"][v.id] = {"snapshot": b.image, "type": "large", "state": "running",
             "lease": {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler"}}
+    self._refresh_status(blocking=True)
 Scheduler.__init__ = _init_with_snapshot_only
 _fixture_status = Scheduler._status_read
 def _status_with_snapshot_only(self):
@@ -607,8 +608,14 @@ class RealSocketHandoff(unittest.TestCase):
             self.assertGreaterEqual(after["client_4xx"]["count"], 14)
             self.assertEqual(after["client_4xx"]["recent"][-1]["read"], 1)
             self.assertEqual(after["client_4xx"]["recent"][-1]["declared"], "20")
-            status, _ = post("/status", b'{}', 200)
-            self.assertEqual(status["health"]["client_4xx"]["count"], after["client_4xx"]["count"])
+            deadline = time.monotonic() + 3
+            while True:
+                status, _ = post("/status", b'{}', 200)
+                if status["health"]["client_4xx"]["count"] == after["client_4xx"]["count"]:
+                    break
+                self.assertLess(time.monotonic(), deadline, status["status_snapshot"])
+                time.sleep(.02)
+            self.assertTrue(status["status_snapshot"]["ready"])
         finally:
             conn.close()
         print(json.dumps({"legacy_http_bodies": "passed", "fragmented_pipelined_keepalive": "passed",

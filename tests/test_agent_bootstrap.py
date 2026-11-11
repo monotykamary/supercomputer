@@ -318,7 +318,8 @@ class SchedulerBootstrapWiring(unittest.TestCase):
 
     def test_strict_unresolved_repair_does_not_upload(self):
         instance = object.__new__(scheduler.Scheduler)
-        vm = types.SimpleNamespace(running={'item': types.SimpleNamespace(batch=types.SimpleNamespace(strict_once=True))})
+        instance.lock = threading.RLock()
+        vm = types.SimpleNamespace(dead=False, running={'item': types.SimpleNamespace(batch=types.SimpleNamespace(strict_once=True))})
         with patch.object(boat, 'bootstrap_agent', side_effect=AssertionError('strict repair attempted')):
             self.assertFalse(instance._repair(vm))
             self.assertIsNone(instance._check_agent(vm))
@@ -335,9 +336,10 @@ class SchedulerBootstrapWiring(unittest.TestCase):
     def test_ambiguous_upgrade_never_bootstraps_over_running_agent(self):
         instance = object.__new__(scheduler.Scheduler)
         instance.agent_b64, instance.agent_version = 'EXACT_SOURCE', 'new-hash'
+        instance.lock, instance.wake = threading.RLock(), threading.Event()
         replies = iter([{'version': 'old-hash'}, {'version': 'new-hash'}])
         client = types.SimpleNamespace(token='same-token', ping=lambda: next(replies), rpc=lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('front down')))
-        vm = types.SimpleNamespace(id='fake-vm', running={}, client=client, dead=False, agent='', lease={'boot': 'b', 'epoch': 1})
+        vm = types.SimpleNamespace(id='fake-vm', running={}, starts=[], client=client, dead=False, agent='', lease={'boot': 'b', 'epoch': 1})
         with patch.object(instance, '_renew_lease', return_value=True), patch.object(boat, 'bootstrap_agent', return_value={'ok': True}) as bootstrap, patch.object(boat, 'read_agent', return_value={}), patch.object(boat, 'write_agent') as write, patch.object(scheduler.time, 'sleep'):
             instance._check_agent(vm)
             bootstrap.assert_not_called()

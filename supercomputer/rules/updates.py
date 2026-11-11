@@ -136,3 +136,11 @@ def handoff_expired(now: float, deadline: float) -> bool:
 # gdp: law an accepted update uses the acknowledged owner: not accepted or result == candidate
 def handoff_owner(previous: int, candidate: int, accepted: bool) -> int:
     return candidate if accepted else previous
+
+
+# gdp: law unknown status never invents a breach: measured or result == 0
+# gdp: law healthy status clears consecutive breaches: not healthy or result == 0
+# gdp: law every measured status breach advances regardless of baseline: not measured or healthy or result == previous + 1
+# gdp: law a first measured status breach does not reject: not measured or healthy or previous != 0 or result == 1
+def canary_status_streak(previous: int, measured: bool, healthy: bool) -> int:
+    return previous + 1 if measured and not healthy else 0

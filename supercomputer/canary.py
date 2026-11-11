@@ -1,5 +1,6 @@
 """The canary: a handoff to new code is watched for WATCH_S (10 min), and handed back to the previous code by itself
-when a target (health.py) is breached in 2 checks in a row that held in the hour before the handoff. Handoff idle
+when a target (health.py) is breached in 2 checks in a row that held in the hour before the handoff.
+Status is mandatory whenever measured, regardless of the previous code's health. Handoff idle
 uses disjoint observation intervals; a missing VM/orphan is a hard fault on its first sample. A hand-back is a
 handoff: nothing let go, every VM and item taken back by the previous code's scheduler; the new code is marked
 rejected, so no scheduler hands the pool to it again until another install replaces it.
@@ -18,8 +19,8 @@ WATCH_S = 600.0
 BASELINE_S = 3600.0
 # (the targets new code can break in 10 minutes; busy and starts need the workload's hours to say anything)
 JUDGED = ("orphans", "modal", "ours", "status", "errors", "churn", "needless", "waste", "handoff", "disk")
-# (with no records before the handoff (a previous code without health.py): only what no load explains; status's
-# latency under the queue of the moment was the previous code's too (02:49: 1.18 s with 26,000 items queued))
+# With no records before the handoff, these other targets need no baseline.
+# Status is mandatory separately: predecessor latency never excuses a slow current response.
 JUDGED_BLIND = ("orphans", "modal", "ours", "errors", "churn", "needless")
 
 
@@ -156,11 +157,12 @@ class Canary:
         if d.get("admissions", {}).get("ready") is False:
             return "watch", f"code {me}: admission recovery still blocked; canary cannot pass"
         t0 = float(d.get("t", now))
-        if self.baseline is None:  # (the targets that held over the hour before the handoff: only those can fail it)
+        if self.baseline is None:  # Other targets must have held before the handoff; status is mandatory.
             minutes = BASELINE_S / 60
             b = health.check(t0, minutes)
             seen = any(e["t"] <= t0 for v in getattr(health, "ev", {}).values() for e in v)
             self.baseline = {k for k, v in b.get("targets", {}).items() if v["ok"] and v["value"] is not None and (seen or k in JUDGED_BLIND)}  # (measured and held)
+            self.baseline.add("status")
         since = max(t0, self._handoff_checked_at if self._handoff_checked_at is not None else t0)
         r = health.check(now, max(1.0, (now - t0) / 60), released_since=t0, handoff_since=since)
         self._handoff_checked_at = max(since, now)
@@ -176,6 +178,8 @@ class Canary:
                 self._handoff_hard_fault |= v.get("hard_faults", 0) > 0
                 self.streak[k] = rules.handoff_health_streak(self.streak.get(k, 0), v["value"] is not None,
                                                              v.get("hard_faults", 0), v["value"] or 0)
+            elif k == "status":
+                self.streak[k] = rules.canary_status_streak(self.streak.get(k, 0), v["value"] is not None, v["ok"])
             else:
                 self.streak[k] = self.streak.get(k, 0) + 1 if breached and k in self.baseline else 0
             if self.streak[k] >= 2:
@@ -188,7 +192,7 @@ class Canary:
             d["why"] = "; ".join(bad)
             self.write(d)
             return "handback", f"code {me} breached {'; '.join(bad)} within {(now - t0) / 60:.0f} min of the handoff: handed back to {d['from']}"
-        if rules.handoff_can_pass(now - t0, WATCH_S, self.streak.get("handoff", 0), self._handoff_hard_fault):
+        if rules.handoff_can_pass(now - t0, WATCH_S, max(self.streak.get("handoff", 0), self.streak.get("status", 0)), self._handoff_hard_fault):
             d["state"] = "passed"
             d["passed"] = (d.get("passed", []) + [me])[-20:]  # (the codes whose canary passed, newest last: rollback's default)
             self.write(d)

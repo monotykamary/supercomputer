@@ -1,7 +1,10 @@
 """Resource warnings are observed by the controller without restarting it."""
 import unittest
+import collections
+import threading
 from unittest.mock import Mock, patch
 from test_wiring import S, sched
+from supercomputer import statusview
 
 
 class MemoryWiring(unittest.TestCase):
@@ -28,12 +31,20 @@ class MemoryWiring(unittest.TestCase):
         s.health.last = {}
         target = {'ok':False,'value':1,'detail':{'high_delta':2}}
         s.health.memory_status.return_value = target
-        s._status = Mock(return_value={})
-        with patch.object(S.blobcache, 'last_report', return_value={}):
-            response = s.status()
+        s.health.client_errors.return_value = {"count": 0, "by_status": {}, "recent": []}
+        s._status_read = Mock(return_value={})
+        s._status_view = statusview.PublishedStatus({})
+        s._status_timings = collections.deque(maxlen=20000)
+        s._status_refresh_lock = threading.Lock()
+        with patch.object(S.blobcache, 'last_report', return_value={}), \
+             patch.object(S, 'code_hash', return_value='candidate'):
+            self.assertTrue(s._refresh_status(blocking=True))
+        s.health.memory_status.assert_called_once()
+        s.health.reset_mock()
+        response = s.status()
         self.assertEqual(response['health']['memory'], target)
         s.health.check.assert_not_called()
-        s.health.memory_status.assert_called_once()
+        s.health.memory_status.assert_not_called()
 
 
 if __name__ == '__main__': unittest.main()

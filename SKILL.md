@@ -5,7 +5,7 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
 
 **Run a jobs file** from any repo (its git root is the tree; `supercomputer.toml` says what it needs):
 - `supercomputer run --jobs jobs.json --out runs/x [--class C] [--timing] [--data DIR[:DEST]] [--env K=V]`
-- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?, "distinct_vm_group"?, "distinct_vm_group_scope"?, "distinct_vm_group_generation"?}]`;
+- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?, "distinct_vm_group"?, "distinct_vm_group_scope"?, "distinct_vm_group_generation"?, "required_agent_capabilities"?}]`;
   `cmd` runs under bash in `<repo>/<cwd>`; logs in `<out>/<name>.log`, `<out>/summary.tsv` (name, exit, seconds, where).
 - The tree ships without node_modules: start a bun job with `bun install --frozen-lockfile && ...`.
 - `--timing`: each job alone on its VM; `<out>/placement.json` is the label a timing claim needs.
@@ -82,8 +82,13 @@ Large Python return values (>32 KiB) and rows (>64 KiB) are complete JSON files,
 a reference/file envelope for a large return; explicitly parse that file only if your client has enough memory.
 Poll responses are paged (128 rows and about 512 KiB maximum), chunks are at most 256 KiB, and clients download
 before closing the batch. Native controller capability `output_files_protocol:1` / `result_files_protocol:1` is
-required for these features; do not assume an old controller or Modal fallback exports artifacts.
-Details and reference schema: `docs/result-files.md`.
+required for these features, but controller support alone does not prove worker support. For artifact or large-return
+jobs, declare `"required_agent_capabilities":{"output_files_protocol":1,"result_files_protocol":1}` in each job
+and run with `--backend boat`. Placement and prelaunch checks require actual agent ping inventory; old/unknown
+agents cannot satisfy the declaration. Busy legacy agents are not upgraded; an actual idle upgrade excludes
+new placement. Jobs without the declaration keep legacy behavior. Never infer capabilities from a source hash
+or assume Modal fallback exports artifacts. See `docs/agent-capabilities.md` for the complete recipe and
+`docs/result-files.md` for transport/reference formats.
 
 **The treadmill:** sweeps of unsolved tasks, soundness fuzz and mutants, and an idea queue:
 `supercomputer queue add jobs.json [--name N] [--meta k=v]`, `queue ls`, `queue results <name>`; `supercomputer

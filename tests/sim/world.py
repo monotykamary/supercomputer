@@ -229,6 +229,8 @@ class World:
             m.time, m.threading, m.os = self.sh["time"], self.sh["threading"], osp
         S.subprocess = subp
         S.concurrent = self.sh["concurrent"]
+        if hasattr(S, "statusview"):
+            S.statusview.time = self.sh["time"]
         for name in ("_sem", "_tick_sem"):
             if hasattr(B, name):
                 setattr(B, name, self.th.BoundedSemaphore(48 if name == "_sem" else 200))
@@ -256,7 +258,8 @@ class World:
         def prepare(pkg):
             self.note("snapshot_prepared", code=pkg.parent.name)
             return {"python": "sim", "cache_tag": "sim", "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
-                    "durable_distinct_vm_group": True, "result_files_protocol": True}
+                    "durable_distinct_vm_group": True, "result_files_protocol": True,
+                    "required_agent_capabilities_protocol": True}
         S.prepare_snapshot = prepare
         if hasattr(S, "memorypressure"):
             # Host cgroups are not virtual controller state; sensor behavior has dedicated tests.
@@ -968,7 +971,8 @@ class Agent:
         return fn(*a) if cmd != "vtick" else self.c_vtick(a[0], timeout)
 
     def c_ping(self):
-        out = {"ok": True, "version": self.d.version, "boot": str(self.v.boot), "cpus": self.v.cpus, "load": 0.3}
+        out = {"ok": True, "version": self.d.version, "boot": str(self.v.boot), "cpus": self.v.cpus, "load": 0.3,
+               "agent_capabilities": dict(getattr(self.d, "agent_capabilities", getattr(self.A._A, "AGENT_CAPABILITIES", {})))}
         if hasattr(self.A._A, "clean_disk"):
             out["disk"] = self._disk()
         return out
@@ -1065,6 +1069,8 @@ class Agent:
             self.w.k.sleep(0.5)
             if v.state == RUNNING:
                 v.disk.version, v.disk.token, v.daemon = ver, tok, "up"
+                if hasattr(v.disk, "agent_capabilities"):
+                    del v.disk.agent_capabilities  # successful upgrade advertises the installed agent
                 self.w.note("upgraded", vm=v.id, version=ver)
         self.w.k.start(self.w.k.world, restart, name=f"upgrade {v.id}")
         return {"ok": True, "from": self.d.version, "to": ver}

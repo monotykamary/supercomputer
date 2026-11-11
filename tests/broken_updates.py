@@ -108,3 +108,23 @@ def retry_without_cooldown(now: float, retry_after: float, rejected: bool) -> bo
 # gdp: law readiness never commits after observed lease loss: not result or not authority_lost
 def ignore_readiness_lease_loss(covered: bool, authority_lost: bool) -> bool:
     return covered
+
+
+# gdp: law every measured status breach advances regardless of baseline: not measured or healthy or result == previous + 1
+def ignore_status_after_unhealthy_predecessor(previous: int, measured: bool, healthy: bool) -> int:
+    return 0
+
+
+# gdp: law unknown status never invents a breach: measured or result == 0
+def synthetic_status_breach(previous: int, measured: bool, healthy: bool) -> int:
+    return previous + 1 if not healthy else 0
+
+
+# gdp: law a first measured status breach does not reject: not measured or healthy or previous != 0 or result == 1
+def reject_first_status_breach(previous: int, measured: bool, healthy: bool) -> int:
+    return 2 if measured and not healthy else 0
+
+
+# gdp: law healthy status clears consecutive breaches: not healthy or result == 0
+def keep_old_status_breach(previous: int, measured: bool, healthy: bool) -> int:
+    return previous

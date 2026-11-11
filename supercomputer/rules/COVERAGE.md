@@ -91,7 +91,8 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `logs` | I/O | the batch's logs merged |
 | `hint` | I/O | a tenant's standing demand recorded with its TTL |
 | `floor` | decision, plain | the policy's floor while a live hint names the image, else 0: a lookup; the hold's laws (VMLife.hold_tick) take the floor as given |
-| `status` | I/O | a report |
+| `fit_shape`, `fits`, `_check_agent`, `_verify_agent_capabilities` | rules/agent_capabilities.py + I/O | explicit per-job protocol versions must be advertised by the actual agent; upgrades exclude placement and require no running, starting or foreign work; prelaunch ping rechecks and flat placement receipts preserve evidence |
+| `status`, `status_response`, `_refresh_status` | I/O + rules/status.py | immutable encoded status; lock-free readers; honest monotonic age and publication ordering are proven; failed/blocked refresh retains the aged last snapshot |
 | `run` | rule | rules.scheduler.abandoned: a batch with items left is closed only after orphan_s with no poll; the idle exit a report of nothing held |
 | `_policy_tick` | rule | rules.scheduler.ItemFate.follow (an item follows the current policy generation after a tick) and VMLife.hold_tick (a VM follows it) |
 | `stale` | I/O | a report of what isn't on the generation or the code |

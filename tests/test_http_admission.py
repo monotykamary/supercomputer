@@ -116,7 +116,8 @@ class HTTPAdmission(unittest.TestCase):
         owner.batch_of = S.Scheduler.batch_of
         owner.poll = Mock(return_value={"rows": [], "done": True})
         owner.capabilities = Mock(return_value={"fixture": True})
-        owner.status = Mock(return_value={"fixture": True})
+        owner.status = Mock(side_effect=AssertionError("status must use published bytes"))
+        owner.status_response = Mock(return_value=b'{"fixture":true}')
         replies = []
         h._send = lambda code, obj=None, raw=None: replies.append((code, json.loads(raw)))
         return h, owner, health, replies
@@ -148,7 +149,8 @@ class HTTPAdmission(unittest.TestCase):
                 with self.subTest(path=path, body=body):
                     h, owner, health, replies = self.dispatch(path, body)
                     h.do_POST()
-                    self.assertEqual(replies[0][0], 200)
+                    self.assertEqual(replies[0], (200, {"fixture": True}))
+                    owner.status.assert_not_called()
                     health.record_error.assert_not_called()
 
     def test_invalid_client_json_is_400_not_a_canary_failure(self):

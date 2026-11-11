@@ -480,6 +480,9 @@ class _ShimTime:
     def monotonic(self):
         return self.k.now
 
+    def monotonic_ns(self):
+        return int(self.k.now * 1e9)
+
     perf_counter = monotonic
 
     def sleep(self, s):

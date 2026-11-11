@@ -236,6 +236,11 @@ Read `supercomputer --skill` before first use in a session.
 | `store push\|pull\|ls ...` | volumes on boat: named snapshots, sha256 manifests, pulls cached by hash |
 | `volumes ...`, `runpod ...` | a Modal volume straight to boat; RunPod's pods |
 
+`/status` serves an immutable published view without waiting on the scheduler
+lock. Its additive `status_snapshot` metadata reports capture/publication time,
+age and readiness; blocked refreshes leave the last view explicitly aged. See
+[status snapshots](docs/status-snapshot.md).
+
 ## More
 
 - [docs/scheduling.md](docs/scheduling.md): the scheduling policy in full, growth and shrink, preemption, restarts,
