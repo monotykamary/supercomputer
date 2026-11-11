@@ -60,7 +60,12 @@ import tempfile
 import urllib.parse
 import weakref
 
-from . import config
+# Keep the complete result-download/legacy-transport dependency chain in memory
+# before submitting work. A concurrent `uv tool install --force --reinstall`
+# may remove or replace this package directory while an existing client waits.
+# Lazy imports at delivery (including error recovery) would then fail or mix
+# code from two installs. Both CLI and programmatic clients import boat first.
+from . import clientresults, config, resultfiles, resultjson, resultrelay
 from .config import env, project
 from .rules import boat as R
 
@@ -1590,7 +1595,6 @@ class AgentClient:
             polling = cmd in ('tick', 'vtick') or (cmd == 'owned_rpc' and args
                 and isinstance(args[0], dict) and args[0].get('command') in ('tick', 'vtick'))
             if store is not None and polling:
-                from . import resultjson
                 decode = lambda stream: resultjson.load_response(stream, store)
             code, data, _ = self._req("POST", "/rpc", body, timeout, **({'decode': decode} if decode else {}))
             if code == 502 and cmd in self.EXEC_OK and len(body) < EXEC_BODY:
@@ -1610,7 +1614,6 @@ class AgentClient:
 
     def _rpc_exec(self, body: bytes, timeout: float, decode=None):
         if decode is not None:
-            from . import resultrelay
             return resultrelay.exec_response(self, body, timeout, decode)
         script = ("import base64,sys,urllib.request,os;t=sys.argv[2];a=sys.argv[1];"
                   "b=(open(a[1:]).read() if a.startswith('@') else a);a.startswith('@') and os.unlink(a[1:]);"
@@ -2598,7 +2601,6 @@ class Session:
 
     @staticmethod
     def _result_chunk(client, bid, name, ref, offset, count):
-        from . import resultfiles
         resultfiles.validate_ref(ref)
         chunk = client.rpc('resultpart', bid, name, ref['sha256'], offset, count, timeout=120)
         if not isinstance(chunk, dict) or chunk.get('offset') != offset or chunk.get('bytes') != ref['bytes'] or chunk.get('sha256') != ref['sha256']:
@@ -2609,7 +2611,6 @@ class Session:
         return data
 
     def _download_results(self, row, reader):
-        from . import clientresults
         directory = pathlib.Path(getattr(self, 'output_dir', config.HOME / 'results' / self.batch))
         return clientresults.download(row, reader, directory)
 

@@ -38,6 +38,11 @@ git clone https://github.com/monotykamary/supercomputer && cd supercomputer
 uv tool install --editable .
 ```
 
+For updates while clients or a scheduler are running, use the reviewed-commit
+[`ROLLOUT.sh`](ROLLOUT.sh) procedure rather than reinstalling a shared environment
+or changing a live checkout. It stages an immutable version before switching the
+entry point. See [journal migration and handoff](docs/result-journal-migration.md).
+
 State lives in `~/.local/share/supercomputer` (or `$SUPERCOMPUTER_HOME`): `live/` holds the pool, the ledgers and
 the caches; `repos/` holds configs for repos that don't carry their own.
 

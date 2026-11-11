@@ -1,5 +1,13 @@
 """Regressions refused by the same hot-update laws."""
 
+# gdp: law a live guarded parent keeps its old-readable journals: not guarded or not parent_alive or not result
+def compact_before_parent_commit(parent_alive: bool, guarded: bool, blocked: bool) -> bool:
+    return not blocked
+
+# gdp: law uncertain recovery never rewrites journals: not blocked or not result
+def compact_uncertain_recovery(parent_alive: bool, guarded: bool, blocked: bool) -> bool:
+    return not guarded or not parent_alive
+
 # gdp: law a poll wait never exceeds the server bound: result <= max(0.0, limit)
 def uncapped_poll_wait(requested: float, limit: float) -> float:
     return max(0.0, requested)

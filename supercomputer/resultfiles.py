@@ -1,10 +1,14 @@
 """Bounded JSON payloads and content-addressed result files.
 
-Refs contain no paths. SHA-256 is checked before publication/import; reads trust
-published content and check type/size without rehashing the file per chunk.
+Refs contain no paths. SHA-256 is checked before first publication/import; reads
+and reuse trust immutable published content and check type/size without rehashing.
+The store directory must be controlled by trusted writers: same-size external
+mutation of a published payload is not detected. Format is reference metadata,
+not an on-disk discriminator; identical bytes may be used as either JSON or file.
 A downloading client must verify the final SHA-256 before accepting its copy.
 """
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -130,6 +134,29 @@ class Store:
         finally:
             os.close(fd)
 
+    def _has_payload(self, directory, ref):
+        """Reuse only a safely opened regular payload of the declared size.
+
+        A digest-named payload was verified and fsynced at publication. As with
+        read/open, this relies on its immutability rather than hashing it again.
+        Missing, wrong-sized and symlink entries can instead be repaired by _put.
+        """
+        try:
+            fd = os.open(ref['sha256'] + '.payload',
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            # O_NOFOLLOW rejects the final symlink, even if its target looks valid.
+            if exc.errno == errno.ELOOP:
+                return False
+            raise
+        try:
+            info = os.fstat(fd)
+            return stat.S_ISREG(info.st_mode) and info.st_size == ref['bytes']
+        finally:
+            os.close(fd)
+
     def _put(self, chunks, expected=None, format='json'):
         with self._directory(create=True) as directory:
             name = '.upload-' + uuid.uuid4().hex
@@ -147,6 +174,8 @@ class Store:
                     ref = dict(version=1, sha256=digest.hexdigest(), bytes=size, format=format)
                     if expected is not None and ref != expected:
                         raise ValueError('result size or digest mismatch')
+                    if self._has_payload(directory, ref):
+                        return ref
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(name, ref['sha256'] + '.payload', src_dir_fd=directory, dst_dir_fd=directory)
@@ -179,6 +208,9 @@ class Store:
 
     def import_ref(self, ref, reader):
         ref = dict(validate_ref(ref))
+        with self._directory(create=True) as directory:
+            if self._has_payload(directory, ref):
+                return ref
         def chunks():
             offset = 0
             while offset < ref['bytes']:

@@ -43,6 +43,14 @@ class LegacyResultJSON(unittest.TestCase):
     def payload(self, ref):
         return (self.store.root / (ref['sha256'] + '.payload')).read_bytes()
 
+    def test_bounded_journal_lines_crossing_chunks_use_fast_decoder(self):
+        rows = [{'name': 'one', 'result': 'x' * 40000},
+                {'name': 'two', 'result': ['unicode-☃'] * 2000}]
+        data = b''.join(json.dumps(row, ensure_ascii=False).encode() + b'\n' for row in rows)
+        for chunk in (1, 17, 65536):
+            with self.subTest(chunk=chunk), patch.object(rj._Reader, 'row', side_effect=AssertionError('slow row decoder')):
+                self.assertEqual(rj.load_journal(Chunked(io.BytesIO(data), chunk), self.store, True), rows)
+
     def test_normal_wrappers_and_already_compact_rows(self):
         row = {'batch': 'batch', 'name': 'item', 'result_ref': {'version': 1, 'sha256': 'a' * 64, 'bytes': 100000, 'format': 'json'}}
         original = {'ok': True, 'owned_rpc': {'result': {'done': [row], 'running': []}}, 'misc': [None, False, 2.5]}

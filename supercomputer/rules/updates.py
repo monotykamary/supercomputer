@@ -97,6 +97,13 @@ def handoff_activate(parent_alive: bool, guarded: bool) -> bool:
     return not guarded or not parent_alive
 
 
+# gdp: law a live guarded parent keeps its old-readable journals: not guarded or not parent_alive or not result
+# gdp: law uncertain recovery never rewrites journals: not blocked or not result
+# gdp: law committed healthy candidates may compact: blocked or (guarded and parent_alive) or result
+def journal_compaction_allowed(parent_alive: bool, guarded: bool, blocked: bool) -> bool:
+    return not blocked and (not guarded or not parent_alive)
+
+
 # gdp: law startup always gets at least ten seconds: result >= 10000
 # gdp: law startup never holds placement beyond the two minute cap: result <= 120000
 # gdp: law VM work gets its budget up to the cap: result >= min(120000, 10000 + 100 * max(0, vms))

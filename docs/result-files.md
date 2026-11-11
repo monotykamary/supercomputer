@@ -71,6 +71,14 @@ Payload publication is atomic and fsynced before row commit/worker ACK. Incomple
 successful results and do not release their placement. State archives stream from disk; `.payload` files are not
 JSON-decoded during capture. This protects result retention and recovery from bulk data memory amplification.
 
+## Persistent journal migration
+
+Staging prepares validated, reusable compact projections before freezing the
+parent. Canonical journals are rewritten only after the new owner activates;
+failed handoffs leave old-readable journals intact. See
+[journal migration and hot updates](result-journal-migration.md) for the format,
+installation ordering, downgrade constraints and real-queue regression.
+
 ## Regression coverage
 
 `tests/bulk_result_rss.py` exercises a full 1 GiB result, first-class output download, verified byte equality,

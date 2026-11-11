@@ -244,7 +244,7 @@ class Guards(unittest.TestCase):
                  mock.patch.object(scheduler, 'Client', side_effect=ConnectionRefusedError), \
                  mock.patch.object(scheduler, 'ensure_running') as spawn:
                 receipt = scheduler.stage_install()
-                self.assertEqual(scheduler.installed_source(), source.parent)
+                self.assertEqual(scheduler.installed_source(), root / "live/code" / receipt["staged"])
                 self.assertEqual(receipt['staged'], scheduler.code_hash(source))
                 self.assertIsNone(receipt['active'])
                 self.assertTrue((root / 'live/code' / receipt['staged'] / 'supercomputer/scheduler.py').exists())

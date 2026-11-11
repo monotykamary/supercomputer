@@ -1,7 +1,9 @@
 """Bounded result payload storage; no provider calls inside these tests."""
 import hashlib
 import json
+import os
 import pathlib
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -88,6 +90,158 @@ class ResultFilesTests(unittest.TestCase):
         self.assertEqual(other.read(ref, len(data) + 1, 1), b'')
         self.assertEqual(other.read(ref, 0, 0), b'')
         self.assertGreater(len(calls), 2)
+
+    def test_known_import_reuses_payload_without_reader_hash_or_upload(self):
+        for value in ({'large': 'x' * (rf.CHUNK_BYTES + 1)}, ''):
+            with self.subTest(value_bytes=len(value)):
+                ref = self.store.put_json(value)
+                path = self.root / (ref['sha256'] + '.payload')
+                before = path.stat()
+                # A new Store also reuses published data; no in-memory cache needed.
+                reopened = rf.Store(self.root)
+                def fail(*args, **kwargs):
+                    raise AssertionError('cache hit performed payload work')
+                with patch.object(rf.hashlib, 'sha256', side_effect=fail), \
+                     patch.object(rf.uuid, 'uuid4', side_effect=fail), \
+                     patch.object(rf.os, 'replace', side_effect=fail), \
+                     patch.object(rf.os, 'fsync', side_effect=fail):
+                    self.assertEqual(reopened.import_ref(ref, fail), ref)
+                self.assertEqual(path.stat().st_ino, before.st_ino)
+                self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+                self.assertFalse(list(self.root.glob('.upload-*')))
+
+    def test_duplicate_put_hashes_input_but_preserves_published_inode(self):
+        value = {'large': 'x' * (rf.CHUNK_BYTES + 1)}
+        ref = self.store.put_json(value)
+        path = self.root / (ref['sha256'] + '.payload')
+        before = path.stat()
+        with patch.object(rf.hashlib, 'sha256', wraps=rf.hashlib.sha256) as digest, \
+             patch.object(rf.os, 'replace', side_effect=AssertionError('replaced payload')), \
+             patch.object(rf.os, 'fsync', side_effect=AssertionError('synced discarded upload')):
+            self.assertEqual(self.store.put_json(value), ref)
+            self.assertEqual(self.store.put_file(path), ref)
+        self.assertEqual(digest.call_count, 2)
+        self.assertEqual(path.stat().st_ino, before.st_ino)
+        self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertFalse(list(self.root.glob('.upload-*')))
+
+    def test_payload_reuse_is_independent_of_valid_reference_format(self):
+        ref = self.store.put_json({'a': 1})
+        file_ref = dict(ref, format='file')
+        with patch.object(rf.os, 'replace', side_effect=AssertionError('duplicate publication')):
+            self.assertEqual(self.store.put_file(self.root / (ref['sha256'] + '.payload'),
+                                                 format='file'), file_ref)
+            self.assertEqual(self.store.import_ref(file_ref, None), file_ref)
+        with self.assertRaises(ValueError):
+            self.store.import_ref(dict(ref, format='unsupported'), None)
+
+    def test_wrong_size_payload_is_repaired_by_import_and_put(self):
+        value = {'a': 'x' * (rf.CHUNK_BYTES + 1)}
+        ref = self.store.put_json(value)
+        raw = self.contents(ref)
+        path = self.root / (ref['sha256'] + '.payload')
+        for operation in ('import', 'put'):
+            for bad in (b'', raw[:-1], raw + b'!'):
+                with self.subTest(operation=operation, size=len(bad)):
+                    path.write_bytes(bad)
+                    calls = []
+                    def reader(offset, count):
+                        calls.append((offset, count))
+                        self.assertLessEqual(count, rf.CHUNK_BYTES)
+                        return raw[offset:offset + count]
+                    if operation == 'import':
+                        self.assertEqual(self.store.import_ref(ref, reader), ref)
+                        self.assertGreater(len(calls), 1)
+                    else:
+                        self.assertEqual(self.store.put_json(value), ref)
+                    self.assertEqual(path.read_bytes(), raw)
+                    self.assertFalse(list(self.root.glob('.upload-*')))
+
+    def test_symlink_payload_is_replaced_not_trusted_or_followed(self):
+        value = {'a': 1}
+        ref = self.store.put_json(value)
+        raw = self.contents(ref)
+        path = self.root / (ref['sha256'] + '.payload')
+        outside = pathlib.Path(self.tmp.name) / 'outside'
+        outside.write_bytes(b'!' * len(raw))
+        for operation in ('import', 'put'):
+            with self.subTest(operation=operation):
+                path.unlink()
+                path.symlink_to(outside)
+                calls = []
+                def reader(offset, count):
+                    calls.append((offset, count))
+                    return raw[offset:offset + count]
+                if operation == 'import':
+                    self.assertEqual(self.store.import_ref(ref, reader), ref)
+                    self.assertTrue(calls)
+                else:
+                    self.assertEqual(self.store.put_json(value), ref)
+                self.assertFalse(path.is_symlink())
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual(outside.read_bytes(), b'!' * len(raw))
+
+    def test_import_rejects_symlink_root_and_parent_before_reader(self):
+        ref = self.store.put_json(1)
+        link = pathlib.Path(self.tmp.name) / 'link'
+        link.symlink_to(self.root, target_is_directory=True)
+        def fail(*args):
+            raise AssertionError('reader called through unsafe root')
+        for root in (link, link / 'child'):
+            with self.assertRaises(OSError):
+                rf.Store(root).import_ref(ref, fail)
+
+    def test_nonregular_payload_is_not_a_cache_hit(self):
+        blank = pathlib.Path(self.tmp.name) / 'blank'
+        blank.write_bytes(b'')
+        ref = self.store.put_file(blank)
+        path = self.root / (ref['sha256'] + '.payload')
+        path.unlink()
+        os.mkfifo(path)
+        calls = []
+        def reader(offset, count):
+            calls.append((offset, count))
+            return b''
+        self.assertEqual(self.store.import_ref(ref, reader), ref)
+        self.assertEqual(calls, [(0, 1)])
+        self.assertTrue(stat.S_ISREG(path.stat().st_mode))
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(OSError):
+            self.store.import_ref(ref, reader)
+        self.assertTrue(path.is_dir())
+        self.assertFalse(list(self.root.glob('.upload-*')))
+
+    def test_failed_repair_leaves_existing_payload_and_cleans_upload(self):
+        ref = self.store.put_json({'a': 1})
+        path = self.root / (ref['sha256'] + '.payload')
+        bad = b'bad'
+        path.write_bytes(bad)
+        corrupt = b'!' * ref['bytes']
+        with self.assertRaisesRegex(ValueError, 'size or digest mismatch'):
+            self.store.import_ref(ref, lambda offset, count: corrupt[offset:offset + count])
+        self.assertEqual(path.read_bytes(), bad)
+        self.assertFalse(list(self.root.glob('.upload-*')))
+
+    def test_new_publication_and_repair_fsync_file_before_replace_then_directory(self):
+        for repair in (False, True):
+            with self.subTest(repair=repair):
+                value = {'a': 1}
+                if repair:
+                    ref = self.store.put_json(value)
+                    (self.root / (ref['sha256'] + '.payload')).write_bytes(b'bad')
+                events = []
+                sync, replace = rf.os.fsync, rf.os.replace
+                def recording_sync(fd):
+                    events.append('directory' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+                    return sync(fd)
+                def recording_replace(*args, **kwargs):
+                    events.append('replace')
+                    return replace(*args, **kwargs)
+                with patch.object(rf.os, 'fsync', side_effect=recording_sync), \
+                     patch.object(rf.os, 'replace', side_effect=recording_replace):
+                    self.store.put_json(value)
+                self.assertEqual(events, ['file', 'replace', 'directory'])
 
     def test_bad_transfers_never_publish_and_cleanup(self):
         good = self.store.put_json({'a': 'x' * 100000})

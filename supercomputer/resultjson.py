@@ -53,6 +53,7 @@ class _Reader:
         self.captures = []
         self.row_depth = 0
         self.wrapper_bytes = 0
+        self.spilled_rows = 0
         self.utf8 = codecs.getincrementaldecoder('utf-8')()
 
     def peek(self):
@@ -285,6 +286,7 @@ class _Reader:
                     raise ValueError('Large job row requires a result store')
                 tmp.flush()
                 projection['row_ref'] = store.put_file(tmp.name)
+                self.spilled_rows += 1
                 return projection
         finally:
             self.row_depth -= 1
@@ -302,16 +304,54 @@ def load_response(stream, store_for_batch):
     return result
 
 
-def load_journal(stream, store, strict=False):
-    """Decode JSON-lines rows; strict mode also rejects null and torn records."""
+def _validate_identity(row):
+    for key in ('name', 'batch'):
+        if key in row and (not isinstance(row[key], str) or not _ID.fullmatch(row[key])):
+            raise ValueError('Invalid job ' + key)
+    return row
+
+
+def iter_journal(stream, store, strict=False, *, stats=None):
+    """Yield bounded JSON-lines rows, rejecting malformed/torn owned records.
+
+    Complete small lines take the C JSON decoder path without a per-row spill
+    file. A long or split line still uses the bounded streaming row decoder.
+    """
     reader = _Reader(stream)
-    result = []
     while True:
+        reader.peek()
+        # A bounded row may straddle an input chunk. Fill only up to one inline
+        # row plus its newline before deciding to use the streaming slow path.
+        while (reader.buf.find(b'\n', reader.pos) < 0 and not reader.eof
+               and len(reader.buf) - reader.pos <= INLINE_BYTES):
+            remaining = len(reader.buf) - reader.pos
+            extra = reader.stream.read(min(CHUNK_BYTES, INLINE_BYTES + 1 - remaining))
+            if not isinstance(extra, bytes):
+                raise TypeError('JSON input must be a binary stream')
+            reader.eof = not extra
+            reader.utf8.decode(extra, final=reader.eof)
+            reader.buf = reader.buf[reader.pos:] + extra
+            reader.pos = 0
+        end = reader.buf.find(b'\n', reader.pos)
+        if end >= 0 and end - reader.pos <= INLINE_BYTES:
+            raw = reader.take(end + 1 - reader.pos).strip(b' \t\r\n')
+            reader.wrapper_bytes = 0
+            if not raw:
+                if strict:
+                    raise ValueError('Blank owned journal record')
+                continue
+            row = json.loads(raw)
+            if row is None and not strict:
+                continue
+            if not isinstance(row, dict):
+                raise ValueError('Job row must be an object')
+            yield _validate_identity(row)
+            continue
         # Only horizontal space here: newlines are record boundaries.
         while reader.peek() in (b' ', b'\t', b'\r'):
             reader.take()
         if not reader.peek():
-            return result
+            return
         if reader.peek() == b'\n':
             if strict:
                 raise ValueError('Blank owned journal record')
@@ -322,6 +362,8 @@ def load_journal(stream, store, strict=False):
             row = None
         else:
             row = reader.row(store=store)
+            if stats is not None and reader.spilled_rows:
+                stats['needs_compaction'] = True
         while reader.peek() in (b' ', b'\t', b'\r'):
             reader.take()
         if reader.peek() == b'\n':
@@ -329,8 +371,13 @@ def load_journal(stream, store, strict=False):
         elif reader.peek() or strict:
             raise ValueError('Journal record must be newline terminated')
         if row is not None:
-            result.append(row)
+            yield row
         reader.wrapper_bytes = 0
+
+
+def load_journal(stream, store, strict=False):
+    """Decode JSON-lines rows; strict mode also rejects null and torn records."""
+    return list(iter_journal(stream, store, strict))
 
 
 def iter_array(stream):

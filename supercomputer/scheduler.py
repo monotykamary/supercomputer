@@ -49,7 +49,7 @@ import threading
 import time
 import urllib.request
 
-from . import blobcache, boat, canary, config, health, memorypressure, resultfiles, resultjson, rules, statebackup
+from . import blobcache, boat, canary, config, health, memorypressure, resultfiles, resultjournal, resultjson, rules, statebackup
 from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
 from .rules.owned_lifecycle import OwnedLifecycle, retention_supported
@@ -275,7 +275,16 @@ def stage_install() -> dict:
     if saved is None or code_hash(saved) != target:
         raise RuntimeError("staged source changed while snapshotting; retry after install completes")
     prepared = prepare_snapshot(saved)
-    manifest = {"source": str(source.parent), "snapshot": str(saved.parent), "code": target, "prepared": prepared}
+    # The live parent keeps serving throughout the expensive conversion. Do not
+    # publish the target (or change an old-readable journal) until it completes.
+    migration = resultjournal.prepare_directory(DIR / "queue")
+    if migration["errors"]:
+        raise RuntimeError(f"result-journal preparation failed: {migration['errors'][:3]}")
+    prepared["result_journals"] = {k: v for k, v in migration.items() if k != "receipts"}
+    log(f"prepared {migration['prepared']} result journals ({migration['source_bytes']} bytes) "
+        f"in {migration['elapsed_s']:.3f}s; {migration['caches_reused']} reused")
+    # Pin the immutable snapshot, not a package/checkout an installer can replace.
+    manifest = {"source": str(saved.parent), "snapshot": str(saved.parent), "code": target, "prepared": prepared}
     tmp = DIR / f"install.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(manifest))
     tmp.replace(DIR / "install.json")
@@ -773,6 +782,9 @@ class Scheduler:
         still open, its delivered rows kept, the rest queued again (what ran on VMs this process no longer holds runs
         again)."""
         self._reload_started = time.monotonic()
+        self._journal_compact_pending = set()
+        self._journal_load_receipts = {}
+        self._journal_compaction_errors = {}
         qd = DIR / "queue"
         self.recovery_errors = {}
         self.recovery_blocked = True
@@ -788,7 +800,11 @@ class Scheduler:
                 if self._valid_batch(b.id) != f.stem:
                     raise ValueError("admission id does not match its file")
                 enhanced = b.strict_once or b.retain_journals or b.admission_closed or b.has_distinct
-                rows = self._read_result_journal(qd / f"{b.id}.rows", enhanced)
+                rows, journal = resultjournal.load_with_receipt(
+                    qd / f"{b.id}.rows", self._result_store(b.id), enhanced)
+                self._journal_load_receipts[b.id] = journal
+                if journal["needs_compaction"]:
+                    self._journal_compact_pending.add(b.id)
                 for r in rows:
                     if r.get("name") in b.items:
                         b.items[r["name"]].state = "done"
@@ -1047,14 +1063,45 @@ class Scheduler:
                 f"{len(missing)} not taken{': ' + str(missing[:6]) if missing else ''}")
         self._h().record_handoff(now, len(info) if snap else len(taken), len(taken), len(missing) if snap else 0, 0, 0)
 
+    def _compact_result_journals(self):
+        """Publish prepared projections only after activation, with all writers fenced.
+
+        Preparation leaves old-readable journals intact so a rejected candidate
+        cannot strand its parent. The live rows include any tail/recovery rows.
+        A failed atomic replacement preserves the original and its valid cache.
+        """
+        pending = getattr(self, "_journal_compact_pending", set())
+        if not pending:
+            return
+        with getattr(self, "_request_lock", self.lock), self.lock:
+            for bid in list(pending):
+                batch = self.batches.get(bid)
+                path = DIR / "queue" / f"{bid}.rows"
+                if batch is None or not path.exists():
+                    pending.discard(bid)
+                    continue
+                try:
+                    with batch.cv:
+                        receipt = resultjournal.compact(path, batch.rows, bounded=True)
+                    log(f"{bid}: compacted {receipt['source_bytes']} journal bytes "
+                        f"to {receipt['compact_bytes']} after activation")
+                    pending.discard(bid)
+                except (OSError, ValueError) as exc:
+                    self._journal_compaction_errors[bid] = str(exc)
+                    log(f"{bid}: journal compaction deferred, original retained: {exc}")
+
     def _activate_handoff(self) -> bool:
         """A loaded candidate remains passive until its live parent commits by exiting."""
         deferred = getattr(self, "_handoff_deferred", None)
+        guarded = deferred is not None
+        parent_alive = bool(guarded and boat.pid_alive(deferred[0], socket.gethostname()))
+        if not rules.handoff_activate(parent_alive, guarded):
+            return False
+        if rules.journal_compaction_allowed(parent_alive, guarded, self.recovery_blocked):
+            self._compact_result_journals()
         if deferred is None:
             return True
-        old, starting = deferred
-        if not rules.handoff_activate(boat.pid_alive(old, socket.gethostname()), True):
-            return False
+        _, starting = deferred
         self._handoff_deferred = None
         if not self.recovery_blocked:
             for vm in self.vms.values():
@@ -1485,8 +1532,7 @@ class Scheduler:
     def _read_result_journal(cls, path, strict):
         if not path.exists():
             return []
-        with path.open('rb') as stream:
-            return resultjson.load_journal(stream, cls._result_store(path.stem), strict)
+        return resultjournal.load(path, cls._result_store(path.stem), strict)
 
     @staticmethod
     def _valid_batch(bid):
