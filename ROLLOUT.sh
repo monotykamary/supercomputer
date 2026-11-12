@@ -22,14 +22,39 @@ bash "$here/INSTALL_VERSION.sh" "$REF"
 # that running clients may still import. Base64 is only transport, not a secret.
 installer_b64=$(python3 -c 'import base64,pathlib,sys; print(base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode())' "$here/INSTALL_VERSION.sh")
 remote_install="set -e; f=\$(mktemp); trap 'rm -f \"\$f\"' EXIT; printf '%s' '$installer_b64' | python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' > \"\$f\"; SC_ROLLOUT_PROTOCOL_COMPATIBLE=1 bash \"\$f\" '$REF'"
-echo '== MacBook Air: installed / active / pending'
-reflex home run --timeout 600 "$remote_install"
-for machine in mini anh-1; do
+# `here` is the Mac running Reflex (currently the mini), not this sandbox.
+# Override only for different registered Reflex aliases; do not use `home`
+# as a permanent alias for the Air.
+read -r -a machines <<< "${SC_ROLLOUT_MACHINES:-here air anh-1}"
+staged=1
+skipped=()
+for machine in "${machines[@]}"; do
+  echo "== $machine: checking Reflex reachability"
+  if ! reflex on "$machine" run --timeout 15 'true'; then
+    echo "SKIP $machine: unreachable through Reflex; continuing to the controller." >&2
+    skipped+=("$machine")
+    continue
+  fi
   echo "== $machine: installed / active / pending"
-  reflex on "$machine" run --timeout 600 "$remote_install"
+  if reflex on "$machine" run --timeout 600 "$remote_install"; then
+    staged=$((staged + 1))
+  else
+    rc=$?
+    if ! reflex on "$machine" run --timeout 15 'true'; then
+      echo "SKIP $machine: lost Reflex connection during staging; install state unknown; continuing to the controller." >&2
+      skipped+=("$machine")
+      continue
+    fi
+    echo "ERROR $machine: reachable, but installation failed (exit $rc); refusing to hide an install error." >&2
+    exit "$rc"
+  fi
 done
 # Ship code and future-start descriptor limits to the existing controller. No setup (pool transfer), service
 # restart, treadmill restart, drain, or agent checkpoint is part of an update.
 echo '== controller bx_gz4zdtbh: installed / active / pending'
 env -u PYTHONPATH -u SUPERCOMPUTER_SRC SUPERCOMPUTER_CONTROLLER=1 "$SC" controller stage
-printf '%s\n' 'Published to five machines; running agents finish their current items before upgrading.'
+staged=$((staged + 1))
+printf 'Staged on %s reachable machines; running agents finish their current items before upgrading.\n' "$staged"
+if ((${#skipped[@]})); then
+  printf 'Skipped unreachable Reflex machines: %s\n' "${skipped[*]}"
+fi

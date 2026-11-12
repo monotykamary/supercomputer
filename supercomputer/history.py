@@ -150,6 +150,41 @@ def payload(queue, bid, name, meta=None):
         return json.load(source)
 
 
+def distinct_groups(queue, bid):
+    """Rebuild closed per-batch exclusions from SHA-checked audit evidence.
+
+    Used only for an old parent's ACK: the archive is not an active admission.
+    Expiry eligibility is irrelevant until collection has actually removed it.
+    """
+    meta = read(queue, bid, expired=True)
+    if meta is None:
+        raise ValueError('retained distinct history missing')
+    record = load(queue / (bid + '.closed'))
+    specs = {item['name']: item for item in record['items']}
+    ref = resultfiles.validate_ref(meta['audit']['snapshot.json'])
+    with resultfiles.Store(queue / (bid + '.results')).open(ref) as source:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(resultfiles.CHUNK_BYTES), b''):
+            digest.update(chunk)
+        if digest.hexdigest() != ref['sha256']:
+            raise ValueError('retained snapshot digest mismatch')
+        source.seek(0)
+        snapshot = json.load(source)
+    groups = {}
+    for placement in snapshot['placements']:
+        if not isinstance(placement, dict):
+            continue  # Legacy ungrouped journals may contain null records.
+        spec = specs.get(placement.get('name'), {})
+        group = placement.get('distinct_vm_group') or spec.get('distinct_vm_group')
+        scope = placement.get('distinct_vm_group_scope') or spec.get('distinct_vm_group_scope')
+        if group and scope != 'durable':
+            vm = placement.get('vm')
+            if not isinstance(vm, str) or not vm:
+                raise ValueError('retained distinct placement has no VM')
+            groups.setdefault(group, set()).add(vm)
+    return {name: sorted(vms) for name, vms in groups.items()}
+
+
 def rows_page(queue, bid, since, meta):
     store = resultfiles.Store(queue / (bid + '.results'))
     with store.open(meta['audit']['rows.json']) as source:

@@ -14,8 +14,17 @@ supercomputer batch fetch BATCH_ID --out recovered/BATCH_ID
 
 The policy accepts finite nonnegative hours. Zero disables post-close reads.
 It applies to future closes; reads, retries, restarts, and policy changes do not
-extend an existing deadline. Existing completed strict admissions are archived
-on recovery; if no original close timestamp exists, retention starts then.
+extend an existing deadline. Existing completed strict admissions are migrated
+only after the successor has been activated (its old parent has committed by
+exiting), never while producing the readiness ACK. If no original close
+timestamp exists, retention starts then.
+
+A legacy parent's handoff may still name already archived closed batches.
+The successor verifies their per-batch distinct-VM history against retained,
+SHA-checked audit snapshots and includes it in the compatibility ACK, without
+loading those batches as work. Missing or mismatched evidence fails closed.
+This keeps the exact-history guard intact and avoids changing the admission
+files beneath a live parent that may need to resume after a rejected candidate.
 History already deleted by an older ordinary close cannot be reconstructed.
 
 Closed records use `queue/BATCH_ID.closed`, not the active `.json` suffix, and

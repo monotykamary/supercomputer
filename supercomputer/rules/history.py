@@ -11,3 +11,9 @@ def history_visible(closed: bool, now: float, expires: float) -> bool:
 # gdp: law expiry never runs early: now >= expires or not result
 def history_expirable(closed: bool, pending: bool, now: float, expires: float) -> bool:
     return closed and not pending and now >= expires
+
+
+# gdp: law migration never precedes a live parent commit: not result or not guarded or not parent_alive
+# gdp: law quarantined recovery cannot migrate admissions: not result or not blocked
+def history_migration_allowed(guarded: bool, parent_alive: bool, blocked: bool) -> bool:
+    return not blocked and (not guarded or not parent_alive)

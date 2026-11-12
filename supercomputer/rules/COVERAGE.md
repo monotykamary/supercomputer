@@ -35,7 +35,8 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | --- | --- | --- |
 | `rules.history.history_visible`, `history_expirable` | rule | only closed, unexpired history is readable; open admissions and pending cleanup never expire; expiry never runs early. Every omission has a broken variant. |
 | `history.capture`, `finish`, `read`, `collect`, `purge` | I/O + rule | frozen content-addressed evidence, fsynced non-execution fence before archive rename, immutable first-close deadline, non-reuse tombstones, and off-lock filesystem cleanup. Pending strict cleanup cannot reach capture. |
-| `Scheduler._retain_closed`, `close_receipt`, `_history_tick` | I/O | one closed generation, read-only receipt retrieval, finite single-flight collection. No placement, provider call, or heartbeat renewal. |
+| `Scheduler._retain_closed`, `close_receipt`, `_history_tick` | I/O + rule | one closed generation, read-only receipt retrieval, finite single-flight collection; `history_migration_allowed` prevents migration before parent commit or during quarantined recovery. No placement, provider call, or heartbeat renewal. |
+| `history.distinct_groups`, `Scheduler._take_pool` | I/O + existing exact-history rule | reconstruct closed-group compatibility ACKs from immutable audit evidence without publishing active work; mismatches and missing evidence refuse readiness. |
 | `Scheduled.recover_close`, `boat.recover_close` | I/O + existing validator | bounded read-only attempts use `_valid_close` unchanged, original local custody bindings, conflict persistence, and single-attempt transport; no execution or cancellation workflow. |
 | `Scheduler._attempt_audit`, `batchfetch.fetch` | I/O | append observed start intent/response metadata, freeze and verify audit payloads; these records alone do not certify physical execution. |
 

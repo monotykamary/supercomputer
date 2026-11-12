@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -546,7 +547,11 @@ class RealPrivateNamespace(OwnedFixture):
         self.receipt_ok(self.cancel())
 
     def test_real_restart_unknown_child_is_not_signaled(self):
-        entry = self.launch()
+        marker = self.root / 'unknown-child-running'
+        entry = self.launch(f'printf started > {shlex.quote(str(marker))}; exec sleep 300')
+        self.assertEqual(self.wait_file(marker), 'started')
+        # Wait for the payload, not just namespace containment: cancelling an
+        # unstarted ownedrun legitimately makes it exit by itself under load.
         # Simulated loss of process-local capabilities, exactly what a fresh agent has.
         saved = A._owned_children
         A._owned_children = {}

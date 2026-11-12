@@ -918,12 +918,10 @@ class Scheduler:
                 # exception turn a durable admission into an unowned worker run.
                 self.recovery_errors[f.stem] = repr(e)
                 log(f"{f.stem}: recovery quarantined, ownership retained: {e!r}")
-        for b in list(self.batches.values()):
-            if b.strict_once and b.closed and all(it.owned.reaped for it in b.items.values()):
-                try:
-                    self._retain_closed(b, self._close_receipt(b))
-                except Exception as exc:
-                    self.recovery_errors[b.id] = repr(exc)
+        # A candidate must leave the old parent's admission files and exact
+        # group snapshot intact until commit. Migrate only after activation.
+        self._history_pending = {b.id for b in self.batches.values()
+                                 if b.strict_once and b.closed and all(it.owned.reaped for it in b.items.values())}
         self._client_closed = self._read_client_closes()
         self.recovery_blocked = bool(self.recovery_errors)
         if self.batches:
@@ -969,8 +967,20 @@ class Scheduler:
             x["batch"] for v in info.values() for x in v.get("items", [])}
         self.recovery, what, why = self.canary.admissions(self.code, expected, loaded, closed, self.recovery_errors)
         self.recovery["manifest_complete"] = "batches" in snap
-        expected_groups = {bid: groups for bid, groups in snap.get("distinct_vm_groups", {}).items() if bid not in closed}
-        if not rules.distinct_history_matches(bool(expected_groups), self._distinct_snapshot() == expected_groups):
+        expected_groups = snap.get("distinct_vm_groups", {})
+        ack_groups = self._distinct_snapshot()
+        try:
+            # A prior failed candidate may already have archived these batches.
+            # Verify their immutable evidence; do not reload or replay them.
+            for bid in expected_groups.keys() & closed:
+                retained = history.distinct_groups(DIR / 'queue', bid)
+                if retained != expected_groups[bid]:
+                    raise ValueError(f'{bid}: retained distinct history mismatch')
+                ack_groups[bid] = retained
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.recovery["ready"] = False
+            self.recovery["retained_history_error"] = str(exc)
+        if not rules.distinct_history_matches(bool(expected_groups), ack_groups == expected_groups):
             self.recovery["ready"] = False
             self.recovery["distinct_vm_groups"] = "history mismatch"
         durable = self._durable_snapshot()
@@ -1121,7 +1131,7 @@ class Scheduler:
         if snap:
             self._handoff_ack = {"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing,
                                  "admissions": self.recovery, "items_ready": items_ready,
-                                 "distinct_vm_groups": self._distinct_snapshot(),
+                                 "distinct_vm_groups": ack_groups,
                                  **({"durable_distinct_vm_groups": self._durable_snapshot()} if durable else {}),
                                  "registry_load_ms": self._registry_load_ms,
                                  "reload_ms": max(0, math.ceil((time.monotonic() - getattr(self, "_reload_started", time.monotonic())) * 1000))}
@@ -2419,11 +2429,25 @@ class Scheduler:
         """One finite maintenance worker; at most 128 manifests per minute."""
         if self.stop.is_set() or getattr(self, "handing_off", False) or getattr(self, "_history_busy", False):
             return
+        deferred = getattr(self, '_handoff_deferred', None)
+        guarded = deferred is not None
+        alive = bool(guarded and boat.pid_alive(deferred[0], socket.gethostname()))
+        from .rules.history import history_migration_allowed
+        if not history_migration_allowed(guarded, alive, getattr(self, 'recovery_blocked', False)):
+            return
         if time.time() - getattr(self, "_history_at", 0) < 60:
             return
         self._history_at, self._history_busy = time.time(), True
         def run():
             try:
+                for bid in sorted(getattr(self, '_history_pending', set()))[:128]:
+                    with self.lock:
+                        if getattr(self, 'handing_off', False):
+                            break
+                        b = self.batches.get(bid)
+                        if b is not None and b.closed and all(it.owned.reaped for it in b.items.values()):
+                            self._retain_closed(b, self._close_receipt(b))
+                        self._history_pending.discard(bid)
                 # Reclaim crash leftovers only after the manifest moved last.
                 garbage = DIR / "queue" / '.expired'
                 for trash in itertools.islice(garbage.iterdir() if garbage.exists() else (), 128):

@@ -106,7 +106,7 @@ class ImmutableInstall(unittest.TestCase):
         records = self.records()
         stages = [x for x in records if x[0]=='cli' and x[2:4]==['scheduler','stage']]
         self.assertEqual(len(stages), 4)
-        self.assertEqual({Path(x[1]).name for x in stages}, {'home','air','mini','anh-1'})
+        self.assertEqual({Path(x[1]).name for x in stages}, {'home','air','here','anh-1'})
         self.assertEqual(len([x for x in records if x[0]=='cli' and x[2:4]==['controller','stage']]), 1)
         self.assertFalse(any('checkout' in x or 'reinstall' in x for record in records for x in record if isinstance(x,str)))
         self.assertEqual(self.old.read_text(), 'old tree remains intact')

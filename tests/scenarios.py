@@ -298,6 +298,49 @@ def strict_once_handoff(code):
     return sim, {"extra": extra}
 
 
+@scenario("retained closed history handoff", ["lost", "clients", "modal", "strikes", "threads"], 1050,
+          "an old parent retains a closed grouped batch in memory after its files were archived; the successor ACKs its exact history without replay and preserves a live strict process")
+def retained_closed_history_handoff(code):
+    from tests.sim.harness import items
+    sim = _sim(code)
+    _warm(sim, 2)
+    sim.scheduler()
+    past = items("past", 1, 25, weight=4)
+    past[0]["distinct_vm_group"] = "retained/group"
+    closed = sim.batch("retained-closed", "gate", past, after=10, strict_once=True)
+    active = sim.batch("retained-active", "gate", items("live", 1, 500, weight=4), after=100, strict_once=True)
+    observed = {}
+    def remember():
+        observed["old_batch"] = sim.w.live_sched()[1].batches[closed]
+    def switch():
+        parent = sim.w.live_sched()[1]
+        archive = sim.S.DIR / "queue" / (closed + ".closed")
+        observed["archive_before"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        parent.batches[closed] = observed["old_batch"]  # old runtime's retained in-memory view
+        observed["before"] = _strict_live(sim, active)
+        sim.w.install("c1")
+    def after():
+        process, child = sim.w.live_sched()
+        observed["code"] = process.env.get("code")
+        observed["after"] = _strict_live(sim, active)
+        observed["closed_loaded"] = closed in child.batches
+        archive = sim.S.DIR / "queue" / (closed + ".closed")
+        observed["archive_after"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+    sim.at(15, remember)
+    sim.at(160, switch)
+    sim.at(300, after)
+    def extra(sim, m):
+        checks = _strict_evidence(sim, active, m)
+        m["retained_handoff"] = {k:v for k,v in observed.items() if k != "old_batch"}
+        checks.update(successor_serving=observed.get("code") == "c1",
+                      no_closed_replay=sim.w.items[(closed, "past0")]["runs"] == 1,
+                      archive_preserved=observed.get("archive_before") == observed.get("archive_after"),
+                      closed_is_not_active=observed.get("closed_loaded") is False,
+                      same_live_identity=bool(observed.get("before")) and observed.get("before") == observed.get("after"))
+        return checks
+    return sim, {"extra": extra}
+
+
 @scenario("strict_once client reconnect", ["lost", "clients", "modal", "strikes", "threads"], 900,
           "submit ACK is lost after admission and polls disconnect; real client reconnects to the SAME batch, never submits twice")
 def strict_once_reconnect(code):
