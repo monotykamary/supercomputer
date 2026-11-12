@@ -21,6 +21,11 @@ class SingleProbeTrips(Breaker):
         return "kept"
 
 
+# gdp: law a disabled start breaker has no deadline: enabled or result == 0
+def disabled_breaker_still_blocks(enabled: bool, open_until: float) -> float:
+    return open_until
+
+
 class ForceRejudgeClosesOutage(Breaker):
     """An operator command must not be a disguised force-close."""
 

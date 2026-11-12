@@ -27,7 +27,8 @@ def sched() -> S.Scheduler:
     s.starts_log, s.shed, s.target, s.bring_up = [], False, {}, 60.0
     s.br = {"open_until": 0.0, "backoff": S.BREAK_BACKOFF, "half": False, "t_trip": 0.0, "reason": "", "trips": 0}
     s.m = s._metrics_new("test")
-    s.pol = {**S.policy_defaults(), "generation": 3}
+    # This fixture exercises the legacy opt-in breaker; production defaults remain off.
+    s.pol = {**S.policy_defaults(), "start_breaker_enabled": True, "generation": 3}
     s.held_before, s.est_hist, s.class_obs = {}, {}, {}
     return s
 

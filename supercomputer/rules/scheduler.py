@@ -558,6 +558,13 @@ class Acquire:
         return self.warm + self.resumes + self.creates
 
 
+# gdp: law a disabled start breaker has no deadline: enabled or result == 0
+# gdp: law an opted in start breaker keeps its deadline: not enabled or result == open_until
+def breaker_deadline(enabled: bool, open_until: float) -> float:
+    """Policy projection only: never erase recorded trip history to allow starts."""
+    return open_until if enabled else 0.0
+
+
 # gdp: law an outage is at least two ready VMs, half of them or more failing: not result or (ready >= 2 and 2 * failing >= ready)
 # gdp: law an isolated worker failure is not a pool outage: not result or failing >= 2
 def outage(ready: int, failing: int) -> bool:

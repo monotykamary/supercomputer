@@ -145,13 +145,16 @@ adopts any left without an owner.
 
 **Capacity, cheapest first:** a free slot on a warm VM, then a lower class's slot, then a free start, then a paid one.
 The pool grows only for queued work the warm VMs can't clear within the hour (a gate's within 15 minutes), never on
-a timer, and a circuit breaker stops every start when recent ones keep failing: more than half of at least
-three starts (also while half-open), or a correlated outage of the provider front. A single failed stopped-VM
+a timer. The pool-wide start-readiness / provider-front circuit breaker is **disabled by default**:
+`start_breaker_enabled=false`. It never suppresses starts or limits them to one probe while disabled,
+even if an older controller left an OPEN record. Explicit opt-in is
+`supercomputer policy start_breaker_enabled=true`; then it stops starts for a sampled majority of
+failures (at least the configured minimum, with an absolute floor of three), or a correlated front outage. A single failed stopped-VM
 resume quarantines only that VM from acquisition/adoption, durably across controller handoffs, and still counts
 as a fruitless CPU draw. It does not escalate the pool-wide pause; a successful probe closes the breaker.
 On startup or hot handoff, an inherited OPEN pause is rejudged under the current sample minimum and
-quarantine rules. A disqualified readiness sample closes; a real multi-start or provider-front outage stays
-open. Incomplete or unrecognized evidence is retained conservatively. The original trip and decision are
+quarantine rules. With the start breaker disabled, any inherited pause closes. While explicitly opted
+in, a disqualified readiness sample closes; a real multi-start or provider-front outage stays open. Incomplete or unrecognized evidence is retained conservatively. The original trip and decision are
 fsynced to `scheduler/breaker-rejudge.jsonl` before any state change.
 Operators can request the same non-forcing decision with
 `supercomputer controller breaker rejudge --reason 'why this needs review'` (capability

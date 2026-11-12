@@ -182,7 +182,7 @@ POLICY = config.LIVE / "policy.json"
 
 
 def policy_defaults() -> dict:
-    return {"floor": _env("FLOOR", 8), "max_vms": 0 if MAX_VMS >= 10 ** 9 else MAX_VMS, "hold_s": HOLD, "gate_horizon_s": GATE_HORIZON, "start_dollars": START_DOLLARS, "vm_hour_dollars": VM_HOUR_DOLLARS, "idle_s": boat.IDLE,
+    return {"start_breaker_enabled": False, "floor": _env("FLOOR", 8), "max_vms": 0 if MAX_VMS >= 10 ** 9 else MAX_VMS, "hold_s": HOLD, "gate_horizon_s": GATE_HORIZON, "start_dollars": START_DOLLARS, "vm_hour_dollars": VM_HOUR_DOLLARS, "idle_s": boat.IDLE,
             "ttl_s": boat.BACKSTOP, "bringup": BRINGUP_MAX, "sub_vms": SUB_VMS, "sub_preempt_s": SUB_PREEMPT, "boat_tries": BOAT_TRIES, "classes": list(CLASSES),
             "drain_step": DRAIN_STEP, "drain_every_s": DRAIN_EVERY, "floor_always": bool(FLOOR_ALWAYS),
             "floor_default": FLOOR_DEFAULT, "floor_idle_s": FLOOR_IDLE, "floor_by_image": dict(FLOOR_BY_IMAGE),
@@ -1774,7 +1774,7 @@ class Scheduler:
         return {"scope": "native-single-vm", "runtime_verified": True, "code": code_hash(),
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
-                "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1,
+                "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
                 "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -2353,7 +2353,9 @@ class Scheduler:
                             "starts": starts, "items_placed": items, "starts_per_100_items": round(100 * starts / items, 1) if items else None,
                             "items_placed_warm": self.m["placed_warm"], "max_binds": self.m.get("max_binds", 0), "hold_ends": self.m["hold_ends"], "peak_vms": self.m["peak_vms"],
                             "breaker_trips": self.m["breaker_trips"], "not_ready": self.m["not_ready"]},
-                    "breaker": {**self.br, "open": now < self.br["open_until"], "open_for_s": max(0, round(self.br["open_until"] - now))},
+                    "breaker": {**self.br, "enabled": self._breaker_enabled(), "half": self._breaker_enabled() and self.br["half"],
+                                 "open": now < rules.breaker_deadline(self._breaker_enabled(), self.br["open_until"]),
+                                 "open_for_s": max(0, round(rules.breaker_deadline(self._breaker_enabled(), self.br["open_until"]) - now))},
                     "resume_quarantine": dict(getattr(self, "resume_quarantine", {})),
                     "shed": self.shed, "load": self.load, "bring_up_s": round(self.bring_up, 1), "alerts": self.alerts[-5:],
                     "policy": self.pol, "hot_handoff": 1, "code": self.code, "code_installed": getattr(self, "_status_installed_code", self.code), "agent_code": self.agent_version, "stale": self.stale(),
@@ -3319,7 +3321,8 @@ class Scheduler:
         # coming up), the breaker; within max_vms and the bring-up cap, none while the breaker is open but one probe)
         pool, in_flight = rules.Pool(max(1, MAX_VMS), max(1, BRINGUP_MAX), int(BREAK_BACKOFF), int(BREAK_MAX)), self._in_flight()
         pool.held, pool.coming = len(live) + sum(self.creating.values()) - in_flight, in_flight
-        pool.open_until, pool.half = float(self.br["open_until"]), bool(self.br["half"])
+        pool.open_until = rules.breaker_deadline(self._breaker_enabled(), float(self.br["open_until"]))
+        pool.half = self._breaker_enabled() and bool(self.br["half"])
         pool.probing = pool.half and any(s["ok"] is None for s in self.starts_log if s["t"] > self.br["t_trip"])
         self.target = {}
         # Advisory only: acquisition rechecks the registry under its lease lock.
@@ -4771,9 +4774,16 @@ class Scheduler:
                 self.vms.pop(vm.id, None)
 
     # -- the breaker, the watchdog, the day's accounts
+    def _breaker_enabled(self) -> bool:
+        """Start throttling is an explicit opt-in; per-worker correctness guards are independent."""
+        return getattr(self, "pol", {}).get("start_breaker_enabled") is True
+
     def _breaker_rejudge_evidence(self, now: float) -> dict:
         """Retain historical evidence if incomplete; quarantined workers never count as a current outage."""
         quarantine = getattr(self, "resume_quarantine", {})
+        if not self._breaker_enabled():
+            return {"enabled": False, "known": True, "judged": 0, "bad": 0, "outage": False,
+                    "minimum": max(3, BREAK_MIN), "historical": None, "quarantined": sorted(quarantine)}
         def judged(rows, at):
             return [s for s in rows if s.get("ok") is not None or at - s["t"] > BREAK_READY]
         def counts(rows):
@@ -4805,7 +4815,7 @@ class Scheduler:
         need = max(3, BREAK_MIN)
         if historical and historical[0] >= need and 2 * historical[1] > historical[0]:
             n, bad = historical
-        return {"known": known, "judged": n, "bad": bad, "outage": outage,
+        return {"enabled": True, "known": known, "judged": n, "bad": bad, "outage": outage,
                 "minimum": need, "historical": historical, "quarantined": sorted(quarantine)}
 
     def rejudge_breaker(self, *, source: str = "operator", actor: str = "operator", reason: str = "") -> dict:
@@ -4846,6 +4856,8 @@ class Scheduler:
     def trip(self, reason: str, *, evidence: dict | None = None):
         """The circuit breaker opens: no start (free or paid) for its backoff, doubled at each trip in a row; then one
         start as a probe, and starts again only once a probe came up."""
+        if not self._breaker_enabled():
+            return
         now = time.time()
         with self.lock:
             b = self._breaker()
@@ -4860,6 +4872,8 @@ class Scheduler:
         self._metrics_save()
 
     def _breaker_eval(self, now: float):
+        if not self._breaker_enabled():
+            return
         recent = [s for s in self.starts_log if s["t"] > self.br["t_trip"] and now - s["t"] < BREAK_WINDOW
                   and s.get("vm") not in getattr(self, "resume_quarantine", {})]
         judged = [s for s in recent if s["ok"] is not None or now - s["t"] > BREAK_READY]

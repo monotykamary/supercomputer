@@ -403,7 +403,7 @@ def one_vm_one_strike(code):
           "the first starts never come up and the breaker opens; a gate waits through it with max_wait 60: no strike for the scheduler's own wait")
 def breaker_wait(code):
     from tests.sim.harness import items
-    sim = _sim(code, cfg={"never_ready_until": 500})
+    sim = _sim(code, cfg={"never_ready_until": 500}, policy={"start_breaker_enabled": True})
     sim.scheduler()
     sim.at(1, lambda: sim.batch("bar-1", "gate", items("g", 40, 300), max_wait=0, on_lost=False))
     sim.at(560, lambda: sim.batch("bar-2", "gate", items("h", 8, 120), max_wait=60))
@@ -1553,7 +1553,7 @@ def several_clients(code):
           "boat's front 502s for 10 min (boat exec still answers), then exec fails too for 5 min: no VM lost, nothing struck")
 def front_failing(code):
     from tests.sim.harness import items
-    sim = _sim(code)
+    sim = _sim(code, policy={"start_breaker_enabled": True})
     _warm(sim, 10)
     sim.scheduler()
     sim.at(10, lambda: sim.batch("lane-a", "submission", items("s", 80, 600)))
@@ -2639,6 +2639,7 @@ def breaker_single_failed_resume(code):
     sim.w.cli_resume = fail_only_known
     def half_open():
         s = sim.w.live_sched()[1]
+        s.pol["start_breaker_enabled"] = True  # explicitly exercise the legacy opt-in
         s.br.update(half=True, open_until=sim.k.now - 1, t_trip=sim.k.now - 2, backoff=3600, trips=4)
     def sample():
         s = sim.w.live_sched()[1]
@@ -2664,7 +2665,7 @@ def breaker_single_failed_resume(code):
 
 def _inherited_breaker_fixture(code, failures):
     import json
-    sim = _sim(code, policy={"max_vms": 2, "floor_default": 1})
+    sim = _sim(code, policy={"max_vms": 2, "floor_default": 1, "start_breaker_enabled": True})
     _warm(sim, 1)
     now = sim.k.t0
     state = {"breaker": {"open_until": now + 3600, "half": True, "backoff": 3600,
@@ -2711,6 +2712,27 @@ def inherited_real_outage_kept(code):
     return sim, {'extra': lambda sim, m: observed}
 
 
+@scenario("default start breaker off", ["clients", "threads"], 400,
+          "an inherited open/half-open record and repeated failures cannot block new starts by default")
+def start_breaker_disabled_by_default(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 2, "floor_default": 0})
+    sim.scheduler()
+    observed = {}
+    def stale_pause():
+        s = sim.w.live_sched()[1]
+        s.br.update(open_until=sim.k.now + 3600, half=True, trips=31, t_trip=sim.k.now - 20)
+        s.starts_log = [{'t': sim.k.now - 10, 'vm': f'failed-{i}', 'ok': False} for i in range(8)]
+        s._breaker_eval(sim.k.now)
+        s.trip("boat's front: the agents of 2 of 2 VMs don't answer")
+        observed.update(default_off=not s._breaker_enabled(), no_escalation=s.br['trips'] == 31)
+    sim.at(5, stale_pause)
+    bid = sim.batch('not-blocked', 'gate', items('g', 2, 20), after=10)
+    def extra(sim, m):
+        return {**observed, 'started_despite_pause': any(e['kind'] == 'item_started' and e.get('batch') == bid for e in sim.w.events)}
+    return sim, {'extra': extra}
+
+
 @scenario("worker-local quarantine", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 1000,
           "one legacy worker loses its agent listener while a live run remains: quarantine only that worker, retain ownership, and serve gates elsewhere")
 def local_worker_quarantine(code):
@@ -2751,7 +2773,7 @@ def local_worker_quarantine(code):
           "a real two-worker front-and-exec outage still trips the pool breaker and recovers without quarantining either worker as local")
 def multi_worker_front_outage(code):
     from tests.sim.harness import items
-    sim = _sim(code, policy={"max_vms": 2, "floor_default": 2})
+    sim = _sim(code, policy={"max_vms": 2, "floor_default": 2, "start_breaker_enabled": True})
     _warm(sim, 2)
     sim.scheduler()
     sim.batch("front-work", "gate", items("f", 8, 600), after=5)
@@ -2820,6 +2842,7 @@ def cpu_known_resume_exhausted(code):
     from tests.sim.harness import items
     sim, known = _known_cpu_resume_fixture(code)
     def breaker():
+        sim.w.live_sched()[1].pol["start_breaker_enabled"] = True
         sim.w.live_sched()[1].br["open_until"] = sim.k.t0 + 60
     sim.at(5, breaker)
     bid = sim.batch("known-resume", "gate", items("k", 1, 30, cpu_model="sim-cpu", vm_type="large", timing=True),
