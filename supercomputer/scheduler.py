@@ -3327,6 +3327,7 @@ class Scheduler:
         self.target = {}
         # Advisory only: acquisition rechecks the registry under its lease lock.
         registry = Registry().read() if any(key[2] for key in groups) else {"vms": {}}
+        fresh_reserved = {}  # one speculative window per image/type/model, across distinct groups
         for (image, vm_type, model, distinct, required), its in groups.items():
             # A worker can wait one full scheduling pass after becoming ready.
             S, bu = vm_slots(vm_type), max(30.0, self.bring_up) + FULL_S
@@ -3346,9 +3347,9 @@ class Scheduler:
                                   and not getattr(v, "cpu_known_resume", False)
                                   and v.image == image and v.type == vm_type for v in live)
                 draw_pending = coming + max(pending, speculative)
-                coming += max(sum(not d["done"] for d in draw["draws"]), unresolved)
+                coming = 0  # unverified draws are not promised matching CPU capacity
                 reusable = self._known_cpu_reuse(registry, image, vm_type, model, used_vms)
-                if not coming:
+                if not coming and not unresolved:
                     for it in its:
                         if (draw["fruitless"] >= self._constraint_limit(it) and not reusable
                                 and not any(vm_fits(fit_shape(it), v, self.retired()) for v in held)):
@@ -3525,8 +3526,18 @@ class Scheduler:
                 if n > earned and free_fit:
                     self._h().record_needless(now, n - earned, image, vm_type)
             tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "break_even_s": B, "growth_source": "legacy override" if BREAK_EVEN_OVERRIDE_S else "economics", "why": ""}
+            fresh_target = False
             if model:
-                n = rules.cpu_capacity(n, len(reusable), draw["fruitless"], draw_pending, limit)
+                draw_key = (image, vm_type, model)
+                needs_cpu = lane_need > 0 or any(self._slot(it) is None for it in real)
+                fresh = rules.cpu_parallel_draws(needs_cpu, BRINGUP_MAX, draw_pending + fresh_reserved.get(draw_key, 0), draw["fruitless"], limit)
+                fresh_target = fresh > 0
+                n = fresh if fresh_target else rules.cpu_capacity(n, len(reusable), draw["fruitless"], draw_pending, limit)
+                tgt["want"] = n
+                tgt["fresh_draws"] = fresh
+                tgt["speculative_pending"] = draw_pending
+                tgt["known_resumes_pending"] = sum(not v.ready and getattr(v, "cpu_known_resume", False)
+                    and v.image == image and v.type == vm_type and getattr(v, "cpu_constraint", "") == model for v in live)
                 tgt["known_cpu_reuse"] = len(reusable)
                 tgt["cpu_model"] = model
                 tgt["fruitless"] = draw["fruitless"]
@@ -3538,7 +3549,15 @@ class Scheduler:
                     n, tgt["why"] = 0, "shed"
                 else:
                     at_max = pool.max_vms - pool.held - pool.coming < n
+                    # Known resumes may take minutes and do not consume the fresh-start window.
+                    # Keep the physical max-vms bound intact while exempting them from bringup.
+                    exempt = sum(not v.ready and getattr(v, "cpu_known_resume", False) for v in live) if fresh_target else 0
+                    n = min(n, max(0, pool.max_vms - pool.held - pool.coming))
+                    pool.coming = max(0, pool.coming - exempt)
                     got = pool.grow(n, now)
+                    pool.coming += exempt
+                    if fresh_target:
+                        fresh_reserved[draw_key] = fresh_reserved.get(draw_key, 0) + got
                     if got < n and not tgt["why"]:
                         if at_max and now - getattr(self, "_max_t", 0) > 300:
                             self._max_t = now
@@ -3729,8 +3748,17 @@ class Scheduler:
                           if it.state == "queued" and it.spec.get("cpu_model") == model
                           and (it.spec.get("vm_type") or batch.vm_type) == vm_type]
                 limit = max(limits, default=int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS)))
-                n = min(n, len(up) + rules.cpu_capacity(max(0, n - len(up)),
-                        sum(i in known for i in stopped), c["fruitless"], self._constraint_pending(c), limit))
+                pending = self.creating.get((image, vm_type), 0) + max(self._constraint_pending(c),
+                    sum(not v.dead and not v.ready and not getattr(v, "cpu_known_resume", False)
+                        and v.image == image and v.type == vm_type and getattr(v, "cpu_constraint", "") == model
+                        for v in self.vms.values()))
+                fresh = rules.cpu_parallel_draws(bool(limits), BRINGUP_MAX, pending, c["fruitless"], limit)
+                if fresh > 0:
+                    stopped = []  # a stale matching cache must not serialize fresh candidates
+                    n = min(n, len(up) + fresh)
+                else:
+                    n = min(n, len(up) + rules.cpu_capacity(max(0, n - len(up)),
+                            sum(i in known for i in stopped), c["fruitless"], pending, limit))
             acq = rules.Acquire()  # warm first; resumes/creations still obey the provider start budget
             acq.plan(max(0, n), len(up), len(stopped), max(0, budget))
             pick = up[:acq.warm] + stopped[:acq.resumes]
@@ -3758,7 +3786,7 @@ class Scheduler:
             self.vms[i] = vm
         threading.Thread(target=self._up, args=(vm, k, b), daemon=True).start()
 
-    def _count_start(self, k: int, b: Batch, got: int, paid: int, ids: list[str], vm_type: str = "", model: str = "", known_resume: bool = False):
+    def _count_start(self, k: int, b: Batch, got: int, paid: int, ids: list[str], vm_type: str = "", model: str = "", known_resume: bool = False, how: str = ""):
         with self.lock:
             n = NAMES[k]
             self.m["starts"][n]["paid"] += paid
@@ -3766,7 +3794,7 @@ class Scheduler:
             b.starts += got
             for i in ids:
                 if model:
-                    self._constraint(b.image, vm_type, model)["draws"].append({"vm": i, "t": time.time(), "model": None, "done": False,
+                    self._constraint(b.image, vm_type, model)["draws"].append({"vm": i, "t": time.time(), "model": None, "done": False, "how": how,
                         **({"known_resume": True} if known_resume else {})})
                     self._constraints_save()
                 self.starts_log.append({"t": time.time(), "vm": i, "ok": None, "image": b.image})
@@ -3809,7 +3837,7 @@ class Scheduler:
                 # Override the released VM's 60s TTL in the resume itself;
                 # extending after bootstrap is too late if hydration/claim takes longer.
                 self._count_start(k, b, 1, paid, [vm.id], vm.type, getattr(vm, "cpu_constraint", ""),
-                                  known_resume=getattr(vm, "cpu_known_resume", False))
+                                  known_resume=getattr(vm, "cpu_known_resume", False), how="resumed")
                 started = True
                 out = boat.boat("resume", vm.id, "--ttl", str(vm.ttl), "--json", check=False, timeout=300)
                 if boat.R.resume_replaces(boat.resume_missing(out), False):
@@ -3887,13 +3915,22 @@ class Scheduler:
                 with self.lock:
                     self._constraint(vm.image, vm.type, vm.cpu_constraint)["observed"][vm.id] = vm.model
                     self._constraints_save()
-            vm.ready = True
-            vm.t_ready = vm.idle_since = vm.t_real = time.time()
-            if vm.id in self.held_before:
-                vm.t_real = float(self.held_before[vm.id].get("t_real", vm.t_real))
-            if started:
-                self._start_done(vm.id, True)
-                self.bring_up = 0.8 * self.bring_up + 0.2 * (vm.t_ready - vm.t_lease)
+            with self.lock:
+                vm.ready = True
+                vm.t_ready = vm.idle_since = vm.t_real = time.time()
+                if vm.id in self.held_before:
+                    vm.t_real = float(self.held_before[vm.id].get("t_real", vm.t_real))
+                if started:
+                    self._start_done(vm.id, True)
+                    started = False
+                    self.bring_up = 0.8 * self.bring_up + 0.2 * (vm.t_ready - vm.t_lease)
+                discard = rules.cpu_discard_candidate(getattr(vm, "cpu_constraint", ""), vm.model, len(vm.running), len(vm.finishing), getattr(vm, "foreign", 0))
+                if discard:
+                    vm.dead, vm.ready = True, False  # never advertise a doomed candidate to placement
+            if discard:
+                log(f"{vm.id}: CPU candidate {vm.model} != {vm.cpu_constraint}; releasing empty owned VM")
+                self._let_go(vm, stop=True)
+                return
             self._worker(vm)
             log(f"{vm.id} ({vm.how}) ready for {NAMES[k]} in {vm.t_ready - vm.t_lease:.0f} s" if vm.how != "adopt" else f"{vm.id} adopted (agent {vm.agent})")
         except boat.LeaseProtocolLost:
@@ -3936,7 +3973,7 @@ class Scheduler:
                 boat.note_starts(-(got - len(ids)))
                 if not ids:
                     self.alert(f"boat new --from {image} made no VM ({out.strip()[-200:]})")
-            self._count_start(k, b, len(ids), min(paid, len(ids)), ids, vm_type, model)
+            self._count_start(k, b, len(ids), min(paid, len(ids)), ids, vm_type, model, how="created")
             with Registry().locked() as d:
                 for i in ids:
                     d["vms"][i] = {"type": vm_type, "snapshot": image, "created": time.time(), "last_used": time.time(), "state": "starting",

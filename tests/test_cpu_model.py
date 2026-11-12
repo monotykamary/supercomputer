@@ -119,7 +119,7 @@ def test_per_item_override_can_resume_a_scarce_constraint():
     assert low.state == "done" and high.state == "queued"
     assert b.rows[0]["constraint"]["limit"] == 2
     assert b.rows[0]["constraint"]["models"] == {OTHER: 2}
-    assert sum(n for n, *_ in plan.values()) == 1
+    assert sum(n for n, *_ in plan.values()) == 3  # fill the remaining speculative window
     assert s._constraint_status()[0]["limit"] == 5
     for value in (0, -1, True, 1.5, "20"):
         spec = {"name": "a", "cpu_model": MODEL, "vm_type": "xlarge", "cpu_model_max_fruitless": value}

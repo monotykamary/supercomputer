@@ -32,6 +32,24 @@ def cpu_capacity(wanted: int, known: int, fruitless: int, pending: int, limit: i
     return min(wanted, known + max(0, limit - fruitless - pending))
 
 
+# gdp: law parallel fresh draws stay within the bringup window: result + pending <= window or result == 0
+# gdp: law parallel fresh draws stay within the fruitless allowance: result + pending + fruitless <= limit or result == 0
+# gdp: law no speculative draws without queued pinned work: queued or result == 0
+# gdp: law an empty window with allowance launches the whole window: not queued or pending != 0 or fruitless + window > limit or result == window
+def cpu_parallel_draws(queued: bool, window: int, pending: int, fruitless: int, limit: int) -> int:
+    if window < 0 or pending < 0 or fruitless < 0 or limit < 1:
+        raise ValueError("nonnegative counts and positive limit required")
+    if not queued:
+        return 0
+    return min(max(0, window - pending), max(0, limit - fruitless - pending))
+
+
+# gdp: law a released candidate is a confirmed CPU mismatch: not result or (requested != "" and actual != "" and actual != requested)
+# gdp: law a candidate with any work is never discarded: not result or (running == 0 and finishing == 0 and foreign == 0)
+def cpu_discard_candidate(requested: str, actual: str, running: int, finishing: int, foreign: int) -> bool:
+    return requested != "" and actual != "" and actual != requested and running == 0 and finishing == 0 and foreign == 0
+
+
 # gdp: law only a verified known matching resume is exempt: result or (known_resume and expected != "" and actual == expected)
 # gdp: law a verified known matching resume does not count: not known_resume or expected == "" or actual != expected or not result
 # gdp: law an unknown or new draw always counts: known_resume or result

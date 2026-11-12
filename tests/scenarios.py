@@ -2733,6 +2733,46 @@ def start_breaker_disabled_by_default(code):
     return sim, {'extra': extra}
 
 
+@scenario("parallel 9950X draws", ["clients", "threads"], 500,
+          "two R4 pins plus one cause pin and a stale known resume launch ten fresh candidates in parallel, releasing mismatches")
+def parallel_cpu_candidates(code):
+    from tests.sim.harness import IMAGE, items
+    model='AMD Ryzen 9 9950X 16-Core Processor'
+    other='AMD EPYC 4585PX 16-Core Processor'
+    sim=_sim(code, cfg={"boot_s":(60,60)}, policy={"floor_default":0,"bringup":10,"max_vms":0})
+    original=sim.w.add_vm
+    created=[]
+    def candidate(*a,**kw):
+        v=original(*a,**kw)
+        v.model=model if len(created)%2==0 else other
+        created.append(v.id)
+        return v
+    sim.w.add_vm=candidate
+    sim.scheduler()
+    def stale():
+        s=sim.w.live_sched()[1]
+        v=sim.S.VMState('stale-known',IMAGE,'xlarge','resumed')
+        v.cpu_constraint,v.cpu_known_resume=model,True
+        s.vms[v.id]=v
+        c=s._constraint(IMAGE,'xlarge',model);c['fruitless']=30
+        c['draws'].append({'vm':v.id,'t':sim.k.now,'model':None,'done':False,'known_resume':True})
+    sim.at(5,stale)
+    r4=sim.batch('R4','gate',items('r4-',2,100,timing=True,cpu_model=model,vm_type='xlarge',cpu_model_max_fruitless=64,distinct_vm_group='R4'),strict_once=True,after=10)
+    cause=sim.batch('cause','gate',items('cause-',1,100,timing=True,cpu_model=model,vm_type='xlarge',cpu_model_max_fruitless=64),strict_once=True,after=10)
+    def extra(sim,m):
+        starts=[e for e in sim.w.events if e['kind']=='start' and e.get('how')=='created']
+        first=min((e['t'] for e in starts),default=0)
+        burst=[e for e in starts if e['t']<=first+2]
+        wrong=[i for i in created if sim.w.vms[i].model==other]
+        runs=[e for e in sim.w.events if e['kind']=='item_started' and e.get('batch') in (r4,cause)]
+        m['parallel_cpu']={'starts':len(starts),'first_burst':len(burst),'wrong':wrong,'runs':runs}
+        return {'ten_parallel_fresh':len(burst)==10,
+                'three_pins_placed':len(runs)==3 and len({e['vm'] for e in runs})==3,
+                'never_stale_or_wrong':all(e['vm']!='stale-known' and sim.w.vms[e['vm']].model==model for e in runs),
+                'mismatches_released':bool(wrong) and all(sim.w.vms[i].state=='stopped' for i in wrong)}
+    return sim,{'extra':extra}
+
+
 @scenario("worker-local quarantine", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 1000,
           "one legacy worker loses its agent listener while a live run remains: quarantine only that worker, retain ownership, and serve gates elsewhere")
 def local_worker_quarantine(code):

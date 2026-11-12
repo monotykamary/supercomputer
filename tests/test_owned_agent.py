@@ -384,7 +384,8 @@ class RealPrivateNamespace(OwnedFixture):
                           "if os.fork()==0:\n"
                           " os.setsid()\n"
                           " if os.fork()==0:\n"
-                          f"  pathlib.Path({str(marker)!r}).write_text(json.dumps(sorted(os.sched_getaffinity(0))))\n"
+                          f"  p=pathlib.Path({str(marker)!r}); tmp=p.with_name(p.name+'.tmp')\n"
+                          "  tmp.write_text(json.dumps(sorted(os.sched_getaffinity(0)))); tmp.replace(p)\n"
                           "  time.sleep(300)\n"
                           " os._exit(0)\n"
                           "time.sleep(300)\n")

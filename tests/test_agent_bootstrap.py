@@ -270,6 +270,7 @@ class ResumeLifetime(unittest.TestCase):
         instance.agent_b64, instance.agent_version = 'EXACT_SOURCE', 'new-hash'
         instance.held_before, instance.bring_up = {}, 30.0
         instance.wake = threading.Event()
+        instance.lock = threading.RLock()  # production readiness publication is atomic with placement
         for name in ('_count_start', '_start_done', '_drop_stale', '_let_go',
                      '_record_agent_ping', '_foreign', '_worker', 'alert'):
             setattr(instance, name, Mock())
