@@ -94,6 +94,46 @@ interrupted, use the bounded read-only `recover_close()` /
 [closed history and recovery](closed-history.md). The original identity checks
 are unchanged.
 
+## Private temporary files and caches
+
+Strict jobs keep the installed Bun/Lean toolchains and agent source read-only.
+They receive these writable defaults inside the existing per-job scratch tree:
+
+| Variable | Default |
+| --- | --- |
+| `TMPDIR` | `<job>/tmp` |
+| `BUN_TMPDIR` | `<job>/tmp` |
+| `XDG_CACHE_HOME` | `<job>/tmp/cache` |
+| `BUN_INSTALL_CACHE_DIR` | `<job>/tmp/cache/bun` |
+
+The absolute paths are unique to the physical job, not shared installation
+caches. The scratch and cache directories are created with mode `0700` and are
+removed by the existing job cleanup. They are not exported as results; copy any
+wanted artifacts to `$SUPERCOMPUTER_OUTPUT_DIR`. This does not make toolchain
+installation directories writable or change attempt, resource, or cleanup rules.
+Ordinary non-strict jobs keep their existing defaults.
+
+These are defaults: job `env` overrides project `env`, which overrides them.
+Explicit paths remain the caller's responsibility, including their permissions
+and isolation. Overriding `TMPDIR` alone does not override the independent Bun
+or XDG cache settings. Strict `HOME` still identifies the worker user and cannot
+be redirected by an environment override.
+
+A wrapper that deliberately clears its environment must forward the settings it
+needs. For example, do not pass only `HOME` and `TMPDIR` to Bun while discarding
+its cache setting: Bun may then select a cache in its read-only installation.
+
+```sh
+env -i PATH="$PATH" HOME="$HOME" \
+  TMPDIR="$TMPDIR" BUN_TMPDIR="$BUN_TMPDIR" \
+  XDG_CACHE_HOME="$XDG_CACHE_HOME" BUN_INSTALL_CACHE_DIR="$BUN_INSTALL_CACHE_DIR" \
+  bun install --frozen-lockfile --ignore-scripts
+```
+
+The agent cannot restore variables intentionally removed by a payload's
+`env -i`. Preflight wrappers should probe their selected temporary/cache paths
+for writability and retain that receipt before installing dependencies.
+
 ## Hash binding and verification
 
 Bind a calibration to the package runtime hash, exact client/scheduler source

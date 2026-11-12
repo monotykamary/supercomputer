@@ -2044,7 +2044,16 @@ def resource_finalize(job_dir):
 def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathlib.Path, cwd: str, argv: list[str]) -> list[str]:
     home = pwd.getpwuid(os.getuid()).pw_dir if spec.get("strict_once") is True else HOME
     tmp = j / "tmp"
-    tmp.mkdir(exist_ok=True)
+    tmp.mkdir(mode=0o700 if spec.get("strict_once") is True else 0o777, exist_ok=True)
+    defaults = {}
+    if spec.get("strict_once") is True:
+        # Installed tools remain read-only. Their scratch/cache defaults belong
+        # to this attempt and are reclaimed with its existing private tmp tree.
+        cache = tmp / "cache"
+        cache.mkdir(mode=0o700, exist_ok=True)
+        defaults = {"TMPDIR": str(tmp.resolve()), "BUN_TMPDIR": str(tmp.resolve()),
+                    "XDG_CACHE_HOME": str(cache.resolve()),
+                    "BUN_INSTALL_CACHE_DIR": str((cache / "bun").resolve())}
     outputs = j / "outputs"
     outputs.mkdir(mode=0o700, exist_ok=True)
     src = f"/src/{ctx.get('name', 'repo')}"
@@ -2073,7 +2082,7 @@ def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathl
     # (bun's install cache in the item's own /tmp: two `bun install`s at once in one shared cache failed, silently,
     # where each Modal container has a HOME of its own)
     env = ["env", "-i", f"PATH={path}", f"HOME={home}", "USER=user", "LOGNAME=user", "SHELL=/bin/bash", "LANG=C.UTF-8", "BUN_INSTALL_CACHE_DIR=/tmp/.bun-install-cache",
-           *[f"{k}={v}" for k, v in {**ctx.get("env", {}), **spec.get("env", {}),
+           *[f"{k}={v}" for k, v in {**defaults, **ctx.get("env", {}), **spec.get("env", {}),
                                       "SUPERCOMPUTER_OUTPUT_DIR": str(outputs.resolve())}.items()],
            *([f"HOME={home}"] if spec.get("strict_once") is True else [])]
     if "runtime" in spec:
