@@ -2429,7 +2429,7 @@ class Scheduler:
                     log(f"{b.id}: no client has asked for it in {ORPHAN_S} s: closed")  # (a client gone for good)
                     self.close(b.id)
             with self.lock:
-                busy = bool(self.batches) or any(v.running for v in self.vms.values())
+                busy = bool(self.batches) or any(v.running for v in self.vms.values()) or not self._pool_settled()
             if not busy:  # (a floor VM held: the scheduler stays to keep it; exiting releases every VM, the floor's too)
                 busy = any(self.floor(img) > 0 for img in {v.image for v in list(self.vms.values()) if not v.dead})
             if busy:
@@ -3293,6 +3293,11 @@ class Scheduler:
         k = self.est_key(it)
         self.est_hist[k] = round(seconds if k not in self.est_hist else 0.7 * self.est_hist[k] + 0.3 * seconds, 2)
         self.class_obs[it.batch.klass] = (self.class_obs.get(it.batch.klass, []) + [round(seconds, 2)])[-200:]
+
+    def _pool_settled(self) -> bool:
+        return rules.handoff_pool_settled(bool(getattr(self, "asking", ())),
+            sum(getattr(self, "creating", {}).values()),
+            sum(not v.ready for v in self.vms.values() if not v.dead))
 
     def _in_flight(self) -> int:
         return sum(self.creating.values()) + sum(1 for v in self.vms.values() if not v.dead and not v.ready)
@@ -5305,15 +5310,16 @@ class Scheduler:
                 if not all(rules.distinct_history_matches(required_durable, prepared[target].get("durable_distinct_vm_group") is True) for target in candidates):
                     self.alert("handoff refused: durable distinct VM groups require a durable-group-aware successor")
                     return
-                if required_cpu and (self.asking or any(self.creating.values()) or any(
-                        not v.ready and getattr(v, "cpu_constraint", "") for v in self.vms.values() if not v.dead)):
-                    log("handoff deferred until CPU draws settle; placement continues")
+                self._prune_handoff_pool(observed)
+                if not self._pool_settled():
+                    # Even after the last pinned item finishes, a draw still belongs to this
+                    # process. Keep serving until every acquisition has a transferable VM.
+                    log("handoff deferred until acquisitions and booting workers settle; placement continues")
                     return
                 if any(it.batch.strict_once and not it.start_done.is_set()
                        for v in self.vms.values() for it in v.running.values()):
                     log("handoff deferred until in-flight strict launches settle; placement continues")
                     return
-                self._prune_handoff_pool(observed)
                 previous_files = {name: (DIR / name).read_bytes() if (DIR / name).exists() else None
                                   for name in ("handoff.json", "handoff.used.json", "handoff.ack")}
                 registry_started = time.monotonic()

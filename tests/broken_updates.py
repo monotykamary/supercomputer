@@ -1,5 +1,17 @@
 """Regressions refused by the same hot-update laws."""
 
+# gdp: law booting workers cannot be omitted by a handoff: not result or booting == 0
+def forget_booting_after_last_pin(acquiring: bool, creating: int, booting: int) -> bool:
+    return not acquiring and creating == 0
+
+
+# gdp: law unregistered creates cannot cross a handoff snapshot: not result or creating == 0
+def forget_create_before_provider_reply(acquiring: bool, creating: int, booting: int) -> bool:
+    return not acquiring and booting == 0
+
+
+
+
 # gdp: law unoffered registry VMs never delay a handoff: not handoff or offered or not result
 def acquire_extra_before_ack(handoff: bool, offered: bool) -> bool:
     return True

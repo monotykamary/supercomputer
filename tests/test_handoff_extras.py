@@ -140,5 +140,33 @@ class DeferredAdoption(unittest.TestCase):
                 self.assertEqual(updates.handoff_registry_vm(handoff, offered), not handoff or offered)
 
 
+class InflightHandoff(unittest.TestCase):
+    def test_idle_and_handoff_share_actual_inflight_state(self):
+        s=object.__new__(scheduler.Scheduler)
+        s.asking,s.creating,s.vms,s.adopting=set(),{},{},False
+        self.assertTrue(s._pool_settled())
+        s.vms['booting']=types.SimpleNamespace(ready=False,dead=False)
+        self.assertFalse(s._pool_settled())
+        s.vms['booting'].ready=True
+        self.assertTrue(s._pool_settled())
+        s.creating[('image','xlarge')]=1
+        self.assertFalse(s._pool_settled())
+        s.creating.clear();s.asking.add("image")
+        self.assertFalse(s._pool_settled())
+        s.asking.clear();s.adopting=True
+        self.assertTrue(s._pool_settled())  # discovery alone is not an acquisition
+
+    def test_snapshot_waits_for_acquisitions_creates_and_booting_workers(self):
+        from supercomputer.rules import updates
+        for acquiring in (False, True):
+            for creating in (0, 1, 10):
+                for booting in (0, 1, 10):
+                    self.assertEqual(updates.handoff_pool_settled(acquiring, creating, booting),
+                                     not acquiring and creating == 0 and booting == 0)
+        for creating, booting in ((-1, 0), (0, -1)):
+            with self.assertRaises(ValueError):
+                updates.handoff_pool_settled(False, creating, booting)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2733,6 +2733,36 @@ def start_breaker_disabled_by_default(code):
     return sim, {'extra': extra}
 
 
+@scenario("handoff after last pin", ["clients", "threads", "orphans", "lost"], 1200,
+          "all pinned items finish on warm workers while ten fresh draws boot; the handoff waits without orphaning them")
+def parallel_draw_handoff(code):
+    from tests.sim.harness import IMAGE, items
+    sim=_sim(code, cfg={"boot_s":(180,180)}, policy={"floor_default":0,"bringup":10,"max_vms":0})
+    for _ in range(2):
+        sim.w.warm_vm(IMAGE).model='sim-cpu'
+    sim.scheduler()
+    bid=sim.batch('late-handoff','gate',items('p',3,5,cpu_model='sim-cpu',vm_type='large',timing=True))
+    observed=[]
+    def attempt():
+        s=sim.w.live_sched()[1]
+        before={'code':s.code,'pending':sum(not v.dead and not v.ready for v in s.vms.values()),
+                'unfinished':sum(it.state!='done' for b in s.batches.values() for it in b.items.values())}
+        observed.append(before)
+        sim.w.install('parallel-handoff-fixed')
+        s.handoff()
+        before['old_kept_serving']=sim.w.live_sched()[1] is s
+    sim.at(100,attempt)
+    def extra(sim,m):
+        # A clean idle exit is allowed after the completed handoff.
+        active=[s for _,s in sim.w.sched_procs if s is not None][-1]
+        m['pending_handoff']=observed
+        return {'late_window_exercised':bool(observed) and observed[0]['pending']==10 and observed[0]['unfinished']==0,
+                'kept_serving_while_booting':bool(observed) and observed[0].get('old_kept_serving') is True,
+                'handoff_eventually_completed':bool(observed) and active.code!=observed[0]['code'],
+                'all_rows_delivered':all(sim.clients[bid]['items'].values())}
+    return sim,{'extra':extra}
+
+
 @scenario("parallel 9950X draws", ["clients", "threads"], 500,
           "two R4 pins plus one cause pin and a stale known resume launch ten fresh candidates in parallel, releasing mismatches")
 def parallel_cpu_candidates(code):

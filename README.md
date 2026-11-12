@@ -168,6 +168,8 @@ window up to `bringup` (10 by default), in addition to unresolved known resumes.
 promised matching capacity until the current boot reports it. The window is shared across distinct groups
 for the same image/type/model; the physical `max_vms` ceiling and remaining per-item fruitless allowance
 still apply. Warm capacity is reused first; fresh candidates no longer queue behind stale stopped-VM resumes.
+A handoff waits for acquisitions and booting workers to settle, even after the last pin finishes;
+the old controller keeps serving (and does not idle-exit) rather than omitting those workers from the takeover snapshot.
 A confirmed non-matching candidate is promptly stopped/released only when its inventory has no running,
 finishing or foreign work. Unknown models are never accepted as matches. New draw records identify
 `how=created` versus `how=resumed`, so fresh-start CPU hit rates can be measured without mixing old cache imports.

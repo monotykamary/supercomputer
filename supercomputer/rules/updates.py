@@ -90,6 +90,16 @@ def handoff_orphan_scope(deferred: bool, acquired: bool) -> bool:
     return not deferred or acquired
 
 
+# gdp: law acquisition cannot cross a handoff snapshot: not result or not acquiring
+# gdp: law unregistered creates cannot cross a handoff snapshot: not result or creating == 0
+# gdp: law booting workers cannot be omitted by a handoff: not result or booting == 0
+# gdp: law a settled pool is eligible for handoff: acquiring or creating != 0 or booting != 0 or result
+def handoff_pool_settled(acquiring: bool, creating: int, booting: int) -> bool:
+    if creating < 0 or booting < 0:
+        raise ValueError("nonnegative in-flight counts required")
+    return not acquiring and creating == 0 and booting == 0
+
+
 # gdp: law a running or unresolved item always requires its VM: not occupied or result
 # gdp: law an empty unavailable VM never blocks handoff: occupied or not unavailable or not result
 # gdp: law a usable VM is still required: unavailable or result
