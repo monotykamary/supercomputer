@@ -382,7 +382,7 @@ def states(max_age: float = 3.0) -> dict:
 
 
 def wait_running(ids: list[str], timeout: int = 600) -> dict:
-    """Waits until each VM answers an exec; returns {id: seconds} for those that did."""
+    """Wait for hydrated, running VMs that answer exec, within the caller's existing budget."""
     t0, ok = time.time(), {}
     pending = list(ids)
     while pending and time.time() - t0 < timeout:
@@ -392,7 +392,8 @@ def wait_running(ids: list[str], timeout: int = 600) -> dict:
             time.sleep(3)
             continue
         for i in list(pending):
-            if states_.get(i, {}).get("state") in RUNNING:
+            status = states_.get(i, {})
+            if R.bootstrap_exec_allowed(status.get("state") in RUNNING, status.get("hydrated") is True):
                 r = exec_(i, ["true"], 30)
                 if r.get("exitCode") == 0:
                     ok[i] = round(time.time() - t0, 1)

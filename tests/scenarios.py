@@ -2271,6 +2271,55 @@ def exclusive_guessed_end(code):
     return sim, {"extra": extra}
 
 
+@scenario("11-12 resumed hydration", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 600,
+          "a resumed VM answers true before its disk hydrates: wait inside the existing readiness budget, then launch exactly once")
+def resumed_hydration(code):
+    from tests.sim.harness import items, IMAGE
+    sim = _sim(code, cfg={"resume_s": (1, 1), "api_s": 0.1, "exec_s": 0.1, "rpc_s": 0.1},
+               policy={"floor_default": 0})
+    vm = sim.w.warm_vm(IMAGE, vm_type="xlarge", held=False)
+    sim.w.stop(vm, "fixture")
+    observations = {"premature_bootstrap": 0, "hydrated_at": None}
+    resume, execute = sim.w.cli_resume, sim.w.cli_exec
+
+    def delayed_resume(args):
+        result = resume(args)
+        if args[1] == vm.id:
+            vm.hydrated = False
+            def hydrate():
+                sim.k.sleep(300)
+                vm.hydrated = True
+                observations["hydrated_at"] = sim.k.now
+                sim.w.note("hydrated", vm=vm.id)
+            sim.k.start(sim.k.world, hydrate, name="resumed disk hydration")
+        return result
+
+    def disk_exec(args):
+        argv = args[args.index("--") + 1:]
+        if args[1] == vm.id and argv != ["true"] and not getattr(vm, "hydrated", True):
+            observations["premature_bootstrap"] += 1
+            sim.k.sleep(90)
+            return json.dumps({"exitCode": 143, "stdout": "", "stderr": "", "success": False})
+        return execute(args)
+
+    sim.w.cli_resume, sim.w.cli_exec = delayed_resume, disk_exec
+    sim.scheduler()
+    bid = sim.batch("hydration", "submission",
+                    items("h", 1, 5, est=600, weight=8, timing=True),
+                    vm_type="xlarge", vm_named=True, strict_once=True, after=5)
+
+    def extra(sim, m):
+        runs = [e for e in sim.w.events if e["kind"] == "item_started" and e.get("batch") == bid]
+        starts = [e for e in sim.w.events if e["kind"] == "start"]
+        m["hydration"] = {**observations, "starts": starts, "runs": runs}
+        return {"no_bootstrap_before_hydration": observations["premature_bootstrap"] == 0,
+                "one_resume_no_replacement": len(starts) == 1 and starts[0]["how"] == "resumed" and starts[0]["vm"] == vm.id,
+                "original_strict_attempt_after_hydration": len(runs) == 1 and runs[0]["vm"] == vm.id and
+                    observations["hydrated_at"] is not None and sim.k.t0 + runs[0]["t"] >= observations["hydrated_at"],
+                "unchanged_breaker_window": sim.S.BREAK_READY == 480 and all(s.br["trips"] == 0 for _, s in sim.w.sched_procs if s is not None)}
+    return sim, {"extra": extra}
+
+
 @scenario("11-08 missing resume", ["threads"], 600,
           "the dedicated fallback receives a direct 404: discard only its own lease, refund the non-start, create once, never retry the missing ID")
 def missing_dedicated_resume(code):

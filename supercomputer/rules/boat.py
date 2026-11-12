@@ -42,6 +42,14 @@ def agent_http_reusable(idle_s: float, ttl: float, connected: bool, readable: bo
     return connected and not readable and idle_s < ttl
 
 
+# gdp: law bootstrap exec requires a running VM: running or not result
+# gdp: law bootstrap exec requires completed hydration: hydrated or not result
+# gdp: law hydrated running VMs may be probed: result == (running and hydrated)
+def bootstrap_exec_allowed(running: bool, hydrated: bool) -> bool:
+    """A cheap exec can succeed before resumed disk hydration; it is not a disk-ready signal."""
+    return running and hydrated
+
+
 # ------------------------------------------------------------------------------------------------- leases and holders
 # gdp: law another host's holder is never presumed dead: host == "" or host == here or result
 # gdp: law a holder of this host, or of no host (an old record), whose pid is gone is dead: not ((host == "" or host == here) and probe == "gone") or not result

@@ -155,9 +155,9 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 Every def of supercomputer/boat.py (153): in a rule of supercomputer/rules/boat.py (the code calls it; the laws
 named are proven by `tests/check_laws.sh`), a decision not yet in a rule (with why), or I/O with no decision (with why).
 
-- in rules/boat.py: 48
+- in rules/boat.py: 49
 - decisions not yet in a rule: 24
-- I/O, no decision: 81
+- I/O, no decision: 80
 
 All of rules/boat.py's laws are proven and checked from any state since gdp-wired-laneS ec3654e/ca8d263 (boat-2: a product guarded at 0 or above; boat-3: LONG = IDLE; boat-4: a field never shadowed by another method's argument; boat-5: the largest inductive set from any state).
 
@@ -186,7 +186,7 @@ Scheduled.run's dropped items (DropsUnreported), the ledger's undercount of resu
 | 275 | `sandboxes` | I/O, no decision: boat list --all |
 | 282 | `named_snapshots` | I/O, no decision: boat snapshot list, cached |
 | 296 | `states` | I/O, no decision: boat list, at most every 3 s |
-| 305 | `wait_running` | I/O, no decision: polls boat until the VMs are up and answer exec, or a timeout |
+| 384 | `wait_running` | **in rules/boat.py**: `bootstrap_exec_allowed` requires a running state and explicit completed hydration before the existing exec probe; timeout, polling and exec are I/O. Unknown hydration is not readiness. |
 | 330 | `layers` | **decision, not yet in rules/boat.py**: each layer's snapshot name is a hash of the image salt and every script up to it, so editing a layer renames it and every layer above, never below: a property of sha256 chaining the prover's arithmetic doesn't read (hashes aren't numbers it models); held by construction |
 | 347 | `image_name` | I/O, no decision: $SUPERCOMPUTER_IMAGE or the top layer's name |
 | 357 | `build_layer` | **decision, not yet in rules/boat.py**: a build's sequence on one VM (poll its exit every 20 s, give up past 6600 s, refuse to snapshot when the credential check fails, delete the VM always); each a single condition on I/O results, the credential gate the one that matters; left for a follow-up rule |

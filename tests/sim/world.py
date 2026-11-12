@@ -318,7 +318,7 @@ class World:
             vs = [v for v in vs if v.state == RUNNING]
         page = int(self.cfg.get("list_page", 10 ** 9))
         vs.sort(key=lambda v: (v.state == RUNNING, v.t_created))
-        return json.dumps({"sandboxes": [{"id": v.id, "name": getattr(v, "pool_name", v.image), "state": v.state, "type": v.type, "snapshotAvailable": True} for v in vs[:page]],
+        return json.dumps({"sandboxes": [{"id": v.id, "name": getattr(v, "pool_name", v.image), "state": v.state, "type": v.type, "hydrated": getattr(v, "hydrated", True), "snapshotAvailable": True} for v in vs[:page]],
                            "pageInfo": {"hasMore": len(vs) > page, "limit": page, "nextCursor": "c" if len(vs) > page else None}})
 
     def cli_snapshots(self, args):

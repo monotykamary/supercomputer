@@ -6,6 +6,16 @@ from typing import Literal
 from supercomputer.rules.boat import Entry, Reports, Resume, RunEnd
 
 
+# gdp: law bootstrap exec requires completed hydration: hydrated or not result
+def bootstrap_before_hydration(running: bool, hydrated: bool) -> bool:
+    return running
+
+
+# gdp: law bootstrap exec requires a running VM: running or not result
+def bootstrap_without_running(running: bool, hydrated: bool) -> bool:
+    return hydrated
+
+
 # gdp: law expired idle HTTP sockets are not reused: idle_s < ttl or not result
 def broken_no_age(idle_s: float, ttl: float, connected: bool, readable: bool) -> bool:
     return connected and not readable
