@@ -522,7 +522,7 @@ def fit_shape(it) -> tuple:
 def vm_fits(shape: tuple, vm, retired: set) -> bool:
     """rules.vm_fits for an item of `shape` on the VM: the one test of placement, preemption and waste."""
     image, _k, _t, _w, vtype, avoid, mem, model, distinct, required = shape
-    return not getattr(vm, "upgrading", False) and agent_capabilities_match(dict(required), getattr(vm, "agent_capabilities", {})) and (not distinct or len(distinct) != 4 or distinct[3]) and rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
+    return not getattr(vm, "quarantine", "") and not getattr(vm, "upgrading", False) and agent_capabilities_match(dict(required), getattr(vm, "agent_capabilities", {})) and (not distinct or len(distinct) != 4 or distinct[3]) and rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
                          bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
 
 
@@ -590,6 +590,9 @@ class VMState:
         self.t_real = time.time()  # its last real (non-filler) work: a VM above the floor goes HOLD s after it
         self.draining = False  # (past its hold: no new filler; released once empty)
         self.failing = 0  # ticks failed in a row
+        self.quarantine, self.quarantine_since = "", 0.0
+        self.repair_lock = threading.Lock()
+        self.recovery_result = {}
         self.disk: dict = {}  # its agent's last word on its disk ({free_mb, total_mb}), with each tick
         self.disk_low = False  # (below rules.disk_ok's threshold: nothing placed there)
         self.t_disk = time.time()  # (that word's time; an empty VM first asked 5 min after it came, its ticks telling before)
@@ -710,7 +713,7 @@ class Scheduler:
             tmp.write_text(json.dumps(self.m))
             tmp.rename(p)
             st = {"breaker": self.br, "bring_up": self.bring_up, "wave": self.wave, "starts_log": self.starts_log[-200:],
-                  "held": {v.id: {"t_real": v.t_real, "draining": v.draining, "lease": v.lease, "ttl": v.ttl} for v in list(self.vms.values()) if not v.dead},
+                  "held": {v.id: {"t_real": v.t_real, "draining": v.draining, "lease": v.lease, "ttl": v.ttl, "quarantine": v.quarantine, "quarantine_since": v.quarantine_since} for v in list(self.vms.values()) if not v.dead},
                   "est": self.est_hist, "class_obs": {str(k): v[-200:] for k, v in self.class_obs.items()},
                   "hints": {k: h for k, h in self.hints.items() if h.get("until", 0) > time.time()},
                   "drains": {img: {"open": d.open, "t_last": d.t_last, "share": d.share, "quota": d.quota, "released": d.released}
@@ -1075,6 +1078,8 @@ class Scheduler:
             vm.gen, vm.agent, vm.t_agent = int(i.get("gen", 0)), i.get("agent", ""), 0.0
             vm.agent_capabilities = normalize_agent_capabilities(i.get("agent_capabilities"))
             vm.model = i.get("model", "")
+            vm.quarantine = i.get("quarantine", hb.get("quarantine", ""))
+            vm.quarantine_since = i.get("quarantine_since", hb.get("quarantine_since", 0.0))
             vm.ready, vm.t_ready, vm.idle_since = True, now, now
             if snap:  # (a handoff: its items exactly as the old one held them there, no record older than that)
                 for x in i.get("items", []):
@@ -1403,6 +1408,7 @@ class Scheduler:
             vms.append({"id": v.id, "image": v.image, "type": v.type, "slots": v.slots, "prepared": sorted(v.prepared), "trees": sorted(v.trees),
                         "model": v.model, "caches": sorted([list(c) for c in v.caches]), "lease": v.lease, "ttl": v.ttl, "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
                         "agent_capabilities": dict(v.agent_capabilities),
+                        "quarantine": v.quarantine, "quarantine_since": v.quarantine_since,
                         "items": [{"batch": it.batch.id, "name": it.name, "run_name": it.run_name,
                                    "state": "running" if it.state == "finishing" else it.state,
                                    "placement": it.last_placement, "launch_identity": it.launch_identity, "placed": it.placed}
@@ -1763,7 +1769,7 @@ class Scheduler:
         return {"scope": "native-single-vm", "runtime_verified": True, "code": code_hash(),
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
-                "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1,
+                "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1,
                 "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -2328,13 +2334,15 @@ class Scheduler:
             items = sum(self.m["placed"].values())
             return {"pid": os.getpid(), "batches": [{"id": b.id, "class": NAMES[b.klass], "client": b.client, "left": b.left(),
                                                      "running": sum(1 for it in b.items.values() if it.state in ("starting", "running"))} for b in self.batches.values()],
-                    "vms": [{"id": v.id, "image": v.image, "type": v.type, "ready": v.ready, "model": v.model, "used": v.used(), "slots": v.slots, "draining": v.draining, "real_ago": round(now - v.t_real), "gen": v.gen, "agent": v.agent,
+                    "vms": [{"id": v.id, "image": v.image, "type": v.type, "ready": v.ready and not v.quarantine, "model": v.model, "used": v.used(), "slots": v.slots, "draining": v.draining, "real_ago": round(now - v.t_real), "gen": v.gen, "agent": v.agent,
                              "agent_capabilities": dict(getattr(v, "agent_capabilities", {})), "agent_upgrading": bool(getattr(v, "upgrading", False)),
+                             "quarantined": bool(v.quarantine), "quarantine_reason": v.quarantine,
+                             "quarantine_since": v.quarantine_since, "failing": v.failing,
                              "classes": sorted({NAMES[it.batch.klass] for it in v.running.values()}), "foreign": getattr(v, "foreign", 0),
                              "runs": [{"batch": it.batch.id, "name": it.run_name, "class": NAMES[it.batch.klass]} for it in v.running.values()]} for v in live],
                     "constraints": self._constraint_status(),
                     "classes": per,
-                    "pool": {"vms": len(live), "ready": sum(1 for v in live if v.ready), "coming": sum(self.creating.values()) + sum(1 for v in live if not v.ready),
+                    "pool": {"vms": len(live), "ready": sum(1 for v in live if v.ready and not v.quarantine), "quarantined": sum(bool(v.quarantine) for v in live), "coming": sum(self.creating.values()) + sum(1 for v in live if not v.ready),
                              "target": {k: v for k, v in self.target.items()}, "max": None if MAX_VMS >= 10 ** 9 else MAX_VMS, "floor": {img: self.floor(img) for img in {v.image for v in live}}},
                     "day": {"day": self.m["day"], "vmh": round(self.m["vmh"], 2), "vmh_filler_hold": round(self.m["vmh_filler_hold"], 2),
                             "starts": starts, "items_placed": items, "starts_per_100_items": round(100 * starts / items, 1) if items else None,
@@ -2975,7 +2983,7 @@ class Scheduler:
     def _peer(self, vm: VMState, tree: str | None = None, cache: tuple | None = None) -> VMState | None:
         """A ready VM (not this one) that has the tree or the cache whole: the one this VM pulls from."""
         for v in list(self.vms.values()):
-            if v is vm or v.dead or not v.ready or not v.client or v.failing:
+            if v is vm or v.dead or not v.ready or not v.client or v.failing or v.quarantine:
                 continue
             if (tree and tree in v.trees) or (cache and cache in v.caches):
                 return v
@@ -3308,12 +3316,14 @@ class Scheduler:
         pool.open_until, pool.half = float(self.br["open_until"]), bool(self.br["half"])
         pool.probing = pool.half and any(s["ok"] is None for s in self.starts_log if s["t"] > self.br["t_trip"])
         self.target = {}
+        # Advisory only: acquisition rechecks the registry under its lease lock.
+        registry = Registry().read() if any(key[2] for key in groups) else {"vms": {}}
         for (image, vm_type, model, distinct, required), its in groups.items():
             # A worker can wait one full scheduling pass after becoming ready.
             S, bu = vm_slots(vm_type), max(30.0, self.bring_up) + FULL_S
             B = BREAK_EVEN_OVERRIDE_S or rules.break_even_s(HOLD, START_DOLLARS, VM_HOUR_DOLLARS, vm_mult(vm_type))
             used_vms = distinct_used(its[0]) if distinct else set()
-            held = [v for v in live if v.image == image and v.type == vm_type and rules.cpu_matches(model, v.model)
+            held = [v for v in live if not v.quarantine and v.image == image and v.type == vm_type and rules.cpu_matches(model, v.model)
                     and rules.distinct_vm_allowed(bool(distinct), v.id in used_vms)
                     and (not required or (not getattr(v, "upgrading", False)
                          and (not v.ready or agent_capabilities_match(dict(required), v.agent_capabilities))))]
@@ -3323,10 +3333,16 @@ class Scheduler:
                 pending = self._constraint_pending(draw)
                 unresolved = sum(not v.ready and getattr(v, "cpu_constraint", "") == model
                                  and v.image == image and v.type == vm_type for v in live)
-                coming += max(pending, unresolved)
+                speculative = sum(not v.ready and getattr(v, "cpu_constraint", "") == model
+                                  and not getattr(v, "cpu_known_resume", False)
+                                  and v.image == image and v.type == vm_type for v in live)
+                draw_pending = coming + max(pending, speculative)
+                coming += max(sum(not d["done"] for d in draw["draws"]), unresolved)
+                reusable = self._known_cpu_reuse(registry, image, vm_type, model, used_vms)
                 if not coming:
                     for it in its:
-                        if draw["fruitless"] >= self._constraint_limit(it) and not any(vm_fits(fit_shape(it), v, self.retired()) for v in held):
+                        if (draw["fruitless"] >= self._constraint_limit(it) and not reusable
+                                and not any(vm_fits(fit_shape(it), v, self.retired()) for v in held)):
                             self._constraint_refused(it, draw)
                     its = [it for it in its if it.state == "queued"]
                     if not its:
@@ -3501,7 +3517,8 @@ class Scheduler:
                     self._h().record_needless(now, n - earned, image, vm_type)
             tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "break_even_s": B, "growth_source": "legacy override" if BREAK_EVEN_OVERRIDE_S else "economics", "why": ""}
             if model:
-                n = rules.cpu_draws(n, draw["fruitless"], coming, limit)
+                n = rules.cpu_capacity(n, len(reusable), draw["fruitless"], draw_pending, limit)
+                tgt["known_cpu_reuse"] = len(reusable)
                 tgt["cpu_model"] = model
                 tgt["fruitless"] = draw["fruitless"]
             if required and not agent_capabilities_match(dict(required), BUILD_AGENT_CAPABILITIES):
@@ -3550,21 +3567,28 @@ class Scheduler:
         return self.cpu_constraints.setdefault(key, {"image": image, "vm_type": vm_type, "cpu_model": model,
                                                     "fruitless": 0, "draws": [], "observed": {}})
 
-    def _constraint_result(self, vm_id, model):
+    def _constraint_result(self, vm_id, model, complete_known=True):
         changed = False
         for c in getattr(self, "cpu_constraints", {}).values():
             for d in c["draws"]:
                 if d["vm"] == vm_id and not d["done"]:
+                    if d.get("known_resume") and not complete_known:
+                        continue  # exempt only after the entire resume becomes ready
                     d.update(model=model, done=True)
                     c["observed"][vm_id] = model
-                    # Arrival order, not provider listing order, defines consecutive draws.
-                    c["fruitless"] = rules.cpu_streak(c["fruitless"], model == c["cpu_model"])
+                    d["counted"] = rules.cpu_draw_counted(d.get("known_resume", False), c["cpu_model"], model)
+                    # A verified known resume neither spends nor replenishes the speculative budget.
+                    if d["counted"]:
+                        c["fruitless"] = rules.cpu_streak(c["fruitless"], model == c["cpu_model"])
+                        if d.get("known_resume"):
+                            log(f"{vm_id}: known CPU resume {'mismatched: ' + model if model else 'failed/unknown'}; "
+                                f"expected {c['cpu_model']}; counts as a fruitless draw ({c['fruitless']})")
                     changed = True
                 elif d["vm"] == vm_id and d["done"] and not d["model"] and model:
                     # A late model report completes an earlier unknown observation.
                     d["model"] = model
                     c["observed"][vm_id] = model
-                    if model == c["cpu_model"]:
+                    if model == c["cpu_model"] and not d.get("known_resume", False):
                         c["fruitless"] = 0
                     changed = True
         if changed:
@@ -3574,7 +3598,20 @@ class Scheduler:
         for d in c["draws"]:
             if not d["done"] and time.time() - d["t"] > BREAK_READY:
                 self._constraint_result(d["vm"], "")
-        return sum(not d["done"] for d in c["draws"])
+        return sum(not d["done"] and not d.get("known_resume", False) for d in c["draws"])
+
+    def _known_cpu_reuse(self, registry, image, vm_type, model, used=()):
+        """Known unleased capacity, never proof of its CPU after a new boot.
+
+        Registry state may lag the release TTL; acquisition reconciles it before
+        selecting a stopped/warm worker. No new or unknown draw inherits this allowance.
+        """
+        observed = self._constraint(image, vm_type, model)["observed"]
+        retired = self.retired()
+        return {i for i, v in registry.get("vms", {}).items()
+                if observed.get(i) == model and v.get("snapshot") == image and v.get("type") == vm_type
+                and v.get("state") in (boat.RUNNING | {"stopped"}) and boat.lease_free(v)
+                and i not in self.vms and i not in retired and i not in used}
 
     def _model_report(self, vm, model):
         if not isinstance(model, str) or not model.strip():
@@ -3589,7 +3626,7 @@ class Scheduler:
                 if c["image"] == vm.image and c["vm_type"] == vm.type and c["observed"].get(vm.id) != model:
                     c["observed"][vm.id] = model
                     changed = True
-            self._constraint_result(vm.id, model)
+            self._constraint_result(vm.id, model, complete_known=vm.ready)
             if changed:
                 self._constraints_save()
 
@@ -3601,6 +3638,8 @@ class Scheduler:
         for c in getattr(self, "cpu_constraints", {}).values():
             models = {}
             for d in c["draws"]:
+                if d.get("known_resume") and not d.get("counted", False):
+                    continue
                 label = d["model"] or ("unknown" if d["done"] else "pending")
                 models[label] = models.get(label, 0) + 1
             waiting = [it for b in self.batches.values() if b.image == c["image"] for it in b.items.values()
@@ -3608,7 +3647,7 @@ class Scheduler:
             out.append({**c, "models": models,
                         "limit": max((self._constraint_limit(it) for it in waiting), default=int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS))),
                         "requested_limits": sorted({self._constraint_limit(it) for it in waiting}),
-                        "matching_vms": [v.id for v in self.vms.values() if v.ready and not v.dead and v.image == c["image"]
+                        "matching_vms": [v.id for v in self.vms.values() if v.ready and not v.dead and not v.quarantine and v.image == c["image"]
                                          and v.type == c["vm_type"] and v.model == c["cpu_model"]],
                         "waiting_items": len(waiting)})
         return out
@@ -3671,33 +3710,45 @@ class Scheduler:
             free = [i for i, v in d["vms"].items() if v["snapshot"] == image and v["type"] == vm_type and boat.lease_free(v) and i not in self.vms and i not in self.retired() and (not model or i not in observed or observed[i] == model) and rules.distinct_vm_allowed(bool(distinct), i in used)]
             up = [i for i in free if d["vms"][i].get("state") in boat.RUNNING and d["vms"][i].get("until", 0) > now + boat.WARM_MARGIN]
             stopped = [i for i in free if i not in up and d["vms"][i].get("state") == "stopped"]
-            acq = rules.Acquire()  # (rules.Acquire: warm ones first, then resumes and creations within the budget)
+            known = self._known_cpu_reuse(d, image, vm_type, model, used) if model else set()
+            stopped.sort(key=lambda i: i not in known)  # known resumes before speculative draws
+            if model:
+                c = self._constraint(image, vm_type, model)
+                limits = [self._constraint_limit(it) for batch in self.batches.values()
+                          if batch.image == image for it in batch.items.values()
+                          if it.state == "queued" and it.spec.get("cpu_model") == model
+                          and (it.spec.get("vm_type") or batch.vm_type) == vm_type]
+                limit = max(limits, default=int(self.pol.get("cpu_model_max_fruitless", CPU_MODEL_MAX_FRUITLESS)))
+                n = min(n, len(up) + rules.cpu_capacity(max(0, n - len(up)),
+                        sum(i in known for i in stopped), c["fruitless"], self._constraint_pending(c), limit))
+            acq = rules.Acquire()  # warm first; resumes/creations still obey the provider start budget
             acq.plan(max(0, n), len(up), len(stopped), max(0, budget))
             pick = up[:acq.warm] + stopped[:acq.resumes]
             for i in pick:
                 d["vms"][i]["lease"] = {"pid": os.getpid(), "host": socket.gethostname(), "batch": "scheduler", "since": now, "label": f"scheduler ({NAMES[k]})"}
                 d["vms"][i].pop("released", None)
-                mine.append((i, i in up))
+                mine.append((i, i in up, i in known))
         create = acq.creates
-        for i, warm in mine:
-            self._bring(i, image, vm_type, "warm" if warm else "resumed", k, b, model=model)
+        for i, warm, known_cpu in mine:
+            kw = {"cpu_known_resume": True} if known_cpu and not warm else {}
+            self._bring(i, image, vm_type, "warm" if warm else "resumed", k, b, model=model, **kw)
         if create > 0:
             with self.lock:
                 self.creating[(image, vm_type)] = self.creating.get((image, vm_type), 0) + create
             threading.Thread(target=self._create, args=(image, vm_type, create, k, b, model), daemon=True).start()
         return len(mine) + max(0, create)
 
-    def _bring(self, i: str, image: str, vm_type: str, how: str, k: int, b: Batch, lease: dict | None = None, nonce: str = "", model: str = ""):
+    def _bring(self, i: str, image: str, vm_type: str, how: str, k: int, b: Batch, lease: dict | None = None, nonce: str = "", model: str = "", cpu_known_resume: bool = False):
         vm = VMState(i, image, vm_type, how)
         vm.lease, vm.birth_nonce = lease or {}, nonce
-        vm.cpu_constraint = model
+        vm.cpu_constraint, vm.cpu_known_resume = model, cpu_known_resume
         with self.lock:
             if i in self.vms:  # (a VM is brought up once at a time: a second bring-up would replace its agent's token)
                 return
             self.vms[i] = vm
         threading.Thread(target=self._up, args=(vm, k, b), daemon=True).start()
 
-    def _count_start(self, k: int, b: Batch, got: int, paid: int, ids: list[str], vm_type: str = "", model: str = ""):
+    def _count_start(self, k: int, b: Batch, got: int, paid: int, ids: list[str], vm_type: str = "", model: str = "", known_resume: bool = False):
         with self.lock:
             n = NAMES[k]
             self.m["starts"][n]["paid"] += paid
@@ -3705,7 +3756,8 @@ class Scheduler:
             b.starts += got
             for i in ids:
                 if model:
-                    self._constraint(b.image, vm_type, model)["draws"].append({"vm": i, "t": time.time(), "model": None, "done": False})
+                    self._constraint(b.image, vm_type, model)["draws"].append({"vm": i, "t": time.time(), "model": None, "done": False,
+                        **({"known_resume": True} if known_resume else {})})
                     self._constraints_save()
                 self.starts_log.append({"t": time.time(), "vm": i, "ok": None, "image": b.image})
                 self._h().record_start(time.time(), b.image, i, vm_type or (self.vms[i].type if i in self.vms else ""))
@@ -3734,6 +3786,9 @@ class Scheduler:
                     raise RuntimeError("no start left")
                 # Override the released VM's 60s TTL in the resume itself;
                 # extending after bootstrap is too late if hydration/claim takes longer.
+                self._count_start(k, b, 1, paid, [vm.id], vm.type, getattr(vm, "cpu_constraint", ""),
+                                  known_resume=getattr(vm, "cpu_known_resume", False))
+                started = True
                 out = boat.boat("resume", vm.id, "--ttl", str(vm.ttl), "--json", check=False, timeout=300)
                 if boat.R.resume_replaces(boat.resume_missing(out), False):
                     boat.note_starts(-1)
@@ -3741,8 +3796,6 @@ class Scheduler:
                     vm.dead = True
                     log(f"{vm.id}: boat no longer has it; replanning on fresh capacity")
                     return
-                self._count_start(k, b, 1, paid, [vm.id], vm.type, getattr(vm, "cpu_constraint", ""))
-                started = True
                 if "rate_limited" in out:
                     boat.note_starts(-1)
                     raise RuntimeError("boat refused the resume")
@@ -3763,6 +3816,7 @@ class Scheduler:
             if not claim.get("ok") or claim.get("stale") or not claim.get("boot") or not claim.get("epoch"):
                 if started:
                     self._start_done(vm.id, False)
+                    started = False
                 self._drop_stale(vm)
                 return
             vm.lease = claim
@@ -3828,9 +3882,12 @@ class Scheduler:
             log(f"{vm.id}: {str(e)[:200]}")
             if started:
                 self._start_done(vm.id, False)
+                started = False
             vm.dead = True
             self._let_go(vm, stop=True)
         finally:
+            if started and not vm.ready:
+                self._start_done(vm.id, False)
             self.wake.set()
 
     def _create(self, image: str, vm_type: str, n: int, k: int, b: Batch, model: str = ""):
@@ -3914,31 +3971,107 @@ class Scheduler:
             return boat.states(10).get(vm_id, {}).get("state") in boat.RUNNING
         return True  # (boat's list not to be had: no verdict, so not lost)
 
-    def _repair(self, vm: VMState) -> bool:
-        """A VM whose agent doesn't answer, repaired in place: its agent restarted through boat exec with its token
-        (its items, in sessions of their own, run on), then asked again. True once it answers."""
+    def _reclaim_ghosts(self, vm):
+        """Observe/journal confirmed legacy ghosts; deliver terminal LOST, never retry here."""
+        from . import workerprobe
+        with self.lock:
+            runs = [{"batch": it.batch.id, "name": it.run_name, "strict": it.batch.strict_once}
+                    for it in vm.running.values() if it.state == "running"]
+        if not runs:
+            return {"protocol": 1, "runs": []}
+        receipt = workerprobe.audit(vm, runs, reclaim=True)
+        directory = DIR / "worker-recovery" / vm.id
+        directory.mkdir(parents=True, exist_ok=True)
+        write_private(directory / f"{time.time_ns()}.json", receipt)
+        expected = {(r["batch"], r["name"]) for r in runs}
+        for row in receipt.get("runs", []):
+            key = (row.get("batch"), row.get("name"))
+            if key not in expected or row.get("reclaimed") is not True:
+                continue
+            result = row.get("result") or {}
+            with self.lock:
+                it = vm.running.get(key)
+                if it is None or it.batch.strict_once:
+                    continue
+            if (result.get("batch"), result.get("name")) != key or result.get("ghost_reclaimed") is not True:
+                raise ValueError("ghost receipt identity mismatch")
+            if self._finished_legacy(vm, result):
+                log(f"{vm.id}: {key[0]}/{key[1]}: LOST; recorded process and descendants absent, no result")
+        return receipt
+
+    def _repair(self, vm: VMState, *, reclaim_ghosts=False) -> bool:
+        """Keep live/unknown ownership intact; reclaim proven ghosts before a normal bootstrap."""
         if any(it.batch.strict_once for it in vm.running.values()):
-            return False  # unresolved owned supervisors may not be detached by repair
-        if vm.running and getattr(vm, "agent", "") != self.agent_version:
-            return False  # repair is not permission to upgrade underneath legacy work
-        if time.time() - getattr(vm, "t_repair", 0) < 30:
+            return False  # no legacy audit can discharge strict ownership
+        if vm.running and not reclaim_ghosts and getattr(vm, "agent", "") != self.agent_version:
+            return False  # busy cross-version recovery is an explicit operator action
+        repair_lock = vm.__dict__.setdefault("repair_lock", threading.Lock())
+        if not repair_lock.acquire(blocking=False):
             return False
-        vm.t_repair = time.time()
-        with contextlib.suppress(Exception):
+        fenced = False
+        try:
+            with self.lock:
+                if getattr(vm, "upgrading", False):
+                    return False
+                vm.upgrading, fenced = True, True
+            if time.time() - getattr(vm, "t_repair", 0) < 30:
+                return False
+            vm.t_repair = time.time()
+            vm.recovery_result = {"vm": vm.id, "target_agent": self.agent_version, "ok": False}
+            if any(it.batch.strict_once for it in vm.running.values()):
+                vm.recovery_result["error"] = "unresolved strict ownership"
+                return False
             if not self._renew_lease(vm):
                 return False
-            boat.bootstrap_agent(vm.id, self.agent_b64, vm.client.token, 60, 2, lease=vm.lease)
-            if vm.client.ping(timeout=15).get("ok"):
-                log(f"{vm.id}: its agent didn't answer: repaired in place ({len(vm.running)} items running on)")
+            if vm.running and reclaim_ghosts:
+                vm.recovery_result["audit"] = self._reclaim_ghosts(vm)
+            if not rules.worker_repair_allowed(False, bool(vm.running), getattr(vm, "agent", "") == self.agent_version):
+                vm.recovery_result["error"] = "live or unknown legacy ownership"
+                return False
+            boot = boat.bootstrap_agent(vm.id, self.agent_b64, vm.client.token, 60, 2, lease=vm.lease)
+            if not boot.get("ok"):
+                vm.recovery_result["error"] = "bootstrap refused"
+                return False
+            pong = vm.client.ping(timeout=15)
+            if pong.get("ok") and pong.get("version") == self.agent_version:
+                self._record_agent_ping(vm, pong)
+                log(f"{vm.id}: its agent didn't answer: repaired in place ({len(vm.running)} live/unknown items retained)")
                 vm.failing, vm.fails = 0, 0
+                vm.recovery_result["ok"] = True
                 return True
-        return False
+            vm.recovery_result["error"] = "target agent did not answer"
+            return False
+        except Exception as error:
+            vm.recovery_result["error"] = type(error).__name__
+            return False
+        finally:
+            if fenced:
+                with self.lock:
+                    vm.upgrading = False
+            repair_lock.release()
+
+    def recover_worker(self, vm_id, expected_agent):
+        """Exact-worker administrative recovery through the controller's ordinary repair path."""
+        if not isinstance(vm_id, str) or not isinstance(expected_agent, str) or expected_agent != self.agent_version:
+            raise ValueError("exact VM and current expected_agent are required")
+        with self.lock:
+            vm = self.vms.get(vm_id)
+            if vm is None or vm.dead:
+                raise ValueError("worker is not held by this controller")
+            if getattr(self, "handing_off", False) or getattr(self, "recovery_blocked", False):
+                raise ValueError("controller ownership is not stable")
+        repaired = self._repair(vm, reclaim_ghosts=True)
+        return {**vm.recovery_result, "vm": vm.id, "target_agent": self.agent_version, "ok": repaired}
 
     def _outage(self) -> bool:
         """boat's front failing most VMs' agents at once (the 2026-10-31 incident: every tick 502): no VM is at fault,
         none is let go, and no start is made until it passes."""
-        rv = [v for v in self.vms.values() if v.ready and not v.dead]
+        rv = self._outage_vms()
         return rules.outage(len(rv), sum(1 for v in rv if v.failing))
+
+    def _outage_vms(self):
+        return [v for v in self.vms.values()
+                if rules.worker_outage_member(v.ready, v.dead, bool(getattr(v, "quarantine", "")))]
 
     # -- the VMs' ticks: a fixed pool of pollers over every VM (POLLERS threads whatever the pool's size), each VM due
     # at its next tick in a heap; never a thread per VM (07:02: 356 threads, 82-94% of a core at 181 VMs, every idle
@@ -4023,7 +4156,7 @@ class Scheduler:
                 self._check_agent(vm)
         if vm.dead:
             return None
-        if not vm.running and not starts and not acks and not getattr(vm, "foreign", 0) and time.time() - getattr(vm, "t_inventory", 0) < 30:
+        if not vm.quarantine and not vm.running and not starts and not acks and not getattr(vm, "foreign", 0) and time.time() - getattr(vm, "t_inventory", 0) < 30:
             if vm.ready is False:
                 return None
             if vm.client and time.time() - vm.t_disk >= (30 if vm.disk_low else 300):  # (its disk asked by ping every 5 min, 30 s while low:
@@ -4060,6 +4193,9 @@ class Scheduler:
                 return None
             r["done"] = owned_done + r.get("done", [])
             vm._fails, vm.failing = 0, 0
+            if vm.quarantine:
+                log(f"{vm.id}: worker quarantine cleared by a successful tick")
+                vm.quarantine, vm.quarantine_since = "", 0.0
         except Exception as e:
             if "stale" in str(e).lower() or "403" in str(e) or "400" in str(e):
                 self.alert(f"{vm.id}: lease protocol lost or refused; relinquished without stopping")
@@ -4067,6 +4203,10 @@ class Scheduler:
                 return None
             fails = vm._fails = getattr(vm, "_fails", 0) + 1
             vm.failing = fails
+            if isinstance(e, boat.WorkerEndpointUnavailable) and not vm.quarantine:
+                vm.quarantine = "worker-local agent connection refused"
+                vm.quarantine_since = time.time()
+                log(f"{vm.id}: quarantined: {vm.quarantine}")
             outage = self._outage()
             if "is stopped" in str(e) and rules.vm_lost(fails, outage, False, True):  # (boat stopped it: let go at once, its items to other VMs)
                 log(f"{vm.id}: boat reports it stopped")
@@ -4082,7 +4222,7 @@ class Scheduler:
                 vm.starts = starts + vm.starts
                 vm.acks = acks + vm.acks
             if outage and time.time() >= self.br["open_until"]:
-                self.trip(f"boat's front: the agents of {sum(1 for v in self.vms.values() if v.failing)} of {sum(1 for v in self.vms.values() if v.ready and not v.dead)} VMs don't answer ({str(e)[:80]})")
+                self.trip(f"boat's front: the agents of {sum(1 for v in self._outage_vms() if v.failing)} of {len(self._outage_vms())} eligible VMs don't answer ({str(e)[:80]})")
             if fails <= 3 or fails % 10 == 0:
                 log(f"{vm.id}: tick failed ({fails}{', an outage' if outage else ''}): {str(e)[:160]}")
             # ("lost": rules.vm_lost, boat reports it stopped or gone; boat asked only past the failures' threshold)
@@ -4267,7 +4407,32 @@ class Scheduler:
                     ensure({k: v for k, v in entry.items() if k != 'path'})
         return store.compact_row(row)
 
+    def _finished_ghost(self, vm, row):
+        """Commit terminal legacy loss before releasing a recorded slot; never requeue."""
+        key = (row["batch"], row["name"])
+        with self.lock:
+            if getattr(self, "handing_off", False):
+                return False
+            it = vm.running.get(key)
+            if it is None:
+                return key not in vm.finishing
+            if it.batch.strict_once:
+                return False
+            done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name,
+                    "vm": vm.id, "run_name": it.run_name, "placement": dict(it.last_placement or {})}
+            self._deliver_owned(it.batch, done)  # fsynced; an error leaves ownership/occupancy intact
+            vm.running.pop(key)
+            it.state = "done"
+            it.fate.finished()
+            if it.t_start:
+                vm.busy_s += time.time() - it.t_start
+            vm.idle_since = time.time()
+        self.wake.set()
+        return True
+
     def _finished_legacy(self, vm: VMState, row: dict):
+        if row.get("ghost_reclaimed") and row.get("lost"):
+            return self._finished_ghost(vm, row)
         if getattr(self, "handing_off", False):
             return False
         row = self._fetch_result_files(vm, row)
@@ -5625,6 +5790,11 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         except (ValueError, OSError) as e:
                             return self._response(409, {"error": str(e)})
                     return self._response(200, raw=s.logs(s.batch_of(m), m.get("vms", [])))
+                if p == "/workers/recover":
+                    try:
+                        return self._response(200, s.recover_worker(m.get("vm"), m.get("expected_agent")))
+                    except (ValueError, TypeError) as e:
+                        return self._response(400, {"error": str(e)})
                 if p == "/hint":
                     return self._response(200, s.hint(m))
                 if p == "/status":
@@ -5662,7 +5832,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                     lines = lp.read_text().splitlines()[-int(m.get("n", 2000)):] if lp.exists() else []
                     return self._response(200, {"lines": lines})
                 if p == "/can":  # can an interactive batch of this image start now, with no start? (a VM held or warm)
-                    held = any(v.ready and not v.dead and v.image == m["image"] for v in s.vms.values())
+                    held = any(v.ready and not v.dead and not v.quarantine and v.image == m["image"] for v in s.vms.values())
                     return self._response(200, {"held": held})
                 return self._response(404, {"error": p})
             except Exception as e:

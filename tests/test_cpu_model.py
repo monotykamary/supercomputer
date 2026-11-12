@@ -198,6 +198,106 @@ def test_schema():
         raise AssertionError("CPU model without type accepted")
 
 
+def test_known_resume_survives_exhaustion_but_not_the_breaker():
+    s = sched()
+    b = constrained(s, n=100, klass=2)
+    c = s._constraint(b.image, b.vm_type, MODEL)
+    c.update(fruitless=25, observed={"known": MODEL})
+    entries = {"vms": {"known": {"snapshot": b.image, "type": b.vm_type, "state": "stopped", "lease": None}}}
+    with patch.object(S.Registry, "read", return_value=entries):
+        assert sum(n for n, *_ in s._plan(S.time.time()).values()) == 1
+        assert all(it.state == "queued" for it in b.items.values())
+        s.br["open_until"] = S.time.time() + 600
+        assert not s._plan(S.time.time())
+        assert all(it.state == "queued" for it in b.items.values())
+    assert c["fruitless"] == 25 and not c["draws"]
+
+
+def test_acquisition_rechecks_known_resumes_before_spending_any_draw():
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    s = sched()
+    b = constrained(s, n=100, klass=2)
+    c = s._constraint(b.image, b.vm_type, MODEL)
+    c.update(fruitless=25, observed={"known": MODEL})
+    def entry():
+        return {"snapshot": b.image, "type": b.vm_type, "state": "stopped", "lease": None}
+    entries = {"vms": {"unknown": entry(), "known": entry()}}
+    reg = SimpleNamespace(locked=lambda: nullcontext(entries))
+    s._bring = Mock()
+    with patch.object(S, "Registry", return_value=reg), patch.object(boat, "limits", return_value={}), \
+         patch.object(boat, "starts_left", return_value=20), patch.object(boat, "budget", return_value=20), \
+         patch.object(boat, "sandboxes", return_value={}), patch.object(boat, "reconcile"):
+        assert s._acquire(b.image, b.vm_type, 20, 2, b, model=MODEL) == 1
+        args, kw = s._bring.call_args
+        assert args[0] == "known" and args[3] == "resumed" and kw["cpu_known_resume"]
+        assert not s.creating and entries["vms"]["unknown"]["lease"] is None
+        # A stale advisory plan must never turn a disappeared/leased known VM into a fresh draw.
+        assert s._acquire(b.image, b.vm_type, 20, 2, b, model=MODEL) == 0
+        assert s._bring.call_count == 1
+
+
+def test_known_resume_outcomes_are_durable_and_do_not_replenish_draws():
+    for actual in (MODEL, OTHER, ""):
+        s = sched()
+        b = constrained(s)
+        c = s._constraint(b.image, b.vm_type, MODEL)
+        c["fruitless"] = 25
+        s._count_start(2, b, 1, 0, ["known"], b.vm_type, MODEL, known_resume=True)
+        assert s._constraint_pending(c) == 0
+        s._constraint_result("known", actual)
+        assert c["fruitless"] == 25 + (actual != MODEL)
+        assert c["draws"][0]["counted"] == (actual != MODEL)
+        s._constraint_result("known", actual)  # one failed observation, not repeated charges
+        assert c["fruitless"] == 25 + (actual != MODEL)
+        reloaded = sched()
+        reloaded.cpu_constraints = reloaded._constraints_load()
+        rc = reloaded._constraint(b.image, b.vm_type, MODEL)
+        assert rc == c
+        if not actual:
+            s._constraint_result("known", MODEL)  # late recovery cannot reopen speculative draws
+            assert c["fruitless"] == 26
+    s = sched()
+    b = constrained(s)
+    c = s._constraint(b.image, b.vm_type, MODEL)
+    c["fruitless"] = 25
+    s._count_start(2, b, 1, 0, ["new"], b.vm_type, MODEL)
+    assert s._constraint_pending(c) == 1
+    s._constraint_result("new", MODEL)
+    assert c["fruitless"] == 0  # genuine matching draws retain the existing reset rule
+
+
+def test_failed_known_resume_is_charged_even_before_provider_reply():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    s = sched()
+    b = constrained(s)
+    v = vm(s, "known", ready=False)
+    v.how, v.cpu_constraint, v.cpu_known_resume = "resumed", MODEL, True
+    s.gate = SimpleNamespace(take_split=lambda *a: (1, 0))
+    s._let_go = Mock()
+    c = s._constraint(b.image, b.vm_type, MODEL)
+    c["fruitless"] = 25
+    with patch.object(boat, "boat", side_effect=RuntimeError("provider failed")):
+        s._up(v, 2, b)
+    assert v.dead and c["fruitless"] == 26
+    assert c["draws"][0]["done"] and c["draws"][0]["counted"]
+
+
+def test_failed_known_resume_after_cpu_report_still_consumes_a_draw():
+    s = sched()
+    b = constrained(s)
+    v = vm(s, 'known', ready=False)
+    c = s._constraint(b.image, b.vm_type, MODEL)
+    c['fruitless'] = 25
+    s._count_start(2, b, 1, 0, [v.id], b.vm_type, MODEL, known_resume=True)
+    s._model_report(v, MODEL)
+    assert not c['draws'][0]['done']
+    s._start_done(v.id, False)
+    assert c['fruitless'] == 26 and c['draws'][0]['counted']
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

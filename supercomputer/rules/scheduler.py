@@ -541,9 +541,10 @@ class Acquire:
 
 
 # gdp: law an outage is at least two ready VMs, half of them or more failing: not result or (ready >= 2 and 2 * failing >= ready)
+# gdp: law an isolated worker failure is not a pool outage: not result or failing >= 2
 def outage(ready: int, failing: int) -> bool:
     """boat's front failing most VMs' agents at once (the 10-31 incident): no VM is at fault, none let go."""
-    return ready >= 2 and failing * 2 >= ready
+    return ready >= 2 and failing >= 2 and failing * 2 >= ready
 
 
 # gdp: law a VM boat reports up is never declared lost: not result or stopped or not boat_up

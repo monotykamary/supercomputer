@@ -96,7 +96,9 @@ try:
     run()
 except Exception as error:
     # HTTP bodies and arbitrary exception strings must never escape on stdout.
-    sys.stderr.write('result relay: ' + type(error).__name__ + '\n')
+    label = ('worker_connection_refused' if isinstance(error, urllib.error.URLError)
+             and isinstance(error.reason, ConnectionRefusedError) else type(error).__name__)
+    sys.stderr.write('result relay: ' + label + '\n')
     sys.exit(1)
 '''
 
@@ -142,6 +144,8 @@ def exec_response(client, body, timeout, decode):
     def call(op, *args, limit=_META_BYTES):
         result = boat.exec_(client.vm, ['python3', '-c', _REMOTE, op, *args], timeout + 15)
         if result.get('exitCode') != 0:
+            if str(result.get('stderr') or '').strip() == 'result relay: worker_connection_refused':
+                raise boat.WorkerEndpointUnavailable('worker-local agent connection refused')
             raise boat.AgentError('result relay exec failed: ' +
                                   str(result.get('stderr') or result.get('error') or '')[-160:])
         text = result.get('stdout', '')

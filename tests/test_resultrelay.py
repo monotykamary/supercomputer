@@ -28,6 +28,7 @@ class RelayTests(unittest.TestCase):
         self.payload = self.root / 'payload'
         self.payload.write_bytes(b'{"done":[]}')
         self.status = 200
+        self.transport_error = None
         self.tamper = None
         self.patcher = patch.object(boat, 'exec_', side_effect=self.remote)
         self.patcher.start()
@@ -57,6 +58,10 @@ class Response:
     def close(self): self.f.close()
     def __getattr__(self, name): return getattr(self.f, name)
 def urlopen(req, timeout):
+    if ERROR == 'refused':
+        raise urllib.error.URLError(ConnectionRefusedError(111, 'private-token'))
+    if ERROR == 'timeout':
+        raise urllib.error.URLError(TimeoutError('private-token'))
     assert req.full_url == 'http://127.0.0.1:8765/rpc'
     assert req.get_header('X-sc-token') == 'private-token'
     assert req.data == BODY
@@ -67,7 +72,7 @@ def urlopen(req, timeout):
 urllib.request.urlopen = urlopen
 '''
         setup = setup.replace('8765', str(boat.AGENT_PORT))
-        header = 'PAYLOAD=%r\nSTATUS=%r\nBODY=%r\n' % (str(self.payload), self.status, self.body)
+        header = 'PAYLOAD=%r\nSTATUS=%r\nBODY=%r\nERROR=%r\n' % (str(self.payload), self.status, self.body, self.transport_error)
         source = header + setup + args[2].replace("dir='/tmp'", 'dir=' + repr(str(self.root)))
         p = subprocess.run([sys.executable, '-c', source, op, *mapped], capture_output=True, timeout=15)
         stdout = p.stdout.decode().replace(str(self.root) + '/sc-result-', '/tmp/sc-result-')
@@ -192,6 +197,14 @@ urllib.request.urlopen = urlopen
         self.assertEqual(self.run_relay(lambda s: 'empty'), (200, 'empty'))
         self.assertIn('read', self.calls)
         self.assert_clean()
+
+    def test_worker_refusal_is_typed_but_other_url_errors_are_not(self):
+        for kind, expected in [('refused', boat.WorkerEndpointUnavailable), ('timeout', boat.AgentError)]:
+            self.transport_error = kind
+            with self.assertRaises(expected) as error:
+                self.run_relay(lambda s: None)
+            self.assertEqual(type(error.exception), expected)
+            self.assertNotIn('private-token', str(error.exception))
 
     def test_request_limit_precedes_execution(self):
         with self.assertRaises(ValueError):

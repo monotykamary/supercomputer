@@ -233,6 +233,33 @@ stops its own host. Inside a boat VM, reach the controller over its http transpo
 legacy `SUPERCOMPUTER_CONTROLLER_FALLBACK=1` do not override a configured controller. A long-lived local client
 whose scheduler disappears never resurrects it while a controller configuration exists, even if unreadable.
 
+## Worker-local failures and ghost recovery
+
+A refused connection to the worker-local agent listener is typed separately from a provider/front failure.
+The scheduler quarantines that worker: no new placement or preemption there, and it is excluded from both
+ready and failing counts used by the pool-wide outage detector. Status reports `quarantined`, its reason and
+start time. Quarantine clears only after an actual successful worker tick. A single failing worker is not a
+pool-wide outage; at least two eligible failing workers and at least half the eligible pool are required.
+Provider/front failures affecting multiple workers still trip the normal breaker. Quarantine never itself
+resets the breaker, authorizes a new CPU draw, releases a VM, or changes strict-once ownership.
+
+Automatic repair never upgrades a busy old agent; audited cross-version recovery is an explicit operator action,
+so a rollout can finish its canary before reclaiming any slots. Before repairing a busy legacy worker, the controller
+can audit recorded runs through a bounded, lease-fenced
+process probe. The probe uses `sudo -n` for complete process visibility, checks PID, process group/session,
+job paths and inherited output-directory identity, and takes the agent's ownership lock. Missing/ambiguous
+PID or process evidence fails closed. A dead legacy root with no live descendants and no completed result
+is journaled as terminal `LOST`, with `ghost_reclaimed` and its evidence; partial output files are retained.
+Those losses go to the client without a controller retry. Live/unknown legacy work blocks an agent-version
+change; unresolved strict runs always block this path. A successful normal bootstrap must ping with the
+controller's exact target version before repair is considered successful.
+
+Controllers advertising `worker_recovery_protocol:1` support `POST /workers/recover` with an exact `vm` and
+`expected_agent` equal to the current target. It invokes this same audited reclaim/repair path for that held
+worker only and returns the audit and repair receipt. It does not release workers or reset the breaker. Audit
+receipts are retained under `scheduler/worker-recovery/<vm>/`. Older controllers without the capability have
+no equivalent targeted recovery endpoint: never emulate it by editing their journals or injecting results.
+
 ## Exact CPU model placement
 
 A native job can pin hardware with `"cpu_model": "AMD Ryzen 9 9950X 16-Core Processor"`
@@ -253,8 +280,19 @@ The report includes that item's effective limit and the model distribution acros
 
 `cpu_model_max_fruitless` (default 12, positive; environment default
 `SUPERCOMPUTER_CPU_MODEL_MAX_FRUITLESS`) limits consecutive fruitless starts **per image/type/model**.
-Unresolved draws occupy the remaining guard room. A known matching draw resets the streak; a failed/blank or
-mismatched draw increments it in observation order. The streak and model distribution survive restart/handoff.
+Unresolved **speculative** draws occupy the remaining guard room. A matching new/unknown draw resets the streak;
+a failed/blank or mismatched draw increments it in observation order. A registered, unleased stopped worker whose
+last observed CPU matches may be resumed even at exhaustion, ahead of unknown resumes or new VMs. Acquisition
+rechecks the registry under its lease lock: disappearing, leased, retired or distinct-group-excluded candidates
+cannot turn that permission into an unknown draw. Every resume still obeys the breaker, provider start budget,
+pacing, bring-up cap and ordinary demand/priority rules; no worker ID or agent hash is implicitly authorized.
+
+The resumed agent must report its CPU again before constrained placement. A verified known matching resume is
+recorded with `known_resume:true, counted:false` and neither spends **nor resets** the speculative streak.
+A failed, missing, timed-out or mismatched known resume is charged once and reported in the draw journal/log;
+a mismatch cannot execute the constrained payload. `models` counts charged draws, not exempt resumes.
+The streak, observations and draw classification survive restart/handoff; historical records without the new
+fields retain their original charged-draw meaning.
 At exhaustion, items without eligible matching capacity get a terminal `unplaceable_by_constraint: true` row,
 error `unplaceable-by-constraint`, and a `constraint` summary (models observed, draws, matching VMs, waiting items).
 It is not a `lost`/Modal retry. Work with matching busy capacity can still wait for it. Raising the load guard

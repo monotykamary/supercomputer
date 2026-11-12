@@ -1419,6 +1419,10 @@ class AgentError(RuntimeError):
     pass
 
 
+class WorkerEndpointUnavailable(AgentError):
+    """The worker-local agent listener refused the exec relay connection."""
+
+
 class LeaseProtocolLost(AgentError):
     """An old client replaced the lease protocol; do not bootstrap it back."""
     pass

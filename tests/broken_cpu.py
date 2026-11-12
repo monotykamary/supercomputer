@@ -1,5 +1,16 @@
 """The pre-constraint placement bug: every ready worker was eligible."""
 
+# gdp: law sufficient known capacity needs no draw allowance: known < wanted or result == wanted
+def blocked_known_resume(wanted: int, known: int, fruitless: int, pending: int, limit: int) -> int:
+    if wanted < 0 or known < 0 or fruitless < 0 or pending < 0 or limit < 1:
+        raise ValueError("bad counts")
+    return min(wanted, max(0, limit - fruitless - pending))
+
+# gdp: law a mismatched or failed resume counts: expected != "" and actual == expected or result
+def exempt_mismatched_resume(known_resume: bool, expected: str, actual: str) -> bool:
+    return not known_resume
+
+
 # gdp: law a handoff cannot discard live CPU constraints: not result or not required or supported
 def unsafe_handoff(required: bool, supported: bool) -> bool:
     return True

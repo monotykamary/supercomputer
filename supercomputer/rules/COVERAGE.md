@@ -29,6 +29,16 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `distinct_key`, `distinct_live`, `distinct_used`, `fit_shape`, `_place_locked`, `_plan`, `_buy` | rule wiring | durable scope uses the shared registry for every exclusion check and reserves before worker launch; absent scope preserves batch keys and history. |
 | `boat._validate_durable_item`, `_require_durable_capability`, `distinct_group`, `distinct_groups_main` | validation / I/O | opt-in fields survive hooks; capability gated before upload; JSON metadata API never starts a local scheduler. |
 
+## Known resumes and worker recovery
+
+| def | where | laws, or why |
+| --- | --- | --- |
+| `rules.cpu.cpu_capacity`, `cpu_draw_counted` | rule | known matching reuse cannot be blocked by an exhausted speculative budget; unknown/new draws stay bounded; only fully verified known resumes are exempt. |
+| `rules.worker.ghost_slot`, `worker_repair_allowed`, `worker_outage_member` | rule | no strict/live/uncertain/result-bearing ghost reclaim; no upgrade over live or unknown work; quarantined workers cannot inflate pool outage counts. |
+| `workerprobe.audit`, static remote probe | I/O + exact shipped rule | lease/ownership-locked process, group/session/path/environment evidence; strict refusal and atomic fsynced LOST journal; no signals or deletion. Real-process tests include orphaned session descendants. |
+| `Scheduler._reclaim_ghosts`, `_finished_ghost`, `recover_worker` | I/O + rule wiring | exact held-worker/current-target binding, persisted terminal loss before slot release, no controller replay; normal lease/bootstrap helper only. Journal failure retains ownership. |
+| `resultrelay`, `Scheduler._outage_vms`, `_poll_one` | I/O + rule wiring | typed/refused localhost connection is worker-local quarantine; no exception secrets; multi-worker provider failures retain the global breaker. |
+
 ## Closed history and strict-close recovery
 
 | def | where | laws, or why |

@@ -427,8 +427,9 @@ class SchedulerBootstrapWiring(unittest.TestCase):
 
     def test_repair_preserves_token_and_verifies_ping(self):
         instance = object.__new__(scheduler.Scheduler)
-        instance.agent_b64 = 'EXACT_SOURCE'
-        vm = types.SimpleNamespace(id='fake-vm', running={}, lease={'boot': 'b', 'epoch': 1}, client=types.SimpleNamespace(token='same-token', ping=lambda **kw: {'ok': True}), failing=3, fails=4)
+        instance.agent_b64, instance.agent_version = 'EXACT_SOURCE', 'target-agent'
+        instance.lock = threading.RLock()
+        vm = types.SimpleNamespace(id='fake-vm', running={}, lease={'boot': 'b', 'epoch': 1}, client=types.SimpleNamespace(token='same-token', ping=lambda **kw: {'ok': True, 'version': 'target-agent'}), failing=3, fails=4)
         with patch.object(instance, '_renew_lease', return_value=True), patch.object(boat, 'bootstrap_agent', return_value={'ok': True}) as bootstrap:
             self.assertTrue(instance._repair(vm))
             bootstrap.assert_called_once_with('fake-vm', 'EXACT_SOURCE', 'same-token', 60, 2, lease=vm.lease)

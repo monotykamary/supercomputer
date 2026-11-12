@@ -2599,6 +2599,172 @@ def cpu_model_absent(code):
     return sim, {"extra": extra}
 
 
+def _known_cpu_resume_fixture(code, mismatch=False):
+    from tests.sim.harness import IMAGE
+    sim = _sim(code, cfg={"resume_s": (1, 1)}, policy={"floor_default": 0})
+    unknown = sim.w.warm_vm(IMAGE, held=False)
+    known = sim.w.warm_vm(IMAGE, held=False)
+    known.model = "other-after-resume" if mismatch else "sim-cpu"
+    for v in (unknown, known):
+        sim.w.stop(v, "fixture")
+    reg = sim.B.Registry()
+    d = reg.read()
+    for v in (unknown, known):
+        d["vms"][v.id]["state"] = "stopped"
+    reg.path.write_text(json.dumps(d))
+    constraint = {"image": IMAGE, "vm_type": "large", "cpu_model": "sim-cpu",
+                  "fruitless": 25, "draws": [], "observed": {known.id: "sim-cpu"}}
+    sim.S.DIR.mkdir(parents=True, exist_ok=True)
+    (sim.S.DIR / "cpu-constraints.json").write_text(json.dumps({json.dumps([IMAGE, "large", "sim-cpu"]): constraint}))
+    sim.scheduler()
+    return sim, known
+
+
+@scenario("worker-local quarantine", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 1000,
+          "one legacy worker loses its agent listener while a live run remains: quarantine only that worker, retain ownership, and serve gates elsewhere")
+def local_worker_quarantine(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 2, "floor_default": 2})
+    _warm(sim, 2)
+    sim.scheduler()
+    bid = sim.batch("live-legacy", "sweep", items("live", 1, 600, timing=True), after=5)
+    observed = {}
+    def fault():
+        proc, s = sim.w.live_sched()
+        bad = next(v for v in s.vms.values() if v.running)
+        observed['bad'] = bad.id
+        bad.agent = sim.w.vms[bad.id].disk.version = 'legacy-worker'
+        sim.w.vms[bad.id].daemon = 'down'
+    def during():
+        s = sim.w.live_sched()[1]
+        bad = s.vms[observed['bad']]
+        observed.update(quarantined=bool(bad.quarantine), retained=bool(bad.running), agent=bad.agent,
+                        outage=s._outage(), trips=s.br['trips'])
+    def restore():
+        sim.w.vms[observed['bad']].daemon = 'up'
+    sim.at(30, fault)
+    sim.at(150, during)
+    sim.at(350, restore)
+    gate = sim.batch("healthy-gate", "gate", items("good", 8, 15), after=70)
+    def extra(sim, m):
+        m['local_fault'] = observed
+        gate_vms = {e['vm'] for e in sim.w.events if e['kind'] == 'item_started' and e.get('batch') == gate}
+        return {'isolated': observed.get('quarantined') and not observed.get('outage') and observed.get('trips') == 0,
+                'live_legacy_preserved': observed.get('retained') and observed.get('agent') == 'legacy-worker',
+                'new_work_elsewhere': bool(gate_vms) and observed['bad'] not in gate_vms,
+                'no_ghost_loss': not any(e['kind'] == 'ghost_reclaimed' for e in sim.w.events)}
+    return sim, {'extra': extra}
+
+
+@scenario("multi-worker outage", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 1000,
+          "a real two-worker front-and-exec outage still trips the pool breaker and recovers without quarantining either worker as local")
+def multi_worker_front_outage(code):
+    from tests.sim.harness import items
+    sim = _sim(code, policy={"max_vms": 2, "floor_default": 2})
+    _warm(sim, 2)
+    sim.scheduler()
+    sim.batch("front-work", "gate", items("f", 8, 600), after=5)
+    sim.w.front_down.append((sim.k.t0 + 50, sim.k.t0 + 250, True))
+    observed = {}
+    def during():
+        s = sim.w.live_sched()[1]
+        observed.update(trips=s.br['trips'], reason=s.br.get('last_reason', ''), quarantined=sum(bool(v.quarantine) for v in s.vms.values()))
+    sim.at(180, during)
+    def extra(sim, m):
+        m['front_fault'] = observed
+        return {'real_outage_tripped': observed.get('trips', 0) > 0 and "boat's front" in observed.get('reason', ''),
+                'not_local_quarantine': observed.get('quarantined') == 0}
+    return sim, {'extra': extra}
+
+
+@scenario("eight ghost slots", ["orphans", "threads"], 1000,
+          "eight dead legacy sweep PIDs with no descendants or done rows become terminal LOST before the old agent is repaired, never controller-replayed")
+def eight_ghost_slots_repair(code):
+    from tests.sim.harness import items, IMAGE
+    sim = _sim(code, policy={"max_vms": 1, "floor_default": 1})
+    sim.w.warm_vm(IMAGE, vm_type='xlarge')
+    sim.scheduler()
+    bid = sim.batch('treadmill-ghosts', 'sweep', items('ghost', 8, 900), after=5, vm_type='xlarge', vm_named=True)
+    observed = {}
+    def fault():
+        s = sim.w.live_sched()[1]
+        v = next(v for v in s.vms.values() if v.running)
+        assert len(v.running) == 8, len(v.running)
+        physical = sim.w.vms[v.id]
+        observed['vm'], observed['target'] = v.id, s.agent_version
+        v.agent = physical.disk.version = 'legacy-worker'
+        for proc in physical.procs.values():
+            proc['alive'] = False
+            proc['job'].done = None
+        physical.daemon = 'down'
+    def recover():
+        s = sim.w.live_sched()[1]
+        v = s.vms[observed['vm']]
+        observed['operator_only'] = len(v.running) == 8 and v.agent == 'legacy-worker' and bool(v.quarantine)
+        observed['receipt'] = s.recover_worker(v.id, s.agent_version)
+    def after():
+        s = sim.w.live_sched()[1]
+        v = s.vms[observed['vm']]
+        observed.update(remaining=len(v.running), repaired=v.agent == s.agent_version,
+                        quarantined=bool(v.quarantine), trips=s.br['trips'])
+    sim.at(40, fault)
+    sim.at(100, recover)
+    sim.at(200, after)
+    def extra(sim, m):
+        rows = list(sim.clients[bid]['items'].values())
+        m['ghost_recovery'] = observed
+        return {'eight_terminal_losses': len(rows) == 8 and all(r and r.get('lost') for r in rows) and
+                    len([e for e in sim.w.events if e['kind'] == 'ghost_reclaimed']) == 8,
+                'operator_controls_reclaim': observed.get('operator_only') and observed.get('receipt', {}).get('ok'),
+                'all_slots_reclaimed': observed.get('remaining') == 0,
+                'target_repaired': observed.get('repaired') and not observed.get('quarantined'),
+                'no_controller_replay': all(x['runs'] == 1 for x in sim.w.items.values()),
+                'not_global_outage': observed.get('trips') == 0}
+    return sim, {'extra': extra}
+
+
+@scenario("known CPU resume", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 900,
+          "a stopped known matching CPU resumes at an exhausted draw budget, after the breaker closes, without unknown draws or replenishing their allowance")
+def cpu_known_resume_exhausted(code):
+    from tests.sim.harness import items
+    sim, known = _known_cpu_resume_fixture(code)
+    def breaker():
+        sim.w.live_sched()[1].br["open_until"] = sim.k.t0 + 60
+    sim.at(5, breaker)
+    bid = sim.batch("known-resume", "gate", items("k", 1, 30, cpu_model="sim-cpu", vm_type="large", timing=True),
+                    strict_once=True, after=10)
+    def extra(sim, m):
+        starts = [e for e in sim.w.events if e["kind"] == "start"]
+        rows = list(sim.clients[bid]["items"].values())
+        c = next(iter([s for _, s in sim.w.sched_procs if s is not None][-1].cpu_constraints.values()))
+        m["known_resume"] = {"starts": starts, "constraint": c}
+        return {"known_only": len(starts) == 1 and starts[0]["vm"] == known.id and starts[0]["how"] == "resumed",
+                "breaker_respected": bool(starts) and starts[0]["t"] >= 60,
+                "verified_cpu": bool(rows) and all(r and r.get("placement", {}).get("cpu") == "sim-cpu" for r in rows),
+                "budget_unchanged": c["fruitless"] == 25 and len(c["draws"]) == 1 and c["draws"][0].get("counted") is False,
+                "strict_once": all(x["runs"] == 1 for x in sim.w.items.values())}
+    return sim, {"extra": extra}
+
+
+@scenario("known CPU resume mismatch", ["clients", "threads"], 900,
+          "a historical matching CPU changes after resume: verify it, count the mismatch once and refuse without unknown replacement or payload")
+def cpu_known_resume_mismatch(code):
+    from tests.sim.harness import items
+    sim, known = _known_cpu_resume_fixture(code, mismatch=True)
+    bid = sim.batch("resume-mismatch", "gate", items("k", 1, 30, cpu_model="sim-cpu", vm_type="large"),
+                    strict_once=True, after=10)
+    def extra(sim, m):
+        starts = [e for e in sim.w.events if e["kind"] == "start"]
+        rows = list(sim.clients[bid]["items"].values())
+        c = next(iter([s for _, s in sim.w.sched_procs if s is not None][-1].cpu_constraints.values()))
+        m["known_resume_mismatch"] = {"starts": starts, "constraint": c}
+        return {"no_replacement": len(starts) == 1 and starts[0]["vm"] == known.id,
+                "mismatch_counted_once": c["fruitless"] == 26 and c["draws"][0].get("counted") is True,
+                "mismatch_reported": c["observed"][known.id] == "other-after-resume" and all(r and r.get("unplaceable_by_constraint") for r in rows),
+                "no_payload": all(x["runs"] == 0 for x in sim.w.items.values())}
+    return sim, {"extra": extra}
+
+
 @scenario("distinct model-pinned VM groups", ["clients", "threads", "lost", "orphans"], 2400,
           "completed group members exclude their VMs across a hot handoff; independent groups may share")
 def distinct_vm_handoff(code):

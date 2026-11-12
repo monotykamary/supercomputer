@@ -470,6 +470,8 @@ class World:
     def cli_exec(self, args):
         v = self.vms.get(args[1])
         argv = args[args.index("--") + 1:]
+        if argv[:3] == ["sudo", "-n", "--"] and len(argv) > 5 and "sc_ghost_agent" in argv[5]:
+            argv = argv[3:]
         if v is None or v.state == "deleted":
             return json.dumps({"exitCode": -1, "stdout": "", "stderr": f"sandbox {args[1]} not found", "success": False})
         if v.state != RUNNING:
@@ -491,6 +493,30 @@ class World:
         if len(argv) >= 6 and argv[0] == "python3" and argv[2:4] == ["keys", "add"]:
             v.disk.keys[argv[4]] = argv[5]
             return json.dumps({"exitCode": 0, "stdout": '{"ok":true}', "stderr": "", "success": True})
+        if argv[:2] == ['python3', '-c'] and 'sc_ghost_agent' in argv[2]:
+            request = json.loads(argv[3])
+            fence = request['lease']
+            if not Agent(self, v).lease_rule().accepts(fence.get('owner', ''), fence.get('boot', ''), fence.get('epoch', 0), fence.get('vm_id', '')):
+                return json.dumps({'exitCode': 1, 'stdout': '', 'stderr': 'stale probe', 'success': False})
+            rows = []
+            for run in request['runs']:
+                bd = v.disk.batches.get(run['batch'])
+                job = bd.jobs.get(run['name']) if bd else None
+                row = {**run, 'complete': job is not None and not getattr(job, 'audit_unknown', False),
+                       'recorded': job is not None and job.pid is not None, 'pid': job.pid if job else None,
+                       'live': bool(job and v.procs.get(job.pid, {}).get('alive')),
+                       'descendants': [99999] if job and getattr(job, 'descendants_alive', False) else [],
+                       'result_exists': job is not None and job.done is not None, 'reclaimed': False}
+                ghost = self.code.sched.rules.ghost_slot(row['strict'], row['complete'], row['recorded'], row['live'], bool(row['descendants']), row['result_exists'])
+                if ghost and request.get('reclaim'):
+                    job.done = {'batch': run['batch'], 'name': run['name'], 'code': -1, 'seconds': -1,
+                                'lost': True, 'status': 'LOST', 'ghost_reclaimed': True,
+                                'error': 'agent dead with no result: recorded PID and descendants absent'}
+                    self.note('ghost_reclaimed', vm=v.id, batch=run['batch'], item=run['name'])
+                if job and job.done and job.done.get('ghost_reclaimed'):
+                    row['reclaimed'], row['result'] = True, job.done
+                rows.append(row)
+            return json.dumps({'exitCode': 0, 'stdout': json.dumps({'protocol': 1, 'boot': str(v.boot), 'runs': rows}), 'stderr': '', 'success': True})
         if argv[:2] == ['python3', '-c'] and '# sc-agent-bootstrap:' in argv[2]:
             # Transport only: same full digest and agent rules as the real install.
             # Only source-upload file operations are modeled. No verdict,
@@ -565,6 +591,8 @@ class World:
                 assert offset or path not in v.files
                 v.files[path] = v.files.get(path, '') + chunk
             elif op == 'post':
+                if v.daemon == 'down':
+                    return json.dumps({'exitCode': 1, 'stdout': '', 'stderr': 'result relay: worker_connection_refused\n', 'success': False})
                 arg = argv[5]
                 encoded = v.files[arg[1:]] if arg.startswith('@') else arg
                 status, data = self.agent_dispatch(v, '/rpc', base64.b64decode(encoded), float(argv[8]))
