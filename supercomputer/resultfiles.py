@@ -24,7 +24,8 @@ POLL_ROWS = 128
 _STRING_CHARS = 65536
 _METADATA = ('name', 'code', 'seconds', 'batch', 'run_name', 'vm', 'placement',
              'launch_identity', 'lost', 'preempted', 'error',
-             'runtime_verified', 'runtime_error', 'runtime_verification')
+             'runtime_verified', 'runtime_error', 'runtime_verification',
+             'resource_verified', 'resource_error', 'resource_limits')
 
 
 def _integer(value, name):

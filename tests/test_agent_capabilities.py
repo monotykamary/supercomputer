@@ -300,7 +300,7 @@ def test_real_advertised_output_protocol_creates_private_directory():
             patch.object(A, "clean_disk", return_value={}), patch.object(A, "_lease_boot", return_value="boot"), \
             patch.object(A, "lease", return_value={}):
         advertised = A.rpc_dispatch("ping", [])
-        assert advertised["agent_capabilities"] == {**CAPS, "runtime_pins_protocol": 1}
+        assert advertised["agent_capabilities"] == {**CAPS, "runtime_pins_protocol": 1, "resource_limits_protocol": 1}
         j = pathlib.Path(d) / "job"
         j.mkdir()
         (j / "cpus").write_text("[0]")

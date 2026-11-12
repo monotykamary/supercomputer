@@ -302,8 +302,15 @@ def py_item(name: str, module: str, fn: str, args: list, limit: int, est: float,
     if (root, module) not in _boat_cfg:
         _boat_cfg[(root, module)] = getattr(agent.import_runner(str(root / module)), "BOAT", {})
     cfg = _boat_cfg[(root, module)]
+    extra = {k: v for k, v in cfg.items() if k in ("mounts", "path", "overlays", "env", "runtime", "required_agent_capabilities", "enforce_memory", "memory_limit_mode")}
+    if cfg.get('enforce_memory') is True and 'memory' in cfg:
+        extra['memory'] = cfg['memory']
+    slots = max(weight, int(cfg.get("weight", 1)))
+    request = agent.normalize_memory_limit(extra)
+    if request is not None:
+        slots = max(slots, (request['mb'] + boat.SLOT_MEM - 1) // boat.SLOT_MEM)
     return {"name": name, "kind": "py", "module": module, "fn": fn, "args": args, "limit": limit, "est": est,
-            "weight": max(weight, int(cfg.get("weight", 1))), **{k: v for k, v in cfg.items() if k in ("mounts", "path", "overlays", "env", "runtime", "required_agent_capabilities")}}
+            "weight": slots, **extra}
 
 
 def sh_item(name: str, cmd: str, cwd: str, limit: int, est: float, weight: int = 1) -> dict:

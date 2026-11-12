@@ -2405,6 +2405,8 @@ class Session:
             required_agent_capabilities(it)
             if "runtime" in it:
                 raise Unavailable("runtime pins require the scheduler; refusing the legacy unverified path")
+            if it.get("enforce_memory") is True:
+                raise Unavailable("memory enforcement requires the scheduler; refusing the legacy unverified path")
         queue = sorted(items, key=lambda it: -it.get("est", 60))
         # (each item's fate: taken, lost and run again once with no fallback, finished exactly once: rules.boat.LocalItem)
         fates = {it.get("orig", it["name"]): R.LocalItem(on_lost is not None) for it in items}
@@ -3184,6 +3186,8 @@ class Scheduled(Session):
                 raise Unavailable("scheduler lacks strict_once_protocol:1; refusing a retrying submission")
             if any("runtime" in it for it in items) and (type(caps.get("runtime_pins_protocol")) is not int or caps["runtime_pins_protocol"] != 1):
                 raise Unavailable("scheduler lacks runtime_pins_protocol:1; refusing unverified runtime pins")
+            if any(it.get('enforce_memory') is True for it in items) and (type(caps.get('resource_limits_protocol')) is not int or caps['resource_limits_protocol'] != 1):
+                raise Unavailable('scheduler lacks resource_limits_protocol:1; refusing unenforced memory')
             if any(required_agent_capabilities(it) for it in items) and caps.get("required_agent_capabilities_protocol") != 1:
                 raise Unavailable("scheduler lacks required_agent_capabilities_protocol:1; refusing unverified agents")
             if any(it.get("distinct_vm_group_scope") == "durable" for it in items):
@@ -3844,7 +3848,7 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                     raise SystemExit(f"{j['name']} asks for {cpu} vCPU and {memory} MB: no boat VM type has that usable ({MEM_OVERHEAD} MB of each is its OS's)")
                 it["vm_type"] = big
             # Hooks may rebuild the execution spec, but cannot silently erase a user pin.
-            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime"):
+            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"):
                 if field in j:
                     it[field] = j[field]
             _validate_durable_item(it)
@@ -3876,7 +3880,8 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
     sched_on = __import__("supercomputer.scheduler", fromlist=["enabled"]).enabled()
     if strict_once and not sched_on:
         raise Unavailable("strict_once requires the scheduler; refusing the legacy retrying path")
-    if any("cpu_model" in it or "distinct_vm_group" in it or "runtime" in it or it.get("required_agent_capabilities") for it in items) and not sched_on:
+    from .rules.agent_capabilities import required_agent_capabilities
+    if any("cpu_model" in it or "distinct_vm_group" in it or required_agent_capabilities(it) for it in items) and not sched_on:
         raise Unavailable("placement constraints require the scheduler; refusing the legacy unconstrained path")
     tiny = on_lost is not None and small and not sched_on
     try:

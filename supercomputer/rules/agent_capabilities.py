@@ -36,6 +36,9 @@ def required_agent_capabilities(spec) -> dict[str, int]:
             or type(v) is not int or v < 1 for k, v in value.items()):
         raise ValueError("required_agent_capabilities must map nonblank names to positive integer versions")
     required = dict(value)
+    from ..agent import normalize_memory_limit
+    if normalize_memory_limit(spec) is not None:
+        required["resource_limits_protocol"] = max(1, required.get("resource_limits_protocol", 0))
     if "runtime" in spec:
         from ..agent import normalize_runtime_pins
         normalize_runtime_pins(spec["runtime"])

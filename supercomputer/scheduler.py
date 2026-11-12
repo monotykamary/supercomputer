@@ -280,7 +280,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
             "durable_distinct_vm_group": capabilities.get("distinct_vm_group_scope") == "durable" and capabilities.get("durable_distinct_vm_group_protocol") == 1,
             "result_files_protocol": capabilities.get("result_files_protocol") == 1,
             "required_agent_capabilities_protocol": capabilities.get("required_agent_capabilities_protocol") == 1,
-            "runtime_pins_protocol": type(capabilities.get("runtime_pins_protocol")) is int and capabilities["runtime_pins_protocol"] == 1}
+            "runtime_pins_protocol": type(capabilities.get("runtime_pins_protocol")) is int and capabilities["runtime_pins_protocol"] == 1,
+            "resource_limits_protocol": type(capabilities.get("resource_limits_protocol")) is int and capabilities["resource_limits_protocol"] == 1}
 
 
 def stage_install() -> dict:
@@ -1753,8 +1754,8 @@ class Scheduler:
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
                 "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1,
-                "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1,
-                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
+                "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
+                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
                 "result_files_protocol": 1, "output_files_protocol": 1,
                 "result_inline_bytes": resultfiles.INLINE_BYTES,
@@ -1989,6 +1990,9 @@ class Scheduler:
                 previous = old.items[name].spec
                 if ("runtime" in item.spec or "runtime" in previous) and item.spec.get("runtime") != previous.get("runtime"):
                     return {"ok": False, "error": "runtime pins differ from the existing admission; use a new batch id"}
+                from .agent import normalize_memory_limit
+                if normalize_memory_limit(item.spec) != normalize_memory_limit(previous):
+                    return {"ok": False, "error": "memory enforcement differs from the existing admission; use a new batch id"}
             return {"ok": True, "kept": True}
         if what == "refuse":
             log(f"{b.id} ({b.client}): a submit under the id of a batch with {old.left()} items live refused (never replaced)")
@@ -4933,6 +4937,11 @@ class Scheduler:
                                        for b in self.batches.values() for it in b.items.values())
                 if required_runtime and not all(prepared[target].get("runtime_pins_protocol") is True for target in candidates):
                     self.alert("handoff refused: runtime pins require a runtime-aware successor")
+                    return
+                required_memory = any(it.spec.get("enforce_memory") is True
+                                      for b in self.batches.values() for it in b.items.values())
+                if required_memory and not all(prepared[target].get("resource_limits_protocol") is True for target in candidates):
+                    self.alert("handoff refused: memory enforcement requires a resource-aware successor")
                     return
                 required_agents = any(required_agent_capabilities(it.spec) and it.state != "done"
                                       for b in self.batches.values() for it in b.items.values())

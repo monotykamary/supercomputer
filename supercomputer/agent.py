@@ -63,7 +63,7 @@ from typing import Literal
 ROOT = pathlib.Path.home() / ".sc"
 HOME = str(pathlib.Path.home())
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1, "runtime_pins_protocol": 1}
+AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1}
 VERSION = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]  # (its code: the scheduler upgrades a stale one in place)
 
 
@@ -1816,6 +1816,230 @@ def runtime_exec(spec_file, receipt_file, argv):
     os.execvpe(argv[0], argv, os.environ)
 
 
+# ------------------------------------------------------------------------------------------------------------------ resource limits
+class ResourceLimitGate:
+    # gdp: law acceptance requires a positive requested cap: not result or requested > 0
+    # gdp: law acceptance requires a positive effective cap: not result or effective > 0
+    # gdp: law acceptance never exceeds the requested cap: not result or effective <= requested
+    # gdp: law acceptance requires actual matching affinity: not result or affinity_matches
+    # gdp: law acceptance requires a successfully applied mechanism: not result or enforced
+    def allow(self, requested: int, effective: int, affinity_matches: bool, enforced: bool) -> bool:
+        return requested > 0 and effective > 0 and effective <= requested and affinity_matches and enforced
+
+    # gdp: law a required cgroup never falls back: not require_cgroup or not result
+    # gdp: law fallback requires a supported address-space limit: not result or rlimit_available
+    def fallback(self, require_cgroup: bool, rlimit_available: bool) -> bool:
+        return not require_cgroup and rlimit_available
+
+
+class MemoryScopeUnverified(RuntimeError):
+    pass
+
+
+RESOURCE_CGROUP_ROOT = pathlib.Path('/sys/fs/cgroup/supercomputer')
+
+
+def normalize_memory_limit(spec):
+    enabled = spec.get('enforce_memory', False)
+    if type(enabled) is not bool:
+        raise ValueError('enforce_memory must be boolean')
+    if not enabled:
+        if 'memory_limit_mode' in spec:
+            raise ValueError('memory_limit_mode requires enforce_memory:true')
+        return None
+    value = spec.get('memory', 4096)
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or value <= 0 or value > (2 ** 63 - 1) // (1024 ** 2) or not math.isfinite(value)):
+        raise ValueError('enforced memory must be positive finite MB within the kernel limit range')
+    mode = spec.get('memory_limit_mode', 'auto')
+    if mode not in ('auto', 'cgroup-v2', 'rlimit-as'):
+        raise ValueError('memory_limit_mode must be auto, cgroup-v2 or rlimit-as')
+    mb = math.ceil(value)
+    return {'mb': mb, 'bytes': mb * 1024 ** 2, 'mode': mode}
+
+
+def _resource_parent():
+    membership = next((line[3:] for line in pathlib.Path('/proc/self/cgroup').read_text().splitlines()
+                       if line.startswith('0::')), None)
+    mount = RESOURCE_CGROUP_ROOT.parent
+    if membership is None or '..' in pathlib.PurePosixPath(membership).parts:
+        raise ValueError('cannot verify existing cgroup memory ancestry')
+    current = mount / membership.lstrip('/')
+    if not current.is_dir():
+        raise ValueError('existing cgroup memory ancestry is not visible')
+    # A sibling retains every ancestor's controls. If this leaf has a finite
+    # control of its own, stay below it instead; unavailable delegation fails
+    # safely rather than moving out of a pre-existing resource ceiling.
+    constrained = False
+    if current != mount:
+        memory = current / 'memory.max'
+        if not memory.exists():
+            raise ValueError('existing cgroup memory ceiling is unknown')
+        constrained = memory.read_text().strip() != 'max'
+        for name in ('memory.high', 'pids.max'):
+            path = current / name
+            constrained = constrained or (path.exists() and path.read_text().strip() != 'max')
+        cpu = current / 'cpu.max'
+        constrained = constrained or (cpu.exists() and cpu.read_text().split()[0] != 'max')
+        io = current / 'io.max'
+        constrained = constrained or (io.exists() and bool(io.read_text().strip()))
+    base = current if current == mount or constrained else current.parent
+    return base / RESOURCE_CGROUP_ROOT.name
+
+
+def _resource_group(j, parent=None):
+    # No job-supplied cgroup path. A fresh run directory determines one scope.
+    ident = hashlib.sha256(str(pathlib.Path(j).resolve()).encode()).hexdigest()
+    return (parent if parent is not None else _resource_parent()) / ident
+
+
+def _resource_cgroup(j, limit):
+    parent = _resource_parent()
+    if parent.is_symlink() or parent.parent.is_symlink():
+        raise ValueError('unsafe resource cgroup root')
+    # Never change the root/ancestor delegation of the worker's VM.
+    available = (parent.parent / 'cgroup.subtree_control').read_text().split()
+    if 'memory' not in available:
+        raise ValueError('cgroup v2 memory controller is not delegated')
+    parent.mkdir(exist_ok=True)
+    if 'memory' not in (parent / 'cgroup.subtree_control').read_text().split():
+        (parent / 'cgroup.subtree_control').write_text('+memory')
+    # Bounded best-effort collection of empty scopes left by a killed wrapper.
+    # Never signal processes, traverse symlinks, or alter a populated scope.
+    for index, stale in enumerate(parent.iterdir()):
+        if index >= 64:
+            break
+        if stale.is_symlink() or not re.fullmatch(r'[0-9a-f]{64}', stale.name):
+            continue
+        with contextlib.suppress(OSError):
+            if not (stale / 'cgroup.procs').read_text().strip():
+                stale.rmdir()
+    group = _resource_group(j, parent)
+    try:
+        group.mkdir()  # Existing scopes are never silently reused or reset.
+    except FileExistsError as exc:
+        raise MemoryScopeUnverified('existing memory scope cannot be reused or bypassed') from exc
+    joined = False
+    try:
+        (group / 'memory.max').write_text(str(limit))
+        (group / 'memory.swap.max').write_text('0')
+        (group / 'memory.oom.group').write_text('1')
+        effective = int((group / 'memory.max').read_text().strip())
+        if effective <= 0 or effective > limit or (group / 'memory.swap.max').read_text().strip() != '0':
+            raise ValueError('cgroup memory limit readback did not match the request')
+        (group / 'cgroup.procs').write_text(str(os.getpid()))
+        joined = True
+        if str(os.getpid()) not in (group / 'cgroup.procs').read_text().split():
+            raise ValueError('payload did not enter its memory cgroup')
+        return {'method': 'cgroup-v2', 'effective_bytes': effective,
+                'aggregate': True, 'swap_max_bytes': 0, 'cgroup': str(group)}
+    except Exception as exc:
+        if joined:
+            raise MemoryScopeUnverified("joined memory cgroup could not be verified") from exc
+        with contextlib.suppress(OSError):
+            group.rmdir()
+        raise
+
+
+def _resource_rlimit(limit):
+    import resource
+    if not hasattr(resource, 'RLIMIT_AS'):
+        raise ValueError('RLIMIT_AS is unavailable')
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    effective = min(limit, hard) if hard != resource.RLIM_INFINITY else limit
+    resource.setrlimit(resource.RLIMIT_AS, (effective, effective))
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if soft <= 0 or hard <= 0 or soft > limit or hard > limit:
+        raise ValueError('RLIMIT_AS readback did not match the request')
+    return {'method': 'rlimit-as', 'effective_bytes': min(soft, hard),
+            'aggregate': False, 'rlimit_as_soft': soft, 'rlimit_as_hard': hard}
+
+
+def apply_memory_limit(j, spec):
+    request = normalize_memory_limit(spec)
+    if request is None:
+        raise ValueError('resource wrapper requires enforce_memory:true')
+    cpus_file = pathlib.Path(j) / 'taskset'
+    expected = json.loads((cpus_file if cpus_file.exists() else pathlib.Path(j) / 'cpus').read_text())
+    if (not isinstance(expected, list) or not expected or len(expected) != len(set(expected))
+            or any(type(cpu) is not int or cpu < 0 for cpu in expected)):
+        raise ValueError('invalid requested CPU affinity')
+    observed = sorted(os.sched_getaffinity(0))
+    receipt = {'protocol': 1, 'ok': False, 'requested_mb': request['mb'],
+               'requested_bytes': request['bytes'], 'requested_mode': request['mode'],
+               'affinity': {'requested': sorted(expected), 'effective': observed}}
+    method = None
+    if request['mode'] != 'rlimit-as':
+        try:
+            method = _resource_cgroup(j, request['bytes'])
+        except MemoryScopeUnverified:
+            raise  # Unknown containment must never become an accepted fallback.
+        except Exception as exc:
+            receipt['cgroup_error'] = str(exc)[:600]
+            if not ResourceLimitGate().fallback(request['mode'] == 'cgroup-v2', True):
+                raise ValueError('required cgroup memory enforcement unavailable: ' + str(exc)) from exc
+    if method is None:
+        method = _resource_rlimit(request['bytes'])
+    receipt.update(method)
+    observed = sorted(os.sched_getaffinity(0))
+    receipt['affinity']['effective'] = observed
+    receipt['ok'] = ResourceLimitGate().allow(request['bytes'], method['effective_bytes'],
+                                            observed == sorted(expected), True)
+    if not receipt['ok']:
+        raise ValueError('effective affinity or memory limit failed validation')
+    return receipt
+
+
+def resource_exec(spec_file, receipt_file, argv):
+    """After taskset, before payload: apply, read back, record, then exec."""
+    receipt = {'protocol': 1, 'ok': False}
+    try:
+        spec = json.loads(pathlib.Path(spec_file).read_text())
+        request = normalize_memory_limit(spec)
+        if request is not None:
+            receipt.update(requested_mb=request['mb'], requested_bytes=request['bytes'], requested_mode=request['mode'])
+        receipt = apply_memory_limit(pathlib.Path(spec_file).parent, spec)
+        if not argv:
+            raise ValueError('missing resource-limited payload')
+    except Exception as exc:
+        receipt.update(ok=False, error=str(exc)[:1500])
+    write_json(pathlib.Path(receipt_file), receipt)
+    if not receipt['ok']:
+        print('resource verification refused payload: ' + receipt.get('error', 'unknown'), file=sys.stderr)
+        raise SystemExit(78)
+    os.execvpe(argv[0], argv, os.environ)
+
+
+def resource_finalize(job_dir):
+    """Read only this job's cgroup counters; remove only an empty scope."""
+    j = pathlib.Path(job_dir)
+    path = j / 'resources.json'
+    receipt = json.loads(path.read_text())
+    if receipt.get('method') != 'cgroup-v2':
+        return
+    group = pathlib.Path(receipt.get('cgroup', ''))
+    expected = hashlib.sha256(str(j.resolve()).encode()).hexdigest()
+    mount = RESOURCE_CGROUP_ROOT.parent
+    if (not group.is_absolute() or not group.is_relative_to(mount) or '..' in group.parts
+            or group.name != expected or group.parent.name != RESOURCE_CGROUP_ROOT.name
+            or any(path.is_symlink() for path in (group, *group.parents))):
+        raise ValueError('resource cgroup identity mismatch')
+    stats = {}
+    for line in (group / 'memory.events').read_text().splitlines():
+        key, value = line.split()
+        stats[key] = int(value)
+    receipt['memory_events'] = stats
+    receipt['oom_kill'] = stats.get('oom_kill', 0)
+    if (group / 'memory.peak').exists():
+        receipt['memory_peak_bytes'] = int((group / 'memory.peak').read_text())
+    # Never kill a process here, or modify another scope. A populated scope
+    # keeps its cap after the wrapper exits and is reported, not silently lost.
+    receipt['cleanup_pending'] = bool((group / 'cgroup.procs').read_text().strip())
+    if not receipt['cleanup_pending']:
+        group.rmdir()
+    write_json(path, receipt)
+
+
 # ------------------------------------------------------------------------------------------------------------------ run
 def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathlib.Path, cwd: str, argv: list[str]) -> list[str]:
     home = pwd.getpwuid(os.getuid()).pw_dir if spec.get("strict_once") is True else HOME
@@ -1857,9 +2081,15 @@ def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathl
         argv = [sys.executable, "-I", str(ROOT / "agent.py"), "runtime-exec",
                 str(j / "spec.json"), str(j / "runtime.json"), *argv]
     cpus = ",".join(map(str, json.loads((j / "taskset" if (j / "taskset").exists() else j / "cpus").read_text())))
-    return ["sudo", "-n", "unshare", "-m", "--propagation", "private", "--", "sh", str(j / "ns.sh"),
-            "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}", "--init-groups", "--",
-            *env, "taskset", "-c", cpus, "timeout", "-s", "KILL", str(int(spec["limit"])), *argv]
+    prefix = ["sudo", "-n", "unshare", "-m", "--propagation", "private", "--", "sh", str(j / "ns.sh")]
+    drop = ["setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}", "--init-groups", "--"]
+    if normalize_memory_limit(spec) is not None:
+        # Apply cgroup/RLIMIT while privileged, after the actual taskset. Only
+        # the requested job enters the new cgroup; the agent remains outside.
+        return [*prefix, "taskset", "-c", cpus, "timeout", "-s", "KILL", str(int(spec["limit"])),
+                sys.executable, "-I", str(ROOT / "agent.py"), "resource-exec",
+                str(j / "spec.json"), str(j / "resources.json"), *drop, *env, *argv]
+    return [*prefix, *drop, *env, "taskset", "-c", cpus, "timeout", "-s", "KILL", str(int(spec["limit"])), *argv]
 
 
 def caches_in(ctx: dict, top: pathlib.Path) -> dict:
@@ -1951,6 +2181,27 @@ def run(batch: str, name: str, launch_identity=None):
     except Exception as e:
         row.update(code=-1, seconds=-1, error=repr(e)[-2000:])
     finally:
+        if spec.get('enforce_memory') is True:
+            resource_path = j / 'resources.json'
+            try:
+                resource_receipt = json.loads(resource_path.read_text())
+                if resource_receipt.get('method') == 'cgroup-v2':
+                    done = sudo(sys.executable, '-I', str(ROOT / 'agent.py'), 'resource-finalize', str(j), check=False)
+                    if done.returncode:
+                        resource_receipt['cleanup_error'] = (done.stderr or 'resource finalization failed')[-1000:]
+                    else:
+                        resource_receipt = json.loads(resource_path.read_text())
+            except (OSError, ValueError) as exc:
+                resource_receipt = {'protocol': 1, 'ok': False, 'error': 'resource verification did not complete: ' + str(exc)[:500]}
+            row['resource_limits'] = resource_receipt
+            row['resource_verified'] = resource_receipt.get('ok') is True
+            row.pop('oom', None)  # The host-global OOM counter is not a per-job proof.
+            if resource_receipt.get('method') == 'cgroup-v2' and resource_receipt.get('oom_kill', 0) > 0:
+                row['oom'] = True
+            if not row['resource_verified']:
+                row['resource_error'] = 'resource_verification_failed'
+                if row.get('code') == 0:
+                    row['code'] = 78
         if "runtime" in spec:
             try:
                 receipt = json.loads((j / "runtime.json").read_text())
@@ -2915,6 +3166,10 @@ if __name__ == "__main__":
         call(*rest)
     elif cmd == "runtime-exec":
         runtime_exec(rest[0], rest[1], rest[2:])
+    elif cmd == "resource-exec":
+        resource_exec(rest[0], rest[1], rest[2:])
+    elif cmd == "resource-finalize":
+        resource_finalize(rest[0])
     elif cmd == "daemon":
         daemon(*rest)
     elif cmd == "ingest":

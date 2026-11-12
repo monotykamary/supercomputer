@@ -39,6 +39,16 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `Scheduled.recover_close`, `boat.recover_close` | I/O + existing validator | bounded read-only attempts use `_valid_close` unchanged, original local custody bindings, conflict persistence, and single-attempt transport; no execution or cancellation workflow. |
 | `Scheduler._attempt_audit`, `batchfetch.fetch` | I/O | append observed start intent/response metadata, freeze and verify audit payloads; these records alone do not certify physical execution. |
 
+## Opt-in job resource enforcement
+
+| def | where | laws, or why |
+| --- | --- | --- |
+| `rules.resources.ResourceLimitGate`, standalone agent copy | rule | payload admission requires a positive requested and observed cap, the effective cap at most requested, matching actual affinity and applied enforcement; required cgroups never fall back. |
+| `agent.normalize_memory_limit` | I/O schema | validates the opt-in flag, finite positive MiB and explicit mechanism; defaults remain unenforced. |
+| `agent._resource_cgroup`, `_resource_rlimit` | I/O | private per-run kernel cgroup or inherited hard address-space limit; readback checked before admission; never reuse a live scope or bypass a finite inherited memory ceiling. Kernel enforcement is exercised by native allocation tests, not assumed proven by the Boolean rule. |
+| `agent.apply_memory_limit`, `resource_exec`, `resource_finalize` | I/O + rule | dispatch to checked admission; record actual launch affinity and selected mechanism; fail before payload on verification error; per-job OOM/counter reads and empty-scope-only cleanup. |
+| Scheduler/client resource protocol, admission identity and handoff checks | I/O + existing capability rules | refuse unsupported workers/controllers, silent backend fallback and changed same-ID caps. Full native and client regressions cover transport, downgrade and retained rows. |
+
 ## blobcache.py
 
 | def | where | laws, or why |

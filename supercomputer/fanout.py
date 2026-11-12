@@ -21,6 +21,7 @@ import contextlib
 import importlib.util
 import inspect
 import json
+import math
 import os
 import pathlib
 import queue
@@ -324,9 +325,14 @@ class BoatEx:
         root = project().root
         self.module = str(pathlib.Path(runner).resolve().relative_to(root))
         cfg = getattr(agent.import_runner(str(root / self.module)), "BOAT", {})
-        self.extra = {k: v for k, v in cfg.items() if k in ("mounts", "path", "overlays", "env", "runtime", "required_agent_capabilities")}
+        self.extra = {k: v for k, v in cfg.items() if k in ("mounts", "path", "overlays", "env", "runtime", "required_agent_capabilities", "enforce_memory", "memory_limit_mode")}
+        if cfg.get('enforce_memory') is True and 'memory' in cfg:
+            self.extra['memory'] = cfg['memory']
         required_agent_capabilities(self.extra)
         self.weight = int(cfg.get("weight", 1))  # slots a call takes (a runner whose calls need more than 4 GB says 2)
+        if self.extra.get('enforce_memory') is True:
+            from .agent import normalize_memory_limit
+            self.weight = max(self.weight, math.ceil(normalize_memory_limit(self.extra)['mb'] / boat.SLOT_MEM))
         self.vms, self.max_vms, self.limit, self.max_wait = vms, max_vms, limit, max_wait
         self.past = {}
         if durations:  # a results.jsonl of an earlier run: each (tool, task)'s seconds, to start the longest first
@@ -354,7 +360,7 @@ class BoatEx:
         self.calls += 1
         out = {}
         self.sess.run([{"name": f"call-{fname(fn)}-{int(time.time() * 1000)}", "kind": "py", "module": self.module, "fn": fname(fn), "args": list(args),
-                        "limit": self.limit, "weight": 1, "est": 1, **self.extra}], lambda it, row: out.update(row), max_wait=self.max_wait or 600)
+                        "limit": self.limit, "weight": self.weight if self.extra.get('enforce_memory') is True else 1, "est": 1, **self.extra}], lambda it, row: out.update(row), max_wait=self.max_wait or 600)
         what = fallback.row_outcome("result" in out, int(out.get("code", -1) if isinstance(out.get("code", -1), int) else -1), float(out.get("seconds", -1) or -1) >= 0, bool(out.get("lost")))
         if what == "own":
             raise CallFailed(f"{fname(fn)} failed on boat: {str(out.get('error', out))[-1500:]}")
