@@ -4,6 +4,13 @@ Every function and method of the tool, by module: `rule` (a call of `supercomput
 law proven and checked by gdp-wired from every state the laws allow, `tests/check_laws.sh`), `I/O` (no decision, with
 why), or a decision not in a rule (with why: what the rules' subset can't state). The modules' own tables follow.
 
+## Manifest-first service startup
+
+| def | where | laws, or why |
+| --- | --- | --- |
+| `launcher.source_hash`, `installed`, `launch`, `main` | filesystem validation / I/O | stdlib-only bootstrap validates an immutable manifest-selected source and prepared interpreter, rechecks the manifest bytes, then execs without importing mutable scheduler code; real subprocess tests cover selection, refusal and generation changes. Filesystem/hash/exec semantics are outside the GDP state model. |
+| `controller.scheduler_service_start`, `scheduler_service_override`, `scheduler_service_install`, `unit`, `setup`, `stage` | I/O | install/load the managed bootstrap before publishing an install; initial enable follows publication, and normal stage does daemon-reload, not restart. No lease, placement or handoff decision is changed. |
+
 ## CPU pinning and controller affinity
 
 | def | where | laws, or why |

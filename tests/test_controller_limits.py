@@ -52,6 +52,17 @@ class ControllerLimitsTests(unittest.TestCase):
         self.assertEqual(command.count("systemctl daemon-reload"), 1)
         self.assertLess(command.index("20-memory.conf"), command.index("systemctl daemon-reload"))
         self.assertIn("SUPERCOMPUTER_CONTROLLER=0 python3 -P -m supercomputer scheduler stage", command)
+        self.assertIn('30-install-pinned.conf', command)
+        startup_printf = next(part for part in command.split('; ') if part.startswith('printf %s ') and 'ExecStart=' in part).split(' | ')[0]
+        self.assertEqual(subprocess.check_output(['/bin/sh', '-c', startup_printf], timeout=5).decode(),
+                         controller.scheduler_service_override())
+        self.assertIn('sudo mv -f', command)
+        self.assertIn('/.install-pinned-$$.tmp', command)
+        self.assertLess(command.index('sudo mv -f'), command.index('systemctl daemon-reload'))
+        self.assertLess(command.index('30-install-pinned.conf'), command.index('systemctl daemon-reload'))
+        self.assertLess(command.index('systemctl daemon-reload'), command.index('scheduler stage'))
+        # Execute only shell parsing, never the remote mutations, in this fixture.
+        subprocess.run(['/bin/bash', '-n'], input=command, text=True, check=True, timeout=5)
         for forbidden in ("restart", "systemctl start", "systemctl stop", "enable", "kill",
                           "set-property", "revert", "/run/systemd", "rm ", "--runtime"):
             self.assertNotIn(forbidden, command)

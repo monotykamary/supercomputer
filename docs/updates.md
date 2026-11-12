@@ -115,6 +115,36 @@ socket stays open or that service management preserves its child. A <5 second
 placement-bound claim requires both load scenarios and an actual subprocess
 handoff receipt. No deployment was performed by this lane.
 
+## Manifest-first service starts
+
+Systemd starts (including reboot, crash recovery and rekey) select code from
+`LIVE/scheduler/install.json` **before importing the scheduler package**. The
+scheduler unit and managed `30-install-pinned.conf` embed the stdlib-only
+`launcher.py` and start it with Python `-I`, ignoring mutable checkout imports.
+The bootstrap requires `source` and `snapshot` to name `code/<hash>`, checks all
+Python sources recursively against that hash, uses the prepared interpreter,
+and rechecks the manifest generation before `exec`. Missing, malformed,
+symlinked, changed or hash-mismatched installs fail closed; they do not fall back
+to `~/sc/tool` or an older saved code. The child keeps the service PID and receives
+only the selected snapshot in `PYTHONPATH`/`SUPERCOMPUTER_SRC`. Existing service
+limits, notify semantics and tmpfs-only Boat credentials are preserved.
+
+Initial setup prepares/publishes the install before enabling the scheduler.
+Normal `controller stage` refreshes the managed startup override and runs
+`daemon-reload` before publishing the verified snapshot, so a crash at the
+publication boundary already has a manifest-first boot path. It neither restarts the scheduler
+nor changes the live handoff/lease protocol. The managed override replaces an
+emergency hash-specific `30-install-pinned.conf`, so a later restart follows the
+new manifest rather than remaining pinned to that old emergency target.
+Treadmill-only setup does not change scheduler units or its install pointer.
+
+This fixes future service starts, not an already-running legacy parent's handoff
+implementation. A cold restart still requires its own recovery/identity audit;
+valid code selection cannot repair missing result payloads or discarded history.
+Real subprocess tests cover a hostile mutable import path, changing install
+pointers, missing/tampered/nested sources, and the actual embedded unit command.
+Filesystem/hash/exec behavior is tested, not claimed as a GDP proof.
+
 ## Implemented update protocol
 
 * `scheduler.py:216` reads the explicit install pointer. `scheduler stage`

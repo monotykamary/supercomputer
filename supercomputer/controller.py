@@ -18,12 +18,14 @@ On the VM (a `small` one, no auto-stop: it runs the scheduler continuously, whic
 Durability: the state lives on the VM's disk, which a stop, a resume and a recover keep; `sync` (run by `run` and
 `queue` at most hourly) also copies it here (LIVE/controller-state/, the last five), without secrets or blobs.
 """
+import base64
 import contextlib
 import fcntl
 import io
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -95,9 +97,35 @@ LIMITS = {"scheduler": f"CPUQuota=250%\n{SCHEDULER_MEMORY_LIMITS}\nTasksMax=1500
           "treadmill": "CPUQuota=100%\nMemoryHigh=1536M\nMemoryMax=2G\nTasksMax=400\nNice=10"}
 
 
+def scheduler_service_start() -> str:
+    """Embed a stdlib bootstrap: no mutable package import before install selection."""
+    source = base64.b64encode(pathlib.Path(__file__).with_name('launcher.py').read_bytes()).decode('ascii')
+    bootstrap = f'import base64;exec(base64.b64decode("{source}"))'
+    return ("ExecStart=\n"
+            f"ExecStart=/usr/bin/python3 -I -c '{bootstrap}' {SC}/live/scheduler/install.json --key-file /run/sc-boat/boat-key\n"
+            f"StandardOutput=append:{SC}/scheduler.log\nStandardError=inherit\n")
+
+
+def scheduler_service_override() -> str:
+    return f'[Service]\nWorkingDirectory={SC}\n' + scheduler_service_start()
+
+
+def scheduler_service_install() -> str:
+    """Publish one complete drop-in; an interrupted write is never a unit file."""
+    directory = '/etc/systemd/system/supercomputer-scheduler.service.d'
+    temporary = directory + '/.install-pinned-$$.tmp'
+    return (f'printf %s {shlex.quote(scheduler_service_override())} | sudo tee {temporary} >/dev/null; '
+            f'sudo chmod 644 {temporary}; sudo mv -f {temporary} {directory}/30-install-pinned.conf; ')
+
+
 def unit(name: str, cmd: str, cwd: str, env: dict) -> str:
     envs = "\n".join(f"Environment={k}={v}" for k, v in env.items())
     notify = "Type=notify\nNotifyAccess=all\nKillMode=process\n" if name == "scheduler" else ""
+    if name == 'scheduler':
+        cwd, start = SC, scheduler_service_start()
+    else:
+        start = f"""ExecStart=/bin/bash -lc 'export BOAT_API_KEY="$$(cat /run/sc-boat/boat-key 2>/dev/null)"; exec {cmd} >> {SC}/{name}.log 2>&1'
+"""
     return f"""[Unit]
 Description=supercomputer {name}
 After=network-online.target
@@ -106,8 +134,7 @@ After=network-online.target
 WorkingDirectory={cwd}
 {envs}
 ExecStartPre=+/bin/bash -c 'mkdir -p /run/sc-boat && chown user:user /run/sc-boat && chmod 700 /run/sc-boat'
-ExecStart=/bin/bash -lc 'export BOAT_API_KEY="$$(cat /run/sc-boat/boat-key 2>/dev/null)"; exec {cmd} >> {SC}/{name}.log 2>&1'
-Restart=always
+{start}Restart=always
 RestartSec=10
 {LIMITS.get(name, "")}
 [Install]
@@ -160,8 +187,12 @@ def setup(vm: str, vms: int = 40, floor: int = 8, only: str = ""):
            "SUPERCOMPUTER_GATE_HORIZON": "900", "SUPERCOMPUTER_WATCHDOG": "1",
            "SUPERCOMPUTER_TREADMILL_SUBS_VMS": "8",
            "PATH": "/home/user/.bun/bin:/home/user/.elan/bin:/home/user/.ascii/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-    units = {f"supercomputer-{n}": unit(n, c.format(vms=floor), f"{SC}/tool" if n == "scheduler" else repo, env) for n, c in UNITS.items()}
+    units = {f"supercomputer-{n}": unit(n, c.format(vms=floor), f"{SC}/tool" if n == "scheduler" else repo, env)
+             for n, c in UNITS.items() if only != 'treadmill' or n == 'treadmill'}
     script = "set -e\n" + "".join(f"sudo tee /etc/systemd/system/{u}.service > /dev/null <<'EOF'\n{t}EOF\n" for u, t in units.items())
+    if only != 'treadmill':
+        script += ("sudo install -d /etc/systemd/system/supercomputer-scheduler.service.d\n"
+                   + scheduler_service_install() + "\n")
     # The running scheduler imports stable source and transfers its listener.
     # Never turn an unsupported first-upgrade endpoint into a destructive restart.
     reload = (f"T={SC}/live/scheduler/token; "
@@ -171,7 +202,13 @@ def setup(vm: str, vms: int = 40, floor: int = 8, only: str = ""):
     if only == "treadmill":  # (the tool's files and the treadmill only: the scheduler, and every batch in it, untouched)
         script += "sudo systemctl daemon-reload\nsudo systemctl restart supercomputer-treadmill\necho UNITS-OK\n"
     else:
-        script += "sudo systemctl daemon-reload\nsudo systemctl enable --now supercomputer-scheduler\n" + reload + "sudo systemctl enable --now supercomputer-treadmill\necho UNITS-OK\n"
+        # Guard crash/rekey starts before publishing, and publish before first enable.
+        script += (f"sudo systemctl daemon-reload\ncd {SC}/tool\n"
+                   f"PYTHONPATH={SC}/tool SUPERCOMPUTER_SRC={SC}/tool "
+                   f"SUPERCOMPUTER_HOME={SC}/tool SUPERCOMPUTER_LIVE={SC}/live "
+                   "SUPERCOMPUTER_CONTROLLER=0 python3 -P -m supercomputer scheduler stage\n"
+                   "sudo systemctl enable --now supercomputer-scheduler\n" + reload
+                   + "sudo systemctl enable --now supercomputer-treadmill\necho UNITS-OK\n")
     code, out = ssh(vm, "bash -s", script.encode(), 300)
     assert "UNITS-OK" in out, out[-600:]
     for _ in range(30):
@@ -197,8 +234,10 @@ def stage(vm: str):
                # Use a fixed printf format: percentage directives are literal data.
                f"printf '%s' '[Service]\n{SCHEDULER_MEMORY_LIMITS}\n' | "
                "sudo tee /etc/systemd/system/supercomputer-scheduler.service.d/20-memory.conf >/dev/null; "
-               # Leave emergency /run/systemd overrides and the running service alone.
-               "sudo systemctl daemon-reload; "
+               # Load the manifest-first boot path before publication can trigger pickup.
+               # Preserve emergency /run/systemd resource overrides and the running service.
+               + scheduler_service_install()
+               + "sudo systemctl daemon-reload; "
                f"mkdir -p {release}; tar xzf - -C {release}; "
                f"cd {release}; PYTHONPATH={release} SUPERCOMPUTER_SRC={release} "
                f"SUPERCOMPUTER_HOME={SC}/tool SUPERCOMPUTER_LIVE={SC}/live "
