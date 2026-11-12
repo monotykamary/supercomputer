@@ -4,7 +4,7 @@
 supercomputer batch fetch 20261111-120000-example --out recovered/example
 ```
 
-This recovers an **existing, completed scheduler admission** after its original
+This recovers an **existing, completed scheduler admission**, including retained closed history, after its original
 client exits. It never submits work, starts a scheduler, closes/cancels a batch,
 reaps a worker, or switches providers. It does not wait for running work. A
 missing admission or a completed admission with missing rows is an error, not
@@ -13,6 +13,11 @@ an empty successful fetch.
 The connected controller must advertise `batch_fetch_protocol: 1`; older
 controllers must be upgraded first. `--timeout SECONDS` bounds each network
 request (default 120 seconds), not the job's execution deadline.
+
+Closed history is retained for **48 hours after close** by default. Configure
+`supercomputer policy history_retention_hours=72` for future closes. See
+[closed history and strict-close recovery](closed-history.md) for expiry and
+audit guarantees. The original batch ID and admission generation are preserved.
 
 ## Files
 
@@ -45,10 +50,17 @@ files, but do not publish a successful `fetch.json`. A repeat fetch invalidates
 its previous success marker before modifying published artifacts. Symlink destinations
 and unsafe row/output paths are refused.
 
+Closed fetches also return an `audit` inventory in `fetch.json`: hash-verified
+snapshot, close receipt, frozen rows, and placement/start/cancellation journals.
+The files live under `audit/.payloads`; each inventory entry names its local file
+and SHA-256 reference. No raw journal is interpreted as permission to execute.
+
 ## Limits
 
-Fetching does not pin journals against another client's concurrent close or
-administrative deletion. Read-only pagination does not renew the original
+Fetching does not pin history against expiry or administrative deletion. An
+ordinary close now retains history instead of deleting it; a close racing an
+open-admission fetch may still require restarting the fetch against the closed
+metadata. Read-only pagination does not renew the original
 client heartbeat or postpone automatic abandonment. If the admission changes or disappears during the
 transfer, the command fails without closing anything. It cannot recover rows,
 logs or private worker `/tmp` files that were already deleted. Only files

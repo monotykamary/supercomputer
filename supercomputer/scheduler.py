@@ -36,6 +36,7 @@ import hmac
 import http.server
 import io
 import json
+import itertools
 import math
 import os
 import pathlib
@@ -50,7 +51,7 @@ import threading
 import time
 import urllib.request
 
-from . import blobcache, boat, canary, config, health, memorypressure, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
+from . import blobcache, boat, canary, config, health, history, memorypressure, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
 from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
 from .agent import AGENT_CAPABILITIES as BUILD_AGENT_CAPABILITIES
@@ -185,7 +186,7 @@ def policy_defaults() -> dict:
             "ttl_s": boat.BACKSTOP, "bringup": BRINGUP_MAX, "sub_vms": SUB_VMS, "sub_preempt_s": SUB_PREEMPT, "boat_tries": BOAT_TRIES, "classes": list(CLASSES),
             "drain_step": DRAIN_STEP, "drain_every_s": DRAIN_EVERY, "floor_always": bool(FLOOR_ALWAYS),
             "floor_default": FLOOR_DEFAULT, "floor_idle_s": FLOOR_IDLE, "floor_by_image": dict(FLOOR_BY_IMAGE),
-            "cpu_model_max_fruitless": CPU_MODEL_MAX_FRUITLESS, "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400}
+            "cpu_model_max_fruitless": CPU_MODEL_MAX_FRUITLESS, "history_retention_hours": 48.0, "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400}
 
 
 def read_policy() -> dict:
@@ -204,6 +205,8 @@ def write_policy(changes: dict) -> dict:
     if not pol.write(not unknown):
         raise SystemExit(f"no policy knob {unknown[0]} (knobs: {', '.join(policy_defaults())})")
     for k, v in changes.items():
+        if k == "history_retention_hours" and isinstance(v, bool):
+            raise ValueError("history_retention_hours must be numeric")
         d = policy_defaults()[k]
         if isinstance(d, dict):  # (floor_by_image={"img": 0}, or img=n,img2=m)
             v = v if isinstance(v, dict) else json.loads(v) if str(v).strip().startswith("{") else {a: int(b) for a, b in (x.split("=", 1) for x in str(v).split(",") if x)}
@@ -215,6 +218,8 @@ def write_policy(changes: dict) -> dict:
         raise SystemExit("blob cache requires bytes >= 0, grace >= 60s, and max age >= grace")
     if p["cpu_model_max_fruitless"] < 1:
         raise ValueError("cpu_model_max_fruitless must be positive")
+    if not math.isfinite(p["history_retention_hours"]) or p["history_retention_hours"] < 0:
+        raise ValueError("history_retention_hours must be finite and nonnegative")
     p["generation"] = pol.generation
     p["t"] = round(time.time(), 1)
     POLICY.parent.mkdir(parents=True, exist_ok=True)
@@ -739,8 +744,10 @@ class Scheduler:
     @staticmethod
     def _read_client_closes() -> set[str]:
         # Until reconciliation succeeds, an extant file remains unresolved.
-        return {bid for bid in Scheduler._scheduled_closes()
-                if not (DIR / "queue" / f"{bid}.json").exists()}
+        q = DIR / "queue"
+        archived = {p.stem for p in q.glob("*.retired")} | {p.stem for p in q.glob("*.closed")}
+        return {bid for bid in Scheduler._scheduled_closes() | archived
+                if not (q / f"{bid}.json").exists()}
 
     def _quarantine_closed_admissions(self):
         """Archive resurrected closes before reload or the handoff manifest.
@@ -750,12 +757,28 @@ class Scheduler:
         """
         with self.lock, blobcache.locked(BLOBS):
             closed = self._scheduled_closes()
-            self._durably_closed = closed | getattr(self, "_durably_closed", set())
+            # New closed sidecars are retention, not resurrected admissions.
+            archived = {p.stem for p in (DIR / "queue").glob("*.retired")}
+            self._durably_closed = closed | archived | getattr(self, "_durably_closed", set())
+            closed -= archived
             q = DIR / "queue"
+            for bid in archived:
+                active = q / f'{bid}.json'
+                if active.exists():
+                    try:
+                        record = history.load(active)
+                        if record.get('closed_history') is not None:
+                            history.metadata(record, bid)
+                            continue  # A legitimate interrupted close, completed by reload.
+                    except (ValueError, OSError):
+                        pass
+                    closed.add(bid)  # A resurrected active record, never replay it.
             evidence = {}
             for path in q.iterdir() if q.exists() else ():
                 if path.suffix in (".json", ".rows", ".placed", ".cancel", ".logs"):
                     bid = path.stem
+                    if bid in archived and path.suffix != ".json":
+                        continue  # Preserve intentional retained evidence.
                     if rules.quarantine_closed_admission(True, bid in closed):
                         evidence.setdefault(bid, []).append(path)
             affected = set(evidence) | (set(self.batches) & closed)
@@ -823,7 +846,11 @@ class Scheduler:
                 continue
             b = None
             try:
-                b = Batch(json.loads(f.read_text()))
+                record = json.loads(f.read_text())
+                if record.get("closed_history") is not None:
+                    history.finish(qd, f.stem, record)
+                    continue
+                b = Batch(record)
                 self._attach_durable(b)
                 if self._valid_batch(b.id) != f.stem:
                     raise ValueError("admission id does not match its file")
@@ -890,6 +917,13 @@ class Scheduler:
                 # exception turn a durable admission into an unowned worker run.
                 self.recovery_errors[f.stem] = repr(e)
                 log(f"{f.stem}: recovery quarantined, ownership retained: {e!r}")
+        for b in list(self.batches.values()):
+            if b.strict_once and b.closed and all(it.owned.reaped for it in b.items.values()):
+                try:
+                    self._retain_closed(b, self._close_receipt(b))
+                except Exception as exc:
+                    self.recovery_errors[b.id] = repr(exc)
+        self._client_closed = self._read_client_closes()
         self.recovery_blocked = bool(self.recovery_errors)
         if self.batches:
             log(f"{len(self.batches)} batches back from before the restart")
@@ -1632,7 +1666,7 @@ class Scheduler:
             raise ValueError("distinct_vm_group requires placement_contract=1 from a group-aware client")
         if (enhanced or grouped) and len(names) != len(set(names)):
             raise ValueError("duplicate item names")
-        if any(k in msg for k in ("admission_closed", "cancellation_complete", "launch_identity")):
+        if any(k in msg for k in ("admission_closed", "cancellation_complete", "launch_identity", "closed_history")):
             raise ValueError("reserved scheduler ownership fields in submission")
 
     @staticmethod
@@ -1718,7 +1752,7 @@ class Scheduler:
         return {"scope": "native-single-vm", "runtime_verified": True, "code": code_hash(),
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
-                "batch_fetch_protocol": 1,
+                "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1,
                 "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -1726,7 +1760,7 @@ class Scheduler:
                 "result_inline_bytes": resultfiles.INLINE_BYTES,
                 "poll_max_bytes": resultfiles.POLL_BYTES + 2048,
                 "retention_requires_strict_once": True,
-                "paths": ["/cancel", "/snapshot", "/capabilities", "/batch/info", "/batch/rows", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"],
+                "paths": ["/cancel", "/snapshot", "/close-receipt", "/capabilities", "/batch/info", "/batch/rows", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"],
                 "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
 
     @classmethod
@@ -1745,8 +1779,11 @@ class Scheduler:
             if bid in getattr(self, "recovery_errors", {}):
                 return {"ok": False, "batch": bid, "owned": True, "error": "admission quarantined; journals and ownership retained"}
             if b is None:
+                retained = history.read(DIR / "queue", bid)
+                if retained is not None:
+                    return history.payload(DIR / "queue", bid, "snapshot.json", retained)
                 exists = (DIR / "queue" / f"{bid}.json").exists()
-                return {"ok": False, "error": "admission quarantined; journals retained" if exists else "no such batch"}
+                return {"ok": False, "error": "admission quarantined; journals retained" if exists else "no such batch or history expired"}
             return {"ok": True, "batch": bid, "strict_once": b.strict_once,
                     "max_attempts": b.max_attempts,
                     "retain_journals": b.retain_journals or b.strict_once, "admission_closed": b.admission_closed,
@@ -1765,12 +1802,67 @@ class Scheduler:
         with self.lock:
             b = self.batches.get(bid)
             if b is None:
-                return {"ok": False, "batch": bid, "error": "no such batch"}
+                retained = history.read(DIR / "queue", bid)
+                return ({"ok": True, **retained} if retained is not None else
+                        {"ok": False, "batch": bid, "error": "no such batch or history expired"})
             return {"ok": True, "batch": bid, "generation": b.cache_generation,
                     "admitted_at": b.t0, "items": len(b.items), "rows": len(b.rows),
                     "complete": b.left() == 0, "closed": b.closed,
                     "strict_once": b.strict_once, "admission_closed": b.admission_closed,
                     "journals_retained": b.retain_journals or b.strict_once}
+
+    @staticmethod
+    def _close_receipt(b):
+        items = list(b.items.values())
+        complete = b.admission_closed and all(it.owned.reaped for it in items)
+        return {"ok": complete, "complete": complete, "cleanup_complete": complete,
+                "admission_closed": b.admission_closed, "journals_retained": True,
+                "strict_once": b.strict_once, "max_attempts": b.max_attempts,
+                "attempts": [{"name": it.name, "attempt": (it.last_placement or {}).get("attempt", it.owned.placements),
+                              "run_name": (it.last_placement or {}).get("run_name"),
+                              "vm": (it.last_placement or {}).get("vm"),
+                              "boot_id": (it.last_placement or {}).get("boot_id"),
+                              "launch_identity": it.launch_identity,
+                              "cleanup_complete": it.owned.reaped}
+                             for it in items if it.owned.placements],
+                "unlaunched": [it.name for it in items if not it.owned.placements],
+                "pending": [it.name for it in items if not it.owned.reaped], "batch": b.id}
+
+    def close_receipt(self, bid):
+        """Read evidence only. Never cancel, reap, submit, or touch a heartbeat."""
+        self._valid_batch(bid)
+        with self.lock:
+            b = self.batches.get(bid)
+            if b is not None:
+                return self._close_receipt(b)
+            retained = history.read(DIR / "queue", bid)
+            if retained is not None:
+                return history.payload(DIR / "queue", bid, "close.json", retained)
+            return {"ok": False, "batch": bid, "cleanup_complete": False,
+                    "error": "close evidence missing or expired"}
+
+    def _retain_closed(self, b, receipt):
+        """Called under the scheduler lock; preserve a durable non-execution fence."""
+        before = b.closed
+        info, snapshot = self.batch_info(b.id), self.snapshot(b.id)
+        b.closed = True
+        try:
+            retained = history.capture(DIR / "queue", b.id, info, snapshot, receipt,
+                                       read_policy()["history_retention_hours"])
+        except Exception:
+            # Before the durable fence, nothing closed. After it, never reopen.
+            path = DIR / "queue" / f"{b.id}.json"
+            try:
+                fenced = history.load(path).get("closed_history") is not None
+            except FileNotFoundError:
+                fenced = (DIR / "queue" / f"{b.id}.closed").exists()
+            except (ValueError, OSError):
+                fenced = True  # Unreadable ownership is never permission to launch.
+            b.closed = before or fenced
+            raise
+        self.batches.pop(b.id, None)
+        self._durably_closed = getattr(self, "_durably_closed", set()) | {b.id}
+        return retained
 
     @staticmethod
     def _matching_receipt(receipt, bid, name, identity):
@@ -1789,7 +1881,7 @@ class Scheduler:
         with self.lock:
             b = self.batches.get(bid)
             if b is None:
-                return {"ok": False, "error": "no such batch"}
+                return self.close_receipt(bid)
             if not b.strict_once:
                 return {"ok": False, "complete": False, "batch": bid,
                         "admission_closed": False,
@@ -1860,11 +1952,11 @@ class Scheduler:
                          "boot_id": (it.last_placement or {}).get("boot_id"),
                          "launch_identity": it.launch_identity, "cleanup_complete": it.owned.reaped}
                         for it in items if it.owned.placements]
-            return {"ok": complete, "complete": complete, "cleanup_complete": complete,
-                    "admission_closed": True, "journals_retained": True, "strict_once": True,
-                    "max_attempts": b.max_attempts, "attempts": attempts,
-                    "unlaunched": [it.name for it in items if not it.owned.placements],
-                    "pending": [it.name for it in items if not it.owned.reaped], "batch": bid}
+            receipt = self._close_receipt(b)
+            if complete:
+                with blobcache.locked(BLOBS):
+                    self._retain_closed(b, receipt)
+            return receipt
 
     def submit(self, msg: dict) -> dict:
         with self.lock:
@@ -1879,7 +1971,7 @@ class Scheduler:
         b = Batch(msg)
         if not hasattr(self, "_durably_closed"):
             self._durably_closed = self._scheduled_closes()
-        if b.id in self._durably_closed:
+        if b.id in self._durably_closed or (DIR / "queue" / f"{b.id}.retired").exists() or (DIR / "queue" / f"{b.id}.closed").exists():
             return {"ok": False, "error": "durably closed batch id cannot be reused"}
         with self.lock:  # (rules.Submit: a batch with items queued or running is never replaced; the same submit again keeps it)
             old = self.batches.get(b.id)
@@ -1940,6 +2032,15 @@ class Scheduler:
         self._valid_batch(bid)
         if type(since) is not int or since < 0:
             raise ValueError("result cursor must be a nonnegative integer")
+        if bid in self.batches:
+            return self.poll(bid, since, 0, touch=False)
+        with self.lock:
+            if bid not in self.batches:
+                retained = history.read(DIR / "queue", bid)
+                if retained is not None:
+                    rows = history.rows_page(DIR / "queue", bid, since, retained)
+                    return {"rows": rows, "done": retained["complete"] and since + len(rows) >= retained["rows"],
+                            "next_since": since + len(rows), "running": 0, "queued": 0}
         return self.poll(bid, since, 0, touch=False)
 
     def poll(self, bid: str, since: int, wait: float, peer_closed=None, *, touch=True) -> dict:
@@ -1977,6 +2078,11 @@ class Scheduler:
 
     def result_part(self, bid, ref, offset=0, length=resultfiles.CHUNK_BYTES):
         """Authenticated, bounded reads from controller-owned immutable files."""
+        self._valid_batch(bid)
+        q = DIR / "queue"
+        if bid not in self.batches and ((q / f"{bid}.retired").exists() or (q / f"{bid}.closed").exists()):
+            if history.read(q, bid) is None:
+                raise ValueError("closed history missing or expired")
         return self._result_store(bid).read(ref, offset, length)
 
     @staticmethod
@@ -1996,16 +2102,17 @@ class Scheduler:
             if not retain:
                 self._full_now = True
                 if b is None:
+                    retained = history.read(DIR / "queue", bid)
+                    if retained is not None and retained.get("strict_once") is True:
+                        return history.payload(DIR / "queue", bid, "close.json", retained)
                     return {}
                 # Same lock order as submit/cancel. Completion must finish its
                 # replacement before deletion, never republish after close.
                 with blobcache.locked(BLOBS):
-                    for f in (DIR / "queue" / f"{bid}.json", DIR / "queue" / f"{bid}.rows", DIR / "queue" / f"{bid}.placed"):
-                        f.unlink(missing_ok=True)
-                    import shutil as _sh
-                    _sh.rmtree(DIR / "queue" / f"{bid}.logs", ignore_errors=True)
-                    _sh.rmtree(DIR / "queue" / f"{bid}.results", ignore_errors=True)
-                    # Keep the reservation and item states if durable deletion fails.
+                    receipt = {"batch": bid, "closed": True, "strict_once": False,
+                               "cleanup_complete": False, "note": "legacy asynchronous close; no namespace attestation"}
+                    self._retain_closed(b, receipt)
+                    # Archive first; only then release active item ownership.
                     for it in b.items.values():  # (a client that gives up: what still runs is killed, what's queued goes)
                         if it.state in ("starting", "running") and it.vm:
                             kill.append((it.vm, it.run_name))
@@ -2041,7 +2148,8 @@ class Scheduler:
         rows = list(b.rows) if b else self._read_result_journal(DIR / "queue" / f"{bid}.rows", False)
         delivered = {r.get("name"): r.get("run_name") or r.get("name") for r in rows if r.get("name")}
         if require_complete:
-            if b is None or vms:
+            retained = history.read(DIR / "queue", bid) if b is None else None
+            if (b is None and retained is None) or vms:
                 raise ValueError("complete retained logs require an existing admission and no worker fallback")
             expected = {r.get("run_name") or r.get("name") for r in rows if r.get("vm") or r.get("run_name")}
             for name in expected:
@@ -2261,6 +2369,7 @@ class Scheduler:
             with contextlib.suppress(Exception):
                 self._policy_tick()
             self._blob_cache_tick()
+            self._history_tick()
             t_s = time.time()
             # (a full pass (the queue ordered, preemption, waits, the plan, the release) at most every FULL_S, or at once
             # when a batch comes or goes; between them a light one places what's queued on the slots items freed, in the
@@ -2301,6 +2410,41 @@ class Scheduler:
         while getattr(self, "handing_off", False):  # (a handoff: its thread exits this process once the next one holds every VM;
             time.sleep(1)  # never shutdown()'s let-go meanwhile: before, it raced the handoff's exit, VMs let go to adoption)
         self.shutdown()
+
+    def _history_tick(self):
+        """One finite maintenance worker; at most 128 manifests per minute."""
+        if self.stop.is_set() or getattr(self, "handing_off", False) or getattr(self, "_history_busy", False):
+            return
+        if time.time() - getattr(self, "_history_at", 0) < 60:
+            return
+        self._history_at, self._history_busy = time.time(), True
+        def run():
+            try:
+                # Reclaim crash leftovers only after the manifest moved last.
+                garbage = DIR / "queue" / '.expired'
+                for trash in itertools.islice(garbage.iterdir() if garbage.exists() else (), 128):
+                    if (trash / (trash.name + '.closed')).is_file():
+                        history.purge(trash)
+                iterator = getattr(self, "_history_scan", None)
+                if iterator is None:
+                    iterator = self._history_scan = iter((DIR / "queue").glob("*.closed"))
+                for _ in range(128):
+                    path = next(iterator, None)
+                    if path is None:
+                        self._history_scan = None
+                        break
+                    with self.lock:
+                        if getattr(self, "handing_off", False):
+                            break
+                        trash = history.collect(DIR / "queue", path.stem, detach=True)
+                    if trash:
+                        history.purge(trash)
+            except Exception as exc:
+                self._history_scan = None
+                log(f"closed history: {exc!r}")
+            finally:
+                self._history_busy = False
+        threading.Thread(target=run, daemon=True).start()
 
     def _blob_cache_tick(self):
         """One bounded maintenance worker, never on the placement thread or during handoff."""
@@ -2654,6 +2798,26 @@ class Scheduler:
         threading.Thread(target=self._start_on, args=(it, vm), daemon=True).start()
         return True
 
+    def _attempt_audit(self, vm, starts, event):
+        # An intent/transport response is not proof of physical execution. Keep
+        # it beside placements so ordinary retry history remains auditable too.
+        with self.lock:
+            recorded = 0
+            for start in starts:
+                bid, name = start.get("batch"), start.get("spec", {}).get("name")
+                b = self.batches.get(bid)
+                if b is None or b.closed:
+                    continue  # Closed audit snapshots are immutable.
+                it = vm.running.get((bid, name))
+                if it is None:
+                    continue
+                self._append_owned(bid, "attempts", {"event": event, "time": time.time(),
+                    "batch": bid, "name": it.name, "run_name": name, "vm": vm.id,
+                    "boot_id": (vm.lease or {}).get("boot"),
+                    "launch_identity": it.launch_identity, "strict_once": b.strict_once})
+                recorded += 1
+            return recorded == len(starts)
+
     def _start_on(self, it: Item, vm: VMState):
         try:
             self._start_on_inner(it, vm)
@@ -2698,21 +2862,25 @@ class Scheduler:
                     raise AgentCapabilityError("agent capability inventory changed before launch")
                 it.state = "running"
             if not (b.strict_once or b.retain_journals or it.spec.get("distinct_vm_group")):
-                # Old handoff snapshots contain only batch/name/state. Rebuild
-                # a legacy placement from the actual held run, never write null.
-                if (not isinstance(it.last_placement, dict) or it.last_placement.get("run_name") != rn
-                        or it.last_placement.get("vm") != vm.id or it.last_placement.get("name") != it.name):
-                    it.last_placement = {"name": it.name, "run_name": rn, "vm": vm.id,
-                                         "image": vm.image, "type": vm.type,
-                                         "identity": it.launch_identity, "t": it.t_start or time.time(),
-                                         "agent_version": vm.agent, "agent_capabilities": dict(vm.agent_capabilities)}
-                with contextlib.suppress(Exception):
-                    with open(DIR / "queue" / f"{b.id}.placed", "a") as f:
-                        f.write(json.dumps(it.last_placement) + "\n")
+                # Legacy placements join the same close barrier as start intents.
+                with self.lock:
+                    if b.closed:
+                        return
+                    if (not isinstance(it.last_placement, dict) or it.last_placement.get("run_name") != rn
+                            or it.last_placement.get("vm") != vm.id or it.last_placement.get("name") != it.name):
+                        it.last_placement = {"name": it.name, "run_name": rn, "vm": vm.id,
+                                             "image": vm.image, "type": vm.type,
+                                             "identity": it.launch_identity, "t": it.t_start or time.time(),
+                                             "agent_version": vm.agent, "agent_capabilities": dict(vm.agent_capabilities)}
+                    self._append_owned(b.id, "placed", it.last_placement)
             vm.fails = 0
             # (the start goes at once, beside the worker's long poll: a placed item doesn't wait for that poll to end)
             cl = self._owned_client(vm) if b.strict_once else vm.client
-            r = cl.rpc("vtick", {"start": [{"batch": b.id, "spec": spec}], "wait": 0}, timeout=60)
+            starts = [{"batch": b.id, "spec": spec}]
+            if not self._attempt_audit(vm, starts, "start_requested"):
+                return  # The admission closed before the request; do not start it.
+            r = cl.rpc("vtick", {"start": starts, "wait": 0}, timeout=60)
+            self._attempt_audit(vm, starts, "start_response")
             if b.strict_once and r.get("err"):
                 raise OwnedAgentRefused("owned preparation lost; placement held")
             if r.get("err") and "isn't prepared here" in str(r["err"]):  # (its preparation gone from the VM: prepared again, no strike)
@@ -5392,11 +5560,12 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         return self._response(200, s.batch_rows(s.batch_of(m), m.get("since", 0)))
                     except (ValueError, TypeError) as e:
                         return self._response(400, {"error": str(e)})
-                if p in ("/cancel", "/snapshot"):
+                if p in ("/cancel", "/snapshot", "/close-receipt"):
                     bid = s.batch_of(m)
                     try:
                         s._valid_batch(bid)
-                        result = s.snapshot(bid) if p == "/snapshot" else s.cancel(bid, m.get("wait_seconds", 10))
+                        result = (s.snapshot(bid) if p == "/snapshot" else s.close_receipt(bid)
+                                  if p == "/close-receipt" else s.cancel(bid, m.get("wait_seconds", 10)))
                     except (ValueError, TypeError) as e:
                         return self._response(400, {"error": str(e)})
                     return self._response(200, result)
@@ -5549,9 +5718,11 @@ class Client:
         import http.client
         last = None
         strict_submit = False
-        if path == "/submit":
+        if path in ("/submit", "/snapshot", "/close-receipt"):
             with contextlib.suppress(ValueError, TypeError, AttributeError):
-                strict_submit = json.loads(body).get("strict_once") is True
+                msg = json.loads(body)
+                strict_submit = ((path == "/submit" and msg.get("strict_once") is True) or
+                    (path in ("/snapshot", "/close-receipt") and type(msg.get("close_recovery")) is int and msg["close_recovery"] == 1))
         attempts = strict_transport_attempts(strict_submit, 3)
         for k in range(attempts):
             c = getattr(self, "_conns", None)

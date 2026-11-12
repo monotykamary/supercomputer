@@ -132,18 +132,18 @@ def capture(live: pathlib.Path, treadmill: pathlib.Path, guard=contextlib.nullco
                 _pin(registry, "live/scheduler/durable-groups.json", entries, required=True)
             if queue.exists():
                 paths = sorted(queue.iterdir())
-                admitted = {p.stem for p in paths if p.suffix == ".json"}
+                admitted = {p.stem for p in paths if p.suffix in {".json", ".closed", ".retired"}}
                 for path in paths:
                     if path.stem not in admitted:
                         continue  # orphan history is not read by admission recovery
-                    if path.suffix in {".json", ".placed", ".rows", ".cancel"}:
+                    if path.suffix in {".json", ".closed", ".retired", ".placed", ".attempts", ".rows", ".cancel"}:
                         _pin(path, f"live/scheduler/queue/{path.name}", entries, required=True)
                     elif path.suffix == '.results' and not path.is_symlink():
                         # These immutable files are required even by closed retained admissions.
                         for payload in _paths(path):
                             if payload.suffix == '.payload':
                                 _pin(payload, f'live/scheduler/queue/{payload.relative_to(queue).as_posix()}', entries, required=True)
-                    elif path.suffix == ".logs" and path.stem not in closed and not path.is_symlink():
+                    elif path.suffix == ".logs" and (path.stem not in closed or (queue / (path.stem + ".closed")).exists()) and not path.is_symlink():
                         # Keep unacknowledged results, not outputs of closed batches.
                         for output in _paths(path):
                             _pin(output, f"live/scheduler/queue/{output.relative_to(queue).as_posix()}", entries, required=True)

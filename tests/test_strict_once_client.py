@@ -682,7 +682,10 @@ class StrictTransport(unittest.TestCase):
 
     def test_https_submit_is_single_attempt_but_ordinary_rpc_still_retries(self):
         for path, body, expected in (("/submit", b'{"strict_once":true}', 1),
-                                     ("/submit", b'{}', 4), ("/poll", b'{}', 4)):
+                                     ("/submit", b'{}', 4), ("/poll", b'{}', 4),
+                                     ("/close-receipt", b'{"close_recovery":1}', 1),
+                                     ("/snapshot", b'{"close_recovery":1}', 1),
+                                     ("/snapshot", b'{"close_recovery":true}', 4)):
             with self.subTest(path=path, body=body):
                 c = object.__new__(boat.AgentClient)
                 c.cookie, c.query, c.base, c.token, c.vm = "", "", "", "token", "vm"

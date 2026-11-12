@@ -269,12 +269,16 @@ def main(argv=None):
     sub.add_parser("migrate", help="move a repo's old pool directory (gdp-wired's supercomputer/.live) into the shared one")
     ct = sub.add_parser("controller", help="the scheduler and the treadmill on a boat VM: setup, status, sync, logs, restart, stop")
     ct.add_argument("args", nargs=argparse.REMAINDER)
-    batch = sub.add_parser("batch", help="read retained ordinary-batch results without closing")
+    batch = sub.add_parser("batch", help="fetch retained results or recover strict-close evidence; read-only")
     batch_commands = batch.add_subparsers(dest="batch_cmd", required=True)
     fetch = batch_commands.add_parser("fetch", help="download a finished batch by ID; never submit or close")
     fetch.add_argument("id")
     fetch.add_argument("--out", required=True)
     fetch.add_argument("--timeout", type=float, default=120, help="per-request timeout in seconds")
+    recover = batch_commands.add_parser("recover-close", help="validate retained strict-close evidence from local custody; read-only")
+    recover.add_argument("id")
+    recover.add_argument("--timeout", type=float, default=30, help="whole recovery deadline in seconds")
+    recover.add_argument("--attempts", type=int, default=3)
     sc = sub.add_parser("scheduler", help="the scheduler: serve (started by clients on demand), status, stop")
     sc.add_argument("args", nargs=argparse.REMAINDER)
     a = ap.parse_args(argv)
@@ -285,10 +289,13 @@ def main(argv=None):
     elif a.cmd == "batch":
         from . import batchfetch
         try:
-            result = batchfetch.fetch(a.id, a.out, timeout=a.timeout)
+            result = (batchfetch.fetch(a.id, a.out, timeout=a.timeout) if a.batch_cmd == 'fetch'
+                      else boat.recover_close(a.id, timeout=a.timeout, attempts=a.attempts))
         except (ValueError, RuntimeError, OSError) as exc:
             raise SystemExit(f"batch fetch: {exc}") from exc
         print(json.dumps(result, indent=2))
+        if a.batch_cmd == "recover-close" and not result["cleanup_complete"]:
+            raise SystemExit(1)
     elif a.cmd == "status":
         boat.status()
     elif a.cmd == "health":

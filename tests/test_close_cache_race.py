@@ -39,7 +39,7 @@ class CloseCacheRaceTests(unittest.TestCase):
         self.path.write_text(json.dumps({"batch": self.b.id, "tree": self.b.tree,
                                          "cache_generation": self.b.cache_generation}))
         for suffix in ("rows", "placed"):
-            self.path.with_suffix("." + suffix).write_text("fixture\n")
+            self.path.with_suffix("." + suffix).write_text("{}\n")
         self.logs = self.path.with_suffix(".logs")
         self.logs.mkdir()
         (self.logs / "out").write_text("fixture")
@@ -94,8 +94,9 @@ class CloseCacheRaceTests(unittest.TestCase):
         self.assertNotIn(self.b.id, self.s.batches)
         self.assertTrue(self.b.closed)
         self.assertIn(self.b.id, self.s._durably_closed)
-        for suffix in ("json", "rows", "placed", "logs"):
-            self.assertFalse(self.path.with_suffix("." + suffix).exists(), suffix)
+        self.assertFalse(self.path.exists())
+        for suffix in ("closed", "retired", "rows", "placed", "logs"):
+            self.assertTrue(self.path.with_suffix("." + suffix).exists(), suffix)
         self.assertEqual(len(self.s.m["batches"]), 1)
         self.ledger.assert_called_once()
 
@@ -103,12 +104,12 @@ class CloseCacheRaceTests(unittest.TestCase):
         paused, release = threading.Event(), threading.Event()
         reached, blocked = threading.Event(), threading.Event()
         real_replace = os.replace
-        def replace(src, dst):
+        def replace(src, dst, **kwargs):
             if pathlib.Path(dst) == self.path:
                 paused.set()
                 if not release.wait(10):
                     raise AssertionError("completion not released")
-            return real_replace(src, dst)
+            return real_replace(src, dst, **kwargs)
         with patch.object(blobcache.os, "replace", side_effect=replace), \
              self.observe_lock("close", reached, blocked):
             try:
@@ -135,14 +136,14 @@ class CloseCacheRaceTests(unittest.TestCase):
     def test_close_before_completion_holds_lock_until_memory_commit(self):
         paused, release = threading.Event(), threading.Event()
         reached, blocked = threading.Event(), threading.Event()
-        real_unlink = pathlib.Path.unlink
-        def unlink(path, *args, **kwargs):
-            if path == self.path:
+        real_replace = os.replace
+        def replace(src, dst, **kwargs):
+            if pathlib.Path(src) == self.path and pathlib.Path(dst) == self.path.with_suffix('.closed'):
                 paused.set()
                 if not release.wait(10):
                     raise AssertionError("close not released")
-            return real_unlink(path, *args, **kwargs)
-        with patch.object(pathlib.Path, "unlink", unlink), \
+            return real_replace(src, dst, **kwargs)
+        with patch.object(os, "replace", replace), \
              self.observe_lock("complete", reached, blocked):
             try:
                 self.start("close", lambda: self.s.close(self.b.id))
@@ -162,28 +163,17 @@ class CloseCacheRaceTests(unittest.TestCase):
         self.assertFalse(self.results["complete"])
         self.assert_removed()
 
-    def test_unlink_failure_keeps_reservation_and_emits_no_close_ledger(self):
-        real_unlink = pathlib.Path.unlink
-        for suffix in ("json", "rows", "placed"):
-            with self.subTest(suffix=suffix):
-                self.b = batch(self.s, "close-cache")
-                for ext in ("json", "rows", "placed"):
-                    self.path.with_suffix("." + ext).write_text("fixture")
-                target = self.path.with_suffix("." + suffix)
-                def unlink(path, *args, **kwargs):
-                    if path == target:
-                        raise PermissionError("injected deletion failure")
-                    return real_unlink(path, *args, **kwargs)
-                with patch.object(pathlib.Path, "unlink", unlink):
-                    with self.assertRaises(PermissionError):
-                        self.s.close(self.b.id)
-                self.assertIs(self.s.batches.get(self.b.id), self.b)
-                self.assertFalse(self.b.closed)
-                self.assertEqual(self.b.items["i0"].state, "queued")
-                self.assertEqual(self.s.m["batches"], [])
-                self.ledger.assert_not_called()
-                self.assertNotIn(self.b.id, getattr(self.s, "_durably_closed", set()))
-                self.assertFalse(self.s.wake.is_set())
+    def test_publication_failure_before_fence_keeps_reservation_and_no_close_ledger(self):
+        with patch.object(S.history, 'atomic', side_effect=PermissionError('publication failure')):
+            with self.assertRaises(PermissionError):
+                self.s.close(self.b.id)
+        self.assertIs(self.s.batches.get(self.b.id), self.b)
+        self.assertFalse(self.b.closed)
+        self.assertEqual(self.b.items['i0'].state, 'queued')
+        self.assertEqual(self.s.m['batches'], [])
+        self.ledger.assert_not_called()
+        self.assertNotIn(self.b.id, getattr(self.s, '_durably_closed', set()))
+        self.assertFalse(self.s.wake.is_set())
         self.s.close(self.b.id)
         self.assert_removed()
 

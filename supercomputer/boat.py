@@ -50,6 +50,7 @@ import random
 import secrets
 import selectors
 import signal
+import stat
 import socket
 import subprocess
 import sys
@@ -1557,10 +1558,12 @@ class AgentClient:
     def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json", decode=None, transport_event=None) -> tuple[int, object, str]:
         from .rules.owned_lifecycle import strict_transport_attempts
         strict = False
-        if method == "POST" and path == "/submit" and body:
+        if method == "POST" and path in ("/submit", "/snapshot", "/close-receipt") and body:
             with contextlib.suppress(ValueError, TypeError, UnicodeDecodeError):
                 msg = json.loads(body)
-                strict = isinstance(msg, dict) and msg.get("strict_once") is True
+                strict = isinstance(msg, dict) and (
+                    (path == "/submit" and msg.get("strict_once") is True) or
+                    (path in ("/snapshot", "/close-receipt") and type(msg.get("close_recovery")) is int and msg["close_recovery"] == 1))
         last, retry = None, R.Retry(strict_transport_attempts(strict, 4))
         def notify(event, **details):
             if transport_event:
@@ -1604,7 +1607,8 @@ class AgentClient:
                 retry.attempt(False)
                 notify("transport_reconnect" if retry.outcome == "trying" else "transport_error",
                        path=path, attempt=k + 1, error=type(e).__name__)
-                time.sleep(0.2 * (k + 1))
+                if retry.outcome == "trying" or not strict:
+                    time.sleep(0.2 * (k + 1))
         raise AgentError(f"{self.vm}: the warm agent didn't answer ({last})")
 
     EXEC_OK = {"ping", "vtick", "killitem", "itemlogs", "begin", "prep", "tree", "have", "pull", "pullcache", "upgrade"}
@@ -3045,8 +3049,13 @@ class Scheduled(Session):
         record = {"name": name, "launch_identity": identity, "attempt": 1, **{k: placement[k] for k in keys}}
         known = self._strict_placements.setdefault(bid, {})
         if (placement.get("identity") is not None and placement["identity"] != identity) or (name in known and known[name] != record):
+            if not known.get(name, {}).get('conflict') and not getattr(self, '_restoring_custody', False):
+                self._custody_event(bid, 'placement_conflict', name=name)
             known[name] = {"conflict": True}
         else:
+            changed = known.get(name) != record
+            if changed and not getattr(self, "_restoring_custody", False):
+                self._custody_event(bid, "placement_binding", placement=record)
             known[name] = record
 
     def _valid_close(self, bid: str, receipt, snapshot) -> bool:
@@ -3199,7 +3208,7 @@ class Scheduled(Session):
                "vm_type_named": bool(getattr(self, "vm_named", False) or env("VM_NAMED")), "items": items}
         if strict_once:
             msg.update(strict_once=True, max_attempts=1, on_lost=False)
-            self._custody_event(bid, "admission_attempt")
+            self._custody_event(bid, "admission_attempt", items=sorted(by))
         if any("distinct_vm_group" in it for it in items):
             msg["placement_contract"] = 1
         def admit():
@@ -3443,8 +3452,100 @@ class Scheduled(Session):
                                cleanup_complete=bool(receipts) and all(validation.values()))
         return self.result
 
+    def recover_close(self, bid=None, *, timeout=30, attempts=3):
+        """Bounded read-only validation of an earlier strict close; never cancel again."""
+        bid = bid or self.batch
+        if bid not in getattr(self, "_strict_items", {}) or not self._strict_items[bid]:
+            raise ValueError("recovery requires the original strict admission item bindings")
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout <= 0
+                or type(attempts) is not int or not 1 <= attempts <= 16):
+            raise ValueError("recovery needs a positive finite timeout and 1..16 attempts")
+        deadline = time.monotonic() + timeout
+        receipt, valid, made = {}, False, 0
+        for attempt in range(1, attempts + 1):
+            if time.monotonic() >= deadline:
+                break
+            made = attempt
+            self._custody_event(bid, "close_recovery_attempt", attempt=attempt)
+            snapshot = None
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                receipt = self._request(bid, "/close-receipt", {"batch": bid, "close_recovery": 1}, timeout=remaining)
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        snapshot = self._request(bid, "/snapshot", {"batch": bid, "close_recovery": 1}, timeout=remaining)
+                    except Exception as exc:
+                        self._custody_event(bid, "close_recovery_snapshot_error", error=type(exc).__name__)
+                valid = time.monotonic() <= deadline and self._valid_close(bid, receipt, snapshot)
+            except Exception as exc:
+                self._custody_event(bid, "close_recovery_error", error=type(exc).__name__)
+            self._custody_event(bid, "close_recovery_receipt" if valid else "close_recovery_failure",
+                                attempt=attempt, cleanup_complete=valid,
+                                receipt_sha256=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest())
+            if valid:
+                break
+            remaining = deadline - time.monotonic()
+            if attempt < attempts and remaining > 0:
+                time.sleep(min(0.2 * attempt, remaining))
+        report = {"batch": bid, "read_only": True, "cleanup_complete": valid,
+                  "attempts": made, "receipt": receipt,
+                  "exhausted": not valid}
+        self._custody_event(bid, "close_recovery_complete", cleanup_complete=valid, attempts=made)
+        if isinstance(getattr(self, "result", None), dict) and "cleanup_validation" in self.result:
+            self.result["batches"][bid] = receipt
+            self.result["cleanup_validation"][bid] = valid
+            self.result["cleanup_complete"] = bool(self.result["cleanup_validation"]) and all(self.result["cleanup_validation"].values())
+        return report
+
     def dollars(self, ids=None):
         return None
+
+
+def recover_close(bid, *, client=None, timeout=30, attempts=3):
+    """Resume from this client's durable custody, without constructing a session.
+
+    Old journals lacking original item bindings are deliberately insufficient.
+    The caller can still audit their retained receipts, but must not certify a
+    different admission by accepting names supplied only by the controller.
+    """
+    from . import scheduler
+    scheduler.Scheduler._valid_batch(bid)
+    path = config.LIVE / "custody" / f"{bid}.jsonl"
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError("custody is not a regular file")
+        events = []
+        for sequence, line in enumerate(source, 1):
+            event = json.loads(line)
+            if not line.endswith(b'\n') or event.get('sequence') != sequence:
+                raise ValueError("custody is torn or non-contiguous")
+            events.append(event)
+    admissions = [e for e in events if e.get('event') == 'admission_attempt']
+    if (len(admissions) != 1 or not isinstance(admissions[0].get('items'), list)
+            or not admissions[0]['items'] or any(not isinstance(n, str) for n in admissions[0]['items'])
+            or len(set(admissions[0]['items'])) != len(admissions[0]['items'])
+            or any(e.get('event') == 'admission_refused' for e in events)):
+        raise ValueError("custody lacks one original strict admission binding")
+    resumed = object.__new__(Scheduled)
+    resumed.client = client if client is not None else scheduler.current()
+    if resumed.client is None:
+        raise RuntimeError("no running scheduler; recovery never starts one")
+    resumed._strict_items = {bid: set(admissions[0]['items'])}
+    resumed._strict_placements = {}
+    resumed._restoring_custody = True
+    for event in events:
+        if event.get('event') == 'placement_binding':
+            placement = event.get('placement', {})
+            resumed._remember_placement(bid, placement, placement.get('launch_identity'))
+        elif event.get('event') == 'placement_conflict':
+            resumed._strict_placements.setdefault(bid, {})[event['name']] = {'conflict': True}
+    resumed._restoring_custody = False
+    return resumed.recover_close(bid, timeout=timeout, attempts=attempts)
 
 
 def session(label: str, klass: str | int | None = None, strict_once: bool = False, max_attempts: int = 1, **kw) -> Session:

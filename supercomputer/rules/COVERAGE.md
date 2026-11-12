@@ -29,6 +29,16 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `distinct_key`, `distinct_live`, `distinct_used`, `fit_shape`, `_place_locked`, `_plan`, `_buy` | rule wiring | durable scope uses the shared registry for every exclusion check and reserves before worker launch; absent scope preserves batch keys and history. |
 | `boat._validate_durable_item`, `_require_durable_capability`, `distinct_group`, `distinct_groups_main` | validation / I/O | opt-in fields survive hooks; capability gated before upload; JSON metadata API never starts a local scheduler. |
 
+## Closed history and strict-close recovery
+
+| def | where | laws, or why |
+| --- | --- | --- |
+| `rules.history.history_visible`, `history_expirable` | rule | only closed, unexpired history is readable; open admissions and pending cleanup never expire; expiry never runs early. Every omission has a broken variant. |
+| `history.capture`, `finish`, `read`, `collect`, `purge` | I/O + rule | frozen content-addressed evidence, fsynced non-execution fence before archive rename, immutable first-close deadline, non-reuse tombstones, and off-lock filesystem cleanup. Pending strict cleanup cannot reach capture. |
+| `Scheduler._retain_closed`, `close_receipt`, `_history_tick` | I/O | one closed generation, read-only receipt retrieval, finite single-flight collection. No placement, provider call, or heartbeat renewal. |
+| `Scheduled.recover_close`, `boat.recover_close` | I/O + existing validator | bounded read-only attempts use `_valid_close` unchanged, original local custody bindings, conflict persistence, and single-attempt transport; no execution or cancellation workflow. |
+| `Scheduler._attempt_audit`, `batchfetch.fetch` | I/O | append observed start intent/response metadata, freeze and verify audit payloads; these records alone do not certify physical execution. |
+
 ## blobcache.py
 
 | def | where | laws, or why |

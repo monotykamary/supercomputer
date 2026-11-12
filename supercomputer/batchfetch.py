@@ -11,7 +11,7 @@ import stat
 import time
 import uuid
 
-from . import clientresults, resultfiles
+from . import clientresults, history, resultfiles
 
 
 @contextlib.contextmanager
@@ -156,6 +156,8 @@ def fetch(bid: str, out, *, client=None, timeout=120):
                     raise ValueError("fetch receipt is not a regular file")
                 os.unlink('fetch.json', dir_fd=parent)
                 os.fsync(parent)
+            def read(ref, offset, length):
+                return client.req('/results', {'batch': bid, 'ref': ref, 'offset': offset, 'length': length}, timeout=timeout, raw=True)
             names, count, since, row_hash = set(), 0, 0, hashlib.sha256()
             pages = []
             with _atomic(directory, 'rows.jsonl', binary=True) as output:
@@ -183,8 +185,6 @@ def fetch(bid: str, out, *, client=None, timeout=120):
                         if name in names:
                             raise ValueError("duplicate result row")
                         names.add(name)
-                        def read(ref, offset, length):
-                            return client.req('/results', {'batch': bid, 'ref': ref, 'offset': offset, 'length': length}, timeout=timeout, raw=True)
                         result = clientresults.download(row, read, directory, verify_cached=True)
                         line = (json.dumps(result, separators=(',', ':')) + '\n').encode()
                         output.write(line)
@@ -196,13 +196,24 @@ def fetch(bid: str, out, *, client=None, timeout=120):
                 if count != before['items']:
                     raise RuntimeError("finished batch has missing result rows")
                 logs = _logs(client, bid, directory, timeout)
+                audit = {}
+                references = before.get('audit', {})
+                if references and (not isinstance(references, dict) or set(references) != set(history.AUDIT_NAMES)):
+                    raise ValueError('invalid closed audit inventory')
+                for name, ref in references.items():
+                    resultfiles.validate_ref(ref)
+                    copied = clientresults.download({'name': 'audit', 'result_ref': ref}, read,
+                                                    directory / 'audit', verify_cached=True)
+                    audit[name] = {'ref': ref, 'file': copied['result_file']}
                 after = _info(client, bid, timeout)
+                if after.get('audit', {}) != references:
+                    raise RuntimeError('closed audit inventory changed during fetch')
                 if any(after[k] != before[k] for k in ('generation', 'admitted_at', 'items', 'rows')):
                     raise RuntimeError("admission changed during fetch")
             result = {'batch': bid, 'generation': before['generation'], 'read_only': True,
                       'complete': True, 'closed_by_fetch': False, 'rows': count,
                       'rows_file': str(directory / 'rows.jsonl'), 'rows_sha256': row_hash.hexdigest(),
-                      'logs': logs, 'pages': pages, 'before': before, 'after': after,
+                      'logs': logs, 'audit': audit, 'pages': pages, 'before': before, 'after': after,
                       'started_at': started, 'finished_at': time.time()}
             _json_file(directory, 'fetch.json', result)
             return result

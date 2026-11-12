@@ -101,7 +101,7 @@ class StrictOnceContract(unittest.TestCase):
         self.assertEqual(receipt['attempts'], [{'name': self.it.name, 'run_name': self.it.run_name,
             'vm': self.vm.id, 'boot_id': 'fixture-boot', 'attempt': 1,
             'launch_identity': self.it.launch_identity, 'cleanup_complete': True}])
-        for suffix in ('json', 'placed', 'rows', 'cancel'):
+        for suffix in ('closed', 'placed', 'rows', 'cancel'):
             self.assertTrue((self.root / 'queue' / f'{self.b.id}.{suffix}').exists())
         self.assertEqual(self.s.close(self.b.id)['attempts'], receipt['attempts'])
 

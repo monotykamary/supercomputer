@@ -73,7 +73,7 @@ set the legacy `lost: true` callback/fallback flag.
 
 ## Synchronous close and cleanup
 
-Strict close does not take the legacy asynchronous kill/delete path. It fences
+Strict close does not take the legacy asynchronous kill path. It fences
 admission, waits for any in-flight launch, requests identity-bound namespace
 reaping, and retains admission, placement, result and cancellation journals.
 Its receipt includes `attempts` with name, run name, VM, boot, attempt number,
@@ -86,6 +86,13 @@ or failed custody write is not success. Terminal LOST and pending cleanup can
 coexist; neither permits replacement or re-execution. The public client retains
 each raw per-batch close receipt and aggregate completion. The jobs CLI saves
 results/cleanup metadata and complete custody sidecars under its output path.
+
+Completed strict histories now expire after the configured retention window
+(default 48 hours); pending cleanup never expires. If close evidence was
+interrupted, use the bounded read-only `recover_close()` /
+`supercomputer batch recover-close` path described in
+[closed history and recovery](closed-history.md). The original identity checks
+are unchanged.
 
 ## Hash binding and verification
 

@@ -78,7 +78,7 @@ class OwnedSchedulerTests(unittest.TestCase):
         self.assertEqual(self.it.state, "done")
         self.assertFalse(self.s._place(self.it, self.vm))
         self.assertFalse(self.vm.client.rpc.called)
-        self.assertTrue(json.loads((self.root / "queue" / f"{self.b.id}.json").read_text())["admission_closed"])
+        self.assertTrue(json.loads((self.root / "queue" / f"{self.b.id}.closed").read_text())["admission_closed"])
 
     def test_cancel_placement_threads_share_the_admission_lock(self):
         fenced, release = threading.Event(), threading.Event()
@@ -250,7 +250,7 @@ class OwnedSchedulerTests(unittest.TestCase):
         self.place_without_thread()
         self.vm.client.rpc.return_value = self.good_receipt()
         self.assertTrue(self.s.close(self.b.id)["complete"])
-        for suffix in ("json", "rows", "placed", "cancel"):
+        for suffix in ("closed", "rows", "placed", "cancel"):
             self.assertTrue((self.root / "queue" / f"{self.b.id}.{suffix}").exists())
         restored = S.Scheduler.__new__(S.Scheduler)
         restored.batches, restored.vms = {}, {}
@@ -258,12 +258,13 @@ class OwnedSchedulerTests(unittest.TestCase):
         restored._take_pool = Mock()
         with patch.object(S.threading, "Thread"):
             restored.reload()
-        b = restored.batches[self.b.id]
-        self.assertTrue(b.admission_closed)
-        self.assertTrue(b.strict_once)
-        self.assertEqual(b.items["item"].owned.placements, 1)
-        self.assertTrue(b.items["item"].owned.reaped)
-        self.assertEqual(b.items["item"].state, "done")
+        self.assertNotIn(self.b.id, restored.batches)
+        b = restored.snapshot(self.b.id)
+        self.assertTrue(b['admission_closed'])
+        self.assertTrue(b['strict_once'])
+        self.assertEqual(b['items'][0]['placements'], 1)
+        self.assertTrue(b['items'][0]['reaped'])
+        self.assertEqual(b['items'][0]['state'], 'done')
 
     def test_snapshot_cumulative_placements_without_provider_calls(self):
         self.place_without_thread()
@@ -666,18 +667,19 @@ class OwnedSchedulerTests(unittest.TestCase):
             self.assertTrue(self.b.closed)
             self.assertFalse(self.s.treadmill_alive(self.b.image))
             self.assertEqual(self.s.floor(self.b.image), 0)
-            saved = json.loads((self.root / "queue" / f"{self.b.id}.json").read_text())
+            saved = json.loads((self.root / "queue" / f"{self.b.id}.closed").read_text())
             self.assertTrue(saved["cancellation_complete"])
             # Reload the same retained admission; no worker RPC or threads run.
             self.s.batches = {}
             self.s._take_pool = Mock()
             with patch.object(S.threading, "Thread"):
                 self.s.reload()
-            restored = self.s.batches[self.b.id]
-            self.assertTrue(restored.closed)
-            self.assertTrue(restored.items["item"].owned.reaped)
-            self.assertFalse(self.s.treadmill_alive(restored.image))
-            self.assertEqual(self.s.floor(restored.image), 0)
+            self.assertNotIn(self.b.id, self.s.batches)
+            restored = self.s.snapshot(self.b.id)
+            self.assertTrue(restored['closed'])
+            self.assertTrue(restored['items'][0]['reaped'])
+            self.assertFalse(self.s.treadmill_alive(self.b.image))
+            self.assertEqual(self.s.floor(self.b.image), 0)
 
     def test_pending_cancel_reload_preserves_active_hint_and_placement(self):
         self.msg["klass"] = self.b.klass = 4

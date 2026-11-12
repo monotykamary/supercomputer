@@ -112,6 +112,21 @@ class BatchFetchTests(unittest.TestCase):
         if self.out.exists():
             self.assertFalse(list(self.out.rglob('.fetch-*')))
 
+    def test_closed_audit_payloads_are_verified_and_downloaded(self):
+        from supercomputer import history
+        self.client.info['closed'] = True
+        refs = {name: self.client.store.put_json({'audit': name}) for name in history.AUDIT_NAMES}
+        self.client.info['audit'] = refs
+        result = self.fetch()
+        self.assertEqual(set(result['audit']), set(refs))
+        for name, item in result['audit'].items():
+            data = pathlib.Path(item['file']).read_bytes()
+            self.assertEqual(hashlib.sha256(data).hexdigest(), refs[name]['sha256'])
+            self.assertEqual(json.loads(data), {'audit': name})
+        self.assertTrue(result['read_only'])
+        self.assertTrue(all(p in ('/capabilities','/batch/info','/batch/rows','/results','/logs')
+                            for p, *_ in self.client.calls))
+
     def test_pages_short_chunks_and_all_reference_kinds(self):
         before = copy.deepcopy(self.client.info)
         result = self.fetch()
