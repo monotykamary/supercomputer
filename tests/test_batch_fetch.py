@@ -51,6 +51,7 @@ class FakeClient:
         self.info = dict(ok=True, batch=BID, generation='admission-one', admitted_at=123,
                          items=2, rows=2, complete=True, closed=False)
         self.caps = {'batch_fetch_protocol': 1}
+        self.status = {'code': 'serving-fixture', 'code_installed': 'installed-fixture'}
         self.calls = []
         self.log_bytes = b'opaque archive bytes: never extract ../escape' * 100
         self.log_headers = {'X-SC-Content-SHA256': hashlib.sha256(self.log_bytes).hexdigest(),
@@ -63,6 +64,10 @@ class FakeClient:
         self.calls.append((path, copy.deepcopy(msg), raw, decode is not None))
         if path == '/capabilities':
             return copy.deepcopy(self.caps)
+        if path == '/status':
+            if isinstance(self.status, Exception):
+                raise self.status
+            return copy.deepcopy(self.status)
         if path == '/batch/info':
             return copy.deepcopy(self.info)
         if path == '/batch/rows':
@@ -169,7 +174,24 @@ class BatchFetchTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'batch_fetch_protocol'):
                     self.fetch()
                 self.assertFalse(self.out.exists())
-        self.assertTrue(all(p == '/capabilities' for p, *_ in self.client.calls))
+        self.assertTrue(all(p in ('/capabilities', '/status') for p, *_ in self.client.calls))
+
+    def test_missing_protocol_names_serving_and_installed_without_fetching(self):
+        self.client.caps = {}
+        self.client.status = {'code': 'e82e84af3cee', 'code_installed': '667a5a2ab401'}
+        with self.assertRaisesRegex(RuntimeError, 'serving=e82e84af3cee, installed=667a5a2ab401'):
+            self.fetch()
+        self.assertEqual([p for p, *_ in self.client.calls], ['/capabilities', '/status'])
+        self.assertFalse(self.out.exists())
+
+    def test_missing_protocol_status_diagnostics_are_best_effort(self):
+        self.client.caps = {}
+        for status in (RuntimeError('offline'), None, {}, 'malformed'):
+            with self.subTest(status=status):
+                self.client.status = status
+                with self.assertRaisesRegex(RuntimeError, 'serving=unknown, installed=unknown'):
+                    self.fetch()
+                self.assertFalse(self.out.exists())
 
     def test_duplicate_cursor_missing_rows_and_unfinished_pages(self):
         cases = [

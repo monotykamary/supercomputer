@@ -11,8 +11,15 @@ missing admission or a completed admission with missing rows is an error, not
 an empty successful fetch.
 
 The connected controller must advertise `batch_fetch_protocol: 1`; older
-controllers must be upgraded first. `--timeout SECONDS` bounds each network
-request (default 120 seconds), not the job's execution deadline.
+controllers must be upgraded first. On refusal the client makes one best-effort,
+read-only `/status` request and names both hashes, for example
+`serving=e82e84af3cee, installed=667a5a2ab401`. Staged/installed support is not
+serving support: verify the active version before retrying. If status is
+unavailable, the hashes are explicitly `unknown`; the capability refusal remains.
+No batch endpoint is called and no output directory is created by this diagnostic.
+`--timeout SECONDS` bounds each network request (default 120 seconds), not the
+job's execution deadline.
+
 
 Closed history is retained for **48 hours after close** by default. Configure
 `supercomputer policy history_retention_hours=72` for future closes. See

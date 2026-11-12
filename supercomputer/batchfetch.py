@@ -125,7 +125,18 @@ def fetch(bid: str, out, *, client=None, timeout=120):
         raise RuntimeError("no running scheduler; fetch never starts one")
     caps = client.req('/capabilities', {}, timeout=timeout)
     if not isinstance(caps, dict) or type(caps.get('batch_fetch_protocol')) is not int or caps['batch_fetch_protocol'] != 1:
-        raise RuntimeError("controller lacks batch_fetch_protocol:1; upgrade it before fetching")
+        try:
+            status = client.req('/status', {}, timeout=min(timeout, 5))
+        except Exception:
+            status = {}
+        if not isinstance(status, dict):
+            status = {}
+        serving = status.get('code') or 'unknown'
+        installed = status.get('code_installed') or 'unknown'
+        raise RuntimeError(
+            f"controller lacks batch_fetch_protocol:1 (serving={serving}, installed={installed}); "
+            "fetch requires support in the serving process, not just staged code; "
+            "verify the serving version before retrying")
     before = _info(client, bid, timeout)
     directory = Path(out).absolute()
     started = time.time()
