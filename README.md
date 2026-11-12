@@ -145,7 +145,11 @@ adopts any left without an owner.
 
 **Capacity, cheapest first:** a free slot on a warm VM, then a lower class's slot, then a free start, then a paid one.
 The pool grows only for queued work the warm VMs can't clear within the hour (a gate's within 15 minutes), never on
-a timer, and a circuit breaker stops every start when recent ones keep failing.
+a timer, and a circuit breaker stops every start when recent ones keep failing: more than half of at least
+three starts (also while half-open), or a correlated outage of the provider front. A single failed stopped-VM
+resume quarantines only that VM from acquisition/adoption, durably across controller handoffs, and still counts
+as a fruitless CPU draw. It does not escalate the pool-wide pause; a successful probe closes the breaker.
+An already-open pause is preserved across a controller update, not reset by installing this policy.
 
 **Warm agents.** Each VM runs a small agent behind boat's token-gated HTTPS. A batch that finds one free sends a single
 request: the tree by id, then the jobs. The agent keeps every file it was sent by content, so the next tree costs only

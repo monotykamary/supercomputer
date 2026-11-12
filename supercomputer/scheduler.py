@@ -637,6 +637,7 @@ class Scheduler:
         # the circuit breaker, the watchdog, the plan, the day's metrics (all kept across restarts)
         self.cpu_constraints = self._constraints_load()
         self.starts_log: list[dict] = []  # {t, vm, ok (None while coming up)}
+        self.resume_quarantine: dict[str, dict] = {}  # failed stopped-VM resumes; never auto-reacquired or adopted
         self.br = {"open_until": 0.0, "backoff": BREAK_BACKOFF, "half": False, "t_trip": 0.0, "reason": "", "trips": 0}
         self.shed = False
         self.load = {}
@@ -683,6 +684,7 @@ class Scheduler:
             self.wave.update(st.get("wave", {}))
             self.starts_log = [s for s in st.get("starts_log", []) if time.time() - s["t"] < BREAK_WINDOW]
             self.held_before = st.get("held", {})
+            self.resume_quarantine = st.get("resume_quarantine", {})
             self.est_hist = st.get("est", {})
             self.class_obs = {int(k): v for k, v in st.get("class_obs", {}).items()}
             self._drains_saved = st.get("drains", {})  # (the staged drain's window outlives a handoff: B4)
@@ -713,6 +715,7 @@ class Scheduler:
             tmp.write_text(json.dumps(self.m))
             tmp.rename(p)
             st = {"breaker": self.br, "bring_up": self.bring_up, "wave": self.wave, "starts_log": self.starts_log[-200:],
+                  "resume_quarantine": getattr(self, "resume_quarantine", {}),
                   "held": {v.id: {"t_real": v.t_real, "draining": v.draining, "lease": v.lease, "ttl": v.ttl, "quarantine": v.quarantine, "quarantine_since": v.quarantine_since} for v in list(self.vms.values()) if not v.dead},
                   "est": self.est_hist, "class_obs": {str(k): v[-200:] for k, v in self.class_obs.items()},
                   "hints": {k: h for k, h in self.hints.items() if h.get("until", 0) > time.time()},
@@ -2349,6 +2352,7 @@ class Scheduler:
                             "items_placed_warm": self.m["placed_warm"], "max_binds": self.m.get("max_binds", 0), "hold_ends": self.m["hold_ends"], "peak_vms": self.m["peak_vms"],
                             "breaker_trips": self.m["breaker_trips"], "not_ready": self.m["not_ready"]},
                     "breaker": {**self.br, "open": now < self.br["open_until"], "open_for_s": max(0, round(self.br["open_until"] - now))},
+                    "resume_quarantine": dict(getattr(self, "resume_quarantine", {})),
                     "shed": self.shed, "load": self.load, "bring_up_s": round(self.bring_up, 1), "alerts": self.alerts[-5:],
                     "policy": self.pol, "hot_handoff": 1, "code": self.code, "code_installed": getattr(self, "_status_installed_code", self.code), "agent_code": self.agent_version, "stale": self.stale(),
                     "agents": {v.id: v.agent for v in live},
@@ -3611,7 +3615,8 @@ class Scheduler:
         return {i for i, v in registry.get("vms", {}).items()
                 if observed.get(i) == model and v.get("snapshot") == image and v.get("type") == vm_type
                 and v.get("state") in (boat.RUNNING | {"stopped"}) and boat.lease_free(v)
-                and i not in self.vms and i not in retired and i not in used}
+                and i not in self.vms and i not in retired and i not in used
+                and i not in getattr(self, "resume_quarantine", {})}
 
     def _model_report(self, vm, model):
         if not isinstance(model, str) or not model.strip():
@@ -3707,7 +3712,7 @@ class Scheduler:
             with contextlib.suppress(Exception):
                 boat.reconcile(d, boat.sandboxes())
             now = time.time()
-            free = [i for i, v in d["vms"].items() if v["snapshot"] == image and v["type"] == vm_type and boat.lease_free(v) and i not in self.vms and i not in self.retired() and (not model or i not in observed or observed[i] == model) and rules.distinct_vm_allowed(bool(distinct), i in used)]
+            free = [i for i, v in d["vms"].items() if v["snapshot"] == image and v["type"] == vm_type and boat.lease_free(v) and i not in self.vms and i not in self.retired() and i not in getattr(self, "resume_quarantine", {}) and (not model or i not in observed or observed[i] == model) and rules.distinct_vm_allowed(bool(distinct), i in used)]
             up = [i for i in free if d["vms"][i].get("state") in boat.RUNNING and d["vms"][i].get("until", 0) > now + boat.WARM_MARGIN]
             stopped = [i for i in free if i not in up and d["vms"][i].get("state") == "stopped"]
             known = self._known_cpu_reuse(d, image, vm_type, model, used) if model else set()
@@ -3776,6 +3781,18 @@ class Scheduler:
                     s["ok"] = ok
             if not ok:
                 self.m["not_ready"] += 1
+                vm = self.vms.get(vm_id)
+                if vm is not None and getattr(vm, "how", "") == "resumed":
+                    vm.quarantine = "resume failed: " + getattr(vm, "start_failure", "not ready")
+                    vm.quarantine_since = time.time()
+                    self.__dict__.setdefault("resume_quarantine", {})[vm_id] = {
+                        "t": vm.quarantine_since, "reason": vm.quarantine,
+                        "image": vm.image, "type": vm.type}
+                    for s in self.starts_log:
+                        if s["vm"] == vm_id and s["ok"] is False:
+                            s["error"] = vm.quarantine
+                    log(f"{vm_id}: quarantined from future acquisition and adoption: {vm.quarantine}")
+                    self._metrics_save()
 
     def _up(self, vm: VMState, k: int, b: Batch):
         started = False
@@ -3814,6 +3831,7 @@ class Scheduler:
             else:
                 claim = boat.lease_vm(vm.id, "renew", lease=cached) if cached else boat.lease_vm(vm.id, "claim")
             if not claim.get("ok") or claim.get("stale") or not claim.get("boot") or not claim.get("epoch"):
+                vm.start_failure = "lease claim refused or incomplete"
                 if started:
                     self._start_done(vm.id, False)
                     started = False
@@ -3880,6 +3898,7 @@ class Scheduler:
             if vm.dead:
                 return
             log(f"{vm.id}: {str(e)[:200]}")
+            vm.start_failure = str(e)[:200]
             if started:
                 self._start_done(vm.id, False)
                 started = False
@@ -5288,7 +5307,7 @@ class Scheduler:
                 name = sb.get("name", "")
                 if (sb.get("state") not in boat.RUNNING or not name.endswith("~l")
                         or name[:-2] not in queued or i in self.vms or i in self.retired()
-                        or i in getattr(self, "_releasing", ())):
+                        or i in getattr(self, "_releasing", ()) or i in getattr(self, "resume_quarantine", {})):
                     continue
                 try:
                     health = boat.agent_health(i)

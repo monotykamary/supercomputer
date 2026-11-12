@@ -402,7 +402,7 @@ class Reattaching(VMLife):
 
 class Breaker:
     """The circuit breaker (README, "Never runaway"): over half of at least min_judged recent starts not ready in time
-    (one, half-open after a pause), or boat's front failing most agents at once, stops every start for its pause,
+    (at least three, including while half-open), or boat's front failing most agents at once, stops every start for its pause,
     doubled at each trip in a row up to backoff_max_s; after the pause, probes (Pool.grow), and a probe that came up
     closes it."""
 
@@ -420,7 +420,8 @@ class Breaker:
         self.backoff = backoff_s
         self.trips = 0
 
-    # gdp: law the breaker trips on starts only when over half of enough of them failed: trips == old(trips) or (2 * bad > judged and (judged >= min_judged or old(half)))
+    # gdp: law the breaker trips on starts only when over half of enough of them failed: trips == old(trips) or (2 * bad > judged and judged >= min_judged and judged >= 3)
+    # gdp: law a failed sample below three cannot escalate the pause: judged >= 3 or probe_up or (backoff == old(backoff) and open_until == old(open_until) and trips == old(trips))
     # gdp: law a probe that came up after the pause closes the breaker: not (old(half) and now >= old(open_until) and probe_up) or not half
     def judge(self, now: float, judged: int, bad: int, probe_up: bool) -> Literal["closed", "tripped", "kept"]:
         """Every 5 s: the recent starts judged (ready, or not within BREAK_READY), the bad among them."""
@@ -428,7 +429,7 @@ class Breaker:
             self.half = False
             self.backoff = self.backoff_s
             return "closed"
-        need = 1 if self.half else self.min_judged
+        need = max(3, self.min_judged)
         if judged >= need and 2 * bad > judged:
             return self.trip(now)
         return "kept"

@@ -3,7 +3,22 @@ would have it), with that law stated again here. `tests/check_laws.sh` asserts e
 the run that breaks it, so a change that brings one of these bugs back is caught.
 """
 from typing import Literal
-from supercomputer.rules.scheduler import Delivery, Drain, ItemFate, Pool, Strike, Submit, VMLife, may_slot  # noqa: F401
+from supercomputer.rules.scheduler import Breaker, Delivery, Drain, ItemFate, Pool, Strike, Submit, VMLife, may_slot  # noqa: F401
+
+
+class SingleProbeTrips(Breaker):
+    """The 07:14 incident: a lone failed resume escalated a half-open pool to an hour."""
+
+    # gdp: law a failed sample below three cannot escalate the pause: judged >= 3 or probe_up or (backoff == old(backoff) and open_until == old(open_until) and trips == old(trips))
+    def judge(self, now: float, judged: int, bad: int, probe_up: bool) -> Literal["closed", "tripped", "kept"]:
+        if self.half and now >= self.open_until and probe_up:
+            self.half = False
+            self.backoff = self.backoff_s
+            return "closed"
+        need = 1 if self.half else self.min_judged
+        if judged >= need and 2 * bad > judged:
+            return self.trip(now)
+        return "kept"
 
 
 class WaitCounted(ItemFate):

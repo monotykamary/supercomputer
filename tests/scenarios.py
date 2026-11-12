@@ -1559,7 +1559,11 @@ def front_failing(code):
     sim.at(10, lambda: sim.batch("lane-a", "submission", items("s", 80, 600)))
     sim.w.front_down.append((sim.k.t0 + 300, sim.k.t0 + 900, False))
     sim.w.front_down.append((sim.k.t0 + 900, sim.k.t0 + 1200, True))
-    return sim, {}
+    def extra(sim, m):
+        histories = [event for _, s in sim.w.sched_procs if s is not None for event in s.br.get("history", [])]
+        m["front_breaker_history"] = histories
+        return {"real_front_outage_trips": any("boat's front" in h["reason"] for h in histories)}
+    return sim, {"extra": extra}
 
 
 @scenario("7b8ec72", ["lost", "strikes", "modal", "clients", "threads"], 2400,
@@ -2618,6 +2622,44 @@ def _known_cpu_resume_fixture(code, mismatch=False):
     (sim.S.DIR / "cpu-constraints.json").write_text(json.dumps({json.dumps([IMAGE, "large", "sim-cpu"]): constraint}))
     sim.scheduler()
     return sim, known
+
+
+@scenario("07:14 one failed known resume", ["clients", "threads"], 900,
+          "one failed known resume while half-open at hour backoff is charged and quarantined, not a global trip; unrelated gates still run")
+def breaker_single_failed_resume(code):
+    from tests.sim.harness import items
+    sim, known = _known_cpu_resume_fixture(code)
+    original = sim.w.cli_resume
+    attempts, observed = [], {}
+    def fail_only_known(args):
+        if args[1] == known.id:
+            attempts.append(sim.k.now)
+            raise RuntimeError('specific stopped VM failed')
+        return original(args)
+    sim.w.cli_resume = fail_only_known
+    def half_open():
+        s = sim.w.live_sched()[1]
+        s.br.update(half=True, open_until=sim.k.now - 1, t_trip=sim.k.now - 2, backoff=3600, trips=4)
+    def sample():
+        s = sim.w.live_sched()[1]
+        observed.update(trips=s.br['trips'], backoff=s.br['backoff'], half=s.br['half'],
+                        starts=list(s.starts_log), quarantine=dict(s.resume_quarantine))
+    sim.at(5, half_open)
+    sim.at(25, sample)
+    sim.batch('failed-known', 'gate', items('k', 1, 30, cpu_model='sim-cpu', vm_type='large'),
+              strict_once=True, after=10)
+    healthy = sim.batch('unrelated', 'gate', items('g', 1, 30), after=40)
+    def extra(sim, m):
+        s = [s for _, s in sim.w.sched_procs if s is not None][-1]
+        constraint = next(iter(s.cpu_constraints.values()))
+        m['lone_resume'] = observed
+        return {'one_failed_resume': len(attempts) == 1 and len(observed.get('starts', [])) == 1 and observed['starts'][0]['ok'] is False,
+                'no_hour_pause': observed.get('trips') == 4 and observed.get('backoff') == 3600 and observed.get('half'),
+                'local_quarantine': known.id in observed.get('quarantine', {}) and known.id in s.resume_quarantine,
+                'fruitless_counted': constraint['fruitless'] == 26,
+                'unrelated_gate_progress': all(sim.clients[healthy]['items'].values()),
+                'healthy_probe_closes': s.br['trips'] == 4 and not s.br['half']}
+    return sim, {'extra': extra}
 
 
 @scenario("worker-local quarantine", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 1000,
