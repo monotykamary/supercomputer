@@ -167,21 +167,25 @@ def test_breaker_watchdog_handoff_policy_acquire():
     s.trip("again")
     assert s.br["open_until"] == first  # (a trip while open changes nothing)
     s.shed = False
-    S.WATCHDOG = True
-    import os as _os
-    load = _os.getloadavg
-    _os.getloadavg = lambda: (1.6 * (_os.cpu_count() or 1), 0, 0)
-    try:
+    import io
+    from unittest.mock import patch
+    real_open = open
+    def fixed_memory(path, *args, **kwargs):
+        if path == "/proc/meminfo":
+            return io.StringIO("MemTotal: 1000 kB\nMemAvailable: 500 kB\n")
+        return real_open(path, *args, **kwargs)
+    # This case tests load hysteresis, not the gate host's changing free memory.
+    with patch.object(S, 'open', side_effect=fixed_memory, create=True), \
+            patch.object(S, 'WATCHDOG', True), patch.object(os, 'getloadavg') as load:
+        load.return_value = (1.6 * (os.cpu_count() or 1), 0, 0)
         s._watch()
         assert s.shed
-        _os.getloadavg = lambda: (1.2 * (_os.cpu_count() or 1), 0, 0)
+        load.return_value = (1.2 * (os.cpu_count() or 1), 0, 0)
         s._watch()
         assert s.shed  # (hysteresis: not cool yet)
-        _os.getloadavg = lambda: (0.5 * (_os.cpu_count() or 1), 0, 0)
+        load.return_value = (0.5 * (os.cpu_count() or 1), 0, 0)
         s._watch()
         assert not s.shed
-    finally:
-        _os.getloadavg = load
     inst = S.rules.Install("old", 60)
     assert inst.tick(0, "new", True) == "stay" and inst.tick(30, "new", True) == "stay" and inst.tick(61, "new", False) == "stay" and inst.tick(61, "new", True) == "handoff"
     S.POLICY.parent.mkdir(parents=True, exist_ok=True)

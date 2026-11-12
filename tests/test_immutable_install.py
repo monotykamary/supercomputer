@@ -28,8 +28,11 @@ print('{"active":"old","staged":"new","pending":true}')
 '''
 FAKE_REFLEX = r'''#!/usr/bin/env python3
 import json,os,pathlib,subprocess,sys
-args=sys.argv[1:]; machine='air' if args[0]=='home' else args[1]
+args=sys.argv[1:]; machine='inventory' if args==['home','machines'] else args[1]
 with open(os.environ['SC_TEST_TRACE'],'a') as f:f.write(json.dumps(['reflex',machine,*args])+'\n')
+if args==['home','machines']:
+ print("Machines Reflex reaches:\nhere (MacBook Air, where Reflex runs)\nmini\nanh-1\nboat-example (boat sandbox)")
+ sys.exit(0)
 home=pathlib.Path(os.environ['SC_TEST_MACHINES'])/machine;home.mkdir(parents=True,exist_ok=True)
 env=dict(os.environ,HOME=str(home));env.pop('XDG_DATA_HOME',None)
 sys.exit(subprocess.run(['bash','-c',args[-1]],env=env).returncode)
@@ -49,7 +52,7 @@ class ImmutableInstall(unittest.TestCase):
                         PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
                         SC_ROLLOUT_PROTOCOL_COMPATIBLE='1', SC_TEST_TRACE=str(self.trace),
                         SC_TEST_CLI=FAKE_CLI, SC_TEST_MACHINES=str(self.root/'machines'))
-        for key in ('XDG_DATA_HOME', 'SUPERCOMPUTER_HOME', 'SUPERCOMPUTER_LIVE', 'SUPERCOMPUTER_SRC', 'SC_TEST_FAIL'):
+        for key in ('XDG_DATA_HOME', 'SUPERCOMPUTER_HOME', 'SUPERCOMPUTER_LIVE', 'SUPERCOMPUTER_SRC', 'SC_TEST_FAIL', 'SC_ROLLOUT_MACHINES'):
             self.env.pop(key, None)
         self.fake = self.root / 'fake-bin'
         self.fake.mkdir()
@@ -106,7 +109,7 @@ class ImmutableInstall(unittest.TestCase):
         records = self.records()
         stages = [x for x in records if x[0]=='cli' and x[2:4]==['scheduler','stage']]
         self.assertEqual(len(stages), 4)
-        self.assertEqual({Path(x[1]).name for x in stages}, {'home','air','here','anh-1'})
+        self.assertEqual({Path(x[1]).name for x in stages}, {'home','mini','here','anh-1'})
         self.assertEqual(len([x for x in records if x[0]=='cli' and x[2:4]==['controller','stage']]), 1)
         self.assertFalse(any('checkout' in x or 'reinstall' in x for record in records for x in record if isinstance(x,str)))
         self.assertEqual(self.old.read_text(), 'old tree remains intact')

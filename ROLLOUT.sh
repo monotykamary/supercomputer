@@ -11,6 +11,41 @@ REF=${1:-}
   echo 'Refusing an unreviewed lease-protocol transition. Hot reload preserves identity; it cannot translate an incompatible protocol.' >&2
   exit 2
 }
+# Discover before staging anything: `here` follows the Mac running Reflex, while
+# named Macs (including mini) must not disappear when that home Mac changes.
+# An explicit override remains available for a deliberately narrower rollout.
+machines=()
+if [[ -n ${SC_ROLLOUT_MACHINES:-} ]]; then
+  read -r -a machines <<< "$SC_ROLLOUT_MACHINES"
+else
+  if ! inventory=$(reflex home machines); then
+    echo 'ERROR: could not discover Reflex machines; nothing staged.' >&2
+    exit 1
+  fi
+  if ! machine_names=$(python3 -c '
+import re, sys
+lines = [line.strip() for line in sys.stdin if line.strip()]
+if not lines or lines.pop(0) != "Machines Reflex reaches:" or not lines:
+    sys.exit("Invalid or empty Reflex machine inventory")
+seen = set()
+for line in lines:
+    name, *description = line.split(maxsplit=1)
+    note = description[0] if description else ""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or (note and not (note.startswith("(") and note.endswith(")"))):
+        sys.exit("Invalid Reflex machine entry: " + repr(line))
+    if note == "(boat sandbox)":
+        continue  # already installed locally below, not through Reflex
+    if name not in seen:
+        seen.add(name)
+        print(name)
+' <<< "$inventory"); then
+    echo 'ERROR: invalid Reflex machine inventory; nothing staged.' >&2
+    exit 1
+  fi
+  while IFS= read -r machine; do
+    [[ -z $machine ]] || machines+=("$machine")
+  done <<< "$machine_names"
+fi
 here="$(cd "$(dirname "$0")" && pwd)"
 SC="$HOME/.local/bin/supercomputer"
 # Stage reports installed + active hash. pending=true is expected. Preparation
@@ -22,10 +57,6 @@ bash "$here/INSTALL_VERSION.sh" "$REF"
 # that running clients may still import. Base64 is only transport, not a secret.
 installer_b64=$(python3 -c 'import base64,pathlib,sys; print(base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode())' "$here/INSTALL_VERSION.sh")
 remote_install="set -e; f=\$(mktemp); trap 'rm -f \"\$f\"' EXIT; printf '%s' '$installer_b64' | python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' > \"\$f\"; SC_ROLLOUT_PROTOCOL_COMPATIBLE=1 bash \"\$f\" '$REF'"
-# `here` is the Mac running Reflex (currently the mini), not this sandbox.
-# Override only for different registered Reflex aliases; do not use `home`
-# as a permanent alias for the Air.
-read -r -a machines <<< "${SC_ROLLOUT_MACHINES:-here air anh-1}"
 staged=1
 skipped=()
 for machine in "${machines[@]}"; do
