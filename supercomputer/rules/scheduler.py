@@ -434,6 +434,23 @@ class Breaker:
             return self.trip(now)
         return "kept"
 
+    # gdp: law rejudging never increments trips: trips == old(trips)
+    # gdp: law a real outage is never forced closed: not outage or open_until == old(open_until)
+    # gdp: law unknown evidence cannot close an inherited pause: known or open_until == old(open_until)
+    # gdp: law a current qualifying sample retains its pause: judged < max(3, min_judged) or 2 * bad <= judged or open_until == old(open_until)
+    # gdp: law a rejected inherited sample closes with the normal initial backoff: not (now < old(open_until) and known and not outage and (judged < max(3, min_judged) or 2 * bad <= judged)) or (open_until == 0 and not half and backoff == backoff_s)
+    # gdp: law rejudging a closed breaker is idempotent: now < old(open_until) or (open_until == old(open_until) and half == old(half) and backoff == old(backoff))
+    def rejudge(self, now: float, judged: int, bad: int, outage: bool, known: bool) -> Literal["closed", "kept"]:
+        """Reconsider a persisted OPEN pause, never force a current-rule outage closed."""
+        if now >= self.open_until or not known or outage:
+            return "kept"
+        if judged >= max(3, self.min_judged) and 2 * bad > judged:
+            return "kept"
+        self.open_until = 0.0
+        self.half = False
+        self.backoff = self.backoff_s
+        return "closed"
+
     # gdp: law a trip while the breaker is open changes nothing: now >= old(open_until) or (open_until == old(open_until) and trips == old(trips))
     def trip(self, now: float) -> Literal["closed", "tripped", "kept"]:
         """The breaker opens (also on an outage of boat's front): no start until now + its pause."""

@@ -664,6 +664,8 @@ class Scheduler:
         self._status_view = statusview.PublishedStatus({"pid": os.getpid(), "code": self.code})
         self._status_timings = collections.deque(maxlen=20000)
         self._status_refresh_lock = threading.Lock()
+        if time.time() < self.br["open_until"]:
+            self.rejudge_breaker(source="startup", actor="controller", reason="startup/handoff under current rules")
         self._refresh_status(blocking=True)
         if not self.batches and not self.recovery_blocked:  # no adoption while ownership is uncertain
             self.adopting = True
@@ -1772,7 +1774,7 @@ class Scheduler:
         return {"scope": "native-single-vm", "runtime_verified": True, "code": code_hash(),
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
-                "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1,
+                "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1,
                 "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -4769,7 +4771,79 @@ class Scheduler:
                 self.vms.pop(vm.id, None)
 
     # -- the breaker, the watchdog, the day's accounts
-    def trip(self, reason: str):
+    def _breaker_rejudge_evidence(self, now: float) -> dict:
+        """Retain historical evidence if incomplete; quarantined workers never count as a current outage."""
+        quarantine = getattr(self, "resume_quarantine", {})
+        def judged(rows, at):
+            return [s for s in rows if s.get("ok") is not None or at - s["t"] > BREAK_READY]
+        def counts(rows):
+            eligible = [s for s in rows if s.get("vm") not in quarantine]
+            return len(eligible), sum(not s.get("ok") for s in eligible)
+        current = judged([s for s in self.starts_log if 0 <= now - s["t"] < BREAK_WINDOW], now)
+        n, bad = counts(current)
+        saved = self.br.get("evidence", {})
+        known, historical, outage = False, None, self._outage()
+        reason = self.br.get("reason", "")
+        match = re.fullmatch(r"(\d+) of the last (\d+) starts not ready within \d+ min", reason)
+        if saved.get("kind") == "readiness" and isinstance(saved.get("starts"), list):
+            historical, known = counts(saved["starts"]), True
+        elif match:
+            old_bad, old_n = map(int, match.groups())
+            if 0 <= old_bad <= old_n:
+                known, historical = True, (old_n, old_bad)
+                at = self.br["t_trip"]
+                rows = judged([s for s in self.starts_log if 0 <= at - s["t"] < BREAK_WINDOW], at)
+                # A partial/expired journal must not erase a genuine multi-start trip.
+                if (len(rows), sum(not s.get("ok") for s in rows)) == historical:
+                    historical = counts(rows)
+        else:
+            front = re.match(r"boat's front: the agents of (\d+) of (\d+) (?:eligible )?VMs don't answer", reason)
+            if front:
+                failed, total = map(int, front.groups())
+                if 0 <= failed <= total:
+                    known, outage = True, outage or rules.outage(total, failed)
+        need = max(3, BREAK_MIN)
+        if historical and historical[0] >= need and 2 * historical[1] > historical[0]:
+            n, bad = historical
+        return {"known": known, "judged": n, "bad": bad, "outage": outage,
+                "minimum": need, "historical": historical, "quarantined": sorted(quarantine)}
+
+    def rejudge_breaker(self, *, source: str = "operator", actor: str = "operator", reason: str = "") -> dict:
+        """One audited policy decision for both startup/handoff and the authenticated operator RPC."""
+        if source not in ("operator", "startup") or not isinstance(reason, str) or not reason.strip() or len(reason) > 512:
+            raise ValueError("a nonempty audit reason (at most 512 characters) is required")
+        if not isinstance(actor, str) or not actor.strip() or len(actor) > 128:
+            raise ValueError("a nonempty audit actor (at most 128 characters) is required")
+        with self.lock:
+            if source == "operator" and (getattr(self, "handing_off", False) or getattr(self, "recovery_blocked", False)):
+                raise ValueError("controller ownership is not stable")
+            now, before = time.time(), copy.deepcopy(self.br)
+            evidence = self._breaker_rejudge_evidence(now)
+            b = self._breaker()
+            decision = b.rejudge(now, evidence["judged"], evidence["bad"], evidence["outage"], evidence["known"])
+            after = {**before, "open_until": b.open_until, "half": b.half, "backoff": b.backoff}
+            if decision == "closed":
+                after["reason"] = ""
+            record = {"protocol": 1, "t": now, "source": source, "actor": actor, "reason": reason,
+                      "code": getattr(self, "code", ""), "pid": os.getpid(), "decision": decision,
+                      "inherited": before, "evidence": evidence, "after": after}
+            # Fail before touching live state if the durable audit cannot be written.
+            audit = DIR / "breaker-rejudge.jsonl"
+            with config.private_umask():
+                with audit.open("a") as f:
+                    f.write(json.dumps(record, sort_keys=True) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            self.br.update(after)
+            self._metrics_save()
+            log("breaker rejudge: " + json.dumps(record, sort_keys=True))
+        if decision == "closed":
+            self.wake.set()
+        if hasattr(self, "_status_view"):
+            self._refresh_status(blocking=True)
+        return {"ok": True, **record, "breaker": {**after, "open": now < after["open_until"]}}
+
+    def trip(self, reason: str, *, evidence: dict | None = None):
         """The circuit breaker opens: no start (free or paid) for its backoff, doubled at each trip in a row; then one
         start as a probe, and starts again only once a probe came up."""
         now = time.time()
@@ -4779,13 +4853,15 @@ class Scheduler:
             if b.trip(now) != "tripped":  # (rules.Breaker.trip: none while open)
                 return
             self.br.update(open_until=b.open_until, t_trip=now, half=b.half, reason=reason, trips=b.trips, backoff=b.backoff, last_reason=reason,
+                           evidence=copy.deepcopy(evidence or {}),
                            history=(self.br.get("history", []) + [{"t": round(now, 1), "reason": reason}])[-20:])  # (every trip's why, kept past its close)
             self.m["breaker_trips"] += 1
         self.alert(f"circuit breaker open for {pause / 60:.0f} min: {reason}")
         self._metrics_save()
 
     def _breaker_eval(self, now: float):
-        recent = [s for s in self.starts_log if s["t"] > self.br["t_trip"] and now - s["t"] < BREAK_WINDOW]
+        recent = [s for s in self.starts_log if s["t"] > self.br["t_trip"] and now - s["t"] < BREAK_WINDOW
+                  and s.get("vm") not in getattr(self, "resume_quarantine", {})]
         judged = [s for s in recent if s["ok"] is not None or now - s["t"] > BREAK_READY]
         bad = [s for s in judged if not s["ok"]]
         b = self._breaker()
@@ -4795,7 +4871,8 @@ class Scheduler:
                 self.br.update(half=b.half, backoff=b.backoff, reason="")
             log("circuit breaker closed: a probe start came up")
         elif what == "tripped":
-            self.trip(f"{len(bad)} of the last {len(judged)} starts not ready within {BREAK_READY / 60:.0f} min")
+            self.trip(f"{len(bad)} of the last {len(judged)} starts not ready within {BREAK_READY / 60:.0f} min",
+                      evidence={"kind": "readiness", "starts": copy.deepcopy(judged)})
 
     def _breaker(self) -> rules.Breaker:
         """The breaker as rules.Breaker holds it (its state kept in self.br, across restarts)."""
@@ -5809,6 +5886,13 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         except (ValueError, OSError) as e:
                             return self._response(409, {"error": str(e)})
                     return self._response(200, raw=s.logs(s.batch_of(m), m.get("vms", [])))
+                if p == "/breaker/rejudge":
+                    try:
+                        if m.get("protocol") != 1:
+                            raise ValueError("breaker rejudge protocol 1 required")
+                        return self._response(200, s.rejudge_breaker(actor=m.get("actor", "operator"), reason=m.get("reason", "")))
+                    except (ValueError, TypeError, OSError) as e:
+                        return self._response(400, {"error": str(e)})
                 if p == "/workers/recover":
                     try:
                         return self._response(200, s.recover_worker(m.get("vm"), m.get("expected_agent")))

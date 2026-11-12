@@ -419,8 +419,9 @@ def maybe_sync():
 def main(argv: list[str]):
     import argparse
     ap = argparse.ArgumentParser(prog="supercomputer controller")
-    ap.add_argument("cmd", choices=["setup", "stage", "status", "sync", "logs", "restart", "stop", "handover", "rekey"])
+    ap.add_argument("cmd", choices=["setup", "stage", "status", "sync", "logs", "restart", "stop", "handover", "rekey", "breaker"])
     ap.add_argument("what", nargs="?", default="scheduler")
+    ap.add_argument("--reason", default="", help="audit reason required for breaker rejudge (never force-closes)")
     ap.add_argument("--vm", default="")
     ap.add_argument("--vms", type=int, default=40, help="pool VMs the controller gets from this registry")
     ap.add_argument("--floor", type=int, default=8, help="the treadmill's floor")
@@ -429,7 +430,17 @@ def main(argv: list[str]):
     vm = a.vm or info().get("vm")
     if not vm:
         raise SystemExit("no controller VM: supercomputer controller setup --vm <id>")
-    if a.cmd == "setup":
+    if a.cmd == "breaker":
+        if a.what != "rejudge" or not a.reason.strip():
+            ap.error("use: supercomputer controller breaker rejudge --reason 'operator reason'")
+        client = scheduler.Client(info())
+        if client.req("/capabilities", {}).get("breaker_rejudge_protocol") != 1:
+            raise SystemExit("controller does not support audited breaker rejudge")
+        result = client.req("/breaker/rejudge", {"protocol": 1, "actor": os.environ.get("USER", "operator"), "reason": a.reason})
+        print(json.dumps(result, indent=1))
+        if not result.get("ok"):
+            raise SystemExit(1)
+    elif a.cmd == "setup":
         setup(vm, a.vms, a.floor, a.only)
     elif a.cmd == "stage":
         stage(vm)

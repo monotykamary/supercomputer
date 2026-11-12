@@ -21,6 +21,24 @@ class SingleProbeTrips(Breaker):
         return "kept"
 
 
+class ForceRejudgeClosesOutage(Breaker):
+    """An operator command must not be a disguised force-close."""
+
+    # gdp: law a real outage is never forced closed: not outage or open_until == old(open_until)
+    def rejudge(self, now: float, judged: int, bad: int, outage: bool, known: bool) -> Literal["closed", "kept"]:
+        self.open_until = 0.0
+        self.half = False
+        return "closed"
+
+
+class InheritedPauseNeverRejudged(Breaker):
+    """The old one-of-one pause survived the 08:20 controller handoff."""
+
+    # gdp: law a rejected inherited sample closes with the normal initial backoff: not (now < old(open_until) and known and not outage and (judged < max(3, min_judged) or 2 * bad <= judged)) or (open_until == 0 and not half and backoff == backoff_s)
+    def rejudge(self, now: float, judged: int, bad: int, outage: bool, known: bool) -> Literal["closed", "kept"]:
+        return "kept"
+
+
 class WaitCounted(ItemFate):
     """Before acac7d0: each max_wait with no VM ready was one of boat's failures of the item, even while the
     scheduler's own breaker forbade starts; items reached 3 and went to Modal without boat ever running them."""

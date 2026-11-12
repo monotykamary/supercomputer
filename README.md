@@ -149,7 +149,16 @@ a timer, and a circuit breaker stops every start when recent ones keep failing: 
 three starts (also while half-open), or a correlated outage of the provider front. A single failed stopped-VM
 resume quarantines only that VM from acquisition/adoption, durably across controller handoffs, and still counts
 as a fruitless CPU draw. It does not escalate the pool-wide pause; a successful probe closes the breaker.
-An already-open pause is preserved across a controller update, not reset by installing this policy.
+On startup or hot handoff, an inherited OPEN pause is rejudged under the current sample minimum and
+quarantine rules. A disqualified readiness sample closes; a real multi-start or provider-front outage stays
+open. Incomplete or unrecognized evidence is retained conservatively. The original trip and decision are
+fsynced to `scheduler/breaker-rejudge.jsonl` before any state change.
+Operators can request the same non-forcing decision with
+`supercomputer controller breaker rejudge --reason 'why this needs review'` (capability
+`breaker_rejudge_protocol: 1`). This is not a reset: it cannot override a current-rule outage. Repeating the
+request is state-idempotent; each request has its own audit record. No worker or batch is changed.
+The initial pause is **300 seconds**, doubling only on repeated qualifying trips up to 3600 seconds;
+closing a disqualified inherited pause restores that 300-second initial backoff.
 
 **Warm agents.** Each VM runs a small agent behind boat's token-gated HTTPS. A batch that finds one free sends a single
 request: the tree by id, then the jobs. The agent keeps every file it was sent by content, so the next tree costs only

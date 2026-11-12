@@ -2662,6 +2662,55 @@ def breaker_single_failed_resume(code):
     return sim, {'extra': extra}
 
 
+def _inherited_breaker_fixture(code, failures):
+    import json
+    sim = _sim(code, policy={"max_vms": 2, "floor_default": 1})
+    _warm(sim, 1)
+    now = sim.k.t0
+    state = {"breaker": {"open_until": now + 3600, "half": True, "backoff": 3600,
+                         "t_trip": now - 10, "trips": 31,
+                         "reason": f"{failures} of the last {failures} starts not ready within 8 min",
+                         "history": [{"t": now - 10, "reason": "inherited legacy trip"}]},
+             "starts_log": [{"t": now - 20 - i, "vm": f"failed-{i}", "ok": False} for i in range(failures)]}
+    (sim.S.DIR / "metrics").mkdir(parents=True, exist_ok=True)
+    (sim.S.DIR / "metrics/state.json").write_text(json.dumps(state))
+    sim.scheduler()
+    return sim
+
+
+@scenario("08:17 inherited single failure", ["clients", "threads"], 400,
+          "startup rejudges the inherited one-of-one pause, preserves its trip record and an operator repeat is idempotent")
+def inherited_breaker_rejudge(code):
+    from tests.sim.harness import items
+    sim = _inherited_breaker_fixture(code, 1)
+    observed = {}
+    def recheck():
+        s = sim.w.live_sched()[1]
+        before = dict(s.br)
+        r = s.rejudge_breaker(actor="scenario-operator", reason="verify startup closure")
+        observed.update(closed=not s.br['half'] and s.br['open_until'] == 0,
+                        idempotent=s.br == before and r['decision'] == 'kept',
+                        history=s.br['trips'] == 31 and s.br['history'][0]['reason'] == 'inherited legacy trip')
+    sim.at(5, recheck)
+    sim.batch('after-rejudge', 'gate', items('g', 1, 20), after=10)
+    return sim, {'extra': lambda sim, m: observed}
+
+
+@scenario("real inherited outage", ["threads"], 100,
+          "a real four-start inherited outage stays open through startup and an explicit operator rejudge")
+def inherited_real_outage_kept(code):
+    sim = _inherited_breaker_fixture(code, 4)
+    observed = {}
+    def recheck():
+        s = sim.w.live_sched()[1]
+        before = dict(s.br)
+        r = s.rejudge_breaker(actor="scenario-operator", reason="verify real outage")
+        observed.update(still_open=s.br['half'] and s.br['open_until'] > sim.k.now,
+                        unchanged=s.br == before and r['decision'] == 'kept' and s.br['trips'] == 31)
+    sim.at(5, recheck)
+    return sim, {'extra': lambda sim, m: observed}
+
+
 @scenario("worker-local quarantine", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 1000,
           "one legacy worker loses its agent listener while a live run remains: quarantine only that worker, retain ownership, and serve gates elsewhere")
 def local_worker_quarantine(code):
