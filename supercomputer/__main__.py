@@ -323,7 +323,7 @@ def main(argv=None):
         boat.teardown(a.all, a.type)
     elif a.cmd == "image":
         if a.build:
-            with boat.signals_as_interrupt():
+            with boat.signals_as_interrupt(), boat.image_build_lock(boat.image_name()):
                 print(boat.ensure_image(True))
         else:
             have = boat.named_snapshots()

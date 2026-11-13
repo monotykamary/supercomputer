@@ -516,6 +516,19 @@ exit $found
 """
 
 
+@contextlib.contextmanager
+def image_build_lock(image: str):
+    """One build of an image at a time on this machine (two agents in one worktree, or `image --build` beside a batch):
+    the second waits, then finds it ready instead of building it again."""
+    LIVE.mkdir(parents=True, exist_ok=True)
+    with open(LIVE / f"image-build-{image}.lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def ensure_image(build: bool = True) -> str:
     have = named_snapshots(60)
     if env("IMAGE"):
@@ -2990,6 +3003,26 @@ class Scheduled(Session):
     def lease_up(self, k: int, vm_type: str) -> int:
         return 0
 
+    def _image_for_scheduler(self):
+        """The scheduler starts VMs of this image but never builds one: a batch for an image boat doesn't have waited,
+        silently, for VMs nobody could start (11-13: a new worktree's batches queued for an hour). So it is checked
+        here and built when missing, as `supercomputer image --build` would (SUPERCOMPUTER_NO_BUILD=1: the batch
+        stops with the reason instead). Boat's API unreachable: left to the scheduler, which reports that itself."""
+        if getattr(self, "_image_ok", False) or not getattr(self, "image", None):
+            return  # (checked already; or a session made without __init__, as tests make them: nothing to check)
+        try:
+            ready = named_snapshots(60).get(self.image, {}).get("status") == "ready"
+        except Exception as e:
+            log(f"(image check skipped: {str(e)[:160]})")
+            return
+        if not ready:
+            if env("NO_BUILD"):
+                raise Unavailable(f"boat image {self.image} isn't built: supercomputer image --build (SUPERCOMPUTER_NO_BUILD is set)")
+            log(f"image {self.image} isn't built yet (a new repo or toolchain): building it now, about a minute, once")
+            with image_build_lock(self.image), getattr(self, "_image_lock", None) or threading.Lock():
+                self.image = ensure_image(True)
+        self._image_ok = True
+
     def _custody_event(self, bid: str, event: str, **details):
         # Full history is durable; only the last 64 events live in result rows.
         # The digest binds ALL bytes, not just the visible tail. No payload/env/token
@@ -3207,6 +3240,7 @@ class Scheduled(Session):
                 raise Unavailable("scheduler lacks distinct_vm_group capability; refusing unconstrained submission")
             if any("cpu_model" in it for it in items) and caps.get("cpu_model_exact") is not True:
                 raise Unavailable("scheduler lacks exact cpu_model capability; refusing unconstrained submission")
+        self._image_for_scheduler()
         by = {it["name"]: it for it in items}
         log(f"submission root: {getattr(self.tree, 'root', '<prebuilt tree>')} ({len(self.tree.files)} files, {len(self.tree.links)} links)")
         upload_client = self.client

@@ -109,6 +109,16 @@ def main_checkout(d: pathlib.Path) -> pathlib.Path:
         return d
 
 
+def repo_name(d: pathlib.Path) -> str:
+    """A checkout's project name: its main checkout's folder for a linked worktree (its git common dir is that
+    checkout's .git), else its own folder (a main checkout, a submodule, a tree that isn't git)."""
+    try:
+        common = pathlib.Path(subprocess.run(["git", "-C", str(d), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, check=True).stdout.strip())
+    except Exception:
+        return d.name
+    return common.parent.name if common.name == ".git" else d.name
+
+
 DEFAULT_IGNORE = ["**/node_modules/**", "**/__pycache__/**", "**/.venv/**", "**/runs/**", "runs/**"]
 
 
@@ -120,7 +130,9 @@ class Project:
         self.cfg = cfg or {}
         self.cfg_path = cfg_path
         c, b = self.cfg, self.cfg.get("boat", {})
-        self.name = c.get("name") or self.root.name
+        # (a worktree is its main checkout's project: one image and one VM path for every worktree of a repo, not a
+        # new image to build per worktree folder; a config's name still wins)
+        self.name = c.get("name") or repo_name(self.root)
         self.prefix = b.get("prefix") or "".join(ch for ch in self.name.lower() if ch.isalnum())[:10] or "sc"
         self.final_prefix = b.get("final_prefix") or f"{self.prefix}-img"
         self.image_salt = b.get("image_salt") or f"{self.prefix}-image-v1"
