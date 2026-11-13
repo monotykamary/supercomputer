@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
@@ -288,6 +289,7 @@ class Guards(unittest.TestCase):
         import types
         s = object.__new__(scheduler.Scheduler)
         s.handing_off, s._handoff_lease_lost = True, False
+        s.lock = threading.RLock()
         s._drop_stale = mock.Mock()
         vm = types.SimpleNamespace(id='held', lease={'epoch': 7})
         with mock.patch.object(scheduler.boat, 'lease_vm', return_value={'ok': False, 'stale': True}):

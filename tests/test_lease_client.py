@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import ANY, MagicMock, Mock, patch
 
@@ -353,6 +354,7 @@ class LeaseClientTests(unittest.TestCase):
         for provider_up in (False, True):
             with self.subTest(provider_up=provider_up):
                 s = S.Scheduler.__new__(S.Scheduler)
+                s.lock = threading.RLock()
                 vm = S.VMState('vm', 'image', 'large', 'warm')
                 vm.lease, vm.ready, vm.t_renew = dict(self.lease), True, 0.0
                 with patch.object(S.time, 'monotonic', return_value=1000.0), \

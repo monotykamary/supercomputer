@@ -51,7 +51,7 @@ import threading
 import time
 import urllib.request
 
-from . import blobcache, boat, canary, config, health, history, memorypressure, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
+from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
 from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
 from .agent import AGENT_CAPABILITIES as BUILD_AGENT_CAPABILITIES
@@ -543,10 +543,12 @@ class SchedulerAgentClient:
             result = getattr(self.client, method)(*args, **kwargs)
         except Exception as error:
             if any(word in str(error).lower() for word in ("stale", "403", "400")):
-                self.scheduler._drop_stale(self.vm_state)
+                self.scheduler._drop_stale(self.vm_state, source='client.exception', error=error,
+                                           operation=lease_diagnostics.operation(method, args))
             raise
         if isinstance(result, dict) and (result.get("stale") or isinstance(result.get("result"), dict) and result["result"].get("stale")):
-            self.scheduler._drop_stale(self.vm_state)
+            self.scheduler._drop_stale(self.vm_state, source='client.stale_reply', reply=result,
+                                       operation=lease_diagnostics.operation(method, args))
             raise AgentError("stale lease: VM relinquished")
         return result
 
@@ -1343,7 +1345,7 @@ class Scheduler:
                     entry["lease"] = None
                     if state in ("stopped", "deleted", "error"):
                         entry["state"] = state
-            self._drop_stale(vm)  # occupied was false, so no item is requeued
+            self._drop_stale(vm, source='handoff.prune', error=reason)  # occupied was false
             pruned[vm.id] = reason
         self._handoff_pruned = pruned
         if pruned:
@@ -1740,6 +1742,9 @@ class Scheduler:
                         "cleanup_complete": it.owned.reaped,
                         "identity_unavailable": not bool(placement.get("vm") and
                             placement.get("boot_id") and placement.get("identity"))}
+        diagnostic = getattr(it.vm, 'lease_relinquishment', None)
+        if isinstance(diagnostic, dict):
+            evidence['lease_relinquishment'] = diagnostic
         self._deliver_owned(it.batch, {"name": it.name, "code": -1, "seconds": -1,
                           "error": why, "strict_once": it.batch.strict_once,
                           "launch_identity": it.launch_identity, **evidence})
@@ -2973,6 +2978,7 @@ class Scheduler:
             if not str(e).startswith("its preparation failed") and "made again" not in str(e):  # (3 in a row: no more placements there, rules.may_slot; a preparation counted
                 vm.prep_fails = getattr(vm, "prep_fails", 0) + 1  # once, not once per item waiting on it: 4 waiters quarantined a VM for one 3-s outage, B9)
             if what == "lost":  # (boat stopped it: nothing more is placed there)
+                self._note_lease_relinquish(vm, source='prepare.provider_lost', error=e)
                 self._lost_vm(vm)
             elif unanswered:
                 threading.Thread(target=self._repair, args=(vm,), daemon=True).start()
@@ -3879,7 +3885,7 @@ class Scheduler:
                 if started:
                     self._start_done(vm.id, False)
                     started = False
-                self._drop_stale(vm)
+                self._drop_stale(vm, source='up.claim_refused', reply=claim, operation='lease/renew')
                 return
             vm.lease = claim
             boat.remember_lease(vm.id, claim)
@@ -3917,7 +3923,7 @@ class Scheduler:
             vm.t_agent = time.time()
             r = cl.rpc("vtick", {"wait": 0}, timeout=30)
             if r.get("stale"):
-                self._drop_stale(vm)
+                self._drop_stale(vm, source='up.stale_reply', reply=r, operation='rpc/vtick')
                 return
             vm.slots = max(1, int(r.get("cpus") or boat.TYPES[vm.type][0]) // boat.SLOT_CPU)
             self._model_report(vm, r.get("model", ""))
@@ -3944,9 +3950,9 @@ class Scheduler:
                 return
             self._worker(vm)
             log(f"{vm.id} ({vm.how}) ready for {NAMES[k]} in {vm.t_ready - vm.t_lease:.0f} s" if vm.how != "adopt" else f"{vm.id} adopted (agent {vm.agent})")
-        except boat.LeaseProtocolLost:
+        except boat.LeaseProtocolLost as error:
             self.alert(f"{vm.id}: lease protocol lost; old client wins, relinquished without stopping")
-            self._drop_stale(vm)
+            self._drop_stale(vm, source='up.protocol_lost', error=error)
         except Exception as e:
             if vm.dead:
                 return
@@ -3996,9 +4002,29 @@ class Scheduler:
                 self.creating[(image, vm_type)] = max(0, self.creating.get((image, vm_type), 0) - n)
             self.wake.set()
 
-    def _drop_stale(self, vm: VMState):
+    def _note_lease_relinquish(self, vm: VMState, *, source, error=None, reply=None, operation=''):
+        """Keep the initiating evidence before a dead wrapper hides it; never gate a fence on logging."""
+        with self.lock:
+            prior = getattr(vm, 'lease_relinquishment', None)
+            if isinstance(prior, dict) and vm.dead:
+                return prior  # only an actual relinquishment freezes its first cause
+            try:
+                diagnostic = lease_diagnostics.event(vm.id, source, lease=getattr(vm, 'lease', None),
+                                                      client=getattr(vm, 'client', None),
+                                                      error=error, reply=reply, operation=operation)
+            except Exception as failure:
+                diagnostic = {'event': 'lease_relinquish', 'vm': vm.id, 'source': source,
+                              'diagnostic_error': type(failure).__name__}
+            diagnostic['t'] = time.time()
+            vm.lease_relinquishment = diagnostic
+            with contextlib.suppress(Exception):
+                log('LEASE_RELINQUISH', json.dumps(diagnostic, sort_keys=True))
+            return diagnostic
+
+    def _drop_stale(self, vm: VMState, *, source='unspecified', error=None, reply=None, operation=''):
         """Lease loss is not a VM fault: no stop, kill, or item strike."""
         with self.lock:
+            self._note_lease_relinquish(vm, source=source, error=error, reply=reply, operation=operation)
             vm.dead, vm.ready = True, False
             if self.vms.get(vm.id) is vm:
                 self.vms.pop(vm.id, None)
@@ -4017,22 +4043,23 @@ class Scheduler:
         self.wake.set()
 
     def _renew_lease(self, vm: VMState) -> bool:
-        def lost():
+        def lost(source, *, error=None, reply=None):
             if getattr(self, "handing_off", False):
+                self._note_lease_relinquish(vm, source=source, error=error, reply=reply, operation='lease/renew')
                 self._handoff_lease_lost = True  # keep frozen identities; the parent must not commit
             else:
-                self._drop_stale(vm)
+                self._drop_stale(vm, source=source, error=error, reply=reply, operation='lease/renew')
         if not vm.lease:
-            lost()
+            lost('renew.missing_fence')
             return False
         try:
             r = boat.lease_vm(vm.id, "renew", lease=vm.lease)
-        except boat.LeaseProtocolLost:
+        except boat.LeaseProtocolLost as error:
             self.alert(f"{vm.id}: lease protocol lost; old client wins, relinquished without stopping")
-            lost()
+            lost('renew.protocol_lost', error=error)
             return False
         if not r.get("ok") or r.get("stale"):
-            lost()
+            lost('renew.refused', reply=r)
             return False
         vm.t_renew = time.monotonic()
         return True
@@ -4211,11 +4238,13 @@ class Scheduler:
             try:
                 if not self._renew_lease(vm):
                     return None
-            except Exception:
+            except Exception as error:
                 # No placement while authority cannot be verified. A stopped VM
                 # cannot renew at all: do not pin its work/capacity forever.
                 vm.ready = False
                 if not self._boat_up(vm.id):
+                    self._note_lease_relinquish(vm, source='renew.transport_provider_down',
+                                              error=error, operation='lease/renew')
                     self._lost_vm(vm)
                     return None
                 return 5.0
@@ -4261,7 +4290,7 @@ class Scheduler:
         try:
             r = vm.client.rpc("vtick", {"start": starts, "acks": acks, "wait": 0}, timeout=self.TICK_S)
             if r.get("stale"):
-                self._drop_stale(vm)
+                self._drop_stale(vm, source='tick.stale_reply', reply=r, operation='rpc/vtick')
                 return None
             r["done"] = owned_done + r.get("done", [])
             vm._fails, vm.failing = 0, 0
@@ -4271,7 +4300,7 @@ class Scheduler:
         except Exception as e:
             if "stale" in str(e).lower() or "403" in str(e) or "400" in str(e):
                 self.alert(f"{vm.id}: lease protocol lost or refused; relinquished without stopping")
-                self._drop_stale(vm)
+                self._drop_stale(vm, source='tick.exception', error=e, operation='rpc/vtick')
                 return None
             fails = vm._fails = getattr(vm, "_fails", 0) + 1
             vm.failing = fails
@@ -4282,6 +4311,7 @@ class Scheduler:
             outage = self._outage()
             if "is stopped" in str(e) and rules.vm_lost(fails, outage, False, True):  # (boat stopped it: let go at once, its items to other VMs)
                 log(f"{vm.id}: boat reports it stopped")
+                self._note_lease_relinquish(vm, source='tick.provider_stopped', error=e, operation='rpc/vtick')
                 self._lost_vm(vm)
                 return None
             if fails >= 2 and fails % 4 == 2:  # (its agent repaired in place, its items running on)
@@ -4299,6 +4329,7 @@ class Scheduler:
                 log(f"{vm.id}: tick failed ({fails}{', an outage' if outage else ''}): {str(e)[:160]}")
             # ("lost": rules.vm_lost, boat reports it stopped or gone; boat asked only past the failures' threshold)
             if rules.vm_lost(fails, outage, fails < (90 if outage else 12) or self._boat_up(vm.id), False):
+                self._note_lease_relinquish(vm, source='tick.provider_lost', error=e, operation='rpc/vtick')
                 self._lost_vm(vm)
                 return None
             return float(min(20, 2 * fails))
@@ -4780,7 +4811,7 @@ class Scheduler:
         if getattr(self, "recovery_blocked", False):
             return
         if not vm.lease:
-            self._drop_stale(vm)
+            self._drop_stale(vm, source='release.missing_fence')
             return
         ttl = max(boat.BACKSTOP, vm.ttl) if keep else boat.IDLE
         try:
@@ -4791,21 +4822,21 @@ class Scheduler:
                 # Same-machine handoff retains its epoch and running jobs.
             elif getattr(vm, "replace", False):
                 if not boat.delete_vm(vm.id, lease=vm.lease):
-                    self._drop_stale(vm)
+                    self._drop_stale(vm, source='release.delete_refused')
                     return
             elif stop:
                 if not boat.stop_vm(vm.id, lease=vm.lease):
-                    self._drop_stale(vm)
+                    self._drop_stale(vm, source='release.stop_refused')
                     return
             else:
                 # The helper reserves provider capacity before taking the stop
                 # fence, so queueing cannot outlive STOP_S and shrink a new holder.
                 if not boat.shrink_ttl(vm.id, ttl, vm.lease):
-                    self._drop_stale(vm)
+                    self._drop_stale(vm, source='release.shrink_refused')
                     return
         except Exception as e:
             log(f"{vm.id}: release not confirmed; left to TTL: {str(e)[:160]}")
-            self._drop_stale(vm)
+            self._drop_stale(vm, source='release.exception', error=e)
             return
         now = time.time()
         with Registry().locked() as d:
@@ -5543,7 +5574,7 @@ class Scheduler:
             return
         r = vm.client._call("ping") if isinstance(vm.client, SchedulerAgentClient) else vm.client.ping()
         if r.get("stale"):
-            self._drop_stale(vm)
+            self._drop_stale(vm, source='upgrade.stale_ping', reply=r, operation='rpc/ping')
             return
         with self.lock:
             stopped = getattr(self, "stop", None)
@@ -5553,7 +5584,7 @@ class Scheduler:
                 return  # A newer observation already superseded this probe.
             if r.get("version") != old and old:
                 self.alert(f"{vm.id}: agent changed outside holder; old client wins, relinquished")
-                self._drop_stale(vm)
+                self._drop_stale(vm, source='upgrade.agent_changed', reply=r, operation='rpc/ping')
                 return
             self._record_agent_ping(vm, r)
             vm.t_agent = time.time()

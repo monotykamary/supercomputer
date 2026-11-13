@@ -55,6 +55,7 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `workerprobe.audit`, static remote probe | I/O + exact shipped rule | lease/ownership-locked process, group/session/path/environment evidence; strict refusal and atomic fsynced LOST journal; no signals or deletion. Real-process tests include orphaned session descendants. |
 | `Scheduler._reclaim_ghosts`, `_finished_ghost`, `recover_worker` | I/O + rule wiring | exact held-worker/current-target binding, persisted terminal loss before slot release, no controller replay; normal lease/bootstrap helper only. Journal failure retains ownership. |
 | `resultrelay`, `Scheduler._outage_vms`, `_poll_one` | I/O + rule wiring | typed/refused localhost connection is worker-local quarantine; no exception secrets; multi-worker provider failures retain the global breaker. |
+| `lease_diagnostics`, `Scheduler._note_lease_relinquish`, `_drop_stale`, `boat._stop_fence` | observability only | bounded, credential-redacted first cause with expected/observed fence fields; kept in strict LOST rows before the dead wrapper can hide it. No extra RPC, retries, receipt import or authority decision; diagnostic failure cannot prevent fencing. Existing refusal classification is unchanged. |
 
 ## Closed history and strict-close recovery
 

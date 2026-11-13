@@ -69,7 +69,10 @@ Terminal results carry `launch_identity`, `attempt`, `attempts`, `max_attempts`,
 `vm`, `boot_id` and `placement`; placement includes the observed agent version.
 Before an authoritative placement is known, `identity_unavailable: true` marks
 missing evidence rather than inventing a VM/boot. LOST intentionally does not
-set the legacy `lost: true` callback/fallback flag.
+set the legacy `lost: true` callback/fallback flag. Lease-related terminal rows
+also retain `lease_relinquishment`: the initiating operation, bounded/redacted
+error or refusal, and expected/observed fence metadata. This diagnostic is not
+execution or cleanup proof and does not alter the strict retry/close contract.
 
 ## Synchronous close and cleanup
 

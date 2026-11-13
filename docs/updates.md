@@ -49,6 +49,35 @@ baseline `file:line`, not promises that the old implementation is safe.
   lease identity and refuse incompatible protocol changes, not manufacture a
   new holder because a process PID changed.
 
+## Lease relinquishment: keep the initiating error
+
+`LEASE_RELINQUISH` records the initiating cause before a VM object is
+marked dead. A live handoff-veto observation cannot mask a later actual
+relinquishment; once dead, the first cause is frozen. It includes the operation (including the nested owned command),
+exception type and bounded/redacted message, text-classifier matches, and
+allowlisted expected/observed boot, epoch and lease state. Owner identities are
+hashed; tokens, cookies, URLs, nonce values and request/context payloads are not
+copied. Repeated calls through the now-dead wrapper cannot overwrite the first
+cause. Strict LOST rows retain the same evidence in `lease_relinquishment`, so
+it remains available through snapshots and closed history. Refused stop fences
+also log their original response as `LEASE_STOP_REFUSED`.
+
+This is observability, not a change in authority: no additional worker query,
+renewal, retry, replacement, cancellation receipt import or provider operation.
+Logging/formatting failure cannot prevent fencing. Failed handoff renewals still
+keep the frozen inventory and veto commit, now with their original refusal.
+
+The `zhy5jg` investigation found a live same-boot worker with a recent successful
+renewal, but the old wrapper discarded its initiating response. A dead retained
+wrapper also prevented controller strict-close from reaching that live worker.
+The exact historical trigger cannot be reconstructed. The current broad
+`stale`/`400`/`403` exception-text classification can classify unrelated text as a
+lease failure; a regression demonstrates and records that ambiguity without
+silently changing existing fencing policy. Neither that hypothesis nor a
+121-specific regression is asserted as the historical cause. Fixing dead-client
+close recovery or changing refusal classification requires a separate policy
+change and tests; this patch does not declare incomplete native closes complete.
+
 ## Deferred handbacks and resumed workers
 
 Rejected canaries and explicit rollback retain `pending_handback` on disk.

@@ -66,7 +66,7 @@ import weakref
 # may remove or replace this package directory while an existing client waits.
 # Lazy imports at delivery (including error recovery) would then fail or mix
 # code from two installs. Both CLI and programmatic clients import boat first.
-from . import clientresults, config, resultfiles, resultjson, resultrelay
+from . import clientresults, config, lease_diagnostics, resultfiles, resultjson, resultrelay
 from .config import env, project
 from .rules import boat as R
 
@@ -1206,9 +1206,16 @@ def _stop_fence(vm: str, lease: dict | None = None, sem=None) -> dict:
         return {}
     try:
         answer = lease_vm(vm, "fence_stop", lease, sem=sem) if sem is not None else lease_vm(vm, "fence_stop", lease)
-        return answer if answer.get("ok") is True and not answer.get("stale") else {}
+        if answer.get("ok") is True and not answer.get("stale"):
+            return answer
+        with contextlib.suppress(Exception):
+            log('LEASE_STOP_REFUSED ' + json.dumps(lease_diagnostics.event(
+                vm, 'stop_fence.refused', lease=lease, reply=answer, operation='lease/fence_stop'), sort_keys=True))
+        return {}
     except Exception as exc:
-        log(f"{vm}: stop/delete not fenced; leaving to TTL ({str(exc)[:120]})")
+        with contextlib.suppress(Exception):
+            log('LEASE_STOP_REFUSED ' + json.dumps(lease_diagnostics.event(
+                vm, 'stop_fence.exception', lease=lease, error=exc, operation='lease/fence_stop'), sort_keys=True))
         return {}
 
 

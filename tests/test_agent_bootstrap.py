@@ -329,7 +329,8 @@ class ResumeLifetime(unittest.TestCase):
     def test_resume_ttl_does_not_bypass_lease_refusal(self):
         instance, vm, commands = self.scheduler_resume(stale=True)
         self.assertFalse(vm.ready)
-        instance._drop_stale.assert_called_once_with(vm)
+        instance._drop_stale.assert_called_once_with(vm, source='up.claim_refused',
+                                                     reply={'ok': False, 'stale': True, 'boot': 'boot', 'epoch': 1}, operation='lease/renew')
         instance._worker.assert_not_called()
         instance._let_go.assert_not_called()
         instance._start_done.assert_called_once_with(vm.id, False)
@@ -409,7 +410,8 @@ class SchedulerBootstrapWiring(unittest.TestCase):
                      patch.object(boat, 'bootstrap_agent', return_value={'ok': False}) as bootstrap, \
                      patch.object(boat, 'lease_vm', return_value={'ok': False}) as claim:
                     instance._up(vm, 3, None)
-                    instance._drop_stale.assert_called_once_with(vm)
+                    instance._drop_stale.assert_called_once_with(vm, source='up.claim_refused',
+                                                                 reply={'ok': False}, operation='lease/renew')
                     instance._let_go.assert_not_called()
                     if how == 'warm':
                         bootstrap.assert_called_once_with('legacy-vm', 'EXACT_SOURCE', 'local-key', 90, nonce='')
