@@ -17,7 +17,7 @@ from supercomputer import boat, scheduler
 
 
 class TakePoolExtras(unittest.TestCase):
-    def take(self, handoff):
+    def take(self, handoff, extra_state="idle"):
         with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
             root = pathlib.Path(tmp)
             (root / "queue").mkdir()
@@ -25,6 +25,7 @@ class TakePoolExtras(unittest.TestCase):
             records = {name: {"type": "large", "snapshot": "image", "state": "idle",
                               "lease": {"pid": pid, "host": host, "batch": "scheduler"}}
                        for name, pid in (("offered", 11), ("extra", 22))}
+            records["extra"]["state"] = extra_state
             original = copy.deepcopy(records)
             leases = {name: {"owner": "owner", "vm_id": name, "boot": "boot", "epoch": 7}
                       for name in records}
@@ -72,6 +73,13 @@ class TakePoolExtras(unittest.TestCase):
         s._renew_lease.assert_not_called()
         self.assertEqual(s._handoff_ack["taken"], ["offered"])
         self.assertEqual(s._handoff_ack["missing"], [])
+
+    def test_stopped_extra_is_in_baseline_before_it_can_become_idle(self):
+        s, records, original, clients = self.take(True, "stopped")
+        self.assertIn("extra", s._handoff["deferred_extras"])
+        self.assertNotIn("extra", s.vms)
+        self.assertEqual(records["extra"], original["extra"])
+        self.assertEqual([c.args[0] for c in clients.call_args_list], ["offered"])
 
     def test_cold_restart_still_takes_dead_registry_holds(self):
         s, records, original, clients = self.take(False)

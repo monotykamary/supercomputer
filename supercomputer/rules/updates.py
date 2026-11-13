@@ -90,6 +90,15 @@ def handoff_orphan_scope(deferred: bool, acquired: bool) -> bool:
     return not deferred or acquired
 
 
+# gdp: law only the current handback owner retries: not result or owner
+# gdp: law a handback requires a distinct saved target: not result or available
+# gdp: law a hard failure stops automatic handback retries: not result or not failed
+# gdp: law handback retries respect their backoff: not result or now >= retry_after
+# gdp: law an eligible deferred handback is retried: not (owner and available and not failed and now >= retry_after) or result
+def handback_due(owner: bool, available: bool, failed: bool, now: float, retry_after: float) -> bool:
+    return owner and available and not failed and now >= retry_after
+
+
 # gdp: law acquisition cannot cross a handoff snapshot: not result or not acquiring
 # gdp: law unregistered creates cannot cross a handoff snapshot: not result or creating == 0
 # gdp: law booting workers cannot be omitted by a handoff: not result or booting == 0

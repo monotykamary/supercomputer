@@ -5,6 +5,17 @@ These are deliberately broken guards, not an alternative production model.
 """
 
 
+
+# gdp: law a previously activated VM can resume without a new birth nonce: not (same_vm and activated and not initial_boot) or not result
+def replay_birth_window_on_resume(fresh: bool, same_vm: bool, activated: bool, initial_boot: bool) -> bool:
+    return fresh
+
+
+# gdp: law a fresh unbound VM requires the birth nonce: not fresh or same_vm or result
+def skip_birth_nonce_on_fork(fresh: bool, same_vm: bool, activated: bool, initial_boot: bool) -> bool:
+    return fresh and not activated
+
+
 class BrokenMixedOwners:
     def __init__(self):
         self.mine = 0

@@ -75,6 +75,15 @@ VERSION = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]  
 Report = Literal["done", "running", "lost", "torn", "skip"]
 
 
+# gdp: law a fresh unbound VM requires the birth nonce: not fresh or same_vm or result
+# gdp: law a fresh unactivated VM requires the birth nonce: not fresh or activated or result
+# gdp: law the initial boot keeps its birth guard: not fresh or not initial_boot or result
+# gdp: law a previously activated VM can resume without a new birth nonce: not (same_vm and activated and not initial_boot) or not result
+# gdp: law an expired birth window does not require a nonce: fresh or not result
+def birth_nonce_required(fresh: bool, same_vm: bool, activated: bool, initial_boot: bool) -> bool:
+    return fresh and (not same_vm or not activated or initial_boot)
+
+
 class VMLease:
     # gdp: law no VM runs items of two owners at once: foreign == 0 or mine == 0
     """Pure admission/fencing decisions; inventory is supplied under lease_lock."""
@@ -2783,10 +2792,15 @@ def lease(op, payload=None):
             if not isinstance(by, str) or not by or not isinstance(vm, str) or not vm:
                 return {"ok": False, "error": "owner and vm_id required"}
             birth = ROOT / "birth.json"
-            if birth.exists() and now < BIRTH_S:
+            same_vm = r.get("vm_id") == vm
+            activated_before = (type(r.get("epoch")) is int and r["epoch"] > 0
+                                and bool(r.get("boot")) and bool(r.get("holder")))
+            # Legacy records have no birth_boot: their prior bound boot is evidence
+            # of activation, but never evidence for a different (forked) VM id.
+            birth_boot = (r.get("birth_boot") or r.get("boot")) if same_vm and activated_before else None
+            if birth.exists() and birth_nonce_required(now < BIRTH_S, same_vm, activated_before, birth_boot == boot):
                 b = json.loads(birth.read_text())
-                # Once activated in THIS boot/id, repeated claims need only the fence.
-                activated = r.get("boot") == boot and r.get("vm_id") == vm and r.get("holder") == b.get("owner")
+                activated = r.get("boot") == boot and same_vm and r.get("holder") == b.get("owner")
                 if by != b.get("owner") or (not activated and (not b.get("nonce") or payload.get("nonce") != b["nonce"])):
                     return {"ok": False, "busy": True, "birth": True, **_lease_who(r)}
             rule = _lease_rule(r)
@@ -2801,7 +2815,8 @@ def lease(op, payload=None):
                 return {"ok": False, "busy": True, **_lease_who(r)}
             r.pop("stop_nonce", None)
             r.update(holder=rule.holder, owner=rule.holder, boot=rule.boot, vm_id=rule.vm_id,
-                     epoch=rule.epoch, draining=False, state="held", renewed=now)
+                     epoch=rule.epoch, draining=False, state="held", renewed=now,
+                     birth_boot=birth_boot or boot)
             _lease_save(r)
             return {"ok": True, **_lease_who(r)}
         if op not in ("renew", "release", "fence_stop", "check"):

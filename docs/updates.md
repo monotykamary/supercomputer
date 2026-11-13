@@ -49,6 +49,26 @@ baseline `file:line`, not promises that the old implementation is safe.
   lease identity and refuse incompatible protocol changes, not manufacture a
   new holder because a process PID changed.
 
+## Deferred handbacks and resumed workers
+
+Rejected canaries and explicit rollback retain `pending_handback` on disk.
+Acquisition, boot, upgrade and strict-launch deferrals retry the saved target
+at most once per 15 seconds, still requiring the full readiness ACK. Retryable
+startup failures back off for 60 seconds; hard failures stop automatic retry.
+The original verdict is not rewritten as passed. Legacy rejected/rolled-back
+records are recognized after upgrade.
+
+Unoffered registry entries are classified before transient provider state, so a
+pre-existing stopped entry becoming idle is not a new handoff orphan. Acquired
+extras remain covered. Ownership-check logs name the counted orphan IDs.
+
+The ten-minute birth-nonce window belongs to the worker's original activated
+boot, not every resume. `birth_boot` preserves that boundary; legacy records use
+their prior activated identity. Different VM IDs still require birth owner/nonce.
+Resumes still require a current-boot grant and refuse unresolved live work.
+Bounded bootstrap/renewal refusal details distinguish birth, busy and stale
+failures; no cached old-boot lease is accepted as current.
+
 ## Handoff health: ownership versus sustained idle
 
 The handoff target is still strict zero. The initial takeover and its +15/+30-second

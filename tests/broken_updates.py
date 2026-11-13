@@ -1,5 +1,16 @@
 """Regressions refused by the same hot-update laws."""
 
+
+# gdp: law an eligible deferred handback is retried: not (owner and available and not failed and now >= retry_after) or result
+def forget_deferred_handback(owner: bool, available: bool, failed: bool, now: float, retry_after: float) -> bool:
+    return False
+
+
+# gdp: law a hard failure stops automatic handback retries: not result or not failed
+def retry_failed_handback(owner: bool, available: bool, failed: bool, now: float, retry_after: float) -> bool:
+    return owner and available and now >= retry_after
+
+
 # gdp: law booting workers cannot be omitted by a handoff: not result or booting == 0
 def forget_booting_after_last_pin(acquiring: bool, creating: int, booting: int) -> bool:
     return not acquiring and creating == 0

@@ -123,6 +123,44 @@ class VMLeasePersistence(unittest.TestCase):
         self.assertNotIn("stop_nonce", A.lease("who"))
         self.assertTrue(A.lease("release", receipt)["ok"])
 
+    def test_legacy_activated_vm_resumes_inside_birth_window_without_nonce(self):
+        self.now = 5
+        (self.root / "birth.json").write_text(json.dumps({"owner": "a", "nonce": "birth-nonce"}))
+        first = self.claim(nonce="birth-nonce")
+        record = json.loads((self.root / "lease.json").read_text())
+        record.pop("birth_boot", None)  # an activated pre-fix worker
+        (self.root / "lease.json").write_text(json.dumps(record))
+        self.boot, self.now = "boot-b", 5
+        resumed = self.claim()
+        self.assertTrue(resumed["ok"])
+        self.assertEqual(resumed["boot"], "boot-b")
+        self.assertGreater(resumed["epoch"], first["epoch"])
+        self.assertEqual(json.loads((self.root / "lease.json").read_text())["birth_boot"], "boot-a")
+        self.assertTrue(A.lease("renew", first)["stale"])
+        self.assertTrue(self.claim()["ok"])
+
+    def test_fork_still_requires_birth_nonce_and_owner(self):
+        self.now = 5
+        (self.root / "birth.json").write_text(json.dumps({"owner": "a", "nonce": "birth-nonce"}))
+        self.claim(nonce="birth-nonce")
+        self.boot = "fork-boot"
+        refused = self.claim(vm_id="fork-vm")
+        self.assertFalse(refused["ok"])
+        self.assertTrue(refused["birth"])
+        self.assertFalse(self.claim("b", vm_id="fork-vm", nonce="birth-nonce")["ok"])
+        self.assertTrue(self.claim(vm_id="fork-vm", nonce="birth-nonce")["ok"])
+
+    def test_resume_birth_fix_does_not_adopt_unfinished_work(self):
+        self.now = 5
+        (self.root / "birth.json").write_text(json.dumps({"owner": "a", "nonce": "birth-nonce"}))
+        self.claim(nonce="birth-nonce")
+        self.job()
+        self.boot = "boot-b"
+        refused = self.claim()
+        self.assertFalse(refused["ok"])
+        self.assertTrue(refused["busy"])
+        self.assertTrue(refused["draining"])
+
     def test_birth_owner_and_nonce_and_snapshot_expiry(self):
         self.now = 5
         (self.root / "birth.json").write_text(json.dumps({"owner": "a", "nonce": "birth-nonce"}))

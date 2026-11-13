@@ -1012,11 +1012,11 @@ class Scheduler:
                 pid = int(l.get("pid") or 0)
                 if not rules.take_over(l.get("batch") == "scheduler", l.get("host") == host, pid == me, boat.pid_alive(pid, l.get("host", "")) if pid else False, bool(old) and pid == old):
                     continue
-                if vid not in info and v.get("state") not in boat.RUNNING:
-                    continue  # (a lease left on a VM boat had stopped: nothing to hold)
                 if not rules.handoff_registry_vm(bool(snap), vid in info):
                     deferred_extras.append(vid)
-                    continue  # Leave its registry lease and agent untouched until post-commit adoption.
+                    continue  # Include stopped extras: provider state can change after the snapshot.
+                if vid not in info and v.get("state") not in boat.RUNNING:
+                    continue  # (a lease left on a VM boat had stopped: nothing to hold)
                 v["lease"] = {**l, "pid": me, "host": host, "batch": "scheduler", "since": now, "label": "scheduler (taken over)"}
                 taken.append(vid)
                 reg[vid] = dict(v)
@@ -1266,6 +1266,7 @@ class Scheduler:
         held = {vid for vid, v in self.vms.items() if not v.dead}
         missing = [vid for vid in h["held"] if vid not in held and self._boat_up(vid)]
         me, host, orphans = os.getpid(), socket.gethostname(), 0
+        orphan_ids = []
         with contextlib.suppress(Exception):
             for vid, v in Registry().read().get("vms", {}).items():
                 if not rules.handoff_orphan_scope(vid in h.get("deferred_extras", ()), vid in self.vms):
@@ -1275,11 +1276,12 @@ class Scheduler:
                 if l.get("batch") == "scheduler" and l.get("host") == host and pid and pid != me and not boat.pid_alive(pid, host) \
                         and v.get("state") in boat.RUNNING:
                     orphans += 1
+                    orphan_ids.append(vid)
         with self.lock:
             live = [v for v in self.vms.values() if not v.dead]
             idle = self._handoff_idle_slots(now, live)
         self._h().record_handoff(now, len(h["held"]) or len(h["taken"]), len(held), len(missing), orphans, idle)
-        log(f"handoff check {h['checks']}: {len(held)} VMs held, {len(missing)} of the handoff's not held, {orphans} orphans, {idle} slots persistently idle beside real work past sub_preempt_s")
+        log(f"handoff check {h['checks']}: {len(held)} VMs held, {len(missing)} of the handoff's not held, {orphans} orphans, {idle} slots persistently idle beside real work past sub_preempt_s; orphan_ids={sorted(orphan_ids)}")
         what, why = self.canary.handoff_verdict(self.code, len(missing) + orphans, idle, f"{len(missing)} VMs not taken, {orphans} orphans, {idle} slots idle beside waiting real work")
         if what == "alert":
             self.alert(why)
@@ -3859,6 +3861,7 @@ class Scheduler:
                 raise RuntimeError("never came up")
             old = boat.read_agent(vm.id) or {}
             cached = vm.lease or old.get("lease") or self.held_before.get(vm.id, {}).get("lease")
+            boot = {}
             if vm.how in ("created", "resumed") or (not cached and vm.how != "adopt"):
                 tok = old.get("token") or boat.owner_key()
                 boot = boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90, nonce=getattr(vm, "birth_nonce", ""))
@@ -3869,7 +3872,10 @@ class Scheduler:
             else:
                 claim = boat.lease_vm(vm.id, "renew", lease=cached) if cached else boat.lease_vm(vm.id, "claim")
             if not claim.get("ok") or claim.get("stale") or not claim.get("boot") or not claim.get("epoch"):
-                vm.start_failure = "lease claim refused or incomplete"
+                detail = {label: {key: reply[key] for key in
+                          ("ok", "stale", "busy", "birth", "valid_boot", "draining", "state", "error") if key in reply}
+                          for label, reply in (("bootstrap", boot), ("claim", claim)) if reply}
+                vm.start_failure = "lease claim refused or incomplete: " + json.dumps(detail, sort_keys=True)
                 if started:
                     self._start_done(vm.id, False)
                     started = False
@@ -5085,11 +5091,15 @@ class Scheduler:
             with contextlib.suppress(Exception):
                 # (a new install, unchanged for 60 s, that imports: rules.Install; no handoff while files are being
                 # written, none of a broken install)
-                h = code_hash()
-                inst = self.__dict__.setdefault("_install", rules.Install(self.code, 60))
-                ripe = h != self.code and inst.seen == h and now - inst.t_seen >= inst.stable_s and self.canary.retry_ready(h, now)
-                if inst.tick(now, h, ripe and self._imports(h)) == "handoff":
-                    self.handoff()
+                back = self.canary.handback_due(self.code, now)
+                if back:
+                    self.handoff(back_to=back)
+                else:
+                    h = code_hash()
+                    inst = self.__dict__.setdefault("_install", rules.Install(self.code, 60))
+                    ripe = h != self.code and inst.seen == h and now - inst.t_seen >= inst.stable_s and self.canary.retry_ready(h, now)
+                    if inst.tick(now, h, ripe and self._imports(h)) == "handoff":
+                        self.handoff()
             if now - t_adopt > 60 and not getattr(self, "adopting", False):
                 t_adopt = now
                 self.adopting = True

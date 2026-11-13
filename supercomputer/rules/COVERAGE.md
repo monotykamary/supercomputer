@@ -4,6 +4,16 @@ Every function and method of the tool, by module: `rule` (a call of `supercomput
 law proven and checked by gdp-wired from every state the laws allow, `tests/check_laws.sh`), `I/O` (no decision, with
 why), or a decision not in a rule (with why: what the rules' subset can't state). The modules' own tables follow.
 
+## Deferred handback and resumed birth guards
+
+| def | where | laws, or why |
+| --- | --- | --- |
+| `rules.updates.handback_due` | rule | owner, saved-target, backoff and hard-failure guards; eligible deferred handbacks retry. |
+| `Canary.handback_due`, `handoff_verdict`, `rollback_to`, `handoff_failed`, `tick`; `Scheduler._sampler` | rule + I/O | durable exact-target retry intent without weakening readiness or changing a rejection to a pass. |
+| `agent.birth_nonce_required` | shipped rule via `rules/agent.py` | fresh, unactivated and forked identities retain birth protection; activated same-VM later boots do not replay the window. |
+| `agent.lease` | rule + I/O | original activated boot persisted/migrated; existing current-boot, epoch, owner and live-work guards remain. |
+| `Scheduler._take_pool`, `_handoff_check`, `_up` | I/O | complete pre-existing-extra baseline, counted orphan IDs and bounded refusal details; no claim or readiness bypass. |
+
 ## Manifest-first service startup
 
 | def | where | laws, or why |

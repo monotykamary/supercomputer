@@ -78,13 +78,36 @@ class Canary:
         else:
             d["state"] = "retryable"
             retry[code] = now + 60  # not a five-second retry storm while the controller is loaded
+        pending = d.get("pending_handback", {})
+        if pending.get("to") == code:
+            pending["retry_after"] = now + 60
+            if not retryable:
+                pending["failed"] = why
         d["why"] = why
         self.write(d)
+
+    def handback_due(self, me: str, now: float) -> str | None:
+        """Retry a persisted handback after deferral; only its current owner may act."""
+        d = self.read()
+        pending = d.get("pending_handback")
+        if not isinstance(pending, dict):
+            target = (d.get("from") if d.get("state") == "rejected" and d.get("to") == me
+                      else d.get("to") if d.get("state") == "rolled back" and d.get("from") == me else None)
+            pending = {"from": me, "to": target, "retry_after": 0.0}
+        target = pending.get("to")
+        available = isinstance(target, str) and bool(target) and target != me and (self.dir / "code" / target / "supercomputer").is_dir()
+        if not rules.handback_due(pending.get("from") == me, available, bool(pending.get("failed")),
+                                  now, float(pending.get("retry_after", 0))):
+            return None
+        d["pending_handback"] = {**pending, "retry_after": now + 15}
+        self.write(d)
+        return target
 
     def handing_off(self, old: str, new: str, now: float):
         self.baseline, self.streak, self._handoff_checked_at = None, {}, now
         self._handoff_hard_fault = False
         d = self.read()
+        d.pop("pending_handback", None)
         d.update({"from": old, "to": new, "t": now, "state": "watching"})
         self.write(d)
 
@@ -96,7 +119,9 @@ class Canary:
         cands = [code] if code else [c for c in reversed(d.get("passed", [])) if c != me] + ([d["from"]] if d.get("from") and d.get("from") != me else [])
         for c in cands:
             if c and c != me and (self.dir / "code" / c / "supercomputer").exists():
-                d.update({"from": me, "to": c, "t": __import__("time").time(), "state": "rolled back", "rejected": sorted(set(d.get("rejected", [])) | {me}),
+                now = time.time()
+                d.update({"from": me, "to": c, "t": now, "state": "rolled back", "rejected": sorted(set(d.get("rejected", [])) | {me}),
+                          "pending_handback": {"from": me, "to": c, "retry_after": now + 15},
                           "why": f"supercomputer rollback{' ' + code if code else ''}"})
                 self.write(d)
                 return c, ""
@@ -124,7 +149,8 @@ class Canary:
         if not self.takes_over(frm):
             return "alert", f"code {me}: the handoff left {what}; no hand-back to {frm}: it re-attaches VM by VM"
         why = f"code {me}: the handoff left {what}: handed back to {frm}"
-        d.update({"state": "rejected", "rejected": sorted(set(d.get("rejected", [])) | {me}), "why": why})
+        d.update({"state": "rejected", "rejected": sorted(set(d.get("rejected", [])) | {me}), "why": why,
+                  "pending_handback": {"from": me, "to": frm, "retry_after": time.time() + 15}})
         self.write(d)
         return "handback", why
 
@@ -188,6 +214,7 @@ class Canary:
             return "watch", ""  # (a hand-back to a code that re-attaches VM by VM would drop the pool: the breach alerted, not handed back)
         if bad and d.get("from") and (self.dir / "code" / d["from"] / "supercomputer").exists():
             d["state"] = "rejected"
+            d["pending_handback"] = {"from": me, "to": d["from"], "retry_after": now + 15}
             d["rejected"] = sorted(set(d.get("rejected", [])) | {me})
             d["why"] = "; ".join(bad)
             self.write(d)
