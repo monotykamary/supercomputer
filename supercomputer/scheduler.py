@@ -377,6 +377,7 @@ class Item:
         self.start_done.set()
         self.launch_identity = None
         self.last_placement = None
+        self.terminal_reap = None  # durable native proof captured before result ACK / VM release
         self.state = "queued"  # queued | starting | running | preempting | done | cancel_pending
         self.vm = None
         self.tries = 0
@@ -905,6 +906,10 @@ class Scheduler:
                     it.owned.closed = b.admission_closed
                 for receipt in self._read_journal(qd / f"{b.id}.cancel", enhanced):
                     it = b.items.get(receipt.get("name"))
+                    if receipt.get("phase") == "terminal":
+                        if it and self._matching_terminal_reap(it, receipt):
+                            it.terminal_reap = receipt
+                        continue  # evidence is not an admission-close fence or a result row
                     if it and receipt.get("admission_closed") is True and receipt.get("identity") == it.launch_identity:
                         it.owned.cancel()
                         if it.state != "done":
@@ -1900,6 +1905,20 @@ class Scheduler:
                 and identity is not None and receipt.get("identity") == identity
                 and receipt.get("batch") == bid and receipt.get("name") == name)
 
+    @classmethod
+    def _matching_terminal_reap(cls, it, evidence):
+        """Only a native terminal receipt for this exact persisted placement is reusable."""
+        pl = it.last_placement or {}
+        return (isinstance(evidence, dict) and evidence.get("phase") == "terminal"
+                and evidence.get("matched") is True and evidence.get("name") == it.name
+                and it.owned.placements == 1 and pl.get("identity") == it.launch_identity
+                and isinstance(pl.get("boot_id"), str) and bool(pl["boot_id"])
+                and type(pl.get("attempt")) is int
+                and all(k in pl and type(evidence.get(k)) is type(pl[k]) and evidence[k] == pl[k]
+                        for k in ("run_name", "vm", "boot_id", "attempt", "identity"))
+                and cls._matching_receipt(evidence.get("receipt"), it.batch.id,
+                                          pl.get("run_name"), it.launch_identity))
+
     def cancel(self, bid, wait_seconds=10):
         self._valid_batch(bid)
         if getattr(self, "recovery_blocked", False):
@@ -1937,8 +1956,9 @@ class Scheduler:
                 name = pl["run_name"] if pl and it.vm is None else it.run_name
                 identity = it.launch_identity
                 placed = it.owned.placements > 0
-            receipt = None
-            if placed and vm is not None and identity:
+                cached = self._matching_terminal_reap(it, it.terminal_reap)
+                receipt = it.terminal_reap["receipt"] if cached else None
+            if receipt is None and placed and vm is not None and identity:
                 try:
                     remaining = max(0, deadline - time.monotonic())
                     receipt = vm.client.rpc("cancelitem", bid, name, remaining, identity,
@@ -1949,7 +1969,8 @@ class Scheduler:
             with self.lock:
                 # Persist evidence first; never acknowledge a reap whose journal failed.
                 self._append_owned(bid, "cancel", {"name": it.name, "run_name": name,
-                    "identity": identity, "matched": matched, "unplaced": not placed, "receipt": {
+                    "identity": identity, "matched": matched, "unplaced": not placed,
+                    "source": "terminal-reap" if cached else "cancel-rpc", "receipt": {
                         k: receipt[k] for k in ("ok", "reaped", "namespace_absent", "identity", "batch", "name", "error") if k in receipt
                     } if isinstance(receipt, dict) else None, "t": time.time()})
                 if it.owned.confirm(matched):
@@ -4630,8 +4651,22 @@ class Scheduler:
         row = self._fetch_result_files(vm, row)
         # Owned cancellation may win during output I/O: its placement/state
         # stays held until the identity/fence-checked atomic terminal commit.
+        receipt = None
         if not row.get("preempted") and not row.get("lost"):
             self._finished_logs(vm, b.id, key[1])
+            with self.lock:
+                if (getattr(self, "handing_off", False) or b.closed or b.admission_closed or it.owned.closed
+                        or vm.running.get(key) is not it):
+                    return False
+                identity = it.launch_identity
+            # A terminal payload is not namespace teardown. Ask the existing bound
+            # native barrier while this worker is still reachable, before ACK frees
+            # the placement and shrink may release its VM. Failure is not proof and
+            # must not suppress or rewrite an otherwise valid payload result.
+            try:
+                receipt = vm.client.rpc("cancelitem", b.id, key[1], 1, identity, timeout=3)
+            except Exception:
+                pass
         with self.lock:
             if (getattr(self, "handing_off", False) or b.closed or b.admission_closed or it.owned.closed
                     or vm.running.get(key) is not it):
@@ -4641,6 +4676,18 @@ class Scheduler:
             if row.get("preempted") or row.get("lost"):
                 self._owned_failed(it, "strict_once: preempted or lost placement")
             else:
+                if self._matching_receipt(receipt, b.id, key[1], it.launch_identity):
+                    # Bind the observed RPC worker, not a relabelled copy of the
+                    # expected placement. Unknown/changed boot or VM is not proof.
+                    evidence = {"phase": "terminal", "name": it.name, "matched": True,
+                                "run_name": key[1], "vm": vm.id, "boot_id": vm.lease.get("boot"),
+                                "attempt": it.owned.placements, "identity": it.launch_identity,
+                                "receipt": {k: receipt[k] for k in
+                                            ("ok", "reaped", "namespace_absent", "identity", "batch", "name")},
+                                "t": time.time()}
+                    if self._matching_terminal_reap(it, evidence):
+                        self._append_owned(b.id, "cancel", evidence)  # fsync before result / ACK
+                        it.terminal_reap = evidence
                 done = {**{k: v for k, v in row.items() if k != "batch"}, "name": it.name, "vm": vm.id, "run_name": it.run_name,
                         "placement": {**{k: (it.last_placement or {})[k] for k in ("distinct_vm_group", "boot_id", "distinct_vm_group_scope", "distinct_vm_group_generation", "attempt", "agent_version", "agent_capabilities") if k in (it.last_placement or {})},
                                       "vm": vm.id, "type": vm.type, "cpu": (it.last_placement or {}).get("cpu") or vm.model, "vcpus": it.weight * boat.SLOT_CPU, "vm_vcpus": boat.TYPES[vm.type][0],

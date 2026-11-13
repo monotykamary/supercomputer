@@ -84,7 +84,24 @@ launch identity and cleanup completion; `unlaunched` lists zero-placement items.
 `journals_retained: true` is explicit.
 
 `cleanup_complete: true` requires positive matching reap evidence for every
-attempt, or no placement. An unreachable/dead worker, timeout, mismatched reply
+attempt, or no placement. On normal strict terminal delivery, the controller
+also requests the existing identity-bound native `cancelitem` barrier **after**
+fetching the complete result and logs, **before** acknowledging the row or
+releasing its placement. A positive receipt is fsynced to the cancellation
+journal as `phase: "terminal"`, bound to the original item/run, VM, boot, attempt
+and launch identity. This does not close the admission or change the result.
+A later strict close reuses that receipt (`source: "terminal-reap"`), including
+after the worker was released or a controller restart. Replaying evidence alone
+does not invent a successful result or an admission-close fence.
+
+The terminal probe has a one-second reap budget and a three-second transport
+timeout. A failed probe does not suppress a valid result; normal strict close
+still requires a positive receipt. Missing agents, release attempts, dead-VM
+flags and unqualified 404s are never accepted as cleanup. Previously completed
+items without a retained positive receipt remain unknown; this fix does not
+retroactively upgrade external audit dispositions or change original rows.
+
+An unreachable/dead worker, timeout, mismatched reply
 or failed custody write is not success. Terminal LOST and pending cleanup can
 coexist; neither permits replacement or re-execution. The public client retains
 each raw per-batch close receipt and aggregate completion. The jobs CLI saves

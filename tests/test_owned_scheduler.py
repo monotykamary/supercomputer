@@ -640,6 +640,247 @@ class OwnedSchedulerTests(unittest.TestCase):
         self.assertFalse(self.s._accept_finished(self.vm, stale))
         self.assertEqual(len(self.vm.acks), 1)
 
+    def complete_with_native_reap(self):
+        self.place_without_thread()
+        def rpc(command, *args, **kwargs):
+            if command == "itemlogs":
+                return {"out": "original output", "err": ""}
+            self.assertEqual(command, "cancelitem")
+            self.assertEqual(args, (self.b.id, self.it.run_name, 1, self.it.launch_identity))
+            self.assertEqual(kwargs, {"timeout": 3})
+            return self.good_receipt()
+        self.vm.client.rpc.side_effect = rpc
+        self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row(details={"original": True})))
+
+    def test_terminal_reap_is_durable_before_result_and_ack(self):
+        deliver = self.s._deliver_owned
+        def checked(batch, row):
+            evidence = S.jlines(self.root / "queue" / f"{self.b.id}.cancel")
+            self.assertEqual(len(evidence), 1)
+            self.assertTrue(self.s._matching_terminal_reap(self.it, evidence[0]))
+            self.assertEqual(self.vm.acks, [])
+            self.assertIn((self.b.id, self.it.run_name), self.vm.running)
+            deliver(batch, row)
+        with patch.object(self.s, "_deliver_owned", side_effect=checked):
+            self.complete_with_native_reap()
+        self.assertFalse(self.b.admission_closed)
+        self.assertFalse(self.it.owned.reaped)  # evidence is not a premature close
+        self.assertFalse(self.it.owned.closed)
+        self.assertEqual(self.b.rows[0]["code"], 0)
+        self.assertNotIn("cancelled", self.b.rows[0])
+        self.assertEqual(self.b.rows[0]["details"], {"original": True})
+
+    def test_terminal_reap_closes_after_worker_release_without_contact(self):
+        self.complete_with_native_reap()
+        original = list(self.b.rows)
+        self.vm.dead = True
+        self.s.vms.clear()
+        self.vm.client.rpc.reset_mock()
+        self.vm.client.rpc.side_effect = AssertionError("released worker must not be contacted")
+        self.assertTrue(self.s.cancel(self.b.id)["complete"])
+        self.assertTrue(self.s.cancel(self.b.id)["complete"])
+        self.vm.client.rpc.assert_not_called()
+        self.assertEqual(self.b.rows, original)
+        evidence = S.jlines(self.root / "queue" / f"{self.b.id}.cancel")
+        self.assertEqual(evidence[-1]["source"], "terminal-reap")
+
+    def test_terminal_reap_survives_restart_without_any_vm(self):
+        self.complete_with_native_reap()
+        original = list(self.b.rows)
+        self.s.batches, self.s.vms = {}, {}
+        self.s._take_pool = Mock()
+        with patch.object(S.threading, "Thread"):
+            self.s.reload()
+        restored = self.s.batches[self.b.id]
+        self.assertIsNotNone(restored.items[self.it.name].terminal_reap)
+        self.assertFalse(restored.items[self.it.name].owned.closed)
+        self.assertEqual(restored.rows, original)
+        self.assertTrue(self.s.cancel(self.b.id)["complete"])
+        self.assertEqual(restored.rows, original)
+        self.s.batches = {}
+        with patch.object(S.threading, "Thread"):
+            self.s.reload()
+        self.assertTrue(self.s.close_receipt(self.b.id)["cleanup_complete"])
+
+    def test_terminal_reap_rejects_every_wrong_placement_component(self):
+        self.complete_with_native_reap()
+        valid = self.it.terminal_reap
+        self.s.vms.clear()
+        self.it.vm = None
+        for field in ("name", "run_name", "vm", "boot_id", "attempt", "identity", "phase", "matched"):
+            for value in (None, "wrong", True):
+                if type(value) is type(valid[field]) and value == valid[field]:
+                    continue
+                with self.subTest(field=field, value=value):
+                    self.it.terminal_reap = {**valid, field: value}
+                    self.assertFalse(self.s._matching_terminal_reap(self.it, self.it.terminal_reap))
+                    self.assertFalse(self.s.cancel(self.b.id, 0)["complete"])
+        for field in ("ok", "reaped", "namespace_absent", "identity", "batch", "name"):
+            with self.subTest(receipt_field=field):
+                self.it.terminal_reap = {**valid, "receipt": {**valid["receipt"], field: None}}
+                self.assertFalse(self.s.cancel(self.b.id, 0)["complete"])
+        self.it.terminal_reap = valid
+        self.assertTrue(self.s.cancel(self.b.id, 0)["complete"])
+
+    def test_terminal_reap_changed_worker_boot_cannot_relabel_receipt(self):
+        self.place_without_thread()
+        self.vm.lease["boot"] = "different-live-worker-boot"
+        self.vm.client.rpc.return_value = self.good_receipt()
+        self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row()))
+        self.assertIsNone(self.it.terminal_reap)
+        self.assertEqual(self.b.rows[0]["code"], 0)
+        self.it.vm = None
+        self.s.vms.clear()
+        self.assertFalse(self.s.cancel(self.b.id, 0)["cleanup_complete"])
+
+    def test_terminal_reap_changed_worker_vm_cannot_relabel_receipt(self):
+        self.place_without_thread()
+        self.vm.id = "different-live-worker-vm"
+        self.vm.client.rpc.return_value = self.good_receipt()
+        self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row()))
+        self.assertIsNone(self.it.terminal_reap)
+        self.assertEqual(self.b.rows[0]["code"], 0)
+        self.it.vm = None
+        self.s.vms.clear()
+        self.assertFalse(self.s.cancel(self.b.id, 0)["cleanup_complete"])
+
+    def test_terminal_reap_timeout_preserves_result_but_not_cleanup(self):
+        self.place_without_thread()
+        def rpc(command, *args, **kwargs):
+            if command == "itemlogs":
+                return {"out": "unchanged", "err": ""}
+            raise TimeoutError("worker unavailable")
+        self.vm.client.rpc.side_effect = rpc
+        self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row()))
+        self.assertIsNone(self.it.terminal_reap)
+        self.assertFalse((self.root / "queue" / f"{self.b.id}.cancel").exists())
+        original = list(self.b.rows)
+        self.s.vms.clear()
+        self.it.vm = None
+        self.assertFalse(self.s.cancel(self.b.id, 0)["complete"])
+        self.assertEqual(self.b.rows, original)
+
+    def test_unknown_or_failed_release_is_not_native_cleanup_evidence(self):
+        self.place_without_thread()
+        self.vm.client.rpc.return_value = {"ok": False, "status": 404, "released": True}
+        self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row()))
+        self.assertIsNone(self.it.terminal_reap)
+        self.vm.dead = True  # not a positive provider STOPPED or namespace proof
+        for response in ({"status": "STOPPED"}, {"released": True}, {"error": "release failed"}, None):
+            self.vm.client.rpc.return_value = response
+            self.assertFalse(self.s.cancel(self.b.id, 0)["cleanup_complete"])
+        self.assertEqual(self.it.owned.placements, 1)
+        self.assertEqual(len(self.b.rows), 1)
+
+    def test_terminal_reap_journal_failure_keeps_unacknowledged_placement(self):
+        self.place_without_thread()
+        self.vm.client.rpc.return_value = self.good_receipt()
+        with patch.object(self.s, "_append_owned", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.s._accept_finished(self.vm, self.terminal_row())
+        self.assertIsNone(self.it.terminal_reap)
+        self.assertEqual(self.vm.acks, [])
+        self.assertEqual(self.b.rows, [])
+        self.assertIn((self.b.id, self.it.run_name), self.vm.running)
+        self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row()))
+        self.assertEqual(len(self.b.rows), 1)
+
+    def test_terminal_reap_duplicate_does_not_contact_or_redeliver(self):
+        self.complete_with_native_reap()
+        original = list(self.b.rows)
+        journal = (self.root / "queue" / f"{self.b.id}.cancel").read_bytes()
+        self.vm.client.rpc.reset_mock()
+        self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row()))
+        self.vm.client.rpc.assert_not_called()
+        self.assertEqual(self.b.rows, original)
+        self.assertEqual((self.root / "queue" / f"{self.b.id}.cancel").read_bytes(), journal)
+
+    def test_terminal_reap_ack_failure_retries_without_reap_or_result_duplication(self):
+        class BrokenACKs(list):
+            def append(self, value):
+                raise OSError("ACK queue unavailable")
+        self.vm.acks = BrokenACKs()
+        with self.assertRaises(OSError):
+            self.complete_with_native_reap()
+        original = list(self.b.rows)
+        evidence = (self.root / "queue" / f"{self.b.id}.cancel").read_bytes()
+        self.vm.acks = []
+        self.vm.client.rpc.reset_mock()
+        self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row()))
+        self.vm.client.rpc.assert_not_called()
+        self.assertEqual(self.b.rows, original)
+        self.assertEqual((self.root / "queue" / f"{self.b.id}.cancel").read_bytes(), evidence)
+        self.assertEqual(len(self.vm.acks), 1)
+
+    def test_terminal_reap_wrong_boot_is_rejected_on_restart(self):
+        self.complete_with_native_reap()
+        path = self.root / "queue" / f"{self.b.id}.cancel"
+        evidence = {**self.it.terminal_reap, "boot_id": "other-kernel-boot"}
+        path.write_text(json.dumps(evidence) + "\n")
+        self.s.batches, self.s.vms = {}, {}
+        self.s._take_pool = Mock()
+        with patch.object(S.threading, "Thread"):
+            self.s.reload()
+        restored = self.s.batches[self.b.id]
+        self.assertIsNone(restored.items[self.it.name].terminal_reap)
+        self.assertFalse(self.s.cancel(self.b.id, 0)["cleanup_complete"])
+        self.assertEqual(restored.rows[0]["code"], 0)
+        self.assertEqual(restored.items[self.it.name].owned.placements, 1)
+
+    def test_terminal_reap_mixed_batch_only_unknown_item_remains_pending(self):
+        spec = {"name": "later", "cmd": "true"}
+        self.msg["items"].append(spec)
+        later = self.b.items["later"] = S.Item(self.b, spec)
+        self.write_batch()
+        self.complete_with_native_reap()
+        first = self.it
+        self.vm.dead = True
+        self.vm.client.rpc.side_effect = AssertionError("first VM was released")
+        other = S.VMState("vm-later", "test-image", S.boat.VM_TYPE, "warm")
+        other.ready, other.client = True, Mock()
+        other.lease = {**self.vm.lease, "vm_id": other.id, "boot": "later-boot"}
+        other.t_renew = S.time.monotonic()
+        self.s.vms[other.id] = other
+        with patch.object(S.threading, "Thread"):
+            self.assertTrue(self.s._place(later, other))
+        later.owned.start_settled()
+        later.start_done.set()
+        other.client.rpc.return_value = {}
+        row = {"batch": self.b.id, "name": later.run_name, "code": 0,
+               "launch_identity": later.launch_identity}
+        self.assertTrue(self.s._accept_finished(other, row))
+        original = list(self.b.rows)
+        closed = self.s.cancel(self.b.id, 0)
+        self.assertFalse(closed["cleanup_complete"])
+        self.assertEqual(closed["pending"], [later.name])
+        self.assertTrue(first.owned.reaped)
+        self.assertFalse(later.owned.reaped)
+        self.assertEqual(self.b.rows, original)
+        other.client.rpc.return_value = {"ok": True, "reaped": True, "namespace_absent": True,
+                                         "batch": self.b.id, "name": later.run_name,
+                                         "identity": later.launch_identity}
+        self.assertTrue(self.s.cancel(self.b.id)["cleanup_complete"])
+        self.assertEqual(self.b.rows, original)
+        self.assertEqual([first.owned.placements, later.owned.placements], [1, 1])
+
+    def test_terminal_reap_before_result_crash_does_not_invent_success(self):
+        self.place_without_thread()
+        self.vm.client.rpc.return_value = self.good_receipt()
+        with patch.object(self.s, "_deliver_owned", side_effect=OSError("result write failed")):
+            with self.assertRaises(OSError):
+                self.s._accept_finished(self.vm, self.terminal_row())
+        self.s.batches, self.s.vms = {}, {}
+        self.s._take_pool = Mock()
+        with patch.object(S.threading, "Thread"):
+            self.s.reload()
+        restored = self.s.batches[self.b.id]
+        self.assertEqual(restored.rows, [])
+        self.assertFalse(restored.items[self.it.name].owned.reaped)
+        self.assertTrue(self.s.cancel(self.b.id)["cleanup_complete"])
+        self.assertEqual(restored.rows[0]["code"], -1)
+        self.assertTrue(restored.rows[0]["cancelled"])
+        self.assertEqual(restored.items[self.it.name].owned.placements, 1)
+
     def test_correct_nonce_lost_row_is_identity_bound_terminal_failure(self):
         self.place_without_thread()
         self.assertTrue(self.s._accept_finished(self.vm, self.terminal_row(lost=True)))

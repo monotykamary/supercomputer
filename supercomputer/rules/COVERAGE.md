@@ -4,6 +4,13 @@ Every function and method of the tool, by module: `rule` (a call of `supercomput
 law proven and checked by gdp-wired from every state the laws allow, `tests/check_laws.sh`), `I/O` (no decision, with
 why), or a decision not in a rule (with why: what the rules' subset can't state). The modules' own tables follow.
 
+## Native terminal cleanup evidence
+
+| def | where | laws, or why |
+| --- | --- | --- |
+| `Scheduler._matching_terminal_reap` | I/O validation | compares the complete persisted placement tuple and original native reap receipt; missing/mismatched evidence is never absence. JSON identity validation is outside the bounded rule model. |
+| `Scheduler._finished`, `reload`, `cancel` | rule + I/O | the existing `OwnedLifecycle` close/confirm laws remain unchanged. Terminal delivery captures and fsyncs positive native cleanup before ACK/pool release; close may reuse only matching evidence, including after restart. Evidence is neither a result nor an admission fence; failed probes do not mint proof. |
+
 ## Deferred handback and resumed birth guards
 
 | def | where | laws, or why |

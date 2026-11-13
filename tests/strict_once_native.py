@@ -73,6 +73,17 @@ def production():
 def loopback_client(B, root, vm):
     """Real AgentClient framing/fencing; only HTTPS -> local HTTP is adapted."""
     class Loopback(B.AgentClient):
+        def rpc(self, command, *args, **kwargs):
+            # A test-only outage AFTER real terminal proof was captured. Do not
+            # replace a native response: any attempted late cleanup is a failure.
+            request = args[0] if command == 'owned_rpc' and args else {}
+            op = request.get('command') if isinstance(request, dict) else None
+            op_args = request.get('args', []) if isinstance(request, dict) else []
+            if op == 'cancelitem' and op_args and (root / ('block-cleanup-' + op_args[0])).exists():
+                append(root / 'blocked-cleanup-rpcs.jsonl', {'command': op, 'batch': op_args[0]})
+                raise ConnectionError('native fixture: completed worker cleanup transport unavailable')
+            return super().rpc(command, *args, **kwargs)
+
         def _get(self, timeout):
             return http.client.HTTPConnection(self.host, timeout=timeout)
 
@@ -372,8 +383,27 @@ def main():
         check('success waiter completed', not success[4].is_alive(), success[3])
         check('success exactly one terminal row', len(success[2]) == 1 and success[2][0]['code'] == 0, success[2])
         check('success no fallback', not success[3], success[3])
-        closed = success[0].close()
+        completed = S.Client().req('/snapshot', {'batch': success[0].batch})
+        terminal = [r for r in completed['cancellation_receipts'] if r.get('phase') == 'terminal']
+        placement = completed['placements'][0]
+        check('success native reap persisted before close', len(terminal) == 1 and
+              terminal[0].get('matched') is True and terminal[0]['receipt'].get('reaped') is True and
+              terminal[0]['receipt'].get('namespace_absent') is True and
+              all(terminal[0].get(k) == placement.get(k) for k in
+                  ('run_name', 'vm', 'boot_id', 'attempt', 'identity')), terminal)
+        blocked = root / ('block-cleanup-' + success[0].batch)
+        blocked.touch()
+        try:
+            closed = success[0].close()
+        finally:
+            blocked.unlink()
         check('success close proves cleanup', closed.get('cleanup_complete') is True, closed)
+        check('success close reused proof without contacting completed worker',
+              not lines(root / 'blocked-cleanup-rpcs.jsonl'))
+        after = S.Client().req('/snapshot', {'batch': success[0].batch})
+        check('success retained native proof source', any(r.get('source') == 'terminal-reap'
+              for r in after['cancellation_receipts']), after['cancellation_receipts'])
+        receipt['scenarios']['success']['terminal_reap'] = terminal[0]
         check('ambiguous ACK never resubmitted', success[1].submits == 1 and success[1].polls > 0, {'submits': success[1].submits, 'polls': success[1].polls})
         custody = closed.get('custody', {}).get(success[0].batch, {})
         check('reconnect custody recorded', custody.get('reconnect_count', 0) >= 1, custody)
