@@ -260,6 +260,7 @@ Read `supercomputer --skill` before first use in a session.
 | --- | --- |
 | `run --jobs F --out D` | a batch: `--class`, `--backend`, `--timing`, `--vm-type`, `--data DIR[:DEST]`, `--env K=V` |
 | `image [--build]` | the repo's boat image, from its config's layers or hooks |
+| `image pin IMAGE... --kind packet\|go --reference ID`, `image pins` | register durable image references or inspect protection; see [image retention](docs/image-retention.md) |
 | `status`, `starts`, `digest` | the pool; the starts ledger; VM-hours and dollars by class |
 | `reap` | dead clients' leases, VMs left up past their time, orphaned Modal apps and pods |
 | `policy [k=v ...]` | the scheduler's knobs, in force within a tick |

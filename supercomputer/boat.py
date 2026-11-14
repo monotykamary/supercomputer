@@ -556,10 +556,15 @@ def images_of(d: dict, p: config.Project | None = None) -> list[str]:
 
 
 def prune_snapshots(keep: set[str], current: str):
-    """Named snapshots of this repo's superseded images (its prefixes'): every layer of the current image is kept, and
-    the image before it (the registry's, newest last), nothing older; the plan names 10 for free."""
-    # (an image is kept while it is younger than a day too: a client started before a layer changed still runs on it;
-    # the order is by when each image was first made current, so an old client can't make its image the newest)
+    """Record image ordering, but NEVER automatically delete provider snapshots.
+
+    Prefix/age/last-two selection is not ownership: another checkout may share
+    the prefix, an older image may have resident workers, or a packet may still
+    pin it. Reading controller pins then deleting here would also race admission.
+    Keep this compatibility entry point non-destructive until a controller-owned
+    deletion protocol can fence every creator and credential holder. Unknown or
+    expired pins do not authorize client-side deletion either.
+    """
     p = project()
     try:
         with Registry().locked() as d:
@@ -570,14 +575,9 @@ def prune_snapshots(keep: set[str], current: str):
                 d["images"] = imgs[-2:]
             else:
                 d.setdefault("images_of", {})[p.prefix] = imgs[-2:]
-            young = {i for i, t in seen.items() if time.time() - t < 86400}
-        last_two = set(imgs[-2:])
-        for n in named_snapshots():  # (rules.boat.keep_snapshot)
-            if not R.keep_snapshot(n.startswith((f"{p.prefix}-", f"{p.final_prefix}-")), n in keep, n in last_two, n in young, n == f"{p.prefix}-base"):
-                boat("snapshot", "rm", n, "--json", check=False)
-                log(f"removed superseded snapshot {n}")
+        log("automatic snapshot deletion disabled; image retention is controller-owned")
     except Exception as e:
-        log(f"(snapshot prune skipped: {e})")
+        log(f"(image bookkeeping skipped; snapshot deletion remains disabled: {e})")
 
 
 def retire(d: dict, image: str):
@@ -2919,6 +2919,34 @@ class Session:
 
 
 HANDOFF_QUIET = 60  # (seconds a client asks again quietly while the scheduler doesn't answer: a handoff's window)
+
+
+def image_pins(operation: str = "list", *, images: list[str] | None = None,
+               kind: str | None = None, reference: str | None = None) -> dict:
+    """Register packet/GO references or inspect pins on an existing controller.
+
+    Call before publishing a packet/GO, and require the durable acknowledgement.
+    This never starts a local controller and never deletes an image.
+    """
+    if operation not in ("list", "register"):
+        raise ValueError("image pin operation must be list or register")
+    msg = {}
+    if operation == "register":
+        if kind not in ("packet", "go") or not isinstance(reference, str) or not reference.strip():
+            raise ValueError("registration requires kind packet/go and a stable reference")
+        if not isinstance(images, list) or not images:
+            raise ValueError("registration requires a nonempty exact image list")
+        msg = {"images": images, "kind": kind, "reference": reference}
+    elif images is not None or kind is not None or reference is not None:
+        raise ValueError("list does not accept registration fields")
+    from . import scheduler
+    conn = scheduler.current()
+    if conn is None:
+        raise Unavailable("no running scheduler; refusing local startup for image pins")
+    caps = conn.req("/capabilities", {})
+    if type(caps.get("image_pins_protocol")) is not int or caps["image_pins_protocol"] != 1:
+        raise Unavailable("scheduler lacks durable image-pin capability")
+    return conn.req("/image-pins/" + operation, msg)
 
 
 def _validate_strict_options(strict_once: bool, max_attempts: int):

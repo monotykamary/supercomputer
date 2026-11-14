@@ -119,7 +119,7 @@ def capture(live: pathlib.Path, treadmill: pathlib.Path, guard=contextlib.nullco
     try:
         for root, prefix, tm in ((live, "live", False), (treadmill, "treadmill", True)):
             for path in _paths(root, treadmill=tm):
-                if not tm and path == live / "scheduler" / "durable-groups.json":
+                if not tm and path in {live / "scheduler" / name for name in ("durable-groups.json", "image-pins.json")}:
                     continue  # pinned with admissions under the placement lock below
                 _pin(path, f"{prefix}/{path.relative_to(root).as_posix()}", entries)
         # This flat directory contains admission JSON and append-only journals.
@@ -127,9 +127,10 @@ def capture(live: pathlib.Path, treadmill: pathlib.Path, guard=contextlib.nullco
         queue = live / "scheduler" / "queue"
         with guard() as state:
             closed = state.get("closed", set()) if isinstance(state, dict) else set()
-            registry = live / "scheduler" / "durable-groups.json"
-            if registry.exists():
-                _pin(registry, "live/scheduler/durable-groups.json", entries, required=True)
+            for name in ("durable-groups.json", "image-pins.json"):
+                registry = live / "scheduler" / name
+                if registry.exists():
+                    _pin(registry, f"live/scheduler/{name}", entries, required=True)
             if queue.exists():
                 paths = sorted(queue.iterdir())
                 admitted = {p.stem for p in paths if p.suffix in {".json", ".closed", ".retired"}}

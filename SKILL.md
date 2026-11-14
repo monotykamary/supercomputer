@@ -30,6 +30,14 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
   and old queued work never silently rebinds. Open groups do not expire automatically. Coordinate close
   with every producer. Durable metadata does not park or reserve VMs; ordinary release policy still applies.
 
+**Image retention:** automatic snapshot deletion is disabled. Before publishing a packet or GO, run
+`supercomputer image pin IMAGE... --kind packet|go --reference STABLE_ID` and require its durable
+receipt (`image_pins_protocol:1`). The controller retains these exact images for at least seven days,
+and pins live batches without a TTL before acknowledging admission. `supercomputer image pins` lists
+pins plus locally known resident workers and pending creations. Neither command starts a local controller.
+Unknown history or inventory never authorizes deletion. Old credentialed clients must also be updated
+in the operator-authorized gap; a new controller alone cannot fence their old pruner. See `docs/image-retention.md`.
+
 **Runtime pins (native):** a job may declare `"runtime":{"bun":{"version":"1.4.3","sha256":"..."},"lean":{"version":"4.34.0","sha256":"..."}}`.
 Use 64-hex digests of the selected executable files, not archives or an Elan proxy; put the actual Lean toolchain
 `bin` on the job PATH. The agent verifies inside the job namespace before payload execution and records the

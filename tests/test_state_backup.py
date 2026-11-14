@@ -72,6 +72,21 @@ class StateFiles(unittest.TestCase):
         self.assertEqual(got['live/scheduler/durable-groups.json'], got['live/scheduler/queue/batch.json'])
         self.assertEqual(got['live/scheduler/durable-groups.json'], b'{"epoch":"new"}')
 
+    def test_image_pins_and_admissions_share_the_guarded_snapshot(self):
+        registry = self.live / 'scheduler/image-pins.json'
+        registry.write_text('{"revision":1}')
+        (self.q / 'batch.json').write_text('{"revision":1}')
+        @contextlib.contextmanager
+        def guard():
+            tmp = registry.with_suffix('.tmp')
+            tmp.write_text('{"revision":2}')
+            tmp.replace(registry)
+            (self.q / 'batch.json').write_text('{"revision":2}')
+            yield
+        got = unpack(B.build(self.live, self.tm, guard))
+        self.assertEqual(got['live/scheduler/image-pins.json'], got['live/scheduler/queue/batch.json'])
+        self.assertEqual(got['live/scheduler/image-pins.json'], b'{"revision":2}')
+
     def test_torn_external_append_is_not_exported(self):
         (self.q / "batch.json").write_text("{}")
         (self.q / "batch.rows").write_bytes(b'{"ok":1}\n{"half":')

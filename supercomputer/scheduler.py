@@ -54,6 +54,7 @@ import urllib.request
 from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, prelaunch, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
 from .rules.prelaunch import prelaunch_can_retry, prelaunch_not_started, prelaunch_transport_retryable
 from .durable_groups import DurableGroups, active as durable_active
+from .image_pins import ImagePins, RETENTION_SECONDS
 from .boat import AgentClient, AgentError, Registry
 from .agent import AGENT_CAPABILITIES as BUILD_AGENT_CAPABILITIES
 from .rules.owned_lifecycle import (OwnedLifecycle, retention_supported, attempt_cap_supported,
@@ -286,7 +287,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
             "result_files_protocol": capabilities.get("result_files_protocol") == 1,
             "required_agent_capabilities_protocol": capabilities.get("required_agent_capabilities_protocol") == 1,
             "runtime_pins_protocol": type(capabilities.get("runtime_pins_protocol")) is int and capabilities["runtime_pins_protocol"] == 1,
-            "resource_limits_protocol": type(capabilities.get("resource_limits_protocol")) is int and capabilities["resource_limits_protocol"] == 1}
+            "resource_limits_protocol": type(capabilities.get("resource_limits_protocol")) is int and capabilities["resource_limits_protocol"] == 1,
+            "image_pins_protocol": type(capabilities.get("image_pins_protocol")) is int and capabilities["image_pins_protocol"] == 1}
 
 
 def stage_install() -> dict:
@@ -869,6 +871,7 @@ class Scheduler:
                     history.finish(qd, f.stem, record)
                     continue
                 b = Batch(record)
+                self._pin_batch_image(b)
                 self._attach_durable(b)
                 if self._valid_batch(b.id) != f.stem:
                     raise ValueError("admission id does not match its file")
@@ -1009,6 +1012,9 @@ class Scheduler:
                                              durable == snap.get("durable_distinct_vm_groups", {}) if snap else True):
             self.recovery["ready"] = False
             self.recovery["durable_distinct_vm_groups"] = "history mismatch"
+        if snap.get("image_pins") is not None and self._image_pins_manifest() != snap["image_pins"]:
+            self.recovery["ready"] = False
+            self.recovery["image_pins"] = "history mismatch"
         self.recovery_blocked = not self.recovery["ready"]
         # A guard-aware parent owns the failed-ACK rollback. Starting a second
         # hand-back here would race its recovery and spawn two replacements.
@@ -1155,6 +1161,7 @@ class Scheduler:
             self._handoff_ack = {"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing,
                                  "admissions": self.recovery, "items_ready": items_ready,
                                  "distinct_vm_groups": ack_groups,
+                                 "image_pins": self._image_pins_manifest(),
                                  **({"durable_distinct_vm_groups": self._durable_snapshot()} if durable else {}),
                                  "registry_load_ms": self._registry_load_ms,
                                  "reload_ms": max(0, math.ceil((time.monotonic() - getattr(self, "_reload_started", time.monotonic())) * 1000))}
@@ -1362,6 +1369,62 @@ class Scheduler:
         if pruned:
             log(f"handoff: pruned {len(pruned)} empty unavailable holds: {pruned}")
 
+    def _pins(self):
+        if not hasattr(self, "_image_pins_registry"):
+            self._image_pins_registry = ImagePins(DIR / "image-pins.json")
+        return self._image_pins_registry
+
+    def _pin_batch_image(self, b):
+        ref, now = "batch:" + b.id, time.time()
+        record = self._pins().get(ref, now)
+        if record is not None:
+            if record["kind"] != "batch" or record["images"] != [b.image] or not record["live"]:
+                raise ValueError("batch image differs from its durable pin or is already closed")
+            return record
+        return self._pins().pin_batch(ref, [b.image], now)
+
+    def _image_pins_manifest(self):
+        snapshot = self._pins().snapshot(time.time())
+        # Compare durable history, not time-dependent presentation fields.
+        return {**{k: snapshot[k] for k in ("version", "epoch", "revision")},
+                "records": {ref: {k: v for k, v in record.items()
+                                   if k not in ("live", "protected", "reason")}
+                            for ref, record in snapshot["records"].items()}}
+
+    def image_pin_register(self, images, kind, reference):
+        with self.lock:
+            if getattr(self, "recovery_blocked", False):
+                raise ValueError("recovery quarantined")
+            if kind not in ("packet", "go") or not isinstance(reference, str) or not reference:
+                raise ValueError("kind packet/go and a stable reference are required")
+            record = self._pins().register(kind + ":" + reference, images, kind, time.time())
+            return {"ok": True, "epoch": self._pins().epoch, "revision": self._pins().revision,
+                    "accepted_at": record["last_observed_at"], "minimum_retention_seconds": RETENTION_SECONDS,
+                    "pin": record, "gc_enabled": False}
+
+    def image_pin_list(self):
+        with self.lock:
+            snapshot = self._pins().snapshot(time.time())
+            protected = snapshot["protected"]
+            def protect(image, reason):
+                if isinstance(image, str) and image:
+                    protected.setdefault(image, []).append(reason)
+            for b in self.batches.values():
+                protect(b.image, {"reason": "live_batch_current", "batch": b.id})
+            for v in self.vms.values():
+                protect(v.image, {"reason": "resident_worker", "vm": v.id})
+            for (image, vm_type), count in getattr(self, "creating", {}).items():
+                if count:
+                    protect(image, {"reason": "pending_creation", "vm_type": vm_type, "count": count})
+            # Local registry is useful evidence, never proof of a complete
+            # provider inventory (its legacy reader can return an empty pool).
+            for vid, row in Registry().read().get("vms", {}).items():
+                if isinstance(row, dict) and row.get("state") != "deleted":
+                    protect(row.get("snapshot"), {"reason": "resident_registry", "vm": vid})
+            return {"ok": True, **snapshot, "gc_enabled": False,
+                    "inventory_complete": False,
+                    "gc_disabled_reason": "no fenced cross-client deletion authority; all automatic snapshot deletion disabled"}
+
     def _groups(self):
         if not hasattr(self, "_durable_registry"):
             self._durable_registry = DurableGroups(DIR / "durable-groups.json")
@@ -1436,6 +1499,7 @@ class Scheduler:
         return {"from_pid": os.getpid(), "t": time.time(), "from": self.code, "vms": vms,
                 "batches": sorted(set(self.batches) | set(getattr(self, "recovery_errors", {}))),
                 "distinct_vm_groups": self._distinct_snapshot(),
+                "image_pins": self._image_pins_manifest(),
                 **({"durable_distinct_vm_groups": durable} if durable else {}),
                 "admission_guard": True, "unavailable": dict(getattr(self, "_handoff_pruned", {}))}
 
@@ -1807,10 +1871,11 @@ class Scheduler:
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
                 "result_files_protocol": 1, "output_files_protocol": 1,
+                "image_pins_protocol": 1, "snapshot_auto_delete": False,
                 "result_inline_bytes": resultfiles.INLINE_BYTES,
                 "poll_max_bytes": resultfiles.POLL_BYTES + 2048,
                 "retention_requires_strict_once": True,
-                "paths": ["/cancel", "/snapshot", "/close-receipt", "/capabilities", "/batch/info", "/batch/rows", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"],
+                "paths": ["/cancel", "/snapshot", "/close-receipt", "/capabilities", "/batch/info", "/batch/rows", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close", "/image-pins/register", "/image-pins/list"],
                 "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
 
     @classmethod
@@ -1910,6 +1975,11 @@ class Scheduler:
                 fenced = True  # Unreadable ownership is never permission to launch.
             b.closed = before or fenced
             raise
+        if receipt.get("cleanup_complete") is True:
+            ref = "batch:" + b.id
+            if self._pins().get(ref, time.time()) is None:
+                self._pin_batch_image(b)
+            self._pins().mark_batch_closed(ref, time.time())
         self.batches.pop(b.id, None)
         self._durably_closed = getattr(self, "_durably_closed", set()) | {b.id}
         return retained
@@ -2051,6 +2121,9 @@ class Scheduler:
         if what == "keep":
             # Name-only idempotency must never acknowledge a newly pinned job
             # while retaining an older, unpinned admission (or changed pins).
+            if b.image != old.image:
+                return {"ok": False, "error": "image differs from the existing admission; use a new batch id"}
+            self._pin_batch_image(old)
             for name, item in b.items.items():
                 previous = old.items[name].spec
                 if ("runtime" in item.spec or "runtime" in previous) and item.spec.get("runtime") != previous.get("runtime"):
@@ -2073,6 +2146,9 @@ class Scheduler:
                 msg = self._bind_durable(msg)
                 b = Batch(msg)
                 self._attach_durable(b)
+            # Durable protection must precede queue publication and ACK.
+            # A crash here may leak a pin, but cannot leave an unprotected batch.
+            self._pin_batch_image(b)
             b.cache_generation = secrets.token_hex(16)
             admission = json.dumps({**msg, "t0": b.t0, "cache_generation": b.cache_generation,
                                     "cache_completed_generation": None})
@@ -5587,6 +5663,10 @@ class Scheduler:
                 if not all(rules.distinct_history_matches(required_durable, prepared[target].get("durable_distinct_vm_group") is True) for target in candidates):
                     self.alert("handoff refused: durable distinct VM groups require a durable-group-aware successor")
                     return
+                required_image_pins = bool(self._image_pins_manifest()["records"])
+                if required_image_pins and not all(prepared[target].get("image_pins_protocol") is True for target in candidates):
+                    self.alert("handoff refused: durable image pins require a retention-aware successor")
+                    return
                 if pending is None:
                     generation = self._handoff_gate().begin(time.monotonic())
                     pending = self._handoff_pending = {"target": new, "back_to": back_to,
@@ -5667,7 +5747,9 @@ class Scheduler:
                         ack.get("items_ready") is True and rules.distinct_history_matches(bool(snap.get("distinct_vm_groups")),
                             ack.get("distinct_vm_groups") == snap.get("distinct_vm_groups")) and
                         rules.distinct_history_matches(bool(snap.get("durable_distinct_vm_groups")),
-                            ack.get("durable_distinct_vm_groups") == snap.get("durable_distinct_vm_groups"))):
+                            ack.get("durable_distinct_vm_groups") == snap.get("durable_distinct_vm_groups")) and
+                        rules.distinct_history_matches(bool(snap.get("image_pins")),
+                            ack.get("image_pins") == snap.get("image_pins"))):
                     _notify_service(ack["pid"])
                     log(f"handoff: serving pid {ack['pid']} holds every VM and running identity; exiting")
                     accepted = True
@@ -6186,6 +6268,15 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                 p = self.path
                 if p == "/capabilities":
                     return self._response(200, s.capabilities())
+                if p in ("/image-pins/register", "/image-pins/list"):
+                    try:
+                        if not isinstance(m, dict):
+                            raise ValueError("image pin request must be an object")
+                        result = (s.image_pin_list() if p.endswith("/list") else
+                                  s.image_pin_register(m.get("images"), m.get("kind"), m.get("reference")))
+                    except (ValueError, TypeError) as e:
+                        return self._response(400, {"error": str(e)})
+                    return self._response(200, result)
                 if p in ("/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close"):
                     try:
                         if not isinstance(m, dict):

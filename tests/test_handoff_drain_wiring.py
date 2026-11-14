@@ -49,7 +49,7 @@ class HandoffDrainWiring(unittest.TestCase):
             "runtime_pins_protocol": True, "resource_limits_protocol": True,
             "required_agent_capabilities_protocol": True, "cpu_model_exact": True,
             "distinct_vm_group": True, "result_files_protocol": True,
-            "durable_distinct_vm_group": True})
+            "durable_distinct_vm_group": True, "image_pins_protocol": True})
         self.states = self.patch(boat, "states", return_value={})
         # A forgotten provider/child call must not turn this into an integration run.
         self.popen = self.patch(S.subprocess, "Popen", side_effect=AssertionError("real child spawn"))
@@ -71,6 +71,14 @@ class HandoffDrainWiring(unittest.TestCase):
         registry.locked = locked
         registry.read.return_value = self.registry_data
         self.patch(S, "Registry", return_value=registry)
+
+    def test_image_pins_refuse_a_retention_unaware_successor(self):
+        self.s._pin_batch_image(self.it.batch)
+        self.prepared.return_value = {**self.prepared.return_value, "image_pins_protocol": False}
+        self.s.handoff()
+        self.assertFalse(self.s._handoff_gate().pending)
+        self.popen.assert_not_called()
+        self.assertIn("retention-aware", self.s.alert.call_args.args[0])
 
     def begin_wait(self):
         self.vm.ready = False

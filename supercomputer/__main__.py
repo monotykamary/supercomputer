@@ -235,6 +235,10 @@ def main(argv=None):
     t.add_argument("--type", default="")
     i = sub.add_parser("image")
     i.add_argument("--build", action="store_true")
+    i.add_argument("action", nargs="?", choices=("pin", "pins"))
+    i.add_argument("images", nargs="*")
+    i.add_argument("--kind", choices=("packet", "go"))
+    i.add_argument("--reference")
     u = sub.add_parser("usage")
     u.add_argument("since")
     g = sub.add_parser("starts")
@@ -322,7 +326,19 @@ def main(argv=None):
     elif a.cmd == "teardown":
         boat.teardown(a.all, a.type)
     elif a.cmd == "image":
-        if a.build:
+        if a.action is not None:
+            if a.build:
+                ap.error("image pin/pins cannot be combined with --build")
+            if a.action == "pin":
+                result = boat.image_pins("register", images=a.images, kind=a.kind, reference=a.reference)
+            else:
+                if a.images or a.kind or a.reference:
+                    ap.error("image pins does not accept registration fields")
+                result = boat.image_pins("list")
+            print(json.dumps(result, sort_keys=True))
+        elif a.images or a.kind or a.reference:
+            ap.error("image registration fields require the pin action")
+        elif a.build:
             with boat.signals_as_interrupt(), boat.image_build_lock(boat.image_name()):
                 print(boat.ensure_image(True))
         else:
