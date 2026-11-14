@@ -156,7 +156,6 @@ class Disk:
         self.scratch: list = []  # [(mtime, mb)]: a job's leftovers in the home (anvil's state), its agent's to clean
         # Independent agent ownership, outside batch directories (like owned-items/).
         self.owned: dict[tuple, dict] = {}
-        self.owned_nonces: set[str] = set()
         self.owned_rpc_receipts: dict[str, dict] = {}
         self.partial_first = False  # (the first tree verified here lacks files: a tree left short, its ready mark kept)
         self.partial: set = set()
@@ -1029,7 +1028,7 @@ class Agent:
         nonce = request.get("nonce")
         features = {"pidfd": True, "private_pid_namespace": "verified-before-payload"}
         fresh = (isinstance(nonce, str) and re.fullmatch("[0-9a-f]{32}", nonce) is not None
-                 and nonce not in self.d.owned_nonces and len(self.d.owned_nonces) < 65536)
+                 and nonce not in self.d.owned_rpc_receipts)
         allowed = self.A.owned_rpc_allowed(
             type(request.get("protocol")) is int and request["protocol"] == 1,
             request.get("version") == self.d.version, fresh, True, False)
@@ -1050,7 +1049,6 @@ class Agent:
         def finish(reply):
             self.d.owned_rpc_receipts[nonce] = {**record, 'state': 'complete', 'reply': json.loads(json.dumps(reply))}
             return reply
-        self.d.owned_nonces.add(nonce)
         cmd, args = request.get("command"), request.get("args")
         self.w.note("owned_rpc", vm=self.v.id, command=cmd, nonce=nonce)
         if not isinstance(args, list):

@@ -1,5 +1,7 @@
 """Lost-reply delivery uses the real transport and durable worker dispatcher; no providers."""
 import http.client
+import contextlib
+import importlib.util
 import itertools
 import json
 import pathlib
@@ -19,7 +21,7 @@ class OwnedReplayTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         self.root = pathlib.Path(tmp.name)
-        for name, value in [('ROOT', self.root), ('_owned_nonces', set()), ('_owned_children', {})]:
+        for name, value in [('ROOT', self.root), ('_owned_children', {})]:
             p = patch.object(A, name, value); p.start(); self.addCleanup(p.stop)
         p = patch.object(A, 'owned_features', return_value=FEATURES); p.start(); self.addCleanup(p.stop)
         self.request = dict(protocol=1, version=A.VERSION, nonce=secrets.token_hex(16), command='vtick', args=[{'start': [], 'acks': [], 'wait': 0}])
@@ -128,11 +130,15 @@ class OwnedReplayTests(unittest.TestCase):
             self.assertEqual(A.owned_rpc(self.request), first)
             body.assert_called_once()
 
-    def test_cached_reply_survives_nonce_memory_reset(self):
+    def test_cached_reply_survives_fresh_module_memory(self):
         with patch.object(A, 'vtick', return_value=self.result) as body:
             first = A.owned_rpc(self.request)
-            A._owned_nonces.clear()
-            self.assertEqual(A.owned_rpc(self.request), first)
+            spec = importlib.util.spec_from_file_location('fresh_replay_agent', A.__file__)
+            fresh = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fresh)
+            with patch.object(fresh, 'ROOT', self.root), patch.object(fresh, 'owned_features', return_value=FEATURES), patch.object(fresh, 'vtick') as repeated:
+                self.assertEqual(fresh.owned_rpc(self.request), first)
+                repeated.assert_not_called()
             body.assert_called_once()
         receipt = json.loads((self.root/'owned-rpc'/(self.request['nonce']+'.json')).read_text())
         self.assertEqual(receipt['state'], 'complete')
@@ -146,7 +152,6 @@ class OwnedReplayTests(unittest.TestCase):
             real_write(path, row)
         with patch.object(A, 'vtick', return_value=self.result) as body, patch.object(A, '_owned_write', side_effect=write):
             self.assertEqual(A.owned_rpc(self.request)['error'], 'owned_receipt_unavailable')
-        A._owned_nonces.clear()
         with patch.object(A, 'vtick') as body_again:
             reply = A.owned_rpc(self.request)
         self.assertEqual(reply['error'], 'owned_rpc_in_progress')
@@ -155,7 +160,7 @@ class OwnedReplayTests(unittest.TestCase):
     def test_failed_intent_write_never_runs_command(self):
         with patch.object(A, '_owned_write', side_effect=OSError('full disk')), patch.object(A, 'vtick') as body:
             self.assertEqual(A.owned_rpc(self.request)['error'], 'owned_receipt_unavailable')
-        body.assert_not_called(); self.assertNotIn(self.request['nonce'], A._owned_nonces)
+        body.assert_not_called()
 
     def test_corrupt_or_null_receipt_never_reexecutes(self):
         path = self.root/'owned-rpc'/(self.request['nonce']+'.json')
@@ -175,6 +180,26 @@ class OwnedReplayTests(unittest.TestCase):
                 fresh = {**self.request, 'nonce': secrets.token_hex(16)}
                 self.assertFalse(A.owned_rpc(fresh)['ok'])
             body.assert_called_once()
+
+    def test_more_than_65536_receipts_do_not_exhaust_fresh_admission(self):
+        # Keep real dispatch/hash/decision code; model only disk IO to exercise
+        # the old lifetime limit without 131,074 synchronous filesystem writes.
+        records = {}
+        def save(path, row): records[str(path)] = json.dumps(row)
+        request = {**self.request, 'command': 'capabilities', 'args': []}
+        with patch.object(A, '_owned_rpc_lock', contextlib.nullcontext), patch.object(A, '_lease_boot', lambda: 'boot'), patch.object(A, '_owned_write', save), patch.object(pathlib.Path, 'exists', lambda path: str(path) in records), patch.object(pathlib.Path, 'read_text', lambda path: records[str(path)]), patch.object(pathlib.Path, 'mkdir', lambda *a, **k: None):
+            for index in range(65537):
+                reply = A.owned_rpc({**request, 'nonce': format(index, '032x')})
+                self.assertTrue(reply['ok'], index)
+            self.assertEqual(len(records), 65537)
+            original = {**request, 'nonce': format(0, '032x')}
+            self.assertTrue(A.owned_rpc(original)['ok'])
+            path = str(self.root/'owned-rpc'/(original['nonce']+'.json'))
+            row = json.loads(records[path]); row['state'] = 'in_progress'; row.pop('reply')
+            records[path] = json.dumps(row)
+            self.assertEqual(A.owned_rpc(original)['error'], 'owned_rpc_in_progress')
+            records[path] = '{bad'
+            self.assertEqual(A.owned_rpc(original)['error'], 'owned_receipt_unavailable')
 
     def test_changed_boot_cannot_replay_or_execute_an_old_request(self):
         with patch.object(A, 'vtick', return_value=self.result) as body:

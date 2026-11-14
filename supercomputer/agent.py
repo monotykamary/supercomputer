@@ -2486,7 +2486,6 @@ def owned_rpc_allowed(protocol: bool, version: bool, nonce: bool, features: bool
 
 
 _rpc_gate_lock = threading.RLock()
-_owned_nonces = set()
 
 
 # gdp: law a fresh execution requires permission and no prior receipt: result != 'execute' or (not found and permitted)
@@ -2617,7 +2616,7 @@ def owned_rpc(request):
                 raise ValueError('invalid owned RPC receipt')
         except (OSError, ValueError, TypeError):
             return {'ok': False, 'error': 'owned_receipt_unavailable', **envelope}
-        fresh = nonce not in _owned_nonces and len(_owned_nonces) < 65536
+        fresh = not exists  # Durable receipts, not a lifetime-sized RAM set, fence reused nonces.
         permitted = owned_rpc_allowed(type(request.get('protocol')) is int and request['protocol'] == 1,
                                       request.get('version') == VERSION, fresh, features is not None,
                                       (ROOT / 'owned-upgrading').exists())
@@ -2639,8 +2638,6 @@ def owned_rpc(request):
             _owned_write(path, record)  # Persist uncertainty before invoking ANY command.
         except OSError:
             return {'ok': False, 'error': 'owned_receipt_unavailable', **envelope}
-        _owned_nonces.add(nonce)
-
         def finish(reply):
             try:
                 _owned_write(path, {**record, 'state': 'complete', 'reply': reply})

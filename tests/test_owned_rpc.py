@@ -24,7 +24,7 @@ class AgentRPC(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=pathlib.Path(self.tmp.name)
-        for name,value in [('ROOT',self.root),('_owned_nonces',set()),('_owned_children',{})]:
+        for name,value in [('ROOT',self.root),('_owned_children',{})]:
             p=patch.object(A,name,value);p.start();self.addCleanup(p.stop)
         p=patch.object(A,'owned_features',return_value=F);p.start();self.addCleanup(p.stop)
     def request(self, **kw):
