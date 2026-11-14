@@ -1912,9 +1912,14 @@ class Scheduler:
         with no serving instance they describe the imported package itself.
         The separately labelled install may be staged but not yet activated.
         """
-        serving = self.code if self is not None else code_hash(pathlib.Path(__file__).resolve().parent)
+        if self is not None and not isinstance(getattr(self, "code", None), str):
+            raise RuntimeError("capabilities requires an initialized serving scheduler")
+        serving = self.code if self is not None else own_code()
+        # Reuse the status publisher's sample. A missing/replaced staged file
+        # must never make this stable, read-only endpoint fail or touch disk.
+        installed = getattr(self, "_status_installed_code", self.code) if self is not None else None
         return {"scope": "native-single-vm", "runtime_verified": True, "code": serving,
-                 "code_installed": code_hash(),
+                 "code_installed": installed,
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
                 "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,

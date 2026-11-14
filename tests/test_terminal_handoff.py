@@ -230,40 +230,76 @@ class TerminalHandoff(unittest.TestCase):
 
 
 class ServingCapabilities(unittest.TestCase):
-    def test_serving_code_remains_stable_when_a_different_install_is_staged(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            pkg = root / "supercomputer"
-            pkg.mkdir()
-            source = pkg / "staged.py"
-            source.write_text("VERSION = 'first'\n")
-            owner = S.Scheduler.__new__(S.Scheduler)
-            owner.code = "serving-frozen-code"
-            with patch.object(S, "installed_source", return_value=root):
-                first = owner.capabilities()
-                self.assertEqual(first["code"], owner.code)
-                self.assertEqual(first["code_installed"], S.code_hash(pkg))
-                source.write_text("VERSION = 'second-and-longer'\n")
-                second = owner.capabilities()
-            self.assertEqual(second["code"], owner.code)
-            self.assertNotEqual(first["code_installed"], second["code_installed"])
-            self.assertEqual(first["strict_once_protocol"], second["strict_once_protocol"])
+    def test_serving_code_remains_stable_when_a_different_install_is_sampled(self):
+        owner = S.Scheduler.__new__(S.Scheduler)
+        owner.code = "serving-frozen-code"
+        owner._status_installed_code = "first-staged-code"
+        with patch.object(S, "code_hash", side_effect=AssertionError("request touched disk")):
+            first = owner.capabilities()
+            owner._status_installed_code = "second-staged-code"
+            second = owner.capabilities()
+        self.assertEqual(first["code"], owner.code)
+        self.assertEqual(second["code"], owner.code)
+        self.assertEqual(first["code_installed"], "first-staged-code")
+        self.assertEqual(second["code_installed"], "second-staged-code")
+        self.assertEqual(first["strict_once_protocol"], second["strict_once_protocol"])
 
-    def test_class_level_probe_reports_imported_source_separately_from_install(self):
-        with patch.object(S, "code_hash", side_effect=lambda pkg=None: "staged" if pkg is None else "imported"):
+    def test_class_level_probe_never_reads_the_staged_install(self):
+        with patch.object(S, "own_code", return_value="imported"), \
+             patch.object(S, "code_hash", side_effect=FileNotFoundError("staged swap")) as disk:
             caps = S.Scheduler.capabilities()
+        disk.assert_not_called()
         self.assertEqual(caps["code"], "imported")
-        self.assertEqual(caps["code_installed"], "staged")
+        self.assertIsNone(caps["code_installed"])
         self.assertEqual(caps["strict_once_protocol"], 1)
 
-    def test_real_http_capabilities_route_uses_the_serving_instance(self):
+    def test_class_level_code_is_frozen_after_first_import_identity_read(self):
+        with patch.dict(S._code_cache, {}, clear=True), \
+             patch.object(S, "code_hash", side_effect=["original-imported-code", AssertionError("files changed")]) as disk:
+            first = S.Scheduler.capabilities()
+            second = S.Scheduler.capabilities()
+        self.assertEqual(first["code"], "original-imported-code")
+        self.assertEqual(second["code"], first["code"])
+        self.assertEqual(disk.call_count, 1)
+
+    def test_missing_or_mid_swap_install_cannot_fail_serving_capabilities(self):
+        owner = S.Scheduler.__new__(S.Scheduler)
+        owner.code = "kept-handback-copy"
+        owner._status_installed_code = "last-published-staged-code"
+        for error in (FileNotFoundError("removed"), OSError("mid-swap"), RuntimeError("unrelated install")):
+            with self.subTest(error=type(error).__name__), patch.object(S, "code_hash", side_effect=error) as disk:
+                caps = owner.capabilities()
+            disk.assert_not_called()
+            self.assertEqual(caps["code"], "kept-handback-copy")
+            self.assertEqual(caps["code_installed"], "last-published-staged-code")
+
+    def test_same_owner_status_and_capabilities_use_the_same_code_fields(self):
+        owner = sched()
+        owner.code, owner.agent_version = "kept-handback-copy", "fixture-agent"
+        owner.load, owner.alerts = 0, []
+        owner.stale = lambda: {}
+        for installed in (None, "new-staged-code"):
+            if installed is not None:
+                owner._status_installed_code = installed
+            with owner.lock, patch.object(S, "code_hash", side_effect=AssertionError("reader touched disk")):
+                status = owner._status_read()
+                caps = owner.capabilities()
+            self.assertEqual(caps["code"], status["code"])
+            self.assertEqual(caps["code_installed"], status["code_installed"])
+
+    def test_uninitialized_owner_fails_closed_with_a_clear_error(self):
+        owner = S.Scheduler.__new__(S.Scheduler)
+        with self.assertRaisesRegex(RuntimeError, "initialized serving scheduler"):
+            owner.capabilities()
+
+    def test_real_http_capabilities_route_uses_the_serving_instance_without_io(self):
         from test_http_admission import handler_class
         owner = S.Scheduler.__new__(S.Scheduler)
         owner.code = "actual-serving-code"
+        owner._status_installed_code = "staged-not-serving"
         handler = object.__new__(handler_class(owner))
         handler.path = "/capabilities"
-        with patch.object(S, "code_hash", return_value="staged-not-serving"):
+        with patch.object(S, "code_hash", side_effect=FileNotFoundError("staged swap")):
             status, raw = handler._post(b"{}")
         caps = json.loads(raw)
         self.assertEqual(status, 200)

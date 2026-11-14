@@ -164,10 +164,17 @@ A failed comparison now reports bounded missing/extra/changed item keys in the
 ACK, instead of only a boolean.
 
 `/capabilities.code` is the serving scheduler's frozen `self.code`, consistent
-with `/status.code`; `code_installed` separately identifies an install waiting
-for activation. A class-level `Scheduler.capabilities()` compile/import probe
-has no serving owner, so its `code` describes the imported package, never a
-newer staged directory. None of these reads activates a staged candidate.
+with `/status.code`. `code_installed` uses the same last sampled install marker
+as status, not a live filesystem read: an unavailable staged tree cannot break
+capability reads. The install marker can lag a swap until status refreshes and
+is not evidence that a candidate is serving. A class-level
+`Scheduler.capabilities()` compile/import probe has no serving owner: its
+`code` is frozen by `own_code()` and `code_installed` is null. None of these
+reads activates a staged candidate.
+
+Before this fix, custody `controller_code` records could name the install
+pointer instead of the serving process. Preserve those original records; do
+not relabel them or compare them blindly with the new serving-code field.
 
 ## Target and limits
 
