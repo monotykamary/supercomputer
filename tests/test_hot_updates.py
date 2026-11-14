@@ -46,8 +46,10 @@ def _init_with_snapshot_only(self, *args, **kw):
            "tree": {"id": "fixture-tree", "files": {}, "links": {}}, "items": [{"name": "work", "cmd": "true"}]}
     qd = DIR / "queue"
     qd.mkdir(parents=True, exist_ok=True)
-    (qd / "snapshot-only.json").write_text(json.dumps(msg))
     b = Batch(msg)
+    # Match admission ordering without inventing a placement journal.
+    self._pin_batch_image(b)
+    (qd / "snapshot-only.json").write_text(json.dumps(msg))
     it = b.items["work"]
     v = VMState("fixture-vm", b.image, "large", "warm")
     v.client, v.ready, v.model = _FixtureAgent(), True, "fixture-cpu"
