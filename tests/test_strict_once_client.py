@@ -572,15 +572,20 @@ class StrictFanout(unittest.TestCase):
                     status = cli.main(["run", "--jobs", str(path), "--out", self.tmp.name,
                                        "--backend", "boat", "--strict-once"])
                 self.assertEqual(0 if status is None else status,
-                                 0 if type(code) is int and code == 0 else 1)
+                                 0 if type(code) is int and code == 0 else 3)
                 self.assertEqual((path.parent / "one.log").read_text(), "native output")
                 self.assertIn(f"one\t{code}\t", (path.parent / "summary.tsv").read_text())
                 self.assertTrue((path.parent / "backends.json").is_file())
 
     def test_missing_native_result_is_a_nonzero_collector_status(self):
         with patch.object(boat, "boat_jobs", return_value=({}, {})):
-            self.assertEqual(self.run_jobs(), 1)
+            self.assertEqual(self.run_jobs(), 3)
         self.assertIn("one\t-1\t", (pathlib.Path(self.tmp.name) / "summary.tsv").read_text())
+
+    def test_collector_exception_is_not_converted_to_a_job_failure_status(self):
+        with patch.object(boat, "boat_jobs", side_effect=RuntimeError("collector transport failed")):
+            with self.assertRaisesRegex(RuntimeError, "collector transport failed"):
+                self.run_jobs()
 
     def test_preflight_refusal_never_falls_back_or_retries(self):
         with patch.object(boat, "boat_jobs", side_effect=boat.Unavailable("old controller")) as jobs:

@@ -7,7 +7,7 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
 - `supercomputer run --jobs jobs.json --out runs/x [--class C] [--timing] [--data DIR[:DEST]] [--env K=V]`
 - jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?, "distinct_vm_group"?, "distinct_vm_group_scope"?, "distinct_vm_group_generation"?, "required_agent_capabilities"?, "runtime"?}]`;
   `cmd` runs under bash in `<repo>/<cwd>`; logs in `<out>/<name>.log`, `<out>/summary.tsv` (name, exit, seconds, where).
-  The CLI exits 0 only when every job has a native exit code of 0; a failed or missing result exits 1 after retaining the logs and summary.
+  The CLI exits 0 only when every job has a native exit code of 0; a failed or missing result exits 3 after retaining the logs and summary. Exit 1 denotes a collector error. Nonzero alone is not infrastructure failure: intentional negative controls remain data; inspect the native codes.
 - The tree ships without node_modules: start a bun job with `bun install --frozen-lockfile && ...`.
 - `--timing`: each job alone on its VM; `<out>/placement.json` is the label a timing claim needs.
 - `--vm-type T` (or a job's `"vm_type"`): every job placed on type T only (a timing claim's fixed hardware); unnamed, the smallest

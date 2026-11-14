@@ -246,7 +246,7 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
     if bsum:
         print(boat.summary_line(bsum))
     (outdir / "backends.json").write_text(json.dumps({"backend": backend, "wall_s": wall, "where": count(where), "fallbacks": why, "boat": bsum}, indent=1))
-    return int(failed > 0)
+    return 3 if failed else 0
 
 
 def _strict_native(spec: list[dict], backend: str):
