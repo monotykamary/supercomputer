@@ -386,14 +386,16 @@ def main():
             wire = {'protocol': 1, 'version': A.VERSION, 'nonce': secrets.token_hex(16), 'command': 'vtick',
                     'args': [{'start': [{'batch': session.batch, 'spec': obs['spec']}], 'wait': 0}]}
             accepted = fresh.rpc('owned_rpc', wire)
-            rejected = fresh.rpc('owned_rpc', wire)
+            replayed = fresh.rpc('owned_rpc', wire)
+            rejected = fresh.rpc('owned_rpc', {**wire, 'command': 'snapshot', 'args': [session.batch]})
             check(name + ': exact start replays idempotently', accepted.get('ok') is True, accepted)
-            check(name + ': reused RPC nonce rejected', rejected.get('ok') is False, rejected)
+            check(name + ': same RPC body returns original result', replayed == accepted, replayed)
+            check(name + ': changed-body reused RPC nonce rejected', rejected.get('ok') is False and rejected.get('error') == 'owned_nonce_conflict', rejected)
             physical = [x for x in lines(root / 'physical-launches.jsonl') if session.batch in x['argv']]
             check(name + ': one physical launch after replay', len(physical) == 1, physical)
             receipt.setdefault('scenarios', {})[name] = {'batch': session.batch, 'placement': placement,
                 'observation': obs, 'markers': events, 'physical_launches': physical,
-                'wire_nonce': wire['nonce'], 'replay_refusal': rejected, 'attempts': attempts}
+                'wire_nonce': wire['nonce'], 'replayed_result': replayed, 'replay_refusal': rejected, 'attempts': attempts}
             return session, client, rows, faults, waiter, marker, gate, obs
 
         success = launch('success', False)
