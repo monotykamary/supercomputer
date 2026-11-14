@@ -9,4 +9,4 @@ def broken_owned_rpc_allowed(protocol: bool, version: bool, nonce: bool, feature
 # gdp: law a fresh execution requires permission and no prior receipt: result != 'execute' or (not found and permitted)
 # gdp: law a replay requires the same completed request and scope: result != 'replay' or (found and same_request and same_scope and complete)
 def broken_owned_rpc_decision(found: bool, same_request: bool, same_scope: bool, complete: bool, permitted: bool):
-    return 'execute'
+    return 'replay' if found else 'execute'

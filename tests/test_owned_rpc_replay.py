@@ -228,7 +228,9 @@ class OwnedReplayTests(unittest.TestCase):
         for found, request, scope, complete, allowed in itertools.product((False, True), repeat=5):
             expected = ('refuse' if not request or not scope else 'replay' if complete else 'pending') if found else 'execute' if allowed else 'refuse'
             self.assertEqual(A.owned_rpc_decision(found, request, scope, complete, allowed), expected)
-        self.assertEqual(broken_owned_rpc_decision(True, False, True, True, True), 'execute')
+        self.assertEqual(broken_owned_rpc_decision(True, False, True, True, True), 'replay')
         self.assertEqual(A.owned_rpc_decision(True, False, True, True, True), 'refuse')
+        self.assertEqual(broken_owned_rpc_decision(False, True, True, True, False), 'execute')
+        self.assertEqual(A.owned_rpc_decision(False, True, True, True, False), 'refuse')
 
 if __name__ == '__main__': unittest.main()
