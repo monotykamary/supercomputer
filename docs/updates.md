@@ -174,8 +174,13 @@ An unwritable diagnostic journal is logged but does not stall VM-wide loss
 handling: other strict attempts and legacy items still follow their existing
 loss paths; durable placement/result ownership and the no-replay fence remain.
 Only `OSError` is caught by design; programming and validation errors still
-propagate. A later owned-journal append starts on a fresh line after a torn
-tail, so the skipped partial diagnostic cannot swallow a genuine reap receipt.
+propagate. Owned-journal appends hold a file lock and restore/fsync the exact
+prior length after any write, flush or fsync exception in a live process;
+short writes also roll back. A failed rollback is a hard error, not an ignored
+diagnostic failure. The strict reader remains strict: a tail torn by process
+death or other pre-existing malformed evidence still quarantines the admission.
+Only non-strict journal readers may skip malformed lines; strict evidence is
+never repaired by inserting a newline.
 History, backups and batch fetch preserve this journal phase as opaque audit
 bytes, not as a reap receipt. Reap consumers must require matching native
 `reaped` and `namespace_absent` evidence, not just a matching identity.

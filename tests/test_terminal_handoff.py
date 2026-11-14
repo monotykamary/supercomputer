@@ -395,23 +395,25 @@ class TerminalHandoff(unittest.TestCase):
         rows = (self.root / "queue" / (self.b.id + ".rows")).read_bytes()
         prefix = path.read_bytes()
 
-        def torn_append(*args):
-            with path.open("ab") as f:
-                f.write(b'{"phase":"terminal_vm_lost","name":')
+        real_write = S.os.write
+
+        def partial_write(fd, data):
+            real_write(fd, data[:len(data) // 2])
             raise OSError("disk full after partial append")
 
         child._let_go = Mock()
-        with patch.object(child, "_append_owned", side_effect=torn_append):
+        with patch.object(S.os, "write", side_effect=partial_write):
             child._lost_vm(vm)
         self.assertTrue(vm.dead)
         self.assertFalse(item.owned.reaped)
         self.assertIsNone(item.terminal_loss)
+        self.assertEqual(path.read_bytes(), prefix)
         receipt = {"name": self.it.name, "run_name": self.it.run_name,
                    "identity": self.it.launch_identity, "matched": True,
                    "receipt": self.good_receipt()}
         child._append_owned(self.b.id, "cancel", receipt)
         self.assertTrue(path.read_bytes().startswith(prefix))
-        self.assertEqual(S.jlines(path)[-1], receipt)
+        self.assertEqual(S.Scheduler._read_journal(path, True)[-1], receipt)
         reloaded = sched()
         reloaded._take_pool = Mock()
         reloaded.reload()
@@ -419,6 +421,75 @@ class TerminalHandoff(unittest.TestCase):
         self.assertTrue(restored.owned.reaped)
         self.assertEqual(restored.state, "done")
         self.assertEqual((self.root / "queue" / (self.b.id + ".rows")).read_bytes(), rows)
+
+    def test_owned_journal_fsync_failure_restores_exact_prefix(self):
+        self.terminal()
+        path = self.root / "queue" / (self.b.id + ".cancel")
+        self.s._append_owned(self.b.id, "cancel", {"before": True})
+        prefix = path.read_bytes()
+        real_fsync = S.os.fsync
+        for fail_at in (1, 2):
+            with self.subTest(fail_at=fail_at):
+                calls = 0
+
+                def fail_once(fd):
+                    nonlocal calls
+                    calls += 1
+                    if calls == fail_at:
+                        raise OSError("fsync failed")
+                    return real_fsync(fd)
+
+                with patch.object(S.os, "fsync", side_effect=fail_once):
+                    with self.assertRaisesRegex(OSError, "fsync failed"):
+                        self.s._append_owned(self.b.id, "cancel", {"after": True})
+                self.assertEqual(path.read_bytes(), prefix)
+                self.assertEqual(S.Scheduler._read_journal(path, True), [{"before": True}])
+
+    def test_short_write_and_non_oserror_restore_exact_prefix(self):
+        self.terminal()
+        path = self.root / "queue" / (self.b.id + ".cancel")
+        self.s._append_owned(self.b.id, "cancel", {"before": True})
+        prefix = path.read_bytes()
+        real_write = S.os.write
+        for error in (OSError, ValueError):
+            with self.subTest(error=error):
+                def partial(fd, data):
+                    count = real_write(fd, data[:1])
+                    if error is ValueError:
+                        raise ValueError("invalid append after partial write")
+                    return count
+
+                with patch.object(S.os, "write", side_effect=partial):
+                    with self.assertRaises(error):
+                        self.s._append_owned(self.b.id, "cancel", {"after": True})
+                self.assertEqual(path.read_bytes(), prefix)
+
+    def test_failed_append_rollback_is_not_swallowed_as_diagnostic(self):
+        self.terminal()
+        child, _ = self.candidate()
+        vm = child.vms[self.vm.id]
+        child._let_go = Mock()
+        with patch.object(S.os, "write", side_effect=OSError("write failed")), \
+             patch.object(S.os, "ftruncate", side_effect=OSError("rollback failed")):
+            with self.assertRaisesRegex(RuntimeError, "rollback failed"):
+                child._lost_vm(vm)
+        self.assertFalse(vm.dead)
+        child._let_go.assert_not_called()
+
+    def test_preexisting_process_death_torn_tail_still_quarantines(self):
+        self.terminal()
+        path = self.root / "queue" / (self.b.id + ".cancel")
+        path.write_bytes(b'{"phase":"terminal_vm_lost","name":')
+        before = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "torn tail"):
+            self.s._append_owned(self.b.id, "cancel", {"later": True})
+        self.assertEqual(path.read_bytes(), before)
+        reloaded = sched()
+        reloaded._take_pool = Mock()
+        reloaded.reload()
+        self.assertNotIn(self.b.id, reloaded.batches)
+        self.assertTrue(reloaded.recovery_blocked)
+        self.assertIn(self.b.id, reloaded.recovery_errors)
 
     def test_non_oserror_diagnostic_failure_still_propagates(self):
         self.terminal()

@@ -1851,20 +1851,34 @@ class Scheduler:
     def _append_owned(bid, suffix, record):
         qd = DIR / "queue"
         qd.mkdir(parents=True, exist_ok=True)
-        with open(qd / f"{bid}.{suffix}", "a+b") as f:
-            f.seek(0, os.SEEK_END)
-            if f.tell():
-                f.seek(-1, os.SEEK_END)
-                if f.read(1) != b"\n":
-                    f.write(b"\n")  # Isolate a torn tail before appending valid evidence.
-            f.write((json.dumps(record) + "\n").encode())
-            f.flush()
-            os.fsync(f.fileno())
-        fd = os.open(qd, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        with open(qd / f"{bid}.{suffix}", "a+b", buffering=0) as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            length = os.fstat(f.fileno()).st_size
+            try:
+                if length:
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) != b"\n":
+                        raise ValueError("owned journal has a torn tail; admission quarantined")
+                data = (json.dumps(record) + "\n").encode()
+                if os.write(f.fileno(), data) != len(data):
+                    raise OSError("short owned-journal append")
+                f.flush()
+                os.fsync(f.fileno())
+                fd = os.open(qd, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except BaseException:
+                try:
+                    os.ftruncate(f.fileno(), length)
+                    f.flush()
+                    os.fsync(f.fileno())
+                except BaseException as exc:
+                    raise RuntimeError("owned-journal append rollback failed; ownership retained") from exc
+                raise
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
     def _persist_fence(self, b):
         path = DIR / "queue" / f"{b.id}.json"
