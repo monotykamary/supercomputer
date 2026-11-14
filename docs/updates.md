@@ -188,6 +188,11 @@ custody instead of discarding the damaged evidence.
 History, backups and batch fetch preserve this journal phase as opaque audit
 bytes, not as a reap receipt. Reap consumers must require matching native
 `reaped` and `namespace_absent` evidence, not just a matching identity.
+`supercomputer run` now exits 1 if any collected job has a nonzero or missing
+native exit code; a completed collector is not itself a passing job. Logs,
+per-job codes and backend evidence are written before the exit is reported.
+This exit status is not a substitute for verdict or cleanup auditing.
+
 Malformed batch, item and run-name fields refuse readiness without being used as
 dictionary keys; omitting invalid names from the comparison never grants readiness.
 Older terminal rows without a run name in either the row or its placement

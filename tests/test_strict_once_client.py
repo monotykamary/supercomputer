@@ -557,6 +557,31 @@ class StrictFanout(unittest.TestCase):
         self.sleep.assert_not_called()
         self.assertIn("one\t-1\t-1\tboat", (pathlib.Path(self.tmp.name) / "summary.tsv").read_text())
 
+    def test_jobs_cli_propagates_native_exit_status_after_retaining_outputs(self):
+        from supercomputer import __main__ as cli, controller
+        path = pathlib.Path(self.tmp.name) / "jobs.json"
+        path.write_text(json.dumps([JOB]))
+        self.proj.cfg, self.proj.modal = {}, {}
+        for code in (0, 1, 124, -1, None, False):
+            with self.subTest(code=code):
+                rows = {"one": {"code": code, "seconds": 0.1, "out": "native output", "err": ""}}
+                with patch.object(config, "project", return_value=self.proj), \
+                     patch.object(config, "use"), patch.object(controller, "maybe_sync"), \
+                     patch.object(boat, "boat_jobs", return_value=(rows, {})), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    status = cli.main(["run", "--jobs", str(path), "--out", self.tmp.name,
+                                       "--backend", "boat", "--strict-once"])
+                self.assertEqual(0 if status is None else status,
+                                 0 if type(code) is int and code == 0 else 1)
+                self.assertEqual((path.parent / "one.log").read_text(), "native output")
+                self.assertIn(f"one\t{code}\t", (path.parent / "summary.tsv").read_text())
+                self.assertTrue((path.parent / "backends.json").is_file())
+
+    def test_missing_native_result_is_a_nonzero_collector_status(self):
+        with patch.object(boat, "boat_jobs", return_value=({}, {})):
+            self.assertEqual(self.run_jobs(), 1)
+        self.assertIn("one\t-1\t", (pathlib.Path(self.tmp.name) / "summary.tsv").read_text())
+
     def test_preflight_refusal_never_falls_back_or_retries(self):
         with patch.object(boat, "boat_jobs", side_effect=boat.Unavailable("old controller")) as jobs:
             with self.assertRaises(boat.Unavailable):

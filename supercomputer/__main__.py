@@ -62,7 +62,7 @@ def _run(a):
     if a.vm_type:  # (a type named: every job placed on that type only, rules.placement_type)
         os.environ["SUPERCOMPUTER_VM_NAMED"] = a.vm_type
     a.vm_type = a.vm_type or os.environ.get("SUPERCOMPUTER_VM") or "large"
-    fanout.run_jobs(app, spec, a.out, pre, cmd, mjobs, backend=a.backend, vms=a.vms, idle=None if a.idle < 0 else a.idle, teardown=a.teardown,
+    return fanout.run_jobs(app, spec, a.out, pre, cmd, mjobs, backend=a.backend, vms=a.vms, idle=None if a.idle < 0 else a.idle, teardown=a.teardown,
                     durations=a.durations, vm_type=a.vm_type, max_vms=a.max_vms, max_wait=a.max_wait,
                     strict_once=strict_once, max_attempts=getattr(a, "max_attempts", 1))
 
@@ -289,7 +289,7 @@ def main(argv=None):
     config.use(a.repo or None)
     from . import boat
     if a.cmd == "run":
-        _run(a)
+        return _run(a)
     elif a.cmd == "batch":
         from . import batchfetch
         try:
@@ -429,4 +429,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

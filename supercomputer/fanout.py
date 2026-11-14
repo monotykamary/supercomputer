@@ -235,7 +235,8 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
     (outdir / "summary.tsv").write_text("".join(f"{n}\t{rows.get(n, {}).get('code', -1)}\t{rows.get(n, {}).get('seconds', -1)}\t{where.get(n, '-')}\n" for n in order))
     wall = round(time.time() - t0, 1)
     done = [rows.get(n, {"code": -1, "seconds": -1}) for n in order]
-    line = f"{len(done)} jobs, {sum(r.get('code', -1) != 0 for r in done)} failed, {wall} s wall, {round(sum(max(r.get('seconds', 0), 0) for r in done), 1)} s of job time"
+    failed = sum(type(r.get("code")) is not int or r["code"] != 0 for r in done)
+    line = f"{len(done)} jobs, {failed} failed, {wall} s wall, {round(sum(max(r.get('seconds', 0), 0) for r in done), 1)} s of job time"
     tail, why = where_line(where, moved)
     print(line + (f"; {tail}" if backend != "modal" else ""))
     timed = [p for p in placed.values() if p.get("exclusive")]
@@ -245,6 +246,7 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
     if bsum:
         print(boat.summary_line(bsum))
     (outdir / "backends.json").write_text(json.dumps({"backend": backend, "wall_s": wall, "where": count(where), "fallbacks": why, "boat": bsum}, indent=1))
+    return int(failed > 0)
 
 
 def _strict_native(spec: list[dict], backend: str):
