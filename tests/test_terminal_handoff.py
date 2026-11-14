@@ -491,6 +491,36 @@ class TerminalHandoff(unittest.TestCase):
         self.assertTrue(reloaded.recovery_blocked)
         self.assertIn(self.b.id, reloaded.recovery_errors)
 
+    def test_contended_journal_lock_refuses_after_bounded_attempts(self):
+        self.terminal()
+        path = self.root / "queue" / (self.b.id + ".cancel")
+        self.s._append_owned(self.b.id, "cancel", {"before": True})
+        prefix = path.read_bytes()
+        with path.open("a+b") as holder:
+            S.fcntl.flock(holder, S.fcntl.LOCK_EX | S.fcntl.LOCK_NB)
+            with patch.object(S.time, "sleep") as sleep:
+                with self.assertRaisesRegex(BlockingIOError, "after 3 attempts"):
+                    self.s._append_owned(self.b.id, "cancel", {"after": True})
+                self.assertEqual(sleep.call_args_list, [((0.01,),), ((0.01,),)])
+            self.assertEqual(path.read_bytes(), prefix)
+        self.s._append_owned(self.b.id, "cancel", {"after": True})
+        self.assertEqual(S.Scheduler._read_journal(path, True), [{"before": True}, {"after": True}])
+
+    def test_live_torn_tail_stops_vm_loss_without_dropping_custody(self):
+        self.terminal()
+        child, _ = self.candidate()
+        vm = child.vms[self.vm.id]
+        path = self.root / "queue" / (self.b.id + ".cancel")
+        path.write_bytes(b'{"phase":"terminal_vm_lost",')
+        before = path.read_bytes()
+        child._let_go = Mock()
+        with self.assertRaisesRegex(ValueError, "torn tail"):
+            child._lost_vm(vm)
+        self.assertFalse(vm.dead)
+        self.assertFalse(child.batches[self.b.id].items[self.it.name].owned.reaped)
+        self.assertEqual(path.read_bytes(), before)
+        child._let_go.assert_not_called()
+
     def test_non_oserror_diagnostic_failure_still_propagates(self):
         self.terminal()
         child, _ = self.candidate()

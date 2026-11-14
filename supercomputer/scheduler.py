@@ -1852,7 +1852,14 @@ class Scheduler:
         qd = DIR / "queue"
         qd.mkdir(parents=True, exist_ok=True)
         with open(qd / f"{bid}.{suffix}", "a+b", buffering=0) as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            for attempt in range(3):
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    if attempt == 2:
+                        raise BlockingIOError("owned-journal lock busy after 3 attempts") from exc
+                    time.sleep(0.01)
             length = os.fstat(f.fileno()).st_size
             try:
                 if length:
