@@ -1595,9 +1595,9 @@ class AgentClient:
         with contextlib.suppress(OSError):
             c.close()
 
-    def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json", decode=None, transport_event=None) -> tuple[int, object, str]:
+    def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json", decode=None, transport_event=None, one_shot=False) -> tuple[int, object, str]:
         from .rules.owned_lifecycle import strict_transport_attempts
-        strict = False
+        strict = one_shot
         if method == "POST" and path in ("/submit", "/snapshot", "/close-receipt") and body:
             with contextlib.suppress(ValueError, TypeError, UnicodeDecodeError):
                 msg = json.loads(body)
@@ -1655,7 +1655,7 @@ class AgentClient:
 
     EXEC_OK = {"ping", "vtick", "killitem", "itemlogs", "begin", "prep", "tree", "have", "pull", "pullcache", "upgrade"}
 
-    def rpc(self, cmd: str, *args, timeout: float = 60):
+    def rpc(self, cmd: str, *args, timeout: float = 60, replay_safe: bool = False):
         args = [*args, {"_lease": {**self.lease, "owner": self.owner, "vm_id": self.vm}}] if cmd != "lease" else list(args)
         body = json.dumps({"cmd": cmd, "args": args}).encode()
         try:
@@ -1665,7 +1665,9 @@ class AgentClient:
                 and isinstance(args[0], dict) and args[0].get('command') in ('tick', 'vtick'))
             if store is not None and polling:
                 decode = lambda stream: resultjson.load_response(stream, store)
-            code, data, _ = self._req("POST", "/rpc", body, timeout, **({'decode': decode} if decode else {}))
+            code, data, _ = self._req("POST", "/rpc", body, timeout,
+                                      **({'decode': decode} if decode else {}),
+                                      **({'one_shot': True} if cmd == 'owned_rpc' and not replay_safe else {}))
             if code == 502 and cmd in self.EXEC_OK and len(body) < EXEC_BODY:
                 raise AgentHTTPError(502, f"{self.vm}: {cmd}: 502 from boat's front")
         except AgentError:

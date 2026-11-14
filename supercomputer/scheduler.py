@@ -100,14 +100,14 @@ class PrelaunchNotStarted(RuntimeError):
 
 class OwnedAgentClient:
     """Same authenticated transport; distinct command legacy daemons must refuse."""
-    def __init__(self, client, version):
-        self.client, self.version = client, version
+    def __init__(self, client, version, replay_safe=False):
+        self.client, self.version, self.replay_safe = client, version, replay_safe
 
     def rpc(self, command, *args, **kwargs):
         nonce = secrets.token_hex(16)
         request = {"protocol": 1, "version": self.version, "nonce": nonce,
                    "command": command, "args": list(args)}
-        reply = self.client.rpc("owned_rpc", request, **kwargs)
+        reply = self.client.rpc("owned_rpc", request, replay_safe=self.replay_safe, **kwargs)
         if (not isinstance(reply, dict) or reply.get("ok") is not True
                 or type(reply.get("protocol")) is not int or reply["protocol"] != 1
                 or reply.get("version") != self.version or reply.get("nonce") != nonce
@@ -115,7 +115,12 @@ class OwnedAgentClient:
                 or reply["features"].get("pidfd") is not True
                 or reply["features"] != {"pidfd": True, "private_pid_namespace": "verified-before-payload"}
                 or not isinstance(reply.get("result"), dict)):
-            raise OwnedAgentRefused("owned RPC source/nonce/features refused")
+            response = reply if isinstance(reply, dict) else {}
+            known = {'owned_protocol_refused', 'owned_nonce_conflict', 'owned_rpc_in_progress',
+                     'owned_receipt_unavailable', 'owned_arguments_refused', 'owned_dispatch_refused'}
+            reason = response.get('error')
+            reason = reason if isinstance(reason, str) and reason in known else 'stale' if response.get('stale') is True else 'invalid_envelope'
+            raise OwnedAgentRefused('owned RPC source/nonce/features refused: ' + reason)
         result = reply["result"]
         if command == "vtick" and (result.get("err") or not isinstance(result.get("done"), list)
                                     or not isinstance(result.get("running"), list)):
@@ -5872,7 +5877,9 @@ class Scheduler:
 
     def _owned_client(self, vm: VMState):
         # Busy agents keep their exact wire version until their safe-point upgrade.
-        return OwnedAgentClient(vm.client, getattr(vm, "agent", "") or self.agent_version)
+        capabilities = normalize_agent_capabilities(getattr(vm, "agent_capabilities", {}))
+        return OwnedAgentClient(vm.client, getattr(vm, "agent", "") or self.agent_version,
+                                replay_safe=capabilities.get("owned_rpc_idempotency_protocol", 0) >= 1)
 
     def _record_agent_ping(self, vm: VMState, reply: dict):
         """Cache only what this agent actually advertised, including unknown old agents."""

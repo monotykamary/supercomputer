@@ -157,6 +157,7 @@ class Disk:
         # Independent agent ownership, outside batch directories (like owned-items/).
         self.owned: dict[tuple, dict] = {}
         self.owned_nonces: set[str] = set()
+        self.owned_rpc_receipts: dict[str, dict] = {}
         self.partial_first = False  # (the first tree verified here lacks files: a tree left short, its ready mark kept)
         self.partial: set = set()
 
@@ -1033,13 +1034,27 @@ class Agent:
             type(request.get("protocol")) is int and request["protocol"] == 1,
             request.get("version") == self.d.version, fresh, True, False)
         envelope = {"protocol": 1, "version": self.d.version, "nonce": nonce, "features": features}
-        if not allowed:
-            return {**envelope, "ok": False, "error": "owned_protocol_refused"}
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+        scope = (self.v.boot, self.d.version)
+        prior = self.d.owned_rpc_receipts.get(nonce)
+        decision = self.A._A.owned_rpc_decision(prior is not None, bool(prior and prior['digest'] == digest),
+                                              bool(prior and prior['scope'] == scope), bool(prior and prior['state'] == 'complete'), allowed)
+        if decision == 'refuse':
+            return {**envelope, "ok": False, "error": "owned_nonce_conflict" if prior else "owned_protocol_refused"}
+        if decision == 'pending':
+            return {**envelope, "ok": False, "error": "owned_rpc_in_progress"}
+        if decision == 'replay':
+            return json.loads(json.dumps(prior['reply']))
+        record = {'digest': digest, 'scope': scope, 'state': 'in_progress'}
+        self.d.owned_rpc_receipts[nonce] = record
+        def finish(reply):
+            self.d.owned_rpc_receipts[nonce] = {**record, 'state': 'complete', 'reply': json.loads(json.dumps(reply))}
+            return reply
         self.d.owned_nonces.add(nonce)
         cmd, args = request.get("command"), request.get("args")
         self.w.note("owned_rpc", vm=self.v.id, command=cmd, nonce=nonce)
         if not isinstance(args, list):
-            return {**envelope, "ok": False, "error": "owned_arguments_refused"}
+            return finish({**envelope, "ok": False, "error": "owned_arguments_refused"})
         try:
             if cmd == "vtick":
                 msg, = args
@@ -1065,9 +1080,9 @@ class Agent:
                 result = getattr(self, "c_" + cmd)(*args)
             else:
                 raise ValueError("unsupported owned command")
-            return {**envelope, "ok": True, "result": result}
+            return finish({**envelope, "ok": True, "result": result})
         except (ValueError, KeyError, TypeError) as error:
-            return {**envelope, "ok": False, "error": "owned_dispatch_refused", "detail": repr(error)}
+            return finish({**envelope, "ok": False, "error": "owned_dispatch_refused", "detail": repr(error)})
         finally:
             self.owned_request = False
 

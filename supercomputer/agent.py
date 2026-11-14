@@ -63,7 +63,7 @@ from typing import Literal
 ROOT = pathlib.Path.home() / ".sc"
 HOME = str(pathlib.Path.home())
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1}
+AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1, "owned_rpc_idempotency_protocol": 1}
 VERSION = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]  # (its code: the scheduler upgrades a stale one in place)
 
 
@@ -2489,6 +2489,31 @@ _rpc_gate_lock = threading.RLock()
 _owned_nonces = set()
 
 
+# gdp: law a fresh execution requires permission and no prior receipt: result != 'execute' or (not found and permitted)
+# gdp: law a replay requires the same completed request and scope: result != 'replay' or (found and same_request and same_scope and complete)
+# gdp: law a changed request or scope is never executed again: not found or (same_request and same_scope) or result == 'refuse'
+# gdp: law an incomplete matching receipt is only observed: not (found and same_request and same_scope and not complete) or result == 'pending'
+def owned_rpc_decision(found: bool, same_request: bool, same_scope: bool, complete: bool, permitted: bool) -> Literal['execute', 'replay', 'pending', 'refuse']:
+    if found:
+        if not same_request or not same_scope:
+            return 'refuse'
+        return 'replay' if complete else 'pending'
+    return 'execute' if permitted else 'refuse'
+
+
+@contextlib.contextmanager
+def _owned_rpc_lock():
+    """Serialize durable nonce publication across daemon/CLI replacement too."""
+    import fcntl
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with open(ROOT / 'owned-rpc.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def owned_features():
     """Actual prerequisite probes, NOT a claim that namespace launch already succeeded."""
     import shutil
@@ -2573,23 +2598,59 @@ def owned_rpc(request):
     execution. Namespace support itself is verified by start before namespace.go.
     A lost reply is unknown, not permission to replace/retry a strict launch.
     """
-    with _rpc_gate_lock:
+    with _rpc_gate_lock, _owned_rpc_lock():
         if not isinstance(request, dict):
             return {'ok': False, 'error': 'owned_protocol_refused'}
         nonce = request.get('nonce')
         features = owned_features()
-        fresh = (isinstance(nonce, str) and re.fullmatch('[0-9a-f]{32}', nonce) is not None
-                 and nonce not in _owned_nonces and len(_owned_nonces) < 65536)
-        # This exact shipped decision, not a test-only model, guards ALL commands below.
-        if not owned_rpc_allowed(type(request.get('protocol')) is int and request['protocol'] == 1,
-                                 request.get('version') == VERSION, fresh, features is not None,
-                                 (ROOT / 'owned-upgrading').exists()):
-            return {'ok': False, 'error': 'owned_protocol_refused', 'protocol': 1,
-                    'version': VERSION, 'nonce': nonce, 'features': features}
+        envelope = {'protocol': 1, 'version': VERSION, 'nonce': nonce, 'features': features}
+        if not isinstance(nonce, str) or re.fullmatch('[0-9a-f]{32}', nonce) is None:
+            return {'ok': False, 'error': 'owned_protocol_refused', **envelope}
+        try:
+            digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+            fence = getattr(_lease_local, 'fence', None) or {}
+            scope = {'boot': _lease_boot(), 'version': VERSION, 'owner': fence.get('owner')}
+            path = ROOT / 'owned-rpc' / (nonce + '.json')
+            exists = path.exists()
+            prior = json.loads(path.read_text()) if exists else None
+            if exists and (not isinstance(prior, dict) or prior.get('state') not in ('in_progress', 'complete')):
+                raise ValueError('invalid owned RPC receipt')
+        except (OSError, ValueError, TypeError):
+            return {'ok': False, 'error': 'owned_receipt_unavailable', **envelope}
+        fresh = nonce not in _owned_nonces and len(_owned_nonces) < 65536
+        permitted = owned_rpc_allowed(type(request.get('protocol')) is int and request['protocol'] == 1,
+                                      request.get('version') == VERSION, fresh, features is not None,
+                                      (ROOT / 'owned-upgrading').exists())
+        decision = owned_rpc_decision(prior is not None, bool(prior and prior.get('request_sha256') == digest),
+                                      bool(prior and prior.get('scope') == scope), bool(prior and prior['state'] == 'complete'), permitted)
+        if decision == 'refuse':
+            return {'ok': False, 'error': 'owned_nonce_conflict' if prior is not None else 'owned_protocol_refused', **envelope}
+        if decision == 'pending':
+            return {'ok': False, 'error': 'owned_rpc_in_progress', **envelope}
+        if decision == 'replay':
+            reply = prior.get('reply')
+            if (not isinstance(reply, dict) or reply.get('nonce') != nonce or reply.get('version') != VERSION
+                    or type(reply.get('protocol')) is not int or reply['protocol'] != 1):
+                return {'ok': False, 'error': 'owned_receipt_unavailable', **envelope}
+            return reply
+        record = {'request_sha256': digest, 'scope': scope, 'state': 'in_progress'}
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _owned_write(path, record)  # Persist uncertainty before invoking ANY command.
+        except OSError:
+            return {'ok': False, 'error': 'owned_receipt_unavailable', **envelope}
         _owned_nonces.add(nonce)
+
+        def finish(reply):
+            try:
+                _owned_write(path, {**record, 'state': 'complete', 'reply': reply})
+            except (OSError, TypeError, ValueError):
+                return {'ok': False, 'error': 'owned_receipt_unavailable', **envelope}
+            return reply
+
         cmd, args = request.get('command'), request.get('args')
         if not isinstance(args, list):
-            return {'ok': False, 'error': 'owned_arguments_refused'}
+            return finish({'ok': False, 'error': 'owned_arguments_refused', **envelope})
         try:
             if cmd == 'vtick':
                 msg, = args
@@ -2620,13 +2681,11 @@ def owned_rpc(request):
                 if cmd not in commands:
                     raise ValueError('unsupported owned command')
                 result = commands[cmd](*args)
-            return {'ok': True, 'protocol': 1, 'version': VERSION, 'nonce': nonce,
-                    'features': features, 'result': result}
+            return finish({'ok': True, **envelope, 'result': result})
         except LeaseStale:
-            return {'ok': False, 'stale': True, 'protocol': 1, 'version': VERSION, 'nonce': nonce}
+            return finish({'ok': False, 'stale': True, **envelope})
         except Exception as error:
-            return {'ok': False, 'error': 'owned_dispatch_refused', 'detail': repr(error),
-                    'protocol': 1, 'version': VERSION, 'nonce': nonce, 'features': features}
+            return finish({'ok': False, 'error': 'owned_dispatch_refused', 'detail': repr(error), **envelope})
 
 
 # ------------------------------------------------------------------------------------------------------- VM leases

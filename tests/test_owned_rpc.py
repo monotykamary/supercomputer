@@ -37,7 +37,7 @@ class AgentRPC(unittest.TestCase):
             body.assert_not_called()
             r=self.request();reply=A.owned_rpc(r)
             self.assertTrue(reply['ok']);self.assertEqual(reply['nonce'],r['nonce']);self.assertEqual(reply['features'],F)
-            self.assertFalse(A.owned_rpc(r)['ok']);self.assertEqual(body.call_count,1)
+            self.assertEqual(A.owned_rpc(r), reply);self.assertEqual(body.call_count,1)
     def test_replacement_and_missing_features_refuse_before_body(self):
         with patch.object(A,'vtick') as body:
             (self.root/'owned-upgrading').touch()

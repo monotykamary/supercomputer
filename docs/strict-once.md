@@ -25,6 +25,25 @@ for an existing strict job and checks real namespace containment before payload
 execution. A new session/batch is a new intentional admission, not a reconnect;
 do not add a user-level retry loop for LOST.
 
+## Idempotent owned-RPC delivery
+
+Owned RPCs retain their one-shot nonce while the transport retries the same body.
+Before dispatch the worker durably records the canonical request digest and an
+in-progress marker, scoped to its boot, source version, and authenticated owner.
+After dispatch it durably records the response before returning it. An identical
+replay returns that original response, including an original failure; it never
+runs the command again. A different body or scope with an already-used nonce is
+refused. A surviving in-progress marker is uncertainty, not permission to repeat
+execution, even after a daemon restart. These records live outside batch scratch.
+
+This is repeated delivery of one logical RPC, not another payload attempt. A
+cached start response may be recovered after a lost reply; no new start identity,
+placement, VM or boot is allocated. Existing lease fencing still runs before the
+owned dispatcher, and missing or corrupt receipts fail closed. Workers advertise
+`owned_rpc_idempotency_protocol: 1`; clients permit transport replay only after
+that capability is observed. Old busy workers retain one-shot delivery until
+their ordinary safe-point upgrade.
+
 ## Preparation-only retries and NOT_STARTED
 
 The controller may retry a transport failure **during preparation**, before any
