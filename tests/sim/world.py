@@ -265,9 +265,11 @@ class World:
             B.Registry.locked = locked
         def prepare(pkg):
             self.note("snapshot_prepared", code=pkg.parent.name)
+            capabilities = getattr(S.Scheduler, "capabilities", lambda: {})()
             return {"python": "sim", "cache_tag": "sim", "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                     "durable_distinct_vm_group": True, "result_files_protocol": True,
-                    "required_agent_capabilities_protocol": True}
+                    "required_agent_capabilities_protocol": True,
+                    "image_pins_protocol": type(capabilities.get("image_pins_protocol")) is int and capabilities["image_pins_protocol"] == 1}
         S.prepare_snapshot = prepare
         if hasattr(S, "memorypressure"):
             # Host cgroups are not virtual controller state; sensor behavior has dedicated tests.
