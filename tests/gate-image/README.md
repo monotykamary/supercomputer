@@ -17,13 +17,15 @@ bash tests/gate-image/gate.sh run /absolute/path/to/fresh-gate-results
 
 The wrapper does only orchestration on the host. Installation, compilation, and
 both complete fixture files run on Boat. The run forces `--backend boat` (no
-Modal fallback), class `gate`, and `OWNED_LIFECYCLE_BOAT_TEST=1`. It refuses image
-overrides and sets `SUPERCOMPUTER_NO_BUILD=1` for runs: a missing or pending
+Modal fallback), class `submission`, and `OWNED_LIFECYCLE_BOAT_TEST=1`. It refuses
+image overrides and sets `SUPERCOMPUTER_NO_BUILD=1` for runs: a missing or pending
 image fails closed instead of implicitly starting another build. Both files run
-even if the first fails; a failing file or any skipped
-test fails the job. It does not run collectors, scenario/simulator suites, or
-project proofs. No existing VM is explicitly restarted/stopped/deleted. The
-native image builder creates and deletes its own temporary builder. Do not run
+even if the first fails; a failing file, any skipped test, or a failed pipeline
+stage (including log/status artifact writes) fails the job. The runner captures
+all pipeline exit codes immediately, not just the Python process status. It does
+not run collectors, scenario/simulator suites, or project proofs. No existing VM
+is explicitly restarted/stopped/deleted. The native image builder creates and
+deletes its own temporary builder. Do not run
 pool-wide cleanup, rollout, sync, or teardown for this gate.
 
 ### Recovering an interrupted image build

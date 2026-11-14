@@ -21,7 +21,7 @@ fresh fixture job:
 | Bun 1.4.3 | `7ce7d6b654eddeec20afddf2396317fba6dc19ab52788a27e894e1806bf8f24b` |
 | Lean 4.34.0 | `e8baaa71855a616dc351028f3ad2200051b0671f423a1696a100e809302d5550` |
 
-## Fresh complete fixture run
+## Initial complete fixture run
 
 Command (host orchestration only; both Python files execute on Boat):
 
@@ -55,3 +55,38 @@ Relative to this directory:
 
 These paths are local evidence for this run, not a claim that ignored artifacts
 are available from a fresh clone.
+
+## Review follow-up: pipeline failures and submission class
+
+The runner now captures every pipeline status immediately (fixture Python and
+log `tee`, plus status-recording `printf` and `tee`). Any nonzero status or
+unreadable log fails the runner; both fixture files still run. The wrapper now
+uses class `submission` rather than `gate` to avoid preempting other workloads.
+The installer, image salt, and snapshot are unchanged.
+
+Fresh positive validation on the same dedicated image:
+
+- Batch: `20261114-030923-ua1wkf`, class `submission`
+- Uploaded tree: `1c171bc89a6e` (221 files)
+- Worker: `bx_wgkef4x7`; no new VM starts
+- `test_runtime_pins.py`: **14 tests, OK, no skips**
+- `test_strict_environment.py`: **8 tests, OK, no skips**
+- Both fixture/log pipelines: exit codes `0 0`; job exit `0`
+- Artifacts: `runs/fixtures-pipeline-review/`
+
+Negative artifact-write validation also ran through Supercomputer/Boat, using
+actual `tee` failures, not stubs or altered tests. Each case precreated a
+directory at one expected artifact-file path, then ran the complete real runner:
+
+- Batch: `20261114-030935-uinwew`, class `submission`
+- `test_runtime_pins.log` write failed: Python exit `0`, `tee` exit `1`, runner
+  exit **1**; both complete fixture files nevertheless ran and passed.
+- `status.tsv` write failed: both fixture files passed, but the status-recording
+  pipeline failed and runner exit was **1**.
+- Regression job exit: `0` (both expected rejections observed).
+- Artifacts: `runs/pipeline-review/failure-results/`, including full job log and
+  `runner-rejects-artifact-failures.files/rejection-status.tsv`.
+- Combined terminal run log: `runs/pipeline-review/review-run.log`.
+
+Only the dedicated fixture-image work changed; the broader units/scenarios/laws
+and native gate are left to Main's separate run.

@@ -14,7 +14,7 @@ case ${1:-} in
     # while an earlier provider snapshot is still saving).
     export SUPERCOMPUTER_NO_BUILD=1
     [[ $# == 2 ]] || { echo 'Usage: gate.sh run OUTPUT_DIRECTORY' >&2; exit 2; }
-    exec supercomputer --repo "$root" run --jobs "$root/tests/gate-image/jobs.json" --out "$2" --backend boat --class gate --max-wait 600
+    exec supercomputer --repo "$root" run --jobs "$root/tests/gate-image/jobs.json" --out "$2" --backend boat --class submission --max-wait 600
     ;;
   *) echo 'Usage: gate.sh build | gate.sh run OUTPUT_DIRECTORY' >&2; exit 2 ;;
 esac
