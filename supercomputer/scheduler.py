@@ -964,6 +964,32 @@ class Scheduler:
             self.reattaching, self.t_reattach = True, time.time()  # (no VM leased or started until the first pass took back what runs where: rules.plan_waits, one tick after a handoff, 60 s at most)
             threading.Thread(target=self._reattach, daemon=True).start()
 
+    def _terminal_handoff_hold(self, it: Item, offered: dict, vm_id: str) -> bool:
+        """A delivered verdict does not release its exact, still-held cleanup ownership.
+
+        Bind to the durable placement and result before trusting an offered terminal
+        hold. In particular, never replace the persisted identity with the snapshot's
+        identity merely to make the readiness dictionaries agree.
+        """
+        placement = it.last_placement or {}
+        supplied = offered.get("placement")
+        identity = it.launch_identity
+        bound = {"name": it.name, "run_name": offered.get("run_name"),
+                 "vm": vm_id, "identity": identity, "attempt": it.owned.placements}
+        matched = (isinstance(supplied, dict) and isinstance(identity, str) and bool(identity)
+                   and it.owned.placements == 1 and type(offered.get("placed", 1)) is int
+                   and offered.get("placed", 1) == 1 and type(placement.get("attempt")) is int
+                   and type(supplied.get("attempt")) is int
+                   and isinstance(placement.get("boot_id"), str) and bool(placement["boot_id"])
+                   and supplied.get("boot_id") == placement["boot_id"]
+                   and offered.get("launch_identity") == identity
+                   and all(placement.get(k) == value and supplied.get(k) == value
+                           for k, value in bound.items())
+                   and any(row.get("name") == it.name and row.get("launch_identity") == identity
+                           and row.get("vm") == vm_id and type(row.get("attempt")) is int
+                           and row["attempt"] == it.owned.placements for row in it.batch.rows))
+        return rules.terminal_handoff_hold(it.batch.strict_once, it.state == "done", matched, it.batch.closed)
+
     def _take_pool(self):
         """At the start, before serving: every VM the previous scheduler held, in one write of the registry
         (rules.take_over), each held here at once, ready, as the handoff's snapshot (or the registry and the hold
@@ -1114,9 +1140,14 @@ class Scheduler:
                 for x in i.get("items", []):
                     b = self.batches.get(x["batch"])
                     it = b.items.get(x["name"]) if b else None
-                    if it is None or it.state == "done" or b.closed:
+                    if it is None or b.closed:
                         continue
-                    it.state = rules.taken_item_state(x.get("state", "running"))
+                    terminal = it.state == "done"
+                    if terminal and not self._terminal_handoff_hold(it, x, vid):
+                        continue  # Keep the identity absent: readiness must refuse an unbound hold.
+                    it.state = rules.reloaded_handoff_state(terminal, x.get("state", "running"))
+                    if terminal:
+                        it.owned.cancel()  # Fence late output/reconciliation; never reopen the verdict.
                     it.vm, it.run_name, it.t_start, it.taken_over, it.reattach = vm, x["run_name"], now, True, None
                     it.last_placement = x.get("placement") or it.last_placement
                     it.launch_identity = x.get("launch_identity") or it.launch_identity
@@ -1140,6 +1171,14 @@ class Scheduler:
             self.recovery_blocked = True
             self.recovery["ready"] = False
             self.recovery["items_ready"] = False
+            missing_items = sorted(expected_items.keys() - actual_items.keys())
+            extra_items = sorted(actual_items.keys() - expected_items.keys())
+            changed_items = sorted(k for k in expected_items.keys() & actual_items.keys()
+                                   if expected_items[k] != actual_items[k])
+            self.recovery["item_mismatch"] = {
+                "missing_count": len(missing_items), "extra_count": len(extra_items),
+                "changed_count": len(changed_items), "missing": missing_items[:8],
+                "extra": extra_items[:8], "changed": changed_items[:8]}
         deferred = bool(snap.get("admission_guard") and old)
         self._handoff_deferred = (old, list(starting)) if deferred else None
         if not self.recovery_blocked and not deferred:

@@ -1134,6 +1134,21 @@ def taken_item_state(old_state: Literal["running", "preempting", "starting"]) ->
     return old_state
 
 
+# gdp: law terminal holds require strict ownership: not result or strict
+# gdp: law terminal holds require a terminal item: not result or terminal
+# gdp: law terminal holds require exact persisted identity: not result or matched
+# gdp: law closed admissions never become live cleanup work: not result or not closed
+# gdp: law every exact open terminal hold is retained: not (strict and terminal and matched and not closed) or result
+def terminal_handoff_hold(strict: bool, terminal: bool, matched: bool, closed: bool) -> bool:
+    return strict and terminal and matched and not closed
+
+
+# gdp: law a persisted terminal item never reopens on takeover: not terminal or result == "done"
+# gdp: law nonterminal takeover keeps the offered state: terminal or result == offered
+def reloaded_handoff_state(terminal: bool, offered: Literal["running", "preempting", "starting", "done"]) -> Literal["running", "preempting", "starting", "done"]:
+    return "done" if terminal else offered
+
+
 # gdp: law the switch never waits for the work in flight a tick or more: result < tick_s
 # gdp: law the switch's wait is never negative: result >= 0
 def switch_wait(in_flight: int, tick_s: float) -> float:

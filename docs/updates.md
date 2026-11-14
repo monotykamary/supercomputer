@@ -150,6 +150,19 @@ for peer disconnects every quarter second. A disconnected wait releases its
 socket without acknowledging rows or changing item state; connected clients
 re-poll normally. New rows still wake the condition immediately.
 
+## Terminal results can still own cleanup
+
+A strict attempt's terminal row does not by itself release its VM/namespace
+cleanup ownership. Takeover retains such an offered hold only when its persisted
+placement, terminal row and snapshot agree on VM, run, launch identity and
+attempt, and the snapshot preserves the placement's original boot. The verdict
+stays `done`, its admission is fenced against late output, and no new start is
+queued. Native cancellation can subsequently reap that same attempt without
+rewriting the first terminal result. Archived closed batches remain closed;
+missing or mismatched evidence still fails the exact readiness comparison.
+A failed comparison now reports bounded missing/extra/changed item keys in the
+ACK, instead of only a boolean.
+
 ## Target and limits
 
 Use immutable, recursively hashed code snapshots; prepare code while the old
