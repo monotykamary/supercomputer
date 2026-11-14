@@ -1439,6 +1439,22 @@ class AgentError(RuntimeError):
     pass
 
 
+class AgentHTTPError(AgentError):
+    """A non-success HTTP response, with the status retained as typed evidence."""
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class AgentTransportError(AgentError):
+    """A recognized transient connection failure; not an HTTP or semantic refusal."""
+
+
+def _transient_transport_error(error) -> bool:
+    return (isinstance(error, (TimeoutError, ConnectionError, http.client.IncompleteRead))
+            or (isinstance(error, socket.gaierror) and error.errno == socket.EAI_AGAIN))
+
+
 class WorkerEndpointUnavailable(AgentError):
     """The worker-local agent listener refused the exec relay connection."""
 
@@ -1616,6 +1632,7 @@ class AgentClient:
                             self.cookie = "; ".join(x for x in [self.cookie, v.split(";")[0]] if x)
                 self._put_back(c)
                 if r.status in (301, 302, 303, 307, 308) or (r.status in (401, 403) and b"token" not in data[:200] and k == 0):
+                    last = None  # redirects/authentication are not a prior connection failure
                     if r.status in (401, 403):  # (boat's cookie gone stale: its token again)
                         self.cookie = ""
                     retry.attempt(False)
@@ -1633,7 +1650,8 @@ class AgentClient:
                        path=path, attempt=k + 1, error=type(e).__name__)
                 if retry.outcome == "trying" or not strict:
                     time.sleep(0.2 * (k + 1))
-        raise AgentError(f"{self.vm}: the warm agent didn't answer ({last})")
+        error_type = AgentTransportError if _transient_transport_error(last) else AgentError
+        raise error_type(f"{self.vm}: the warm agent didn't answer ({last})") from last
 
     EXEC_OK = {"ping", "vtick", "killitem", "itemlogs", "begin", "prep", "tree", "have", "pull", "pullcache", "upgrade"}
 
@@ -1649,7 +1667,7 @@ class AgentClient:
                 decode = lambda stream: resultjson.load_response(stream, store)
             code, data, _ = self._req("POST", "/rpc", body, timeout, **({'decode': decode} if decode else {}))
             if code == 502 and cmd in self.EXEC_OK and len(body) < EXEC_BODY:
-                raise AgentError(f"{self.vm}: {cmd}: 502 from boat's front")
+                raise AgentHTTPError(502, f"{self.vm}: {cmd}: 502 from boat's front")
         except AgentError:
             # (boat's front failing, the agent itself fine: the same request from inside the VM, over boat exec;
             # work on the VMs we hold goes on through an outage of the front, at an API call a request;
@@ -1659,7 +1677,9 @@ class AgentClient:
             code, data = self._rpc_exec(body, timeout, **({'decode': decode} if decode else {}))
         if code == 200 and isinstance(data, dict):
             return data
-        if code != 200 or data[:1] not in (b"{", b"["):
+        if code != 200:
+            raise AgentHTTPError(code, f"{self.vm}: {cmd}: {code} {data[:300]!r}")
+        if data[:1] not in (b"{", b"["):
             raise AgentError(f"{self.vm}: {cmd}: {code} {data[:300]!r}")
         return json.loads(data)
 
@@ -1686,19 +1706,19 @@ class AgentClient:
     def raw(self, cmd: str, *args, timeout: float = 120) -> bytes:
         code, data, _ = self._req("POST", "/rpc", json.dumps({"cmd": cmd, "args": [*args, {"_lease": {**self.lease, "owner": self.owner, "vm_id": self.vm}}]}).encode(), timeout)
         if code != 200:
-            raise AgentError(f"{self.vm}: {cmd}: {code} {data[:300]!r}")
+            raise AgentHTTPError(code, f"{self.vm}: {cmd}: {code} {data[:300]!r}")
         return data
 
     def put(self, path: str, data: bytes, timeout: float = 300) -> dict:
         code, out, _ = self._req("POST", path, data, timeout, "application/octet-stream")
         if code != 200:
-            raise AgentError(f"{self.vm}: {path}: {code} {out[:300]!r}")
+            raise AgentHTTPError(code, f"{self.vm}: {path}: {code} {out[:300]!r}")
         return json.loads(out)
 
     def who(self, timeout: float = 8) -> dict:
         code, data, _ = self._req("GET", "/health", timeout=timeout)
         if code != 200:
-            raise AgentError(f"{self.vm}: health: {code}")
+            raise AgentHTTPError(code, f"{self.vm}: health: {code}")
         answer = json.loads(data)
         if not answer.get("lease"):
             raise AgentError(f"{self.vm}: lease protocol missing; old client wins")

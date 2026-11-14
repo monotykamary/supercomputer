@@ -52,7 +52,7 @@ import time
 import urllib.request
 
 from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, prelaunch, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
-from .rules.prelaunch import prelaunch_can_retry, prelaunch_not_started
+from .rules.prelaunch import prelaunch_can_retry, prelaunch_not_started, prelaunch_transport_retryable
 from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
 from .agent import AGENT_CAPABILITIES as BUILD_AGENT_CAPABILITIES
@@ -2952,8 +2952,11 @@ class Scheduler:
                 self._prepare(it.batch, vm)
                 self._verify_agent_capabilities(it, vm)
                 return True
-            except (AgentError, TimeoutError, ConnectionError) as error:
-                if isinstance(error, boat.LeaseProtocolLost) or vm.dead:
+            except AgentError as error:
+                transient = prelaunch_transport_retryable(
+                    isinstance(error, boat.AgentTransportError),
+                    error.status if isinstance(error, boat.AgentHTTPError) else 0)
+                if not transient or vm.dead:
                     raise
                 with self.lock:
                     audit = self._prelaunch_evidence(it)
@@ -2967,7 +2970,7 @@ class Scheduler:
                         'prelaunch_failure': failure, 'time': time.time(), 'audit': audit,
                         'error': diagnostic['error']})
                     retry = prelaunch_can_retry(audit['complete'], audit['reserved'],
-                        audit['start_requested'], True, it.batch.admission_closed or it.owned.closed,
+                        audit['start_requested'], transient, it.batch.admission_closed or it.owned.closed,
                         self.stop.is_set(), failure, max(1, BOAT_TRIES))
                 if not retry:
                     raise PrelaunchNotStarted(diagnostic['error']['message']) from error

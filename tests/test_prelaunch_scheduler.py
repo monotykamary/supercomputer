@@ -28,12 +28,12 @@ class PrelaunchSchedulerTests(unittest.TestCase):
             self.commands.append(kind)
             if kind == 'capabilities' and self.remaining:
                 self.remaining -= 1
-                raise S.AgentError('HTTP Error 502: fixture pre-launch transport failure')
+                raise S.boat.AgentHTTPError(502, 'fixture pre-launch transport failure')
             if kind == 'vtick':
                 for start in request['args'][0].get('start', []):
                     self.starts.append(start['spec']['launch_identity'])
                 if lose_start_reply:
-                    raise S.AgentError('HTTP Error 502: fixture reply lost AFTER physical start')
+                    raise S.boat.AgentHTTPError(502, 'fixture reply lost AFTER physical start')
             return {'ok': True, 'protocol': 1, 'version': self.s.agent_version,
                     'nonce': request['nonce'], 'features': {'pidfd': True,
                     'private_pid_namespace': 'verified-before-payload'},
@@ -61,11 +61,50 @@ class PrelaunchSchedulerTests(unittest.TestCase):
 
     def test_prepare_transport_failure_retries_without_replacement(self):
         self.configure()
-        self.s._prepare.side_effect = [S.AgentError('HTTP Error 502: prepare'), None]
+        self.s._prepare.side_effect = [S.boat.AgentTransportError('connection reset during prepare'), None]
         self.run_start()
         self.assertEqual(self.s._prepare.call_count, 2)
         self.assertEqual(len(self.starts), 1)
         self.assertEqual(self.it.owned.placements, 1)
+
+    def assert_permanent_refusal(self, error, *, preparation=False):
+        self.configure()
+        if preparation:
+            self.s._prepare.side_effect = error
+        else:
+            def refuse(command, *args, **kwargs):
+                self.commands.append(args[0]['command'])
+                raise error
+            self.vm.client.rpc.side_effect = refuse
+        self.run_start()
+        self.assertEqual(self.commands, ['capabilities'])
+        self.assertEqual(self.s._prepare.call_count, 1 if preparation else 0)
+        self.assertFalse(self.starts)
+        self.assertEqual(self.b.rows[-1]['status'], 'LOST')
+        self.assertNotIn('prelaunch_evidence', self.b.rows[-1])
+        self.assertNotIn('prelaunch_failures', self.b.rows[-1])
+        self.assertEqual([r['event'] for r in self.events()], ['prelaunch_reserved'])
+
+    def test_http_400_does_not_retry_or_become_not_started(self):
+        self.assert_permanent_refusal(S.boat.AgentHTTPError(400, 'bad request'))
+
+    def test_http_401_does_not_retry_or_become_not_started(self):
+        self.assert_permanent_refusal(S.boat.AgentHTTPError(401, 'unauthorized'))
+
+    def test_http_403_does_not_retry_or_become_not_started(self):
+        self.assert_permanent_refusal(S.boat.AgentHTTPError(403, 'forbidden'))
+
+    def test_unknown_http_500_does_not_retry(self):
+        self.assert_permanent_refusal(S.boat.AgentHTTPError(500, 'unknown server failure'))
+
+    def test_semantic_tree_refusal_does_not_retry(self):
+        self.assert_permanent_refusal(S.AgentError('tree: semantic refusal'), preparation=True)
+
+    def test_semantic_prep_refusal_does_not_retry(self):
+        self.assert_permanent_refusal(S.AgentError('prep: semantic refusal'), preparation=True)
+
+    def test_error_text_cannot_authorize_retry(self):
+        self.assert_permanent_refusal(S.AgentError('HTTP Error 502: not typed transport evidence'))
 
     def test_exhaustion_is_not_started_and_retains_cleanup_hold(self):
         self.configure(failures=10)

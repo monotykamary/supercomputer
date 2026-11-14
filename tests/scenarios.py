@@ -227,6 +227,22 @@ def _strict_prelaunch_case(code, mode):
         owned = message.get('cmd') == 'owned_rpc'
         envelope = (message.get('args') or [{}])[0] if owned else {}
         command = envelope.get('command')
+        if mode.startswith('http-') and command == 'capabilities':
+            faults.append(command)
+            return int(mode[5:]), b'{"error":"token or request refused"}', 'application/json'
+        semantic = None
+        if mode == 'semantic-tree' and command == 'begin':
+            semantic = {'need': 'manifest', 'version': envelope['version']}
+        elif mode == 'semantic-tree' and command == 'tree':
+            semantic = {'ok': False, 'missing': []}
+        elif mode == 'semantic-prep' and command == 'begin':
+            semantic = {'ok': True, 'prep': {'ok': False}}
+        if semantic is not None:
+            faults.append(command)
+            reply = {'protocol': 1, 'version': envelope['version'], 'nonce': envelope['nonce'],
+                     'features': {'pidfd': True, 'private_pid_namespace': 'verified-before-payload'},
+                     'ok': True, 'result': semantic}
+            return 200, json.dumps(reply).encode(), 'application/json'
         before = ((mode == 'recover' and command in ('capabilities', 'begin') and command not in faults)
                   or (mode == 'exhaust' and command == 'capabilities')
                   or (mode == 'ambiguous' and command == 'capabilities' and not faults))
@@ -280,11 +296,17 @@ def _strict_prelaunch_case(code, mode):
             checks.update(no_retry_on_ambiguity=len(faults) == 1,
                           fail_closed=row.get('status') == 'LOST' and not audit['complete'],
                           no_fabricated_no_start='prelaunch_evidence' not in row)
-        else:
+        elif mode == 'lost-reply':
             checks.update(no_retry_after_start=faults == ['start_reply'],
                           post_intent_lost=row.get('status') == 'LOST' and row.get('code') == -1,
                           durable_intent=audit['complete'] and audit['start_requested'],
                           no_fabricated_no_start='prelaunch_evidence' not in row)
+        else:
+            expected = ['begin', 'tree'] if mode == 'semantic-tree' else ['begin'] if mode == 'semantic-prep' else ['capabilities']
+            checks.update(permanent_refusal_not_retried=faults == expected,
+                          permanent_refusal_stays_lost=row.get('status') == 'LOST' and row.get('code') == -1,
+                          no_not_started_reclassification='prelaunch_evidence' not in row and 'prelaunch_failures' not in row,
+                          no_retry_record=audit['complete'] and audit['failures'] == 0 and not audit['start_requested'])
         return checks
     return sim, {'extra': extra}
 
@@ -311,6 +333,36 @@ def strict_prelaunch_ambiguous(code):
           'a 502 after dispatch leaves one actual process and a durable intent; no second launch is sent')
 def strict_start_reply_lost_no_retry(code):
     return _strict_prelaunch_case(code, 'lost-reply')
+
+
+@scenario('strict prelaunch HTTP 400 refusal', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'a typed HTTP 400 remains LOST without another preparation call or NOT_STARTED reclassification')
+def strict_prelaunch_http_400(code):
+    return _strict_prelaunch_case(code, 'http-400')
+
+
+@scenario('strict prelaunch HTTP 401 refusal', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'a typed HTTP 401 remains LOST without another preparation call or NOT_STARTED reclassification')
+def strict_prelaunch_http_401(code):
+    return _strict_prelaunch_case(code, 'http-401')
+
+
+@scenario('strict prelaunch HTTP 403 refusal', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'a typed HTTP 403 remains LOST without another preparation call or NOT_STARTED reclassification')
+def strict_prelaunch_http_403(code):
+    return _strict_prelaunch_case(code, 'http-403')
+
+
+@scenario('strict prelaunch semantic tree refusal', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'a semantic tree rejection remains LOST and never retries preparation')
+def strict_prelaunch_semantic_tree(code):
+    return _strict_prelaunch_case(code, 'semantic-tree')
+
+
+@scenario('strict prelaunch semantic prep refusal', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'a semantic prep rejection remains LOST and never retries preparation')
+def strict_prelaunch_semantic_prep(code):
+    return _strict_prelaunch_case(code, 'semantic-prep')
 
 
 @scenario("strict_once preemption", ["lost", "clients", "modal", "strikes", "threads"], 900,

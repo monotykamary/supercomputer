@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from supercomputer import prelaunch
-from supercomputer.rules.prelaunch import prelaunch_can_retry, prelaunch_not_started
+from supercomputer.rules.prelaunch import prelaunch_can_retry, prelaunch_not_started, prelaunch_transport_retryable
 
 
 class PrelaunchAuditTests(unittest.TestCase):
@@ -23,6 +23,14 @@ class PrelaunchAuditTests(unittest.TestCase):
         return raw + self.line(event='prelaunch_not_started', phase='prelaunch',
                                terminal=True, status='NOT_STARTED',
                                prelaunch_failure=proof['failures'] + 1, audit=proof)
+
+    def test_only_explicit_typed_transport_statuses_are_retryable(self):
+        allowed = {408, 429, 502, 503, 504}
+        for status in range(600):
+            for network in (False, True):
+                self.assertEqual(prelaunch_transport_retryable(network, status),
+                                 status in allowed or (network and status == 0),
+                                 (network, status))
 
     def test_complete_reserved_prefix_proves_no_start(self):
         p = prelaunch.inspect(self.raw, self.binding)

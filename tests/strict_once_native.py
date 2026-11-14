@@ -82,7 +82,7 @@ def loopback_client(B, root, vm):
             if op == 'capabilities' and not (root / 'prelaunch-rpc-faults.jsonl').exists():
                 append(root / 'prelaunch-rpc-faults.jsonl', {
                     'command': op, 'fault': '502 before dispatch', 'time': time.time()})
-                raise B.AgentError('native fixture: HTTP 502 before owned capabilities dispatch')
+                raise B.AgentHTTPError(502, 'native fixture: HTTP 502 before owned capabilities dispatch')
             if op == 'cancelitem' and op_args and (root / ('block-cleanup-' + op_args[0])).exists():
                 append(root / 'blocked-cleanup-rpcs.jsonl', {'command': op, 'batch': op_args[0]})
                 raise ConnectionError('native fixture: completed worker cleanup transport unavailable')

@@ -31,8 +31,12 @@ The controller may retry a transport failure **during preparation**, before any
 payload start has been requested. It uses the existing `boat_tries` preparation
 budget (normally three calls), without a new placement, VM, boot, launch nonce,
 physical-attempt allowance or fallback. Cancellation, shutdown and lease loss do
-not grant a retry. Permanent protocol/capability refusals keep their existing
-failure behavior.
+not grant a retry. Eligibility uses typed transport evidence, never error text:
+recognized connection/timeouts, incomplete reads and temporary DNS failures, or
+HTTP **408, 429, 502, 503, 504**. Other HTTP statuses (including 400/401/403 and
+500), certificate/protocol failures, untyped errors and semantic tree/prep
+negative replies do not retry and retain their existing LOST outcome. Permanent
+owned-protocol/capability refusals likewise keep their existing behavior.
 
 This path requires a complete, identity-bound `*.attempts` journal, opened and
 fsynced as `prelaunch_reserved` before the preparation thread starts. Each
