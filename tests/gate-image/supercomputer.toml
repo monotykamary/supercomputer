@@ -1,0 +1,11 @@
+# Opt-in test image only. Never use this config for a production controller.
+name = "supercomputer-gate-tools"
+hooks = "hooks.py"
+
+[boat]
+prefix = "sc-gate-tools"
+final_prefix = "sc-gate-tools-img"
+image_salt = "sc-gate-tools-v1"
+vm_type = "large"
+path = ["~/.bun/bin", "~/.elan/toolchains/leanprover--lean4---v4.34.0/bin", "~/.elan/bin"]
+ignore = ["**/__pycache__/**", "live/**", "**/runs/**", ".pi/**"]

@@ -1,0 +1,24 @@
+{
+  "observed_on": "2026-11-14",
+  "method": "Unauthenticated HTTPS GitHub releases API; exact release tag and asset selection",
+  "bun": {
+    "api": "https://api.github.com/repos/oven-sh/bun/releases/tags/bun-v1.4.3",
+    "tag": "bun-v1.4.3",
+    "published_at": "2026-10-10T05:24:54Z",
+    "asset_id": 626789490,
+    "asset": "bun-linux-x64-baseline.zip",
+    "bytes": 42015103,
+    "sha256": "1fc2edac843102909e3a1be1d8d9802cc6071cf074e67e88231f4ffe0f8b397b",
+    "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-linux-x64-baseline.zip"
+  },
+  "lean": {
+    "api": "https://api.github.com/repos/leanprover/lean4/releases/tags/v4.34.0",
+    "tag": "v4.34.0",
+    "published_at": "2026-09-14T14:04:36Z",
+    "asset_id": 563514501,
+    "asset": "lean-4.34.0-linux.tar.zst",
+    "bytes": 580367391,
+    "sha256": "caaa98356098c85dc0fcbbd28e1ec66f39eb6551829972b752ff20e1286b646b",
+    "url": "https://github.com/leanprover/lean4/releases/download/v4.34.0/lean-4.34.0-linux.tar.zst"
+  }
+}

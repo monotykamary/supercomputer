@@ -1,0 +1,12 @@
+[
+  {
+    "name": "real-toolchain-fixtures",
+    "cmd": "bash tests/gate-image/run-fixtures.sh",
+    "cpu": 2,
+    "memory": 4096,
+    "timeout": 240,
+    "backend": "boat",
+    "env": {"OWNED_LIFECYCLE_BOAT_TEST": "1"},
+    "required_agent_capabilities": {"output_files_protocol": 1, "result_files_protocol": 1}
+  }
+]
