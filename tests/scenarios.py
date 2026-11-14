@@ -2649,6 +2649,34 @@ def gate_68_slot_hours(code):
     return sim, {"extra": extra}
 
 
+@scenario("68 slot-hour gate with uncertain supply", ["lost", "clients", "threads"], 1800,
+          "the same gate workload meets its deadline under variable boot time without a hindsight-zero-waste promise")
+def gate_68_slot_hours_jitter(code):
+    # Reuse the fixed-supply workload and every safety/deadline check. The
+    # virtual kernel has not run yet, so future boots use the original jitter.
+    sim, options = gate_68_slot_hours(code)
+    sim.w.cfg["boot_s"] = (60, 120)
+    fixed_extra = options["extra"]
+
+    def extra(sim, m):
+        checks = fixed_extra(sim, m)
+        # Preserve the planner's needless-start signal. Only the retrospective
+        # claim that every future arrival must find work is inapplicable here.
+        del checks["no_needless_start"]
+        checks["no_forecast_needless_start"] = m["needless_recorded"] == 0
+        made = {e["vm"] for e in sim.w.events if e["kind"] == "start"}
+        delays = [v.ups[0][0] - v.t_created for v in sim.w.vms.values()
+                  if v.id in made and v.ups]
+        m["created_boot_samples"] = len(delays)
+        m["created_boot_range_s"] = [min(delays), max(delays)] if delays else []
+        checks["variable_supply_exercised"] = (len(delays) == len(made)
+            and len(delays) > 1 and max(delays) - min(delays) > 1
+            and all(60 - 1e-6 <= delay <= 120 + 1e-6 for delay in delays))
+        return checks
+
+    return sim, {**options, "extra": extra}
+
+
 @scenario("economic growth: steady small submissions", ["lost", "clients", "threads"], 1500,
           "a held four-VM pool clears repeated small submissions without any start")
 def steady_small_submissions(code):

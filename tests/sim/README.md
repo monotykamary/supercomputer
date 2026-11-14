@@ -19,8 +19,16 @@ real provider resources. Run the simulation *inside* a Boat job, not on the host
   random future boot latency: the measured arrival estimate can legitimately
   buy a worker which later arrives after faster workers clear the tail. Keep
   default-jitter diagnostic failures as evidence rather than claiming that a
-  fixed-supply pass proves a production cost improvement. Other growth/bringup
-  scenarios continue to use the default variable boot times.
+  fixed-supply pass proves a production cost improvement.
+- `gate_68_slot_hours_jitter` retains that exact workload and all safety/deadline
+  checks under the original 60–120-second boot distribution. It requires actual
+  varied boot samples for every created worker and preserves the planner's
+  needless-start signal. It records hindsight-unused workers rather than
+  demanding that an earlier estimate predict a later random arrival exactly.
+  The diagnostic counterexample had 144 queued slots against 140 forecast
+  slots, making a start justified, but actual slower boot allowed 148 slots
+  before arrival. That is not evidence of a production growth-policy fix.
+  Other growth/bringup scenarios also retain default variable boot times.
 - A blocked-extra handoff fixture must first have a settled required pool. A
   request correctly deferred during bootstrap is not a committed handoff. Create
   the unoffered extra only after that prerequisite; continue blocking its execs
