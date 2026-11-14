@@ -390,6 +390,7 @@ class Item:
         self.launch_identity = None
         self.last_placement = None
         self.terminal_reap = None  # durable native proof captured before result ACK / VM release
+        self.terminal_loss = None  # diagnostic only: VM loss never proves namespace reap
         self.state = "queued"  # queued | starting | running | preempting | done | cancel_pending
         self.vm = None
         self.tries = 0
@@ -924,6 +925,11 @@ class Scheduler:
                         if it and self._matching_terminal_reap(it, receipt):
                             it.terminal_reap = receipt
                         continue  # evidence is not an admission-close fence or a result row
+                    if receipt.get("phase") == "terminal_vm_lost":
+                        if it and self._matching_terminal_loss(it, receipt):
+                            it.terminal_loss = receipt
+                            it.owned.cancel()
+                        continue  # loss is not a reap receipt, fence, or terminal result
                     if it and receipt.get("admission_closed") is True and receipt.get("identity") == it.launch_identity:
                         it.owned.cancel()
                         if it.state != "done":
@@ -973,10 +979,16 @@ class Scheduler:
         """
         placement = it.last_placement or {}
         supplied = offered.get("placement")
-        identity = it.launch_identity
-        bound = {"name": it.name, "run_name": offered.get("run_name"),
+        identity, run_name = it.launch_identity, offered.get("run_name")
+        rows = [row for row in it.batch.rows if row.get("name") == it.name]
+        row = rows[0] if len(rows) == 1 else {}
+        row_placement = row.get("placement")
+        row_run = row.get("run_name", row_placement.get("run_name") if isinstance(row_placement, dict) else None)
+        bound = {"name": it.name, "run_name": run_name,
                  "vm": vm_id, "identity": identity, "attempt": it.owned.placements}
-        matched = (isinstance(supplied, dict) and isinstance(identity, str) and bool(identity)
+        matched = (all(isinstance(v, str) and bool(v) for v in (it.name, run_name, vm_id, identity))
+                   and offered.get("name") == it.name and offered.get("batch") == it.batch.id
+                   and isinstance(supplied, dict)
                    and it.owned.placements == 1 and type(offered.get("placed", 1)) is int
                    and offered.get("placed", 1) == 1 and type(placement.get("attempt")) is int
                    and type(supplied.get("attempt")) is int
@@ -985,9 +997,9 @@ class Scheduler:
                    and offered.get("launch_identity") == identity
                    and all(placement.get(k) == value and supplied.get(k) == value
                            for k, value in bound.items())
-                   and any(row.get("name") == it.name and row.get("launch_identity") == identity
-                           and row.get("vm") == vm_id and type(row.get("attempt")) is int
-                           and row["attempt"] == it.owned.placements for row in it.batch.rows))
+                   and len(rows) == 1 and row_run == run_name
+                   and row.get("launch_identity") == identity and row.get("vm") == vm_id
+                   and type(row.get("attempt")) is int and row["attempt"] == it.owned.placements)
         return rules.terminal_handoff_hold(it.batch.strict_once, it.state == "done", matched, it.batch.closed)
 
     def _take_pool(self):
@@ -1138,23 +1150,27 @@ class Scheduler:
             vm.ready, vm.t_ready, vm.idle_since = True, now, now
             if snap:  # (a handoff: its items exactly as the old one held them there, no record older than that)
                 for x in i.get("items", []):
-                    b = self.batches.get(x["batch"])
-                    it = b.items.get(x["name"]) if b else None
+                    b = self.batches.get(x.get("batch"))
+                    it = b.items.get(x.get("name")) if b else None
                     if it is None or b.closed:
                         continue
                     terminal = it.state == "done"
                     if terminal and not self._terminal_handoff_hold(it, x, vid):
                         continue  # Keep the identity absent: readiness must refuse an unbound hold.
                     it.state = rules.reloaded_handoff_state(terminal, x.get("state", "running"))
+                    it.vm, it.run_name, it.taken_over, it.reattach = vm, x["run_name"], True, None
                     if terminal:
                         it.owned.cancel()  # Fence late output/reconciliation; never reopen the verdict.
-                    it.vm, it.run_name, it.t_start, it.taken_over, it.reattach = vm, x["run_name"], now, True, None
-                    it.last_placement = x.get("placement") or it.last_placement
-                    it.launch_identity = x.get("launch_identity") or it.launch_identity
-                    suffix = it.run_name.rpartition("~s")[2]
-                    it.placed = max(it.placed, int(x.get("placed", 0)), int(suffix) if suffix.isdigit() else 1)
-                    it.fate.reloaded(vid)
-                    it.fate.reattached(vid)
+                        it.placed = it.owned.placements
+                        # Durable placement, identity, start clock and delivered fate stay untouched.
+                    else:
+                        it.t_start = now
+                        it.last_placement = x.get("placement") or it.last_placement
+                        it.launch_identity = x.get("launch_identity") or it.launch_identity
+                        suffix = it.run_name.rpartition("~s")[2]
+                        it.placed = max(it.placed, int(x.get("placed", 0)), int(suffix) if suffix.isdigit() else 1)
+                        it.fate.reloaded(vid)
+                        it.fate.reattached(vid)
                     vm.running[(b.id, x["run_name"])] = it
                     if it.state == "starting":
                         if b.strict_once:
@@ -1162,8 +1178,8 @@ class Scheduler:
                         else:
                             starting.append((it, vm))  # Legacy agents deduplicate the same run name.
             self.vms[vid] = vm
-        expected_items = {(v["id"], x["batch"], x["name"], x["run_name"]): x.get("launch_identity")
-                          for v in info.values() for x in v.get("items", []) if x["batch"] not in closed}
+        expected_items = {(v["id"], x.get("batch"), x.get("name"), x.get("run_name")): x.get("launch_identity")
+                          for v in info.values() for x in v.get("items", []) if x.get("batch") not in closed}
         actual_items = {(v.id, it.batch.id, it.name, it.run_name): it.launch_identity
                         for v in self.vms.values() for it in v.running.values()}
         items_ready = not snap or expected_items == actual_items
@@ -1171,10 +1187,10 @@ class Scheduler:
             self.recovery_blocked = True
             self.recovery["ready"] = False
             self.recovery["items_ready"] = False
-            missing_items = sorted(expected_items.keys() - actual_items.keys())
-            extra_items = sorted(actual_items.keys() - expected_items.keys())
-            changed_items = sorted(k for k in expected_items.keys() & actual_items.keys()
-                                   if expected_items[k] != actual_items[k])
+            missing_items = sorted(expected_items.keys() - actual_items.keys(), key=repr)
+            extra_items = sorted(actual_items.keys() - expected_items.keys(), key=repr)
+            changed_items = sorted((k for k in expected_items.keys() & actual_items.keys()
+                                    if expected_items[k] != actual_items[k]), key=repr)
             self.recovery["item_mismatch"] = {
                 "missing_count": len(missing_items), "extra_count": len(extra_items),
                 "changed_count": len(changed_items), "missing": missing_items[:8],
@@ -1994,7 +2010,8 @@ class Scheduler:
                               "vm": (it.last_placement or {}).get("vm"),
                               "boot_id": (it.last_placement or {}).get("boot_id"),
                               "launch_identity": it.launch_identity,
-                              "cleanup_complete": it.owned.reaped}
+                              "cleanup_complete": it.owned.reaped,
+                              **({"terminal_loss": it.terminal_loss} if getattr(it, "terminal_loss", None) else {})}
                              for it in items if it.owned.placements],
                 "unlaunched": [it.name for it in items if not it.owned.placements],
                 "pending": [it.name for it in items if not it.owned.reaped], "batch": b.id}
@@ -2046,6 +2063,18 @@ class Scheduler:
                 and receipt.get("reaped") is True and receipt.get("namespace_absent") is True
                 and identity is not None and receipt.get("identity") == identity
                 and receipt.get("batch") == bid and receipt.get("name") == name)
+
+    @staticmethod
+    def _matching_terminal_loss(it, evidence):
+        pl = it.last_placement or {}
+        fields = {"name": it.name, "run_name": pl.get("run_name"), "vm": pl.get("vm"),
+                  "boot_id": pl.get("boot_id"), "identity": it.launch_identity}
+        return (it.batch.strict_once and it.state == "done"
+                and isinstance(evidence, dict) and evidence.get("phase") == "terminal_vm_lost"
+                and evidence.get("cleanup_complete") is False
+                and type(evidence.get("attempt")) is int and evidence["attempt"] == it.owned.placements == 1
+                and all(isinstance(value, str) and bool(value) and evidence.get(key) == value
+                        for key, value in fields.items()))
 
     @classmethod
     def _matching_terminal_reap(cls, it, evidence):
@@ -5030,6 +5059,19 @@ class Scheduler:
             return
         log(f"{vm.id}: lost")
         with self.lock:
+            # Persist why cleanup became unreachable before releasing this VM.
+            # This diagnostic is never namespace-reap proof and never changes a verdict.
+            for it in vm.running.values():
+                if it.batch.strict_once and it.state == "done" and not it.owned.reaped and not it.terminal_loss:
+                    pl = it.last_placement or {}
+                    evidence = {"phase": "terminal_vm_lost", "name": it.name,
+                                "run_name": pl.get("run_name"), "vm": vm.id,
+                                "boot_id": pl.get("boot_id"), "identity": it.launch_identity,
+                                "attempt": it.owned.placements, "cleanup_complete": False,
+                                "reason": "worker_lost_before_terminal_reap", "t": time.time()}
+                    self._append_owned(it.batch.id, "cancel", evidence)
+                    it.terminal_loss = evidence
+                    it.owned.cancel()
             vm.dead = True
             # (rules.slept_through, ItemFate.vm_lost: a VM boat stopped while this machine slept is no strike)
             slept = rules.slept_through(time.time(), getattr(self, "t_wake", 0), 900)

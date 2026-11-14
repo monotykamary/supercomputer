@@ -163,6 +163,13 @@ missing or mismatched evidence still fails the exact readiness comparison.
 A failed comparison now reports bounded missing/extra/changed item keys in the
 ACK, instead of only a boolean.
 
+Terminal custody also requires nonempty string identity names and exactly one
+matching terminal row. Takeover keeps the complete persisted placement, start
+clock and delivered fate; it never derives an extra attempt from a run-name
+suffix. A lost worker with pending terminal cleanup is durably recorded as
+`terminal_vm_lost` and exposed in the close receipt. This is diagnostic evidence
+only: it never marks a namespace reaped or replaces the original verdict.
+
 `/capabilities.code` is the serving scheduler's frozen `self.code`, consistent
 with `/status.code`. `code_installed` uses the same last sampled install marker
 as status, not a live filesystem read: an unavailable staged tree cannot break

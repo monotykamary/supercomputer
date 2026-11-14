@@ -229,6 +229,160 @@ class TerminalHandoff(unittest.TestCase):
         self.assertEqual(child._handoff_deferred[1], [])
 
 
+    def test_missing_empty_or_non_string_terminal_run_name_refuses_cleanly(self):
+        self.terminal()
+        for value in (None, "", 17, "missing"):
+            with self.subTest(value=value):
+                snap = self.snapshot()
+                offered = snap["vms"][0]["items"][0]
+                if value == "missing":
+                    del offered["run_name"]
+                else:
+                    offered["run_name"] = value
+                child, _ = self.candidate(snap)
+                self.assertFalse(child.recovery["ready"])
+                self.assertFalse(child.vms[self.vm.id].running)
+        offered = self.snapshot()["vms"][0]["items"][0]
+        self.assertFalse(self.s._terminal_handoff_hold(self.it, offered, ""))
+        old_name, self.it.name = self.it.name, ""
+        try:
+            self.assertFalse(self.s._terminal_handoff_hold(self.it, offered, self.vm.id))
+        finally:
+            self.it.name = old_name
+
+    def test_absent_identity_names_do_not_match_by_none_equality(self):
+        self.terminal()
+        offered = self.snapshot()["vms"][0]["items"][0]
+        del offered["run_name"]
+        offered["placement"]["run_name"] = None
+        self.it.last_placement["run_name"] = None
+        self.b.rows[0]["run_name"] = None
+        self.assertFalse(self.s._terminal_handoff_hold(self.it, offered, self.vm.id))
+
+    def test_duplicate_or_conflicting_terminal_rows_refuse_readiness(self):
+        self.terminal()
+        path = self.root / "queue" / (self.b.id + ".rows")
+        original = path.read_bytes()
+        for conflict in (False, True):
+            with self.subTest(conflict=conflict):
+                row = copy.deepcopy(self.b.rows[0])
+                if conflict:
+                    row["launch_identity"] = "conflicting-identity"
+                self.b.rows.append(row)
+                try:
+                    self.assertFalse(self.s._terminal_handoff_hold(self.it, self.snapshot()["vms"][0]["items"][0], self.vm.id))
+                finally:
+                    self.b.rows.pop()
+                path.write_bytes(original + (json.dumps(row) + "\n").encode())
+                before = self.journal_bytes()
+                child, _ = self.candidate()
+                self.assertFalse(child.recovery["ready"])
+                self.assertFalse(child.vms[self.vm.id].running)
+                self.assertEqual(before, self.journal_bytes())
+        path.write_bytes(original)
+
+    def test_terminal_row_run_name_is_bound_to_the_placement(self):
+        self.terminal()
+        path = self.root / "queue" / (self.b.id + ".rows")
+        row = json.loads(path.read_text())
+        row["run_name"] = "wrong-run"
+        path.write_text(json.dumps(row) + "\n")
+        child, _ = self.candidate()
+        self.assertFalse(child.recovery["ready"])
+        self.assertFalse(child.vms[self.vm.id].running)
+
+    def test_terminal_takeover_keeps_full_persisted_placement_clock_and_fate(self):
+        self.terminal()
+        path = self.root / "queue" / (self.b.id + ".placed")
+        placement = json.loads(path.read_text())
+        placement["extra_provenance"] = {"original": True, "cpu_observation": "kept"}
+        path.write_text(json.dumps(placement) + "\n")
+        predicate = S.Scheduler._terminal_handoff_hold
+        def checked(owner, item, offered, vm):
+            item.t_start = 123.0
+            item.fate.reloaded, item.fate.reattached = Mock(), Mock()
+            return predicate(owner, item, offered, vm)
+        with patch.object(S.Scheduler, "_terminal_handoff_hold", checked):
+            child, _ = self.candidate()
+        item = child.batches[self.b.id].items[self.it.name]
+        self.assertTrue(child.recovery["ready"])
+        self.assertEqual(item.last_placement, placement)
+        self.assertEqual(item.t_start, 123.0)
+        self.assertEqual(item.launch_identity, placement["identity"])
+        self.assertEqual(item.fate.state, "done")
+        item.fate.reloaded.assert_not_called()
+        item.fate.reattached.assert_not_called()
+
+    def test_terminal_placement_count_is_not_inflated_by_a_run_suffix(self):
+        self.terminal()
+        self.it.run_name += "~s99"
+        self.it.last_placement["run_name"] = self.it.run_name
+        path = self.root / "queue" / (self.b.id + ".placed")
+        path.write_text(json.dumps(self.it.last_placement) + "\n")
+        path = self.root / "queue" / (self.b.id + ".rows")
+        row = json.loads(path.read_text())
+        row["run_name"] = self.it.run_name
+        row["placement"]["run_name"] = self.it.run_name
+        path.write_text(json.dumps(row) + "\n")
+        child, _ = self.candidate()
+        item = child.batches[self.b.id].items[self.it.name]
+        self.assertTrue(child.recovery["ready"])
+        self.assertEqual(item.placed, 1)
+        self.assertEqual(item.owned.placements, 1)
+        self.assertEqual(item.run_name, self.it.run_name)
+
+    def test_vm_loss_is_durable_diagnostic_not_reap_or_a_new_verdict(self):
+        self.terminal()
+        child, _ = self.candidate()
+        item = child.batches[self.b.id].items[self.it.name]
+        vm = child.vms[self.vm.id]
+        rows = (self.root / "queue" / (self.b.id + ".rows")).read_bytes()
+        child._let_go = Mock(side_effect=lambda v, **kw: child.vms.pop(v.id))
+        child._lost_vm(vm)
+        child._lost_vm(vm)
+        loss_path = self.root / "queue" / (self.b.id + ".cancel")
+        self.assertTrue(loss_path.exists(), "VM loss must leave durable diagnostic evidence")
+        events = [json.loads(x) for x in loss_path.read_text().splitlines()]
+        losses = [x for x in events if x.get("phase") == "terminal_vm_lost"]
+        self.assertEqual(len(losses), 1)
+        self.assertTrue(child._matching_terminal_loss(item, losses[0]))
+        self.assertFalse(item.owned.reaped)
+        self.assertEqual(item.state, "done")
+        self.assertEqual((self.root / "queue" / (self.b.id + ".rows")).read_bytes(), rows)
+        receipt = child._close_receipt(item.batch)
+        self.assertFalse(receipt["cleanup_complete"])
+        self.assertEqual(receipt["attempts"][0]["terminal_loss"], losses[0])
+        reloaded, _ = self.candidate()
+        restored = reloaded.batches[self.b.id].items[self.it.name]
+        self.assertEqual(restored.terminal_loss, losses[0])
+        self.assertTrue(restored.owned.closed)
+        self.assertFalse(restored.owned.reaped)
+        self.assertEqual(restored.state, "done")
+
+    def test_failed_loss_journal_keeps_the_worker_and_cleanup_hold(self):
+        self.terminal()
+        child, _ = self.candidate()
+        item = child.batches[self.b.id].items[self.it.name]
+        vm = child.vms[self.vm.id]
+        child._let_go = Mock()
+        with patch.object(child, "_append_owned", side_effect=OSError("fsync failed")):
+            with self.assertRaisesRegex(OSError, "fsync failed"):
+                child._lost_vm(vm)
+        self.assertFalse(vm.dead)
+        self.assertIs(child.vms[vm.id], vm)
+        self.assertIs(vm.running[(self.b.id, item.run_name)], item)
+        self.assertFalse(item.owned.reaped)
+        child._let_go.assert_not_called()
+
+    def test_non_strict_terminal_offer_is_not_a_cleanup_hold(self):
+        self.terminal()
+        self.msg["strict_once"] = False
+        self.write_batch()
+        child, _ = self.candidate()
+        self.assertFalse(child.recovery["ready"])
+        self.assertFalse(any(vm.running for vm in child.vms.values()))
+
+
 class ServingCapabilities(unittest.TestCase):
     def test_serving_code_remains_stable_when_a_different_install_is_sampled(self):
         owner = S.Scheduler.__new__(S.Scheduler)
