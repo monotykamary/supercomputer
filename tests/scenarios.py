@@ -1326,6 +1326,126 @@ def handoff_under_load(code):
     return sim, {}
 
 
+@scenario("bounded handoff under continuing acquisition", ["lost", "strikes", "modal", "clients", "threads", "orphans"], 2100,
+          "a pending code update must transfer a busy pool before a finite stream of new boot demand ends, rather than wait for global quiescence")
+def handoff_acquisition_stream(code):
+    from tests.sim.harness import IMAGE, items
+    # Each real wave needs a fresh image, so warm capacity from an earlier wave
+    # cannot accidentally make the acquisition stream quiescent. This is ordinary
+    # client demand, not a patched readiness predicate or a hung bootstrap thread.
+    waves = [(40 + 60 * n, f"sc-img-handoff-{n}") for n in range(15)]
+    requested, deadline, candidate = 120, 600, "bounded-stream"
+    sim = _sim(code, cfg={"images": [IMAGE] + [image for _, image in waves], "boot_s": (180, 180)},
+               policy={"floor_default": 0, "max_vms": 0, "bringup": 10, "hold_s": 3600})
+    _warm(sim, 4)
+    sim.scheduler(idle_exit=3000)
+    # Separate ready capacity keeps useful work and filler running while the
+    # other images continually acquire/boot. Neither is stopped for the update.
+    anchor = sim.batch("stream-anchor", "gate", items("anchor", 2, 1300, weight=4), after=10)
+    sim.at(30, lambda: sim.treadmill(base_vms=2, filler_n=8, filler_s=180, until=1100))
+    sim.status_monitor(every=20)
+    batches = [anchor]
+    for at, image in waves:
+        def submit(image=image):
+            batches.append(sim.batch("stream-" + image, "gate", items("wave", 1, 180, weight=4), image=image))
+        sim.at(at, submit, name="continued acquisition demand")
+    observed = {"samples": [], "orphaned_items": []}
+
+    def physical_anchor():
+        return [{"vm": v.id, "boot": v.boot, "pid": pid, "item": p["name"], "owner": p["job"].owner}
+                for v in sim.w.vms.values() for pid, p in v.procs.items()
+                if p["batch"] == anchor and p["alive"]]
+
+    def filler_live():
+        return any(p["alive"] and sim.w.items[(p["batch"], p["name"])]["klass"] == "filler"
+                   for v in sim.w.vms.values() for p in v.procs.values())
+
+    def request():
+        proc, s = sim.w.live_sched()
+        observed.update(requested=requested, deadline=deadline, traffic_last_submit=waves[-1][0],
+                        filler_before=filler_live(),
+                        old_pid=proc.pid, before=physical_anchor(), initially_held=sorted(s.vms),
+                        initial_unsettled=not s._pool_settled())
+        sim.w.install(candidate)
+        sim.k.start(proc, s.handoff, name="request bounded handoff")
+    sim.at(requested, request)
+
+    def sample():
+        current = sim.w.live_sched()
+        if current:
+            proc, s = current
+            observed["samples"].append({"t": sim.k.now - sim.k.t0, "code": proc.env["code"],
+                                        "unsettled": not s._pool_settled(),
+                                        "asking": len(s.asking), "creating": sum(s.creating.values()),
+                                        "booting": sum(not v.ready for v in s.vms.values() if not v.dead)})
+    for at in range(requested + 15, deadline + 1, 15):
+        sim.at(at, sample, name="observe moving handoff barrier")
+
+    def bounded_checkpoint():
+        proc, s = sim.w.live_sched()
+        root = pathlib.Path(sim.tmp)
+        snap_path, ack_path = root / "scheduler/handoff.used.json", root / "scheduler/handoff.ack"
+        snap = json.loads(snap_path.read_text()) if snap_path.exists() else {}
+        ack = json.loads(ack_path.read_text()) if ack_path.exists() else {}
+        registry = json.loads((root / "boat-pool.json").read_text())["vms"]
+        offered = {v["id"] for v in snap.get("vms", [])}
+        # Ownership is checked at the deadline, not necessarily at commit: an
+        # offered VM may since have completed and been safely released empty.
+        retired = {vid for vid in offered if not registry.get(vid, {}).get("lease")
+                   and (vid not in s.vms or s.vms[vid].dead)
+                   and not any(p["alive"] for p in sim.w.vms[vid].procs.values())}
+        observed.update(code_at_deadline=proc.env["code"], new_pid=proc.pid, filler_at_deadline=filler_live(),
+                        old_alive=sim.k.procs[observed["old_pid"]].alive,
+                        after=physical_anchor(), offered=sorted(offered), ack=ack,
+                        snapshot_from=snap.get("from_pid"), snapshot_t=snap.get("t"), retired_offered=sorted(retired),
+                        registry_pids={vid: (registry.get(vid, {}).get("lease") or {}).get("pid") for vid in offered},
+                        anchor_placements={it.name: it.vm.id if it.vm else None for b in s.batches.values() if b.id == anchor for it in b.items.values()})
+    sim.at(deadline, bounded_checkpoint, name="bounded handoff checkpoint before traffic ends")
+
+    def observe_owners():
+        # Empty released VMs may reach their TTL in the same tick as the sampler.
+        # They are not orphaned work; every physical live item needs an owner.
+        owners = sim.held_by()
+        orphaned = [{"vm": v.id, "batch": p["batch"], "item": p["name"]}
+                    for v in sim.w.vms.values() if owners.get(v.id) in (None, "released")
+                    for p in v.procs.values() if p["alive"]]
+        if orphaned:
+            observed["orphaned_items"].append({"t": sim.k.now - sim.k.t0, "items": orphaned})
+    for at in range(requested, 2100, 10):
+        sim.at(at, observe_owners, name="observe physical item ownership")
+
+    def extra(sim, m):
+        state = json.loads((pathlib.Path(sim.tmp) / "scheduler/canary.json").read_text())
+        ack, offered = observed.get("ack", {}), set(observed.get("offered", []))
+        rows = [row for rec in sim.clients.values() for row in rec["items"].values()]
+        starts = [e for e in sim.w.events if e["kind"] == "item_started"]
+        counts = {f"{bid}/{name}": sum(e["batch"] == bid and e["original"] == name for e in starts)
+                  for bid, rec in sim.clients.items() for name in rec["items"]}
+        early_new_starts = [e for e in sim.w.events if e["kind"] == "start" and deadline < e["t"] < waves[-1][0]]
+        observed.update(canary=state, physical_start_counts=counts, acquisitions_after_deadline=early_new_starts,
+                        real_batches=len(batches),
+                        deferrals=[{"t": t, "line": msg} for t, _, msg in sim.w.log_lines if "handoff deferred" in msg])
+        m["acquisition_stream"] = observed
+        return {"request_during_boots_and_work": observed.get("initial_unsettled") and len(observed.get("before", [])) == 2,
+                "handoff_by_deadline_with_traffic_open": observed.get("code_at_deadline") == candidate and deadline < waves[-1][0],
+                "old_process_exited_by_deadline": observed.get("old_alive") is False,
+                "exact_offered_pool_acknowledged": bool(offered) and offered == set(ack.get("taken", [])) and not ack.get("missing"),
+                "occupied_pool_preserved": bool(offered) and {p["vm"] for p in observed.get("before", [])} <= offered,
+                "ack_bound_to_old_and_new": ack.get("pid") == observed.get("new_pid") and observed.get("snapshot_from") == observed.get("old_pid") and ack.get("of") == observed.get("snapshot_t"),
+                "registry_owned_by_successor": bool(offered) and all(pid == observed.get("new_pid") or vid in observed.get("retired_offered", [])
+                    for vid, pid in observed.get("registry_pids", {}).items()),
+                "same_running_processes": bool(observed.get("before")) and observed.get("before") == observed.get("after"),
+                "exact_anchor_placements": len(observed.get("after", [])) == 2 and all(observed.get("anchor_placements", {}).get(p["item"]) == p["vm"] for p in observed.get("after", [])),
+                "continued_acquisitions_after_deadline": bool(early_new_starts),
+                "every_item_started_once": bool(counts) and all(n == 1 for n in counts.values()),
+                "all_rows_successful": bool(rows) and all(isinstance(row, dict) and row.get("code") == 0 for row in rows),
+                "all_waves_submitted": len(batches) == len(waves) + 1,
+                "filler_kept_active": observed.get("filler_before") and observed.get("filler_at_deadline"),
+                "no_orphaned_items": not observed["orphaned_items"],
+                "canary_passed": state.get("state") == "passed" and candidate in state.get("passed", []) and candidate not in state.get("rejected", [])}
+    return sim, {"extra": extra}
+
+
 @scenario("hot reload", ["lost", "strikes", "modal", "clients", "threads"], 1800,
           "full gate across deploy: exact worker runs preserved and placement resumes in under five seconds")
 def deploy_full_gate(code):
