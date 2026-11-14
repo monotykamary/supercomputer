@@ -580,6 +580,7 @@ class VMState:
         self.client: AgentClient | None = None
         self.lease: dict = {}
         self.t_renew = 0.0
+        self.renewal_pending = False  # poller recovery is independent of heartbeat renewal
         self.ttl = boat.BACKSTOP
         self.ready = False
         self.dead = False
@@ -4395,7 +4396,9 @@ class Scheduler:
             return None
         if getattr(self, "handing_off", False):
             return 0.5
-        if time.monotonic() - vm.t_renew >= 60:
+        # Heartbeats refresh authority, not operational readiness. Recovery
+        # must still run when a heartbeat made the periodic lease timer fresh.
+        if rules.worker_renewal_needed(getattr(vm, "renewal_pending", False), time.monotonic() - vm.t_renew >= 60):
             try:
                 if not self._renew_lease(vm):
                     return None
@@ -4403,13 +4406,19 @@ class Scheduler:
                 # No placement while authority cannot be verified. A stopped VM
                 # cannot renew at all: do not pin its work/capacity forever.
                 vm.ready = False
+                vm.renewal_pending = True
                 if not self._boat_up(vm.id):
                     self._note_lease_relinquish(vm, source='renew.transport_provider_down',
                                               error=error, operation='lease/renew')
                     self._lost_vm(vm)
                     return None
                 return 5.0
-            vm.ready = True
+            with self.lock:
+                if vm.dead or self.stop.is_set() or (getattr(vm, "renewal_pending", False) and self.vms.get(vm.id) is not vm):
+                    return None
+                if getattr(self, "handing_off", False):
+                    return 0.5
+                vm.ready, vm.renewal_pending = True, False
         with vm.lock:
             starts, acks = vm.starts, vm.acks
             vm.starts, vm.acks = [], []
@@ -4420,12 +4429,12 @@ class Scheduler:
             return None
         if not vm.quarantine and not vm.running and not starts and not acks and not getattr(vm, "foreign", 0) and time.time() - getattr(vm, "t_inventory", 0) < 30:
             if vm.ready is False:
-                return None
+                return rules.idle_worker_poll_delay(False)
             if vm.client and time.time() - vm.t_disk >= (30 if vm.disk_low else 300):  # (its disk asked by ping every 5 min, 30 s while low:
                 vm.t_disk = time.time()  # a vtick of an empty VM would read its runs mid-handoff)
                 with contextlib.suppress(Exception):
                     self._disk(vm, vm.client.ping().get("disk") or {})
-            return 1.0  # (nothing of ours there: no call, looked at again in a second)
+            return rules.idle_worker_poll_delay(True)  # empty, but still observed
         busy_queue = getattr(self, "_any_queued", True)  # (the last pass's word: no scan of every item at every tick of every VM)
         strict_starts = [st for st in starts if st.get("spec", {}).get("strict_once") is True]
         strict_acks = [ack for ack in acks if "launch_identity" in ack]

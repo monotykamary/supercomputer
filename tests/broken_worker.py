@@ -1,5 +1,14 @@
 """Local faults and stale occupancy must not become global policy."""
 
+# gdp: law pending poller recovery always revalidates: not pending or result
+def heartbeat_hides_recovery(pending: bool, due: bool) -> bool:
+    return due
+
+# gdp: law live idle workers always retain a bounded polling delay: result > 0 and result <= 5
+def abandon_unready_poll(ready: bool) -> int:
+    return 1 if ready else 0
+
+
 # gdp: law quarantined workers do not count toward a pool outage: not result or not quarantined
 def count_quarantined(ready: bool, dead: bool, quarantined: bool) -> bool:
     return ready and not dead

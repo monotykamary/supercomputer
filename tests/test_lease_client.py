@@ -343,6 +343,7 @@ class LeaseClientTests(unittest.TestCase):
                     s._heartbeat()
                 self.assertFalse(vm.dead)
                 self.assertIs(s.vms[vm.id], vm)
+                self.assertFalse(vm.ready, "heartbeat is not initialization")
                 if claimed:
                     renew.assert_called_once_with(vm)
                     provider.assert_called_once()
@@ -370,6 +371,125 @@ class LeaseClientTests(unittest.TestCase):
                 else:
                     self.assertIsNone(delay)
                     lost.assert_called_once_with(vm)
+
+    def _idle_poll_worker(self, ready=False):
+        s = S.Scheduler.__new__(S.Scheduler)
+        s.lock, s.stop, s.wake = threading.RLock(), threading.Event(), threading.Event()
+        s.shed, s._any_queued = False, False
+        vm = S.VMState('vm', 'image', 'large', 'warm')
+        vm.lease, vm.ready, vm.t_renew = dict(self.lease), ready, 1000.0
+        vm.renewal_pending = not ready
+        vm.t_ready = vm.t_agent = vm.t_disk = vm.t_inventory = S.time.time()
+        vm.agent_capabilities = {'output_files_protocol': 1, 'result_files_protocol': 1, 'runtime_pins_protocol': 1}
+        vm.client = Mock()
+        s.vms = {vm.id: vm}
+        return s, vm
+
+    def test_nonready_idle_worker_revalidates_after_background_renewal(self):
+        s, vm = self._idle_poll_worker()
+        with patch.object(S.time, 'monotonic', return_value=1001.0), \
+             patch.object(B, 'lease_vm', return_value={'ok': True}) as renew:
+            delay = s._tick(vm)
+        renew.assert_called_once_with('vm', 'renew', lease=self.lease)
+        self.assertTrue(vm.ready)
+        self.assertEqual(delay, 1.0, 'an initialized idle worker must keep its poller')
+        shape = ('image', 2, False, 1, 'large', None, 8192, '', None,
+                 tuple(sorted(vm.agent_capabilities.items())))
+        self.assertTrue(S.vm_fits(shape, vm, set()), 'the recovered exact large shape must be placeable')
+        vm.client.rpc.assert_not_called()
+
+    def test_failed_poll_renew_then_successful_heartbeat_cannot_strand_worker(self):
+        s, vm = self._idle_poll_worker(ready=True)
+        vm.t_renew = 0.0
+        clock = [1000.0]
+        with patch.object(S.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(B, 'lease_vm', side_effect=[RuntimeError('temporary relay failure'), {'ok': True}, {'ok': True}]) as renew, \
+             patch.object(s, '_boat_up', return_value=True), \
+             patch.object(B, 'boat', return_value='{}'):
+            self.assertEqual(s._tick(vm), 5.0)
+            self.assertFalse(vm.ready)
+            clock[0] += 1.0
+            s.stop = Mock()
+            s.stop.wait.side_effect = [False, True]
+            s._heartbeat()
+            self.assertFalse(vm.ready, 'heartbeat must not advertise an unready or booting worker')
+            self.assertEqual(vm.t_renew, clock[0])
+            s.stop = threading.Event()
+            clock[0] += 1.0
+            self.assertEqual(s._tick(vm), 1.0, 'the next poll revalidates despite the fresh heartbeat')
+            self.assertTrue(vm.ready)
+            self.assertEqual(renew.call_count, 3)
+        self.assertFalse(vm.dead)
+        self.assertIs(s.vms[vm.id], vm)
+
+    def test_nonready_idle_worker_does_not_bypass_renew_refusal(self):
+        s, vm = self._idle_poll_worker()
+        with patch.object(S.time, 'monotonic', return_value=1001.0), \
+             patch.object(B, 'lease_vm', return_value={'ok': False}), \
+             patch.object(s, '_drop_stale') as drop:
+            self.assertIsNone(s._tick(vm))
+        drop.assert_called_once()
+        self.assertFalse(vm.ready)
+        vm.client.rpc.assert_not_called()
+
+    def test_nonready_idle_worker_keeps_retrying_transient_renewal(self):
+        s, vm = self._idle_poll_worker()
+        with patch.object(S.time, 'monotonic', return_value=1001.0), \
+             patch.object(B, 'lease_vm', side_effect=RuntimeError('temporary relay failure')), \
+             patch.object(s, '_boat_up', return_value=True), \
+             patch.object(s, '_lost_vm') as lost:
+            self.assertEqual(s._tick(vm), 5.0)
+        self.assertFalse(vm.ready)
+        lost.assert_not_called()
+        vm.client.rpc.assert_not_called()
+
+    def test_uninitialized_idle_worker_is_not_promoted_by_fresh_lease(self):
+        s, vm = self._idle_poll_worker()
+        vm.t_ready, vm.renewal_pending = None, False
+        with patch.object(S.time, 'monotonic', return_value=1001.0), \
+             patch.object(B, 'lease_vm') as renew:
+            self.assertEqual(s._tick(vm), 5)
+        renew.assert_not_called()
+        self.assertFalse(vm.ready)
+        vm.client.rpc.assert_not_called()
+
+    def test_recovery_does_not_resurrect_removed_dead_or_stopped_worker(self):
+        for state in ('removed', 'dead', 'stopped'):
+            with self.subTest(state=state):
+                s, vm = self._idle_poll_worker()
+                def finish(*args, **kwargs):
+                    if state == 'removed':
+                        s.vms.pop(vm.id)
+                    elif state == 'dead':
+                        vm.dead = True
+                    else:
+                        s.stop.set()
+                    return {'ok': True}
+                with patch.object(S.time, 'monotonic', return_value=1001.0), \
+                     patch.object(B, 'lease_vm', side_effect=finish):
+                    self.assertIsNone(s._tick(vm))
+                self.assertFalse(vm.ready)
+                self.assertTrue(vm.renewal_pending)
+
+    def test_recovery_does_not_reopen_readiness_during_handoff(self):
+        s, vm = self._idle_poll_worker()
+        def finish(*args, **kwargs):
+            s.handing_off = True
+            return {'ok': True}
+        with patch.object(S.time, 'monotonic', return_value=1001.0), \
+             patch.object(B, 'lease_vm', side_effect=finish):
+            self.assertEqual(s._tick(vm), 0.5)
+        self.assertFalse(vm.ready)
+        self.assertTrue(vm.renewal_pending)
+        vm.client.rpc.assert_not_called()
+
+    def test_ready_worker_with_fresh_lease_keeps_fast_path(self):
+        s, vm = self._idle_poll_worker(ready=True)
+        with patch.object(S.time, 'monotonic', return_value=1001.0), \
+             patch.object(B, 'lease_vm') as renew:
+            self.assertEqual(s._tick(vm), 1)
+        renew.assert_not_called()
+        self.assertTrue(vm.ready)
 
     def test_urgent_results_keep_fast_polling_after_queue_drains(self):
         from types import SimpleNamespace

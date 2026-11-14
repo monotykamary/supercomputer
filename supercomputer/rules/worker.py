@@ -1,6 +1,20 @@
 """Worker-local quarantine and conservative legacy ghost recovery."""
 
 
+# gdp: law pending poller recovery always revalidates: not pending or result
+# gdp: law elapsed leases are renewed: not due or result
+# gdp: law fresh leases without recovery need no renewal: pending or due or not result
+def worker_renewal_needed(pending: bool, due: bool) -> bool:
+    return pending or due
+
+
+# gdp: law live idle workers always retain a bounded polling delay: result > 0 and result <= 5
+# gdp: law unavailable idle workers retry in five seconds: ready or result == 5
+# gdp: law ready idle workers poll in one second: not ready or result == 1
+def idle_worker_poll_delay(ready: bool) -> int:
+    return 1 if ready else 5
+
+
 # gdp: law quarantined workers do not count toward a pool outage: not result or not quarantined
 # gdp: law only ready live workers count toward a pool outage: not result or (ready and not dead)
 def worker_outage_member(ready: bool, dead: bool, quarantined: bool) -> bool:

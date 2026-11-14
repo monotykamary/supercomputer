@@ -52,6 +52,27 @@ def test_idle_foreign_inventory_is_refreshed():
     assert v.foreign == 0, "empty VMs must keep polling until foreign slots are actually gone"
 
 
+def test_large_only_gate_recovers_when_heartbeat_kept_its_lease_fresh():
+    s = sched()
+    v = vm(s, 'large', ready=False)
+    v.type, v.slots, v.renewal_pending = 'large', 4, True
+    v.lease = {'owner': boat.owner_id(), 'vm_id': v.id, 'boot': 'test-boot', 'epoch': 1}
+    v.t_renew = time.monotonic()
+    v.t_agent = v.t_disk = v.t_inventory = time.time()
+    v.client = SimpleNamespace(rpc=lambda *a, **k: {'running': [], 'done': []}, ping=lambda **k: {})
+    v.agent_capabilities = {'output_files_protocol': 1, 'result_files_protocol': 1, 'runtime_pins_protocol': 1}
+    other = vm(s, 'xlarge')
+    other.type, other.slots = 'xlarge', 8
+    b = batch(s, klass=2)
+    it = b.items['i0']
+    it.spec['vm_type'], it.memory = 'large', 8192
+    it.spec['required_agent_capabilities'] = dict(v.agent_capabilities)
+    assert s._slot(it) is None, 'ready xlarge capacity cannot substitute for the exact large seal'
+    with patch.object(boat, 'lease_vm', return_value={'ok': True}):
+        assert s._tick(v) == 1
+    assert s._slot(it) is v, 'the actual scheduler must regain exact-type placement after renewal recovery'
+
+
 def test_low_or_exhausted_prepaid_balance_is_not_a_billing_block():
     for plan, pack in [(0, 1000), (0, 0), (12, 1)]:
         lim = {"canStart": True, "billingStatus": "active", "planIncluded": {"vmHoursRemaining": plan}, "packBalanceHours": pack}
