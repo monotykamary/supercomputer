@@ -1,6 +1,66 @@
 """Regressions refused by the same hot-update laws."""
 
 
+class SlidingHandoffDrain:
+    def __init__(self):
+        self.pending = False
+        self.deadline = 0.0
+
+    # gdp: law repeated begin never slides the drain deadline: not old(pending) or deadline == old(deadline)
+    def begin(self, now: float) -> None:
+        self.pending = True
+        self.deadline = now + 300.0
+
+
+class StaleHandoffFinish:
+    def __init__(self):
+        self.pending = True
+        self.freezing = True
+        self.generation = 1
+
+    # gdp: law stale completion preserves the entire drain: generation == old(self.generation) or (pending == old(pending) and freezing == old(freezing) and self.generation == old(self.generation))
+    def finish(self, generation: int) -> bool:
+        self.pending = False
+        self.freezing = False
+        return True
+
+
+class FreezeWithoutPendingDrain:
+    # gdp: law freezing implies a pending drain: not freezing or pending
+    def __init__(self):
+        self.pending = False
+        self.freezing = False
+
+    def freeze(self) -> bool:
+        self.freezing = True
+        return self.freezing
+
+
+# gdp: law a new drain gets exactly five minutes: result == now + 300.0
+def drain_budget_too_short(now: float) -> float:
+    return now + 299.0
+
+
+# gdp: law no new growth while a drain is pending: result == (not pending)
+def grow_while_draining(pending: bool) -> bool:
+    return True
+
+
+# gdp: law placement remains allowed until the final freeze: result == (not freezing)
+def freeze_placement_during_drain(pending: bool, freezing: bool) -> bool:
+    return not pending and not freezing
+
+
+# gdp: law expiry is exactly a pending drain at its deadline: result == (pending and now >= deadline)
+def drain_expires_one_tick_late(pending: bool, now: float, deadline: float) -> bool:
+    return pending and now > deadline
+
+
+# gdp: law expiry is exactly a pending drain at its deadline: result == (pending and now >= deadline)
+def finished_drain_stays_expired(pending: bool, now: float, deadline: float) -> bool:
+    return now >= deadline
+
+
 # gdp: law an eligible deferred handback is retried: not (owner and available and not failed and now >= retry_after) or result
 def forget_deferred_handback(owner: bool, available: bool, failed: bool, now: float, retry_after: float) -> bool:
     return False

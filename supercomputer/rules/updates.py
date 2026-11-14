@@ -1,5 +1,79 @@
 """Hot-update guards used by the scheduler, not a model of OS/network latency."""
 
+
+# Pure query helpers are called by HandoffDrain below. Keeping their laws here
+# also lets gdp-wired check them: its class inference selects mutating methods.
+# gdp: law expiry is exactly a pending drain at its deadline: result == (pending and now >= deadline)
+def handoff_drain_expired(pending: bool, now: float, deadline: float) -> bool:
+    return pending and now >= deadline
+
+
+# gdp: law no new growth while a drain is pending: result == (not pending)
+def handoff_drain_growth_allowed(pending: bool) -> bool:
+    return not pending
+
+
+# gdp: law placement remains allowed until the final freeze: result == (not freezing)
+def handoff_drain_placement_allowed(freezing: bool) -> bool:
+    return not freezing
+
+class HandoffDrain:
+    """A fixed drain window, followed by a short placement freeze.
+
+    The scheduler owns the target, prepared snapshot and ongoing-work counters.
+    Repeated observations of a target must not restart this window. Calls are
+    serialized by the scheduler's lock; generations fence delayed completions.
+    """
+
+    # gdp: law freezing implies a pending drain: not freezing or pending
+    # gdp: law a pending drain has a fixed five minute window: not pending or deadline == started + 300.0
+    def __init__(self):
+        self.pending = False
+        self.freezing = False
+        self.started = 0.0
+        self.deadline = 0.0
+        self.generation = 0
+
+    # gdp: law repeated begin never slides the drain deadline: not old(pending) or deadline == old(deadline)
+    # gdp: law repeated begin preserves the entire drain: not old(pending) or (pending == old(pending) and freezing == old(freezing) and started == old(started) and self.generation == old(self.generation))
+    # gdp: law a new drain gets exactly five minutes: old(pending) or (pending and not freezing and started == now and deadline == now + 300.0)
+    # gdp: law a new drain advances its generation: old(pending) or self.generation == old(self.generation) + 1
+    # gdp: law begin returns the current generation: result == self.generation
+    def begin(self, now: float) -> int:
+        if not self.pending:
+            self.generation += 1
+            self.pending = True
+            self.freezing = False
+            self.started = now
+            self.deadline = now + 300.0
+        return self.generation
+
+    # gdp: law only a pending drain freezes placement: freezing == pending and result == freezing
+    def freeze(self) -> bool:
+        self.freezing = self.pending
+        return self.freezing
+
+    # gdp: law only the current generation can finish: result == (generation == old(self.generation))
+    # gdp: law stale completion preserves the entire drain: generation == old(self.generation) or (pending == old(pending) and freezing == old(freezing) and started == old(started) and deadline == old(deadline) and self.generation == old(self.generation))
+    # gdp: law current completion resumes growth and placement: generation != old(self.generation) or (not pending and not freezing)
+    # gdp: law completion retains the window and generation: started == old(started) and deadline == old(deadline) and self.generation == old(self.generation)
+    def finish(self, generation: int) -> bool:
+        if generation != self.generation:
+            return False
+        self.pending = False
+        self.freezing = False
+        return True
+
+    def expired(self, now: float) -> bool:
+        return handoff_drain_expired(self.pending, now, self.deadline)
+
+    def growth_allowed(self) -> bool:
+        return handoff_drain_growth_allowed(self.pending)
+
+    def placement_allowed(self) -> bool:
+        return handoff_drain_placement_allowed(self.freezing)
+
+
 # gdp: law no absent record is quarantined: persisted or not result
 # gdp: law no record without durable close authority is quarantined: closed or not result
 # gdp: law every persisted durably closed record is quarantined: not persisted or not closed or result
