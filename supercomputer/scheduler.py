@@ -1150,6 +1150,8 @@ class Scheduler:
             vm.ready, vm.t_ready, vm.idle_since = True, now, now
             if snap:  # (a handoff: its items exactly as the old one held them there, no record older than that)
                 for x in i.get("items", []):
+                    if not isinstance(x.get("run_name"), str) or not x["run_name"]:
+                        continue  # Missing live names must fail readiness too, never crash takeover.
                     b = self.batches.get(x.get("batch"))
                     it = b.items.get(x.get("name")) if b else None
                     if it is None or b.closed:
@@ -5059,9 +5061,9 @@ class Scheduler:
             return
         log(f"{vm.id}: lost")
         with self.lock:
-            # Persist why cleanup became unreachable before releasing this VM.
-            # This diagnostic is never namespace-reap proof and never changes a verdict.
-            for it in vm.running.values():
+            # A best-effort diagnostic never proves reap or stalls unrelated loss handling.
+            held = {id(it): it for it in list(vm.running.values()) + list(vm.finishing.values())}
+            for it in held.values():
                 if it.batch.strict_once and it.state == "done" and not it.owned.reaped and not it.terminal_loss:
                     pl = it.last_placement or {}
                     evidence = {"phase": "terminal_vm_lost", "name": it.name,
@@ -5069,8 +5071,12 @@ class Scheduler:
                                 "boot_id": pl.get("boot_id"), "identity": it.launch_identity,
                                 "attempt": it.owned.placements, "cleanup_complete": False,
                                 "reason": "worker_lost_before_terminal_reap", "t": time.time()}
-                    self._append_owned(it.batch.id, "cancel", evidence)
-                    it.terminal_loss = evidence
+                    try:
+                        self._append_owned(it.batch.id, "cancel", evidence)
+                    except OSError as exc:
+                        log(f"{vm.id}: terminal loss diagnostic not persisted for {it.batch.id}/{it.run_name}: {exc!r}")
+                    else:
+                        it.terminal_loss = evidence
                     it.owned.cancel()
             vm.dead = True
             # (rules.slept_through, ItemFate.vm_lost: a VM boat stopped while this machine slept is no strike)

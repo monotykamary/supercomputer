@@ -169,6 +169,15 @@ clock and delivered fate; it never derives an extra attempt from a run-name
 suffix. A lost worker with pending terminal cleanup is durably recorded as
 `terminal_vm_lost` and exposed in the close receipt. This is diagnostic evidence
 only: it never marks a namespace reaped or replaces the original verdict.
+The diagnostic covers held terminal items in both `running` and `finishing`.
+An unwritable diagnostic journal is logged but does not stall VM-wide loss
+handling: other strict attempts and legacy items still follow their existing
+loss paths; durable placement/result ownership and the no-replay fence remain.
+History, backups and batch fetch preserve this journal phase as opaque audit
+bytes, not as a reap receipt. Reap consumers must require matching native
+`reaped` and `namespace_absent` evidence, not just a matching identity.
+Older terminal rows without a run name in either the row or its placement
+refuse takeover and must be closed before handoff; their evidence is not rewritten.
 
 `/capabilities.code` is the serving scheduler's frozen `self.code`, consistent
 with `/status.code`. `code_installed` uses the same last sampled install marker

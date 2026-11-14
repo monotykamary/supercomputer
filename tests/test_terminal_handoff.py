@@ -359,20 +359,59 @@ class TerminalHandoff(unittest.TestCase):
         self.assertFalse(restored.owned.reaped)
         self.assertEqual(restored.state, "done")
 
-    def test_failed_loss_journal_keeps_the_worker_and_cleanup_hold(self):
+    def test_diagnostic_write_failure_does_not_stall_other_vm_items(self):
+        from test_wiring import batch as make_batch
+        self.terminal()
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                child, _ = self.candidate()
+                item = child.batches[self.b.id].items[self.it.name]
+                vm = child.vms[self.vm.id]
+                other = make_batch(child, bid="other").items["i0"]
+                other.batch.strict_once = strict
+                other.vm, other.state = vm, "running"
+                other.fate.place(vm.id, False)
+                vm.running[(other.batch.id, other.run_name)] = other
+                child._let_go, child._boat_failed = Mock(), Mock()
+                with patch.object(child, "_append_owned", side_effect=OSError("fsync failed")):
+                    child._lost_vm(vm)
+                self.assertTrue(vm.dead)
+                self.assertFalse(item.owned.reaped)
+                self.assertTrue(item.owned.closed)
+                self.assertIsNone(item.terminal_loss)
+                child._let_go.assert_called_once_with(vm, stop=True)
+                self.assertIs(child._boat_failed.call_args.args[0], other)
+                self.assertFalse(child._close_receipt(item.batch)["cleanup_complete"])
+
+    def test_terminal_in_finishing_gets_one_loss_diagnostic(self):
         self.terminal()
         child, _ = self.candidate()
         item = child.batches[self.b.id].items[self.it.name]
         vm = child.vms[self.vm.id]
+        key = (self.b.id, item.run_name)
+        vm.finishing[key] = vm.running.pop(key)
         child._let_go = Mock()
-        with patch.object(child, "_append_owned", side_effect=OSError("fsync failed")):
-            with self.assertRaisesRegex(OSError, "fsync failed"):
-                child._lost_vm(vm)
-        self.assertFalse(vm.dead)
-        self.assertIs(child.vms[vm.id], vm)
-        self.assertIs(vm.running[(self.b.id, item.run_name)], item)
+        child._lost_vm(vm)
+        self.assertIsNotNone(item.terminal_loss)
+        self.assertTrue(child._matching_terminal_loss(item, item.terminal_loss))
         self.assertFalse(item.owned.reaped)
-        child._let_go.assert_not_called()
+        events = [json.loads(x) for x in (self.root / "queue" / (self.b.id + ".cancel")).read_text().splitlines()]
+        self.assertEqual(sum(x.get("phase") == "terminal_vm_lost" for x in events), 1)
+
+    def test_live_missing_or_invalid_run_name_refuses_without_crashing(self):
+        self.place_without_thread()
+        for value in (None, "", 17, "missing"):
+            with self.subTest(value=value):
+                snap = self.snapshot()
+                offered = snap["vms"][0]["items"][0]
+                if value == "missing":
+                    del offered["run_name"]
+                else:
+                    offered["run_name"] = value
+                child, _ = self.candidate(snap)
+                self.assertFalse(child.recovery["ready"])
+                self.assertFalse(any(vm.running for vm in child.vms.values()))
+                child._start_on.assert_not_called()
 
     def test_non_strict_terminal_offer_is_not_a_cleanup_hold(self):
         self.terminal()
