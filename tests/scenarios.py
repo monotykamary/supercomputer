@@ -1463,6 +1463,14 @@ def handoff_blocked_extra(code):
     def deploy():
         proc, s = sim.w.live_sched()
         def offer():
+            # This case measures transfer of a settled pool, not the (correct)
+            # deferral while a replacement worker is still being bootstrapped.
+            # Introduce the unoffered extra only when we can offer immediately;
+            # otherwise the still-serving parent may legitimately adopt it.
+            deadline = sim.k.now + 180
+            while not s._pool_settled():
+                assert sim.k.now < deadline, "handoff fixture did not settle"
+                sim.k.sleep(0.1)
             with s.lock:
                 v = sim.w.warm_vm(IMAGE)
                 lease = sim.B.read_agent(v.id)["lease"]
@@ -1769,11 +1777,18 @@ def _waste_watch(sim, grace: float = 90.0, every: float = 10.0, t_from: float = 
                 if it["klass"] in REAL and now - since[key] >= grace:
                     waiters.append(it)
             cap = []
+            ls = sim.w.live_sched()
+            held = getattr(ls[1], "vms", {}) if ls else {}
             for v in sim.w.vms.values():
-                if v.state != W.RUNNING or not (v.daemon == "up" or v.t_daemon is not None):
+                sv = held.get(v.id)
+                # A daemon coming up is not yet placeable. Ignore reservations:
+                # a ready VM blocked by a ghost reservation MUST count as waste.
+                if (v.state != W.RUNNING or v.daemon != "up" or sv is None
+                        or not sv.ready or sv.dead or getattr(sv, "upgrading", False)):
                     continue
                 slots = max(1, v.cpus // 2)
                 used = fil = swp = 0
+                accounted = set()
                 for pr in v.procs.values():  # (a run ended within the last 5 s is its report on its way: not idle yet)
                     j = pr["job"]
                     if pr["alive"] or (j.done is not None and not j.acked and now - j.mtime < 5):
@@ -1784,6 +1799,11 @@ def _waste_watch(sim, grace: float = 90.0, every: float = 10.0, t_from: float = 
                         # preemptible work: its replacement may already hold these slots.
                         fil += n if pr["alive"] and gt.get("klass") == "filler" else 0
                         swp += n if pr["alive"] and gt.get("klass") == "sweep" else 0
+                        accounted.add((pr["batch"], j.spec.get("name")))
+                # A dispatched start owns slots before the process appears in
+                # agent inventory. Do not mislabel prep/transport time as idle.
+                used += sum(x.weight for x in sv.running.values()
+                            if x.state == "starting" and (x.batch.id, x.run_name) not in accounted)
                 cap.append([v, max(0, slots - used), fil, swp, slots])
             snap = [f"{c[0].id[-4:]}:idle{c[1]}+f{c[2]}+s{c[3]}" for c in cap if c[1] + c[2] + c[3]][:12]
             idle_ids = [c[0].id for c in cap if c[1]][:3]
@@ -2029,7 +2049,7 @@ def wide_beside_gates(code):
           "a submission client at its share on its image's pool of filler while a gate of another image waits for a VM that never comes: the submission takes the filler's slots (before: any waiting gate, of any image, held it at its share)")
 def share_other_image(code):
     from tests.sim.harness import items
-    sim = _sim(code, cfg={"never_ready_until": 10 ** 6}, policy={"sub_vms": 1})
+    sim = _sim(code, cfg={"never_ready_until": 10 ** 6, "images": ["sc-img-sim", "sc-img-other"]}, policy={"sub_vms": 1})
     _warm(sim, 8)
     sim.treadmill(base_vms=8, filler_s=1800, backlog=True)
     sim.scheduler()
@@ -2040,7 +2060,9 @@ def share_other_image(code):
     def extra(sim, m):
         m["waste"] = {**rec, "mean": round(rec["slot_s"] / 10 / rec["samples"], 2) if rec["samples"] else None}
         m["sub_waits"] = _waits(sim, "lane-s")
-        return {"no_filler_while_real_waits": rec["samples"] > 0 and rec["slot_s"] / 10 / rec["samples"] <= 0.5}
+        return {"no_filler_while_real_waits": rec["samples"] > 0 and rec["slot_s"] / 10 / rec["samples"] <= 0.5,
+                "other_image_exercised": any(e["kind"] == "start" and e.get("image") == "sc-img-other"
+                                             for e in sim.w.events)}
     return sim, {"extra": extra}
 
 
@@ -2598,7 +2620,11 @@ def closed_legacy_slot(code):
           "one client queues 68 slot-hours on 28 large VMs: grow for the gate deadline, not the economic window")
 def gate_68_slot_hours(code):
     from tests.sim.harness import items
-    sim = _sim(code, policy={"floor_default": 28})
+    # This checks discrete gate-capacity sizing, including whether each purchase
+    # is useful. Fix the supply latency: with unpredictable boot times a correct
+    # estimate can buy a worker that arrives after faster workers clear the tail.
+    # The other growth/bringup scenarios retain the default variable boot times.
+    sim = _sim(code, cfg={"boot_s": (90, 90)}, policy={"floor_default": 28})
     _warm(sim, 28)
     sim.scheduler()
     bid = sim.batch("large-gate", "gate", items("g", 816, 300), after=30)

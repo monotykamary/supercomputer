@@ -188,6 +188,8 @@ class World:
         self.rng = random.Random(seed)
         self.cfg = {"boot_s": (60, 120), "resume_s": (30, 60), "api_s": 1.0, "exec_s": 1.5, "rpc_s": 0.15, "cpus": 8, "minute": 60, "hour": 2000, "day": 20000,
                     "refuse_p": 0.0, "never_ready_p": 0.0, **(cfg or {})}
+        # Named snapshots outlive their workers. A cold pool still has its image.
+        self.images: set[str] = set(self.cfg.get("images", ()))
         self.vms: dict[str, VMRec] = {}
         self.events: list[dict] = []
         self.front_down: list[tuple] = []  # (t0, t1, also_exec)
@@ -217,7 +219,7 @@ class World:
     def share_pool(self, other):
         """Share the provider, never local registries, agent credentials or scheduler locks."""
         self.pool = getattr(other, "pool", other)
-        for field in ("vms", "events", "items", "batches", "front_down", "api_down", "client_errors", "log_lines"):
+        for field in ("vms", "images", "events", "items", "batches", "front_down", "api_down", "client_errors", "log_lines"):
             setattr(self, field, getattr(self.pool, field))
 
     # -- bookkeeping
@@ -322,7 +324,7 @@ class World:
                            "pageInfo": {"hasMore": len(vs) > page, "limit": page, "nextCursor": "c" if len(vs) > page else None}})
 
     def cli_snapshots(self, args):
-        return json.dumps({"named": [{"name": i, "status": "ready"} for i in {v.image for v in self.vms.values()}]})
+        return json.dumps({"named": [{"name": i, "status": "ready"} for i in sorted(self.images)]})
 
     def limits(self):
         now = self.k.now
@@ -344,6 +346,8 @@ class World:
 
     def cli_new(self, args):
         image = args[args.index("--from") + 1]
+        if image not in self.images:
+            return (f"snapshot {image} not found",)
         name = args[args.index("--name") + 1] if "--name" in args else image
         vm_type = args[args.index("--type") + 1] if "--type" in args else "large"
         n = int(args[args.index("--count") + 1]) if "--count" in args else 1
@@ -365,6 +369,7 @@ class World:
         return "\n".join(lines)
 
     def add_vm(self, image, vm_type="large", ttl=900, up_now=False, never_ready=None) -> VMRec:
+        self.images.add(image)
         v = VMRec(self._new_id(), image, vm_type, {"small": 2, "default": 4, "large": 8, "xlarge": 16}.get(vm_type, 8), self.k.now)
         v.until = self.k.now + ttl
         v.cv = self.th.Condition()

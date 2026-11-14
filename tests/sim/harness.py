@@ -40,7 +40,7 @@ class Sim:
         self.k = shared.k if shared is not None else K.Kernel(T0, seed)
         package = "supercomputer" if shared is None else "supercomputer_sim_" + machine.replace("-", "_")
         self.code = W.load_code(code_dir, self.tmp, name=package)
-        self.w = W.World(self.k, self.code, self.tmp, seed, cfg)
+        self.w = W.World(self.k, self.code, self.tmp, seed, {"images": [IMAGE], **(cfg or {})})
         self.w.machine = machine
         self.peers = shared.peers if shared is not None else []
         self.peers.append(self)
