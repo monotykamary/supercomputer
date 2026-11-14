@@ -383,6 +383,54 @@ class TerminalHandoff(unittest.TestCase):
                 self.assertIs(child._boat_failed.call_args.args[0], other)
                 self.assertFalse(child._close_receipt(item.batch)["cleanup_complete"])
 
+    def test_torn_loss_diagnostic_cannot_swallow_later_native_reap(self):
+        self.terminal()
+        self.s._append_owned(self.b.id, "cancel", {
+            "name": self.it.name, "run_name": self.it.run_name,
+            "identity": self.it.launch_identity, "admission_closed": True})
+        child, _ = self.candidate()
+        item = child.batches[self.b.id].items[self.it.name]
+        vm = child.vms[self.vm.id]
+        path = self.root / "queue" / (self.b.id + ".cancel")
+        rows = (self.root / "queue" / (self.b.id + ".rows")).read_bytes()
+        prefix = path.read_bytes()
+
+        def torn_append(*args):
+            with path.open("ab") as f:
+                f.write(b'{"phase":"terminal_vm_lost","name":')
+            raise OSError("disk full after partial append")
+
+        child._let_go = Mock()
+        with patch.object(child, "_append_owned", side_effect=torn_append):
+            child._lost_vm(vm)
+        self.assertTrue(vm.dead)
+        self.assertFalse(item.owned.reaped)
+        self.assertIsNone(item.terminal_loss)
+        receipt = {"name": self.it.name, "run_name": self.it.run_name,
+                   "identity": self.it.launch_identity, "matched": True,
+                   "receipt": self.good_receipt()}
+        child._append_owned(self.b.id, "cancel", receipt)
+        self.assertTrue(path.read_bytes().startswith(prefix))
+        self.assertEqual(S.jlines(path)[-1], receipt)
+        reloaded = sched()
+        reloaded._take_pool = Mock()
+        reloaded.reload()
+        restored = reloaded.batches[self.b.id].items[self.it.name]
+        self.assertTrue(restored.owned.reaped)
+        self.assertEqual(restored.state, "done")
+        self.assertEqual((self.root / "queue" / (self.b.id + ".rows")).read_bytes(), rows)
+
+    def test_non_oserror_diagnostic_failure_still_propagates(self):
+        self.terminal()
+        child, _ = self.candidate()
+        vm = child.vms[self.vm.id]
+        child._let_go = Mock()
+        with patch.object(child, "_append_owned", side_effect=ValueError("invalid evidence")):
+            with self.assertRaisesRegex(ValueError, "invalid evidence"):
+                child._lost_vm(vm)
+        self.assertFalse(vm.dead)
+        child._let_go.assert_not_called()
+
     def test_terminal_in_finishing_gets_one_loss_diagnostic(self):
         self.terminal()
         child, _ = self.candidate()
@@ -412,6 +460,29 @@ class TerminalHandoff(unittest.TestCase):
                 self.assertFalse(child.recovery["ready"])
                 self.assertFalse(any(vm.running for vm in child.vms.values()))
                 child._start_on.assert_not_called()
+
+    def assert_unhashable_names_refuse(self):
+        before = self.journal_bytes()
+        for field in ("batch", "name", "run_name"):
+            for value in ([], {}, ["invalid"], {"invalid": "name"}):
+                with self.subTest(field=field, value=value):
+                    snap = self.snapshot()
+                    snap["vms"][0]["items"][0][field] = value
+                    child, _ = self.candidate(snap)
+                    self.assertFalse(child.recovery["ready"])
+                    self.assertTrue(child.recovery_blocked)
+                    self.assertEqual(child.recovery["item_mismatch"]["invalid_count"], 1)
+                    self.assertFalse(any(vm.running for vm in child.vms.values()))
+                    self.assertEqual(self.journal_bytes(), before)
+                    child._start_on.assert_not_called()
+
+    def test_unhashable_live_identity_names_refuse_without_crashing(self):
+        self.place_without_thread()
+        self.assert_unhashable_names_refuse()
+
+    def test_unhashable_terminal_identity_names_refuse_without_crashing(self):
+        self.terminal()
+        self.assert_unhashable_names_refuse()
 
     def test_non_strict_terminal_offer_is_not_a_cleanup_hold(self):
         self.terminal()

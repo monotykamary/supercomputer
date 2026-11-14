@@ -173,9 +173,14 @@ The diagnostic covers held terminal items in both `running` and `finishing`.
 An unwritable diagnostic journal is logged but does not stall VM-wide loss
 handling: other strict attempts and legacy items still follow their existing
 loss paths; durable placement/result ownership and the no-replay fence remain.
+Only `OSError` is caught by design; programming and validation errors still
+propagate. A later owned-journal append starts on a fresh line after a torn
+tail, so the skipped partial diagnostic cannot swallow a genuine reap receipt.
 History, backups and batch fetch preserve this journal phase as opaque audit
 bytes, not as a reap receipt. Reap consumers must require matching native
 `reaped` and `namespace_absent` evidence, not just a matching identity.
+Malformed batch, item and run-name fields refuse readiness without being used as
+dictionary keys; omitting invalid names from the comparison never grants readiness.
 Older terminal rows without a run name in either the row or its placement
 refuse takeover and must be closed before handoff; their evidence is not rewritten.
 

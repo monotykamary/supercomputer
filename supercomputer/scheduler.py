@@ -1124,6 +1124,11 @@ class Scheduler:
 
         with concurrent.futures.ThreadPoolExecutor(32) as ex:
             acquired = dict(zip(taken, ex.map(acquire, taken)))
+        def named_item(item):
+            return (isinstance(item, dict) and
+                    all(isinstance(item.get(key), str) and item[key]
+                        for key in ("batch", "name", "run_name")))
+
         for vid in list(taken):
             i, hb = info.get(vid, {}), self.held_before.get(vid, {})
             cl, vm, valid = acquired[vid]
@@ -1150,8 +1155,8 @@ class Scheduler:
             vm.ready, vm.t_ready, vm.idle_since = True, now, now
             if snap:  # (a handoff: its items exactly as the old one held them there, no record older than that)
                 for x in i.get("items", []):
-                    if not isinstance(x.get("run_name"), str) or not x["run_name"]:
-                        continue  # Missing live names must fail readiness too, never crash takeover.
+                    if not named_item(x):
+                        continue  # Invalid identity fields must refuse readiness, never crash takeover.
                     b = self.batches.get(x.get("batch"))
                     it = b.items.get(x.get("name")) if b else None
                     if it is None or b.closed:
@@ -1180,11 +1185,17 @@ class Scheduler:
                         else:
                             starting.append((it, vm))  # Legacy agents deduplicate the same run name.
             self.vms[vid] = vm
-        expected_items = {(v["id"], x.get("batch"), x.get("name"), x.get("run_name")): x.get("launch_identity")
-                          for v in info.values() for x in v.get("items", []) if x.get("batch") not in closed}
+        expected_items, invalid_items = {}, 0
+        for v in info.values():
+            for x in v.get("items", []):
+                if not named_item(x):
+                    invalid_items += 1
+                    continue
+                if x["batch"] not in closed:
+                    expected_items[(v["id"], x["batch"], x["name"], x["run_name"])] = x.get("launch_identity")
         actual_items = {(v.id, it.batch.id, it.name, it.run_name): it.launch_identity
                         for v in self.vms.values() for it in v.running.values()}
-        items_ready = not snap or expected_items == actual_items
+        items_ready = not snap or (invalid_items == 0 and expected_items == actual_items)
         if not items_ready:
             self.recovery_blocked = True
             self.recovery["ready"] = False
@@ -1194,6 +1205,7 @@ class Scheduler:
             changed_items = sorted((k for k in expected_items.keys() & actual_items.keys()
                                     if expected_items[k] != actual_items[k]), key=repr)
             self.recovery["item_mismatch"] = {
+                "invalid_count": invalid_items,
                 "missing_count": len(missing_items), "extra_count": len(extra_items),
                 "changed_count": len(changed_items), "missing": missing_items[:8],
                 "extra": extra_items[:8], "changed": changed_items[:8]}
@@ -1839,8 +1851,13 @@ class Scheduler:
     def _append_owned(bid, suffix, record):
         qd = DIR / "queue"
         qd.mkdir(parents=True, exist_ok=True)
-        with open(qd / f"{bid}.{suffix}", "a") as f:
-            f.write(json.dumps(record) + "\n")
+        with open(qd / f"{bid}.{suffix}", "a+b") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell():
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")  # Isolate a torn tail before appending valid evidence.
+            f.write((json.dumps(record) + "\n").encode())
             f.flush()
             os.fsync(f.fileno())
         fd = os.open(qd, os.O_RDONLY)
