@@ -499,9 +499,9 @@ class TerminalHandoff(unittest.TestCase):
         with path.open("a+b") as holder:
             S.fcntl.flock(holder, S.fcntl.LOCK_EX | S.fcntl.LOCK_NB)
             with patch.object(S.time, "sleep") as sleep:
-                with self.assertRaisesRegex(BlockingIOError, "after 3 attempts"):
+                with self.assertRaisesRegex(BlockingIOError, "after 21 attempts"):
                     self.s._append_owned(self.b.id, "cancel", {"after": True})
-                self.assertEqual(sleep.call_args_list, [((0.01,),), ((0.01,),)])
+                self.assertEqual([call.args for call in sleep.call_args_list], [(0.1,)] * 20)
             self.assertEqual(path.read_bytes(), prefix)
         self.s._append_owned(self.b.id, "cancel", {"after": True})
         self.assertEqual(S.Scheduler._read_journal(path, True), [{"before": True}, {"after": True}])

@@ -180,8 +180,10 @@ short writes also roll back. A failed rollback is a hard error, not an ignored
 diagnostic failure. The strict reader remains strict: a tail torn by process
 death or other pre-existing malformed evidence still quarantines the admission.
 Only non-strict journal readers may skip malformed lines; strict evidence is
-never repaired by inserting a newline. Lock acquisition uses three nonblocking
-attempts with at most two 10 ms sleeps, then refuses without changing bytes.
+never repaired by inserting a newline. Lock acquisition uses 21 nonblocking
+attempts with twenty 100 ms sleeps (a two-second sleep budget), then refuses
+without changing bytes. A busy lock is an `OSError`; the loss-diagnostic path
+skips that diagnostic while preserving the admission fence and other loss handling.
 A live torn tail makes later appends raise `ValueError`; loss handling for a VM
 carrying that admission's pending terminal cleanup stops by design, preserving
 custody instead of discarding the damaged evidence.
