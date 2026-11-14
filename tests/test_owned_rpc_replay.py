@@ -80,6 +80,45 @@ class OwnedReplayTests(unittest.TestCase):
             self.assertIn(expected, str(error.exception))
             self.assertNotIn('secret', str(error.exception))
 
+    def test_authenticated_dispatch_fences_cached_and_fresh_requests(self):
+        fence = A.lease('claim', {'owner': 'owner-a', 'vm_id': 'vm-a'})
+        self.assertTrue(fence['ok'])
+        def call(request, lease=fence, owner='owner-a'):
+            return A.rpc_dispatch('owned_rpc', [request, {'_lease': lease}], token_owner=owner)
+        with patch.object(A, 'vtick', return_value=self.result) as body:
+            first = call(self.request)
+            self.assertTrue(first['ok'])
+            original = A._lease_record()
+            changes = ({'state': 'released'}, {'state': 'stopping'}, {'draining': True},
+                       {'epoch': original['epoch'] + 1}, {'holder': 'owner-b'}, {'boot': 'other-boot'})
+            for change in changes:
+                with self.subTest(change=change):
+                    A._lease_save({**original, **change})
+                    self.assertTrue(call(self.request)['stale'])
+                    self.assertTrue(call({**self.request, 'nonce': secrets.token_hex(16)})['stale'])
+            A._lease_save(original)
+            self.assertEqual(call(self.request), first)
+            body.assert_called_once()
+
+    def test_authenticated_owner_change_cannot_replay_receipt(self):
+        fence = A.lease('claim', {'owner': 'owner-a', 'vm_id': 'vm-a'})
+        with patch.object(A, 'vtick', return_value=self.result) as body:
+            first = A.rpc_dispatch('owned_rpc', [self.request, {'_lease': fence}], token_owner='owner-a')
+            self.assertTrue(first['ok'])
+            record = A._lease_record()
+            A._lease_save({**record, 'holder': 'owner-b', 'owner': 'owner-b', 'epoch': record['epoch'] + 1})
+            other = {**fence, 'holder': 'owner-b', 'owner': 'owner-b', 'epoch': record['epoch'] + 1}
+            reply = A.rpc_dispatch('owned_rpc', [self.request, {'_lease': other}], token_owner='owner-b')
+            self.assertEqual(reply['error'], 'owned_nonce_conflict')
+            body.assert_called_once()
+
+    def test_changed_source_cannot_replay_receipt(self):
+        with patch.object(A, 'vtick', return_value=self.result) as body:
+            A.owned_rpc(self.request)
+            with patch.object(A, 'VERSION', 'different-source'):
+                self.assertEqual(A.owned_rpc(self.request)['error'], 'owned_nonce_conflict')
+            body.assert_called_once()
+
     def test_changed_body_with_used_nonce_is_refused(self):
         with patch.object(A, 'vtick', return_value=self.result) as body:
             first = A.owned_rpc(self.request)

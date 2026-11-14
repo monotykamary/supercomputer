@@ -3060,7 +3060,7 @@ def rpc_dispatch(cmd, args, token_owner=None, cli=False):
     try:
         # Strict dispatch takes rpc_gate_lock internally; preserve global order
         # lease -> rpc gate -> owned-items, including concurrent upgrades.
-        with _lease_request(fence), (lease_lock() if cmd == "owned_rpc" else contextlib.nullcontext()):
+        with _lease_request(fence), (lease_guard(fence) if cmd == "owned_rpc" else contextlib.nullcontext()):
             if not cli and cmd == "cacheout" and len(args) > 2 and args[2] == "tar":
                 return cache_tar(args[0], args[1])
             if not cli and cmd in ("tick", "vtick"):

@@ -1035,7 +1035,7 @@ class Agent:
             request.get("version") == self.d.version, fresh, True, False)
         envelope = {"protocol": 1, "version": self.d.version, "nonce": nonce, "features": features}
         digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
-        scope = (self.v.boot, self.d.version)
+        scope = (self.v.boot, self.d.version, self.caller)
         prior = self.d.owned_rpc_receipts.get(nonce)
         decision = self.A._A.owned_rpc_decision(prior is not None, bool(prior and prior['digest'] == digest),
                                               bool(prior and prior['scope'] == scope), bool(prior and prior['state'] == 'complete'), allowed)
