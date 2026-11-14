@@ -1494,7 +1494,9 @@ class Scheduler:
                             self._boat_failed(it, vid, f"its VM {vid} not reached after the restart")
                         else:  # (its agent hung on a VM boat reports up: ours to repair, no strike; B2)
                             it.head = True
-        self.reattach_pending = set()
+        with self.lock:
+            self.reattaching = False
+            self.reattach_pending = set()
         if n or pending:
             log(f"re-attached {n} items running on {len(by_vm) - len(pending)} VMs since before the restart; {len(pending)} VMs left to adoption, their items queued again")
         taken = [self.vms[vid] for vid in getattr(self, "_handoff", {}).get("taken", []) if vid in self.vms]
@@ -5318,7 +5320,10 @@ class Scheduler:
                     else:
                         # A changed/withdrawn install must earn stability anew.
                         with self.lock:
-                            self._clear_handoff_pending(pending["generation"])
+                            self.__dict__.pop("_install", None)
+                            pending["invalidated"] = True
+                            if not getattr(self, "_handoff_preparing", False):
+                                self._clear_handoff_pending(pending["generation"])
                 else:
                     h = code_hash()
                     inst = self.__dict__.setdefault("_install", rules.Install(self.code, 60))
@@ -5538,6 +5543,8 @@ class Scheduler:
             # Imports, source copies and provider observation happened while placement continued.
             request_lock = getattr(self, "_request_lock", self.lock)
             with request_lock, self.lock:
+                if pending and pending.get("invalidated"):
+                    return  # A source change observed during preparation stays cancelled.
                 required_runtime = any("runtime" in it.spec
                                        for b in self.batches.values() for it in b.items.values())
                 if required_runtime and not all(prepared[target].get("runtime_pins_protocol") is True for target in candidates):
@@ -5678,7 +5685,7 @@ class Scheduler:
                     self._resume_handoff(previous_files)
             finally:
                 with self.lock:
-                    if not keep_pending and generation is not None:
+                    if generation is not None and (not keep_pending or pending.get("invalidated")):
                         self._clear_handoff_pending(generation)
                     self._handoff_preparing = False
 

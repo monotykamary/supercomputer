@@ -366,6 +366,123 @@ class HandoffDrainWiring(unittest.TestCase):
         self.assert_open()
         self.popen.assert_not_called()
 
+    def test_changed_or_withdrawn_install_must_earn_stability_again(self):
+        self.s.canary.handback_due.return_value = None
+        self.s.adopting = True
+
+        def sampler_once(now):
+            self.s.stop = mock.Mock()
+            self.s.stop.wait.side_effect = [False, True]
+            with mock.patch.object(S.time, "time", return_value=now), \
+                 mock.patch.object(self.s, "_flush_status_timings"), \
+                 mock.patch.object(self.s, "_watch"), \
+                 mock.patch.object(self.s, "_handoff_check"), \
+                 mock.patch.object(self.s, "_breaker_eval"):
+                self.s._sampler()
+
+        for changed in ("other", "old"):
+            with self.subTest(changed=changed):
+                self.target = "new"
+                self.s._install = S.rules.Install("old", 60)
+                self.s._install.tick(100, "new", False)
+                self.begin_wait()
+                self.target = changed
+                sampler_once(200)
+                self.assert_open()
+                self.assertNotIn("_install", self.s.__dict__)
+                self.target = "new"
+                with mock.patch.object(self.s, "handoff") as handoff:
+                    sampler_once(201)
+                    self.assertEqual(self.s._install.t_seen, 201)
+                    sampler_once(260.999)
+                    handoff.assert_not_called()
+                    sampler_once(261)
+                    handoff.assert_called_once_with()
+
+    def test_sampler_cannot_cancel_an_in_progress_handoff_preparation(self):
+        pending = self.begin_wait()
+        self.s.canary.handback_due.return_value = None
+        self.s.adopting = True
+        observed = []
+
+        def sampler_once(now):
+            self.s.stop = mock.Mock()
+            self.s.stop.wait.side_effect = [False, True]
+            with mock.patch.object(S.time, "time", return_value=now), \
+                 mock.patch.object(self.s, "_flush_status_timings"), \
+                 mock.patch.object(self.s, "_watch"), \
+                 mock.patch.object(self.s, "_handoff_check"), \
+                 mock.patch.object(self.s, "_breaker_eval"):
+                self.s._sampler()
+
+        def probe(*_args, **_kwargs):
+            # A /reload retry is in provider observation while the ordinary
+            # sampler observes another install. Cancellation must not open its
+            # growth fence beneath the preparing handoff's local state.
+            self.assertTrue(self.s._handoff_preparing)
+            self.target = "other"
+            sampler_once(200)
+            observed.append((self.s._handoff_pending is pending,
+                             self.s._handoff_gate().pending))
+            return {}
+
+        with mock.patch.object(boat, "states", side_effect=probe):
+            self.s.handoff()
+        self.assertEqual(observed, [(True, True)])
+        self.assert_open()  # The preparing retry releases its invalidated fence.
+        sampler_once(205)
+        self.assert_open()
+
+    def test_source_return_cannot_erase_deferred_invalidation(self):
+        self.s._install = S.rules.Install("old", 60)
+        self.s._install.tick(100, "new", False)
+        pending = self.begin_wait()
+        self.s.canary.handback_due.return_value = None
+        self.s.adopting = True
+        observed = []
+
+        def sampler_once(now):
+            self.s.stop = mock.Mock()
+            self.s.stop.wait.side_effect = [False, True]
+            with mock.patch.object(S.time, "time", return_value=now), \
+                 mock.patch.object(self.s, "_flush_status_timings"), \
+                 mock.patch.object(self.s, "_watch"), \
+                 mock.patch.object(self.s, "_handoff_check"), \
+                 mock.patch.object(self.s, "_breaker_eval"):
+                self.s._sampler()
+
+        def probe(*_args, **_kwargs):
+            self.target = "other"
+            sampler_once(200)
+            observed.append((self.s._handoff_pending is pending,
+                             not self.s._handoff_gate().growth_allowed()))
+            self.assertNotIn("_install", self.s.__dict__)
+            self.target = "new"  # Returns before the preparing retry gives up.
+            return {}
+
+        with mock.patch.object(boat, "states", side_effect=probe):
+            self.s.handoff()
+        self.assertEqual(observed, [(True, True)])
+        self.assert_open()
+        with mock.patch.object(self.s, "handoff") as handoff:
+            sampler_once(201)
+            self.assertEqual(self.s._install.t_seen, 201)
+            sampler_once(260.999)
+            handoff.assert_not_called()
+            sampler_once(261)
+            handoff.assert_called_once_with()
+
+    def test_empty_reattachment_pass_clears_the_handoff_dependency(self):
+        self.s.reattaching = True
+        self.s.reattach_pending = set()
+        self.it.reattach = None  # The handoff already attached this item.
+        self.s.adopting = True  # No unrelated adoption thread in this test.
+        self.assertFalse(self.s._pool_settled())
+        self.s._reattach()
+        self.assertFalse(self.s.reattaching)
+        self.assertEqual(self.s.reattach_pending, set())
+        self.assertTrue(self.s._pool_settled())
+
     def test_candidate_rejection_restores_both_gates_and_keeps_pool(self):
         self.begin_wait()
         self.vm.ready = True
