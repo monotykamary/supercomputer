@@ -25,6 +25,39 @@ for an existing strict job and checks real namespace containment before payload
 execution. A new session/batch is a new intentional admission, not a reconnect;
 do not add a user-level retry loop for LOST.
 
+## Preparation-only retries and NOT_STARTED
+
+The controller may retry a transport failure **during preparation**, before any
+payload start has been requested. It uses the existing `boat_tries` preparation
+budget (normally three calls), without a new placement, VM, boot, launch nonce,
+physical-attempt allowance or fallback. Cancellation, shutdown and lease loss do
+not grant a retry. Permanent protocol/capability refusals keep their existing
+failure behavior.
+
+This path requires a complete, identity-bound `*.attempts` journal, opened and
+fsynced as `prelaunch_reserved` before the preparation thread starts. Each
+failed preparation appends a `prelaunch_not_started` record with `phase:
+"prelaunch"`, `status: "NOT_STARTED"`, and the SHA-256/byte length of the complete
+preceding journal prefix. That record is terminal for that preparation call,
+not necessarily for the item: a later safe preparation call may succeed.
+The scheduler still fsyncs `start_requested` before sending the sole launch RPC.
+
+If preparation exhausts its budget with complete evidence and no start request,
+the terminal item row is `NOT_STARTED`, code `-1`, with `prelaunch_evidence` and
+`prelaunch_failures`. A successful item may also report `prelaunch_failures`.
+`attempts: 1` continues to mean the single placement/physical-attempt reservation;
+it does not assert that a payload actually ran. Neither NOT_STARTED nor a
+preparation record proves namespace cleanup: the existing positive close/reap
+requirements still apply.
+
+A persisted `start_requested` is an irreversible no-retry boundary, even when
+its reply is absent or failed. Missing, torn, malformed or identity-mismatched
+audits are unknown, not proof of zero execution. Those cases remain fail-closed
+LOST, as do post-intent transport errors. Older admissions without the new
+reservation marker are not upgraded or replayed. Historical LOST rows are never
+rewritten; an explicitly authorized manual recovery is separate from this
+upstream automatic policy.
+
 ## Public tuple
 
 ```sh

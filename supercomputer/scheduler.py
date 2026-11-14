@@ -51,7 +51,8 @@ import threading
 import time
 import urllib.request
 
-from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
+from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, prelaunch, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
+from .rules.prelaunch import prelaunch_can_retry, prelaunch_not_started
 from .durable_groups import DurableGroups, active as durable_active
 from .boat import AgentClient, AgentError, Registry
 from .agent import AGENT_CAPABILITIES as BUILD_AGENT_CAPABILITIES
@@ -90,6 +91,10 @@ CLIENT = "scheduler"
 
 class OwnedAgentRefused(RuntimeError):
     pass
+
+
+class PrelaunchNotStarted(RuntimeError):
+    """Preparation ended with complete durable evidence that no start was requested."""
 
 
 class OwnedAgentClient:
@@ -1732,7 +1737,7 @@ class Scheduler:
         finally:
             os.close(fd)
 
-    def _owned_failed(self, it, why):
+    def _owned_failed(self, it, why, *, not_started=False):
         if it.state == "done" and any(r.get("name") == it.name for r in it.batch.rows):
             return
         # `lost` is a legacy retry request. A strict LOST is terminal, never that flag.
@@ -1747,6 +1752,10 @@ class Scheduler:
                         "cleanup_complete": it.owned.reaped,
                         "identity_unavailable": not bool(placement.get("vm") and
                             placement.get("boot_id") and placement.get("identity"))}
+        if it.batch.strict_once and not_started:
+            audit = self._prelaunch_evidence(it)
+            if prelaunch_not_started(audit['complete'], audit['reserved'], audit['start_requested']):
+                evidence.update(status='NOT_STARTED', prelaunch_evidence=audit)
         diagnostic = getattr(it.vm, 'lease_relinquishment', None)
         if isinstance(diagnostic, dict):
             evidence['lease_relinquishment'] = diagnostic
@@ -1772,6 +1781,9 @@ class Scheduler:
                                "max_attempts": b.max_attempts},
                    "status": "CANCELLED" if row.get("cancelled") else ("SUCCEEDED" if row.get("code") == 0 else "FAILED"),
                    **row}
+            audit = self._prelaunch_evidence(it)
+            if audit['complete'] and audit['failures']:
+                row['prelaunch_failures'] = audit['failures']
         row = self._result_store(b.id).compact_row(row)
         # Callers hold self.lock: first terminal result wins without replacement.
         with b.cv:
@@ -2830,6 +2842,10 @@ class Scheduler:
                 it.batch.durable_registry.reserve(it.last_placement, time.time())
             if it.batch.strict_once or it.batch.retain_journals or group:
                 self._append_owned(it.batch.id, "placed", it.last_placement)
+            if it.batch.strict_once:
+                self._append_owned(it.batch.id, 'attempts', {
+                    **self._prelaunch_binding(it), 'event': 'prelaunch_reserved',
+                    'protocol': 1, 'time': time.time()})
             if group and not durable_item(it):
                 it.batch.distinct_vms.setdefault(group, set()).add(vm.id)
         except Exception:
@@ -2883,12 +2899,79 @@ class Scheduler:
                 it = vm.running.get((bid, name))
                 if it is None:
                     continue
+                if b.strict_once and event == 'start_requested':
+                    binding = self._prelaunch_binding(it)
+                    if (it.vm is not vm or binding['vm'] != vm.id
+                            or binding['boot_id'] != (vm.lease or {}).get('boot')
+                            or start.get('spec', {}).get('launch_identity') != it.launch_identity):
+                        raise OwnedAgentRefused('strict start identity changed before launch')
+                    audit = self._prelaunch_evidence(it)
+                    if not prelaunch_not_started(audit['complete'], audit['reserved'], audit['start_requested']):
+                        raise OwnedAgentRefused('strict start audit incomplete or start already requested')
                 self._append_owned(bid, "attempts", {"event": event, "time": time.time(),
                     "batch": bid, "name": it.name, "run_name": name, "vm": vm.id,
                     "boot_id": (vm.lease or {}).get("boot"),
                     "launch_identity": it.launch_identity, "strict_once": b.strict_once})
                 recorded += 1
             return recorded == len(starts)
+
+    @staticmethod
+    def _prelaunch_binding(it):
+        p = it.last_placement or {}
+        return {'batch': it.batch.id, 'name': it.name, 'run_name': p.get('run_name'),
+                'vm': p.get('vm'), 'boot_id': p.get('boot_id'),
+                'launch_identity': p.get('identity')}
+
+    def _prelaunch_evidence(self, it):
+        return prelaunch.read(DIR / 'queue' / f'{it.batch.id}.attempts', self._prelaunch_binding(it))
+
+    def _strict_prepare(self, it: Item, vm: VMState) -> bool:
+        """Retry preparation only; this function cannot invoke a payload start.
+
+        Keep the original placement, nonce and physical-attempt reservation. Every
+        retry binds a complete audit prefix; a missing/torn journal or any durable
+        start_requested fails closed. BOAT_TRIES limits preparation calls, not
+        physical attempts. Cancellation and ownership loss never widen this path.
+        """
+        while True:
+            with self.lock:
+                if it.batch.admission_closed or it.owned.closed:
+                    it.state = 'cancel_pending'
+                    return False
+                binding = self._prelaunch_binding(it)
+                if binding['vm'] != vm.id or binding['boot_id'] != (vm.lease or {}).get('boot'):
+                    raise OwnedAgentRefused('strict prelaunch VM/boot identity changed')
+                audit = self._prelaunch_evidence(it)
+                if not prelaunch_not_started(audit['complete'], audit['reserved'], audit['start_requested']):
+                    raise OwnedAgentRefused('strict prelaunch audit incomplete or start already requested')
+                if self.stop.is_set():
+                    raise PrelaunchNotStarted('controller stopped before payload launch')
+            try:
+                self._verify_agent_capabilities(it, vm)
+                self._owned_client(vm).rpc('capabilities')
+                self._prepare(it.batch, vm)
+                self._verify_agent_capabilities(it, vm)
+                return True
+            except (AgentError, TimeoutError, ConnectionError) as error:
+                if isinstance(error, boat.LeaseProtocolLost) or vm.dead:
+                    raise
+                with self.lock:
+                    audit = self._prelaunch_evidence(it)
+                    if not prelaunch_not_started(audit['complete'], audit['reserved'], audit['start_requested']):
+                        raise
+                    diagnostic = lease_diagnostics.event(vm.id, 'prelaunch', client=vm.client, error=error)
+                    failure = audit['failures'] + 1
+                    self._append_owned(it.batch.id, 'attempts', {
+                        **self._prelaunch_binding(it), 'event': 'prelaunch_not_started',
+                        'phase': 'prelaunch', 'terminal': True, 'status': 'NOT_STARTED',
+                        'prelaunch_failure': failure, 'time': time.time(), 'audit': audit,
+                        'error': diagnostic['error']})
+                    retry = prelaunch_can_retry(audit['complete'], audit['reserved'],
+                        audit['start_requested'], True, it.batch.admission_closed or it.owned.closed,
+                        self.stop.is_set(), failure, max(1, BOAT_TRIES))
+                if not retry:
+                    raise PrelaunchNotStarted(diagnostic['error']['message']) from error
+                self.stop.wait(min(failure, 3))
 
     def _start_on(self, it: Item, vm: VMState):
         try:
@@ -2907,17 +2990,20 @@ class Scheduler:
                 if b.admission_closed or it.owned.closed:
                     it.state = "cancel_pending"
                     return
-            self._verify_agent_capabilities(it, vm)
             if b.strict_once:
-                self._owned_client(vm).rpc("capabilities")
-            self._prepare(b, vm)
+                if not self._strict_prepare(it, vm):
+                    return
+            else:
+                self._verify_agent_capabilities(it, vm)
+                self._prepare(b, vm)
             vm.prep_fails = 0  # (prepared: a candidate again; rules.may_slot)
             spec = {k: v for k, v in it.spec.items() if k not in ("est", "weight", "vm_type", "meta", "try", "orig", "timing")} | {"cpus": it.weight * boat.SLOT_CPU, "name": it.run_name, "launch_identity": it.launch_identity}
             if b.strict_once:
                 spec["strict_once"] = True
             if not (b.strict_once or b.retain_journals):
                 spec.pop("launch_identity", None)
-            self._verify_agent_capabilities(it, vm)
+            if not b.strict_once:
+                self._verify_agent_capabilities(it, vm)
             with self.lock:  # (its batch closed, the item preempted or moved while the batch was prepared here: never started.
                 if it.state != "starting" or it.vm is not vm or it.run_name != rn or b.closed or b.admission_closed or it.owned.closed:  # Their kill found nothing to kill: a run
                     if b.admission_closed or it.owned.closed:
@@ -2971,6 +3057,11 @@ class Scheduler:
                 raise RuntimeError(r["err"])
             for row in r.get("done", []):
                 self._accept_finished(vm, row)
+        except PrelaunchNotStarted as e:
+            with self.lock:
+                it.result_error = 'strict preparation NOT_STARTED; cleanup retained: ' + str(e)[:200]
+                self._owned_failed(it, it.result_error, not_started=True)
+            self.wake.set()
         except AgentCapabilityError as e:
             with self.lock:
                 vm.running.pop((b.id, rn), None)

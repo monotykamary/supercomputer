@@ -64,6 +64,15 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `resultrelay`, `Scheduler._outage_vms`, `_poll_one` | I/O + rule wiring | typed/refused localhost connection is worker-local quarantine; no exception secrets; multi-worker provider failures retain the global breaker. |
 | `lease_diagnostics`, `Scheduler._note_lease_relinquish`, `_drop_stale`, `boat._stop_fence` | observability only | bounded, credential-redacted first cause with expected/observed fence fields; kept in strict LOST rows before the dead wrapper can hide it. No extra RPC, retries, receipt import or authority decision; diagnostic failure cannot prevent fencing. Existing refusal classification is unchanged. |
 
+## Strict preparation retries
+
+| def | where | laws, or why |
+| --- | --- | --- |
+| `rules.prelaunch.prelaunch_not_started`, `prelaunch_can_retry` | rule | complete reserved evidence, no durable start request, open admission, live controller, transport failure and existing preparation budget; broken variants remove the evidence, intent and cancellation barriers. |
+| `prelaunch.inspect`, `read` | I/O validation | complete identity-bound JSONL, reservation before intent, exact prefix digest for each NOT_STARTED preparation record; missing/torn/malformed/unknown evidence fails closed. Parser regressions cover ambiguous history. |
+| `Scheduler._strict_prepare`, `_attempt_audit`, `_owned_failed` | I/O + exact rule wiring | same placement/VM/boot/nonce only; fsynced reservation precedes the start thread, fsynced intent precedes the sole payload RPC; no retry past intent and no rewrite of historic LOST. Unit and physical-process scenario regressions cover both sides of the fence. |
+| `strict_once_native` preparation fault | native one-VM gate | one pre-dispatch capability 502 recovers through the real scheduler/client/agent to one kernel payload; retains complete audit plus real namespace and cleanup evidence. No provider operations or production rollout. |
+
 ## Closed history and strict-close recovery
 
 | def | where | laws, or why |

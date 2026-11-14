@@ -210,6 +210,109 @@ def _strict_live(sim, bid):
             for v in sim.w.vms.values() for pid, p in v.procs.items() if p["batch"] == bid and p["alive"]]
 
 
+def _strict_prelaunch_case(code, mode):
+    """The real scheduler/client against HTTP faults, with independent process events."""
+    from tests.sim.harness import items
+    sim = _sim(code)
+    _warm(sim, 2)  # spare capacity makes an accidental replacement visible
+    sim.scheduler()
+    bid = sim.batch('prelaunch-' + mode, 'gate', items('p', 1, 60, weight=4),
+                    after=10, strict_once=True)
+    original = sim.w.agent_req
+    faults = []
+    def request(client, method, path, body, timeout):
+        if path.split('?')[0] != '/rpc':
+            return original(client, method, path, body, timeout)
+        message = json.loads(body or b'{}')
+        owned = message.get('cmd') == 'owned_rpc'
+        envelope = (message.get('args') or [{}])[0] if owned else {}
+        command = envelope.get('command')
+        before = ((mode == 'recover' and command in ('capabilities', 'begin') and command not in faults)
+                  or (mode == 'exhaust' and command == 'capabilities')
+                  or (mode == 'ambiguous' and command == 'capabilities' and not faults))
+        if before:
+            faults.append(command)
+            if mode == 'ambiguous':
+                with (sim.S.DIR / 'queue' / (bid + '.attempts')).open('ab') as journal:
+                    journal.write(b'{"event":"start_requested"')
+            sim.w.note('prelaunch_fault', batch=bid, command=command, mode=mode)
+            return 502, b'<html>502 fixture before dispatch</html>', 'text/html'
+        result = original(client, method, path, body, timeout)
+        if (mode == 'lost-reply' and command == 'vtick'
+                and envelope.get('args', [{}])[0].get('start')):
+            faults.append('start_reply')
+            sim.w.note('prelaunch_fault', batch=bid, command=command, mode=mode)
+            return 502, b'<html>502 fixture AFTER dispatch</html>', 'text/html'
+        return result
+    sim.w.agent_req = request
+    def extra(sim, m):
+        rows = sim.clients[bid]['items']
+        row = rows.get('p0') or {}
+        starts = [e for e in sim.w.events if e['kind'] == 'item_started' and e.get('batch') == bid]
+        placed = sim.S.jlines(sim.S.DIR / 'queue' / (bid + '.placed'))
+        raw = (sim.S.DIR / 'queue' / (bid + '.attempts')).read_bytes()
+        binding = {'batch': bid, 'name': 'p0', 'run_name': 'p0',
+                   'vm': row.get('vm'), 'boot_id': row.get('boot_id'),
+                   'launch_identity': row.get('launch_identity')}
+        audit = sim.S.prelaunch.inspect(raw, binding)
+        requests = [e for e in sim.w.events if e['kind'] == 'client_request' and e.get('batch') == bid]
+        m['prelaunch_retry'] = {'mode': mode, 'faults': faults, 'physical_starts': starts,
+                               'placements': placed, 'row': row, 'audit': audit,
+                               'journal': raw.decode(), 'requests': requests}
+        checks = {'one_persisted_placement': len(placed) == 1 and placed[0].get('attempt') == 1,
+                  'identity_unchanged': len(placed) == 1 and row.get('launch_identity') == placed[0].get('identity')
+                      and row.get('vm') == placed[0].get('vm') and row.get('boot_id') == placed[0].get('boot_id'),
+                  'one_admission': sum(e['path'] == '/submit' for e in requests) == 1,
+                  'at_most_one_physical_start': len(starts) <= 1,
+                  'expected_physical_starts': len(starts) == (1 if mode in ('recover', 'lost-reply') else 0),
+                  'no_fallback': not sim.clients[bid]['lost'] and 'lost' not in row}
+        if mode == 'recover':
+            checks.update(retried_only_prelaunch=faults == ['capabilities', 'begin'] and audit['failures'] == 2,
+                          success=row.get('code') == 0 and row.get('status') == 'SUCCEEDED',
+                          complete_intent=audit['complete'] and audit['start_requested'],
+                          physical_binding=len(starts) == 1 and starts[0]['launch_identity'] == row.get('launch_identity'))
+        elif mode == 'exhaust':
+            checks.update(bounded_preparation=len(faults) == 3 and audit['failures'] == 3,
+                          terminal_not_started=row.get('status') == 'NOT_STARTED' and row.get('code') == -1,
+                          complete_no_intent=audit['complete'] and not audit['start_requested'],
+                          bound_row_evidence=row.get('prelaunch_evidence') == audit)
+        elif mode == 'ambiguous':
+            checks.update(no_retry_on_ambiguity=len(faults) == 1,
+                          fail_closed=row.get('status') == 'LOST' and not audit['complete'],
+                          no_fabricated_no_start='prelaunch_evidence' not in row)
+        else:
+            checks.update(no_retry_after_start=faults == ['start_reply'],
+                          post_intent_lost=row.get('status') == 'LOST' and row.get('code') == -1,
+                          durable_intent=audit['complete'] and audit['start_requested'],
+                          no_fabricated_no_start='prelaunch_evidence' not in row)
+        return checks
+    return sim, {'extra': extra}
+
+
+@scenario('strict prelaunch transport recovery', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'capabilities and begin each lose one pre-dispatch reply; the same item/VM/nonce then starts once')
+def strict_prelaunch_recovers(code):
+    return _strict_prelaunch_case(code, 'recover')
+
+
+@scenario('strict prelaunch exhaustion', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'three preparation failures produce bound NOT_STARTED evidence and zero physical starts')
+def strict_prelaunch_exhausted(code):
+    return _strict_prelaunch_case(code, 'exhaust')
+
+
+@scenario('strict prelaunch incomplete audit', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'a torn audit after a preparation 502 forbids retry and remains LOST, never inferred NOT_STARTED')
+def strict_prelaunch_ambiguous(code):
+    return _strict_prelaunch_case(code, 'ambiguous')
+
+
+@scenario('strict start reply loss', ['lost', 'clients', 'modal', 'strikes', 'threads'], 500,
+          'a 502 after dispatch leaves one actual process and a durable intent; no second launch is sent')
+def strict_start_reply_lost_no_retry(code):
+    return _strict_prelaunch_case(code, 'lost-reply')
+
+
 @scenario("strict_once preemption", ["lost", "clients", "modal", "strikes", "threads"], 900,
           "higher-priority interactive work preempts a strict sweep; a bound cancellation yields terminal LOST, never another worker")
 def strict_once_preemption(code):

@@ -1,6 +1,6 @@
 """One-VM, real-kernel acceptance probe; never run native work on the submit host.
 
-Run as ONE native boat job, image sc-f0d8daeee6c3, config tests/laws.toml:
+Run as ONE native boat job on the current repo image, config tests/laws.toml:
   OWNED_LIFECYCLE_BOAT_TEST=1 python3 tests/strict_once_native.py
 Artifacts go to SUPERCOMPUTER_OUTPUT_DIR. No provider allocation, resume, replacement,
 or stop is permitted. The outer placement receipt supplies the provider VM identity;
@@ -79,6 +79,10 @@ def loopback_client(B, root, vm):
             request = args[0] if command == 'owned_rpc' and args else {}
             op = request.get('command') if isinstance(request, dict) else None
             op_args = request.get('args', []) if isinstance(request, dict) else []
+            if op == 'capabilities' and not (root / 'prelaunch-rpc-faults.jsonl').exists():
+                append(root / 'prelaunch-rpc-faults.jsonl', {
+                    'command': op, 'fault': '502 before dispatch', 'time': time.time()})
+                raise B.AgentError('native fixture: HTTP 502 before owned capabilities dispatch')
             if op == 'cancelitem' and op_args and (root / ('block-cleanup-' + op_args[0])).exists():
                 append(root / 'blocked-cleanup-rpcs.jsonl', {'command': op, 'batch': op_args[0]})
                 raise ConnectionError('native fixture: completed worker cleanup transport unavailable')
@@ -267,7 +271,8 @@ def main():
         receipt['candidate'] = {'agent_version': A.VERSION, 'scheduler_code': S.code_hash(REPO / 'supercomputer'),
              'sha256': {str(p.relative_to(REPO)): hashlib.sha256(p.read_bytes()).hexdigest()
                         for p in [REPO / 'supercomputer/agent.py', REPO / 'supercomputer/scheduler.py',
-                                  REPO / 'supercomputer/boat.py', Path(__file__).resolve()]}}
+                                  REPO / 'supercomputer/boat.py', REPO / 'supercomputer/prelaunch.py',
+                                  REPO / 'supercomputer/rules/prelaunch.py', Path(__file__).resolve()]}}
 
         def spawn(mode, *args):
             log = (root / (mode + '.log')).open('w')
@@ -362,6 +367,20 @@ def main():
             check(name + ': one durable placement', len(snapshot['placements']) == 1, snapshot)
             placement = snapshot['placements'][0]
             check(name + ': placement identity', placement['vm'] == label and placement['boot_id'] == boot and placement['attempt'] == 1 and placement['identity'] == obs['spec']['launch_identity'], placement)
+            audit_path = root / 'live/scheduler/queue' / (session.batch + '.attempts')
+            attempts = wait_for(lambda: (xs if any(x.get('event') == 'start_response' for x in xs) else None)
+                                if (xs := lines(audit_path)) else None, name + ' durable start response')
+            check(name + ': exactly one durable start request',
+                  sum(x.get('event') == 'start_requested' for x in attempts) == 1, attempts)
+            check(name + ': preparation retry keeps original binding',
+                  all(x.get('vm') == placement['vm'] and x.get('boot_id') == placement['boot_id']
+                      and x.get('launch_identity') == placement['identity'] for x in attempts), attempts)
+            expected_failures = 1 if name == 'success' else 0
+            audit = S.prelaunch.inspect(audit_path.read_bytes(), {
+                'batch': session.batch, 'name': name, 'run_name': name, 'vm': placement['vm'],
+                'boot_id': placement['boot_id'], 'launch_identity': placement['identity']})
+            check(name + ': complete prelaunch retry evidence', audit['complete']
+                  and audit['start_requested'] and audit['failures'] == expected_failures, audit)
             # Fresh transport, same owned attempt. Also test wire nonce replay refusal.
             fresh = loopback_client(B, root, label)
             wire = {'protocol': 1, 'version': A.VERSION, 'nonce': secrets.token_hex(16), 'command': 'vtick',
@@ -374,7 +393,7 @@ def main():
             check(name + ': one physical launch after replay', len(physical) == 1, physical)
             receipt.setdefault('scenarios', {})[name] = {'batch': session.batch, 'placement': placement,
                 'observation': obs, 'markers': events, 'physical_launches': physical,
-                'wire_nonce': wire['nonce'], 'replay_refusal': rejected}
+                'wire_nonce': wire['nonce'], 'replay_refusal': rejected, 'attempts': attempts}
             return session, client, rows, faults, waiter, marker, gate, obs
 
         success = launch('success', False)
@@ -501,12 +520,13 @@ def main():
         # Do not publish endpoint credentials or context containing secrets.
         for path in root.glob('*.log'):
             shutil.copyfile(path, output / path.name)
-        for name in ('physical-launches.jsonl', 'start-observations.jsonl', 'client-events.jsonl', 'forbidden-provider.jsonl'):
+        for name in ('physical-launches.jsonl', 'start-observations.jsonl', 'client-events.jsonl',
+                     'forbidden-provider.jsonl', 'prelaunch-rpc-faults.jsonl'):
             if (root / name).exists():
                 shutil.copyfile(root / name, output / name)
         q = root / 'live/scheduler/queue'
         if q.exists():
-            for suffix in ('placed', 'cancel', 'rows'):
+            for suffix in ('placed', 'cancel', 'rows', 'attempts'):
                 for path in q.glob('*.' + suffix):
                     shutil.copyfile(path, output / path.name)
         custody_dir = root / 'live/custody'

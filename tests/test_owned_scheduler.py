@@ -141,6 +141,9 @@ class OwnedSchedulerTests(unittest.TestCase):
             placements = S.jlines(self.root / "queue" / f"{self.b.id}.placed")
             self.assertEqual(len(placements), 1)
             self.assertEqual(placements[0]["identity"], self.it.launch_identity)
+            audit = self.s._prelaunch_evidence(self.it)
+            self.assertTrue(audit["complete"])
+            self.assertFalse(audit["start_requested"])
             return Mock()
         with patch.object(S.threading, "Thread", side_effect=on_thread):
             self.assertTrue(self.s._place(self.it, self.vm))
