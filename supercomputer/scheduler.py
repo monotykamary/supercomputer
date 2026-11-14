@@ -1905,9 +1905,16 @@ class Scheduler:
             b.rows.append(row)
             b.cv.notify_all()
 
-    @staticmethod
-    def capabilities():
-        return {"scope": "native-single-vm", "runtime_verified": True, "code": code_hash(),
+    def capabilities(self=None):
+        """Report the serving owner, not the install selected for a future handoff.
+
+        Class-level calls remain available for isolated compile/import probes;
+        with no serving instance they describe the imported package itself.
+        The separately labelled install may be staged but not yet activated.
+        """
+        serving = self.code if self is not None else code_hash(pathlib.Path(__file__).resolve().parent)
+        return {"scope": "native-single-vm", "runtime_verified": True, "code": serving,
+                 "code_installed": code_hash(),
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
                 "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,

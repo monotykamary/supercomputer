@@ -163,6 +163,12 @@ missing or mismatched evidence still fails the exact readiness comparison.
 A failed comparison now reports bounded missing/extra/changed item keys in the
 ACK, instead of only a boolean.
 
+`/capabilities.code` is the serving scheduler's frozen `self.code`, consistent
+with `/status.code`; `code_installed` separately identifies an install waiting
+for activation. A class-level `Scheduler.capabilities()` compile/import probe
+has no serving owner, so its `code` describes the imported package, never a
+newer staged directory. None of these reads activates a staged candidate.
+
 ## Target and limits
 
 Use immutable, recursively hashed code snapshots; prepare code while the old

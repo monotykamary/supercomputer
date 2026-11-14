@@ -229,5 +229,47 @@ class TerminalHandoff(unittest.TestCase):
         self.assertEqual(child._handoff_deferred[1], [])
 
 
+class ServingCapabilities(unittest.TestCase):
+    def test_serving_code_remains_stable_when_a_different_install_is_staged(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pkg = root / "supercomputer"
+            pkg.mkdir()
+            source = pkg / "staged.py"
+            source.write_text("VERSION = 'first'\n")
+            owner = S.Scheduler.__new__(S.Scheduler)
+            owner.code = "serving-frozen-code"
+            with patch.object(S, "installed_source", return_value=root):
+                first = owner.capabilities()
+                self.assertEqual(first["code"], owner.code)
+                self.assertEqual(first["code_installed"], S.code_hash(pkg))
+                source.write_text("VERSION = 'second-and-longer'\n")
+                second = owner.capabilities()
+            self.assertEqual(second["code"], owner.code)
+            self.assertNotEqual(first["code_installed"], second["code_installed"])
+            self.assertEqual(first["strict_once_protocol"], second["strict_once_protocol"])
+
+    def test_class_level_probe_reports_imported_source_separately_from_install(self):
+        with patch.object(S, "code_hash", side_effect=lambda pkg=None: "staged" if pkg is None else "imported"):
+            caps = S.Scheduler.capabilities()
+        self.assertEqual(caps["code"], "imported")
+        self.assertEqual(caps["code_installed"], "staged")
+        self.assertEqual(caps["strict_once_protocol"], 1)
+
+    def test_real_http_capabilities_route_uses_the_serving_instance(self):
+        from test_http_admission import handler_class
+        owner = S.Scheduler.__new__(S.Scheduler)
+        owner.code = "actual-serving-code"
+        handler = object.__new__(handler_class(owner))
+        handler.path = "/capabilities"
+        with patch.object(S, "code_hash", return_value="staged-not-serving"):
+            status, raw = handler._post(b"{}")
+        caps = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(caps["code"], owner.code)
+        self.assertEqual(caps["code_installed"], "staged-not-serving")
+
+
 if __name__ == "__main__":
     unittest.main()
