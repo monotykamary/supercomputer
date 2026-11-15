@@ -1,6 +1,6 @@
 """The treadmill: a long-lived client of the boat pool that keeps a base pool of VMs busy with a queue, caches every
 result by key so nothing unchanged runs twice, and writes a daily digest. This is its generic part: the batches (boat
-first, Modal for what boat loses), the result cache, the queue of submissions (a jobs file and its tree as it is),
+only, terminal failure when retries are exhausted), the result cache, the queue of submissions (a jobs file and its tree as it is),
 the controller's loop (work launched while the chains gain; no VM-hour or dollar cap) and the digest's pool section. A
 repo adds its own chains (gdp-wired: benchmark sweeps, soundness fuzz and mutants) by subclassing Treadmill in the
 module its supercomputer.toml names ([treadmill] module), which `supercomputer treadmill` runs.
@@ -41,7 +41,7 @@ from .rules import treadmill as rules
 from .config import project
 
 CHAIN_CLASS = {"a": "sweep", "b": "filler", "c": "submission"}  # the scheduler's class of each chain's batches
-MODAL_MAX = rules.MODAL_MAX  # a batch boat refuses whole goes to Modal only when it is this small (a submission, a short round)
+MODAL_MAX = rules.MODAL_MAX  # legacy import compatibility; never enables execution
 YIELD = 60  # the treadmill starts a VM only while more than this many free starts are left this hour (else warm ones)
 
 
@@ -202,7 +202,7 @@ class Batch:
         threading.Thread(target=self.sess.ensure, args=(live + k,), daemon=True).start()
 
     def go(self):
-        """The items on boat; those boat loses (a VM gone, no VM within --max-wait, boat failing) on Modal; then
+        """The items on boat; exhausted losses are terminal, unserved work waits for boat; then
         `after` with every item's logs."""
         summary, logs, lost, got = {}, {}, {}, set()
         boat_err = False
@@ -234,54 +234,21 @@ class Batch:
             if self.sess:
                 summary = self.sess.close()
         todo = [it for it in self.items if it["name"] not in got]
-        # Even exception/preflight paths must not strip requirements by moving
-        # an unreported item to Modal. Mixed batches may still move plain items.
+        from .rules import fallback as _fb
         from .rules.agent_capabilities import required_agent_capabilities
-        constrained = [it for it in todo if required_agent_capabilities(it)]
-        for it in constrained:
-            self.failed = True
-            row(it, {"code": -1, "seconds": -1,
-                     "error": lost.get(it["name"], "native boat did not return a row; no fallback")})
-        todo = [it for it in todo if it not in constrained]
-        # (Modal only for items boat failed 3 times: the scheduler's lost rows; a batch boat's API failed whole runs
-        # again on boat later, however small: rules.treadmill.BatchFate)
-        route = self.fate.boat_ended(len(todo), boat_err, bool(self.tm.modal))
-        if route == "again":
-            # (boat refused the batch, gave it no VM within --max-wait, its image not built or its API down: a sweep isn't
-            # urgent, so it waits for boat rather than send hundreds of items to Modal; a few items lost do go to Modal)
-            log(f"{self.label}: boat can't run it now; again later ({len(todo)} items, past MODAL_MAX for Modal)")
-            self.failed = True
-            for it in todo:
-                self.on_row(it, {"code": -1, "error": "boat couldn't run it now", "lost": True, "retry": True})
-            todo = []
-        if route == "failed":
-            log(f"{self.label}: {len(todo)} items boat failed 3 times and --no-modal: recorded as failed ({'; '.join(sorted(set(lost.values()))[:2])[:200]})")
-            self.failed = True
-            for it in todo:
-                self.on_row(it, {"code": -1, "error": lost.get(it["name"], "boat couldn't run it"), "lost": True})
-        if route == "modal":  # (Modal only for what boat failed 3 times on distinct VMs: rules.fallback.lost_route; the rest again on boat)
-            from .rules import fallback as _fb
-            back = [it for it in todo if _fb.lost_route(False, boat.boat_fails_of(lost.get(it["name"])), 3, True) == "boat"]
-            if back:
-                log(f"{self.label}: {len(back)} items boat didn't run, not for 3 boat failures ({'; '.join(sorted({str(lost.get(it['name'], 'no row'))[:80] for it in back})[:2])}): again on boat later")
-                self.failed = True
-                for it in back:
-                    self.on_row(it, {"code": -1, "error": "boat couldn't run it now", "lost": True, "retry": True})
-            todo = [it for it in todo if it not in back]
-            if not todo:
-                route = "again"
-        if route == "modal":
-            why = sorted(set(lost.values()))[:3] or ["boat couldn't run them"]
-            log(f"{self.label}: {len(todo)} items on Modal ({'; '.join(w[:120] for w in why)})")
-            append(TM / "modal.jsonl", {"t": time.time(), "label": self.label, "items": len(todo), "why": why})
-            try:
-                logs.update(on_modal(todo, self.root or self.unpacked(), row))
-            except Exception as e:
-                log(f"{self.label}: Modal too: {str(e)[:300]}")
-                self.fate.modal_failed()
-                self.failed = True
-                for it in [it for it in todo if it["name"] not in got]:
-                    self.on_row(it, {"code": -1, "error": f"boat and Modal failed: {str(e)[:200]}", "lost": True})
+        retry = []
+        for it in todo:
+            why = lost.get(it["name"], "boat did not return a row")
+            if not required_agent_capabilities(it) and _fb.lost_route(False, boat.boat_fails_of(why), 3, False) == "boat":
+                retry.append(it)
+                self.on_row(it, {"code": -1, "error": why, "lost": True, "retry": True})
+            else:
+                row(it, {"code": -1, "seconds": -1, "error": why, "lost": True,
+                         "status": "LOST", "terminal": True, "boat_fails": boat.boat_fails_of(why)})
+        route = self.fate.boat_ended(len(todo), bool(retry), False)
+        self.failed = route == "again"
+        if self.failed:
+            log(f"{self.label}: {len(retry)} unserved items wait for boat; no provider fallback")
         try:
             if self.after and self.fate.record():  # (a batch to run again later records nothing now)
                 self.after(logs)
@@ -318,71 +285,19 @@ def sh_item(name: str, cmd: str, cwd: str, limit: int, est: float, weight: int =
 
 
 def import_real(path: pathlib.Path):
-    """A module of a tree (a runner, the repo's Modal module) under the real Modal client: its app, functions and image."""
-    if getattr(sys.modules.get("modal"), "__sc_stub__", False) or getattr(sys.modules.get("modal"), "__gdpw_stub__", False):
-        del sys.modules["modal"]
-    import modal  # noqa: F401
-    name = "tm_" + hashlib.sha256(str(path).encode()).hexdigest()[:10]
-    if name in sys.modules:
-        return sys.modules[name]
-    sys.path.insert(0, str(path.parent))
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_modal_lock = threading.Lock()
+    """Read a legacy decorated runner locally without enabling a Modal client."""
+    return agent.import_runner(str(path))
 
 
 @contextlib.contextmanager
 def modal_app(app):
-    """A tree's Modal app running for one fallback (one at a time: the client is not for threads at once), its id and
-    this client's pid in LIVE meanwhile (`supercomputer reap` stops it if this client dies)."""
-    with _modal_lock, app.run():
-        t = config.live_dir() / app.app_id
-        t.write_text(str(os.getpid()))
-        try:
-            yield
-        finally:
-            t.unlink(missing_ok=True)
+    """Legacy API retained solely for an explicit removal error."""
+    raise ValueError(config.MODAL_REMOVED)
+    yield  # keep the context-manager calling convention without launching an app
 
 
 def on_modal(items: list[dict], root: pathlib.Path, on_row) -> dict:
-    """Items boat couldn't run, on Modal: a runner's function through the runner's own app, shell items through the
-    repo's Modal module (else the supercomputer's own app); each row to on_row, and the shell items' logs back."""
-    from .rules.agent_capabilities import required_agent_capabilities
-    if any(required_agent_capabilities(it) for it in items):
-        raise ValueError("agent requirements need native boat; no Modal fallback")
-    logs: dict = {}
-    for module in sorted({it["module"] for it in items if it["kind"] == "py"}):
-        mod = import_real(root / module)
-        group = [it for it in items if it["kind"] == "py" and it["module"] == module]
-        with modal_app(mod.app):
-            for fn in sorted({it["fn"] for it in group}):
-                its = [it for it in group if it["fn"] == fn]
-                for it, res in zip(its, list(getattr(mod, fn).starmap([tuple(it["args"]) for it in its], return_exceptions=True, order_outputs=True))):
-                    on_row(it, {"code": -1, "error": repr(res)[:400]} if isinstance(res, BaseException) else {"code": 0, "result": res, "where": "modal"})
-    sh = [it for it in items if it["kind"] == "sh"]
-    if sh:
-        mpath = project().modal.get("module")
-        cands = [root / mpath] if mpath else []
-        cands += [root / "modal" / "run.py"] if mpath and mpath.startswith("supercomputer/") else []  # (a tree from before gdp-wired's rename)
-        found = next((c for c in cands if c.exists()), None)
-        if found:
-            run = import_real(found)
-        else:
-            from . import modal_run as run
-        by = {it["name"]: it for it in sh}
-        spec = [{"name": it["name"], "cmd": it["cmd"], "cwd": it.get("cwd", "."), "cpu": 2.0 * it.get("weight", 1), "memory": 4096 * it.get("weight", 1), "timeout": int(it["limit"]) + 30} for it in sh]
-
-        def done(name, r):
-            logs[name] = {"out": r.get("out", ""), "err": r.get("err", "")}
-            on_row(by[name], {"code": r.get("code", -1), "seconds": r.get("seconds", -1), "where": "modal"})
-        with modal_app(run.app):
-            run.modal_jobs(spec, "", lambda c: c, done)
-    return logs
+    raise ValueError(config.MODAL_REMOVED)
 
 
 # --------------------------------------------------------------------------------------------- the queue (submissions)
@@ -396,12 +311,13 @@ def job_key(tk: str, j: dict) -> str:
 
 def submit(jobs: str, tree: str, name: str, meta: dict | None = None):
     spec = json.loads(pathlib.Path(jobs).read_text())
+    config.reject_removed_backend("auto", spec)
     root = config.select_root(tree)
     name = name or f"{root.name}-{pathlib.Path(jobs).stem}-{time.strftime('%m%d-%H%M%S')}"
     d = TM / "subs" / name
     why = rules.submit_refusal(any(j.get("image") and j["image"] not in project().images for j in spec), any(j.get("backend") == "modal" for j in spec), any(j.get("gpu") for j in spec), d.exists())
     if why == "not_here":
-        raise SystemExit("a job on Modal's own image or a GPU doesn't belong on the treadmill: `supercomputer run` it")
+        raise SystemExit("the treadmill accepts boat CPU images only; use `supercomputer run` for RunPod GPU jobs")
     if why == "exists":
         raise SystemExit(f"{d} exists: another --name")
     tar = boat.tree_tarball(root)
@@ -449,6 +365,9 @@ class Submission:
         cache.mkdir(parents=True, exist_ok=True)
         keys = {j["name"]: job_key(self.meta["tree_key"], j) for j in spec}
         rows = {n: json.loads((cache / f"{k}.json").read_text()) for n, k in keys.items() if (cache / f"{k}.json").exists()}
+        terminal_path = self.d / "terminal-results.json"
+        terminal = json.loads(terminal_path.read_text()) if terminal_path.exists() else {}
+        rows.update(terminal)
         todo = [j for j in spec if j["name"] not in rows]
         items, _ = boat.job_items(todo, "", lambda c: c, boat.VM_TYPE, {})
         made = self.fate.start(not todo)
@@ -456,7 +375,10 @@ class Submission:
         self.save()
 
         def on_row(it, row):
-            rows[it["name"]] = {k: row.get(k) for k in ("code", "seconds", "error")} | {"where": row.get("where", "boat")}
+            rows[it["name"]] = dict(row, where=row.get("where", "boat"))
+            if row.get("terminal") and not row.get("retry"):
+                terminal[it["name"]] = rows[it["name"]]
+                terminal_path.write_text(json.dumps(terminal, indent=1))
 
         def after(logs):
             out = self.d / "out"
@@ -496,7 +418,7 @@ class Treadmill:
 
     CLIENT = "treadmill"
 
-    def __init__(self, vms: int, budget_vmh: float | str, quiet: int, modal: bool = True, max_wait: int = 900, max_vms: int = 0, step_vms: int = 4,
+    def __init__(self, vms: int, budget_vmh: float | str, quiet: int, modal: bool = False, max_wait: int = 900, max_vms: int = 0, step_vms: int = 4,
                  backlog_hours: float = 2.0):
         TM.mkdir(parents=True, exist_ok=True)
         self.main = config.main_checkout(project().root)
@@ -515,7 +437,7 @@ class Treadmill:
         self.t_grow, self.t_budget = 0.0, 0.0
         self.held_now = 0
         self.pool_now = 0  # (the scheduler's VMs of the image, all classes)
-        self.modal, self.max_wait = modal, max_wait
+        self.modal, self.max_wait = False, max_wait  # legacy argument cannot enable Modal
         self.cache = Cache()
         self.state = json.loads((TM / "state.json").read_text()) if (TM / "state.json").exists() else {}
         self.batches: list[Batch] = []
@@ -766,7 +688,7 @@ def scheduler_section(day: str) -> list[str]:
            f"- starts: {starts} ({starts - paid} free, {paid} paid) for {items} items placed: {100 * starts / max(1, items):.1f} per 100 items; "
            f"{m['placed_warm']} items placed on a VM already up; {m['not_ready']} starts never ready; circuit breaker tripped {m['breaker_trips']} times",
            f"- boat's failures of items (a VM lost, a row missing, no VM ready): {sum(m.get('boat_fails', {}).values())}; items boat failed "
-           f"{scheduler.BOAT_TRIES} times, so sent back for Modal: {sum(m.get('to_modal', {}).values())}",
+           f"{scheduler.BOAT_TRIES} times end terminal LOST; legacy Modal handoffs: {sum(m.get('to_modal', {}).values())}",
            "- by class: " + "; ".join(f"{n} {m['placed'].get(n, 0)} items, starts {m['starts'][n]['free']}+{m['starts'][n]['paid']} paid, "
                                       f"wait p50 {scheduler.pct(m['waits'].get(n, []), 0.5)} s p95 {scheduler.pct(m['waits'].get(n, []), 0.95)} s, "
                                       f"{m['preempted'].get(n, 0)} preempted" for n in scheduler.CLASSES if m["placed"].get(n) or m["preempted"].get(n))]

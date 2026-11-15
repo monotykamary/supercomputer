@@ -209,9 +209,10 @@ def test_outer_fanout_rejects_unsupported_backends():
 
 def test_outer_fanout_three_strikes_never_drops_runtime_into_modal():
     def failed(jobs, *args, on_lost=None, **kwargs):
-        for job in jobs:
-            on_lost(job["name"], "boat failed it 3 times (last: lost)")
-        return {}, {}
+        assert on_lost is None  # terminal native rows stay in the result stream
+        return {job["name"]: {"code": -1, "seconds": -1, "lost": True, "boat_fails": 3,
+                              "status": "LOST", "terminal": True, "error": "boat failed it 3 times (last: lost)"}
+                for job in jobs}, {}
     with tempfile.TemporaryDirectory() as d, patch.object(fanout, "project", return_value=SimpleNamespace(images={})), \
             patch.object(fanout.fallback, "preflight_on", return_value=False), patch.object(boat, "boat_jobs", side_effect=failed), \
             patch.object(fanout.time, "sleep"):

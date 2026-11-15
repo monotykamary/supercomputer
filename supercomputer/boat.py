@@ -2446,6 +2446,7 @@ class Session:
         An item whose VM died (or whose runner vanished) runs again once on another VM; lost again, it goes to
         on_lost(item, reason) (else it's done with exit -1). With max_wait, if no VM is ready that many seconds after
         the start, or every VM is gone, what hasn't run goes to on_lost too."""
+        config.reject_removed_backend("auto", items)
         from .rules.agent_capabilities import required_agent_capabilities
         for it in items:
             required_agent_capabilities(it)
@@ -3245,6 +3246,7 @@ class Scheduled(Session):
 
     def _run(self, items: list[dict], on_done, on_start=None, on_lost=None, max_wait: int = 0, *,
              strict_once: bool | None = None, max_attempts: int | None = None):
+        config.reject_removed_backend("auto", items)
         strict_once = getattr(self, "strict_once", False) if strict_once is None else strict_once
         max_attempts = getattr(self, "max_attempts", 1) if max_attempts is None else max_attempts
         _validate_strict_options(strict_once, max_attempts)
@@ -3957,6 +3959,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
               max_vms: int = 0, on_lost=None, max_wait: int = 0, on_done=None, tar: bytes | None = None, klass: str | None = None, strict_once: bool = False, max_attempts: int = 1) -> tuple[dict, dict]:
     """supercomputer/run.py's jobs on the pool: {name: {code, seconds, out, err}} for those that ran, and the batch's figures.
     A job lost twice (its VM died) goes to on_lost(name, reason), as does every job when boat can't serve the batch."""
+    config.reject_removed_backend("auto", spec)
     _validate_strict_options(strict_once, max_attempts)
     if strict_once:
         from .fanout import _strict_native

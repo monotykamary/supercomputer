@@ -342,8 +342,12 @@ def gpu_list(jobs: list[dict]) -> list[str] | None:
 
 
 def gpu_jobs(jobs: list[dict], out: str, pre: str, cmd, backend: str = "auto", on_done=None, gpu_modal=None) -> tuple[dict, dict, dict]:
-    """A batch's GPU jobs: on one RunPod pod (auto, runpod), on Modal when RunPod can't (auto) or when asked (modal).
-    Returns {name: row}, {name: backend}, {name: why it moved}."""
+    """GPU jobs on RunPod only. Exhausted retries retain terminal failures.
+    The legacy gpu_modal callback is never invoked."""
+    from . import config
+    config.reject_removed_backend(backend, jobs)
+    if backend not in ("auto", "runpod"):
+        raise ValueError("GPU jobs require runpod or auto")
     rows, where, moved = {}, {}, {}
     todo = list(jobs)
     reason = None
@@ -379,24 +383,16 @@ def gpu_jobs(jobs: list[dict], out: str, pre: str, cmd, backend: str = "auto", o
                     log(reason + ("; once more on a new pod" if tries.pods < 2 else ""))
         if todo and fallback.gpu_leftover(backend) == "failed":
             for j in todo:
-                rows[j["name"]] = {"code": -1, "seconds": -1, "out": "", "err": reason or "never ran"}
+                rows[j["name"]] = {"code": -1, "seconds": -1, "out": "", "err": reason or "never ran", "status": "FAILED", "terminal": True}
                 where[j["name"]] = "runpod"
             return rows, where, moved
-    if todo:
-        why = reason or "asked for Modal"
-        log(f"{len(todo)} GPU jobs on Modal ({why})")
-        moved.update({j["name"]: why for j in todo})
-        got = (gpu_modal or modal_gpu_jobs)(todo, pre, cmd, on_done)
-        rows.update(got)
-        where.update({n: "modal" for n in got})
     return rows, where, moved
 
 
 def modal_gpu_jobs(jobs: list[dict], pre: str, cmd, on_done) -> dict:
-    """GPU jobs on Modal, in the supercomputer's own Modal app for the repo (modal_run.py: the repo's [gpu] setup)."""
-    from . import fanout, modal_run
-    with fanout.ModalCtx(modal_run.app):
-        return modal_run.modal_jobs(jobs, pre, cmd, on_done, gpu=True)
+    """Legacy entry point retained only to refuse removed Modal execution."""
+    from .config import MODAL_REMOVED
+    raise ValueError(MODAL_REMOVED)
 
 
 def reap():

@@ -80,16 +80,16 @@ def hero(t: dict) -> str:
     body = f'''
 <g>
   <circle class="pulse" cx="44" cy="45" r="4" fill="{t["accent"]}"/>
-  <text class="m mu" x="56" y="49.5" font-size="13" letter-spacing=".02em">boat.dev · RunPod · Modal</text>
+  <text class="m mu" x="56" y="49.5" font-size="13" letter-spacing=".02em">boat.dev · RunPod</text>
   <text class="d ink" x="38" y="112" font-size="56" font-weight="650" letter-spacing="-.025em">supercomputer</text>
   <text class="t t2" x="40" y="148" font-size="18">One job runner for every repo on your machine: a warm pool of boat.dev VMs</text>
-  <text class="t t2" x="40" y="173" font-size="18">first, RunPod for GPU jobs, Modal as the fallback of both.</text>
+  <text class="t t2" x="40" y="173" font-size="18">for CPU jobs, RunPod for GPU jobs. No provider fallback.</text>
 </g>
 {"".join(cards)}
 <text class="m mu" x="{x0}" y="{y0 - 12}" font-size="11.5" letter-spacing=".04em">THE POOL · BUSY, NEVER PARKED</text>
 <text class="m mu" x="{w - x0}" y="{y0 - 12}" font-size="11.5" text-anchor="end" letter-spacing=".04em">a slot lit = an item running</text>
 '''
-    return svg(w, h, t, body, "\n".join(css), "supercomputer: one job runner over boat.dev, RunPod and Modal")
+    return svg(w, h, t, body, "\n".join(css), "supercomputer: one job runner over boat.dev and RunPod")
 
 
 # ---------------------------------------------------------------------------------------------------------- flow
@@ -110,11 +110,11 @@ def flow(t: dict) -> str:
         "in": "M170 180 L232 180",
         "boat": "M412 168 C462 168 462 92 520 92",
         "gpu": "M412 186 C462 186 462 212 520 212",
-        "modal": "M412 198 C470 198 452 300 520 300",
+        "failed": "M412 198 C470 198 452 300 520 300",
     }
     lines = []
     for k, d in paths.items():
-        dash = ' stroke-dasharray="4 5"' if k == "modal" else ""
+        dash = ' stroke-dasharray="4 5"' if k == "failed" else ""
         col = t["accent"] if k in ("in", "boat") else t["line2"]
         lines.append(f'<path id="p-{k}" d="{d}" fill="none" stroke="{col}" stroke-width="1.5"{dash}/>')
 
@@ -150,16 +150,16 @@ def flow(t: dict) -> str:
 {box(520, 34, 330, 104, "boat.dev VMs", ["a warm pool shared by every repo"], strong=True)}
 {"".join(chips)}
 {box(520, 172, 330, 74, "RunPod", ["GPU jobs: a pod per batch"])}
-{box(520, 262, 330, 74, "Modal", ["the fallback of both"])}
-<text class="m mu" x="248" y="258" font-size="11.5">Modal: after 3 boat failures,</text>
-<text class="m mu" x="248" y="275" font-size="11.5">each on another VM</text>
+{box(520, 262, 330, 74, "Terminal failure", ["receipts retained; no other provider"])}
+<text class="m mu" x="248" y="258" font-size="11.5">Boat: retries on another VM;</text>
+<text class="m mu" x="248" y="275" font-size="11.5">exhaustion is terminal</text>
 {packets("in", 3, 2.4, t["accent"])}
 {packets("boat", 4, 2.0, t["accent"])}
 {packets("gpu", 1, 4.5, t["muted"], -1.0, ("0;1;1;0;0", "0;.05;.9;.95;1"))}
-{packets("modal", 1, 9.0, t["muted"], -6.0, ("0;0;1;1;0", "0;.62;.66;.95;1"))}
+{packets("failed", 1, 9.0, t["muted"], -6.0, ("0;0;1;1;0", "0;.62;.66;.95;1"))}
 '''
     return svg(w, h, t, body, "\n".join(css),
-               "jobs.json goes to the scheduler on your machine, which places it on boat.dev VMs, RunPod for GPU jobs, or Modal after three boat failures")
+               "jobs.json goes to boat.dev for CPU jobs or RunPod for GPU jobs; exhausted retries fail without changing providers")
 
 
 # ---------------------------------------------------------------------------------------------------------- terminal

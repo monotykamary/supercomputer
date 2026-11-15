@@ -168,7 +168,7 @@ BREAK_EVEN_OVERRIDE_S = _env("HORIZON", 0.0)
 if not math.isfinite(BREAK_EVEN_OVERRIDE_S) or BREAK_EVEN_OVERRIDE_S < 0:
     raise ValueError("SUPERCOMPUTER_HORIZON must be a finite positive replay override, or 0 to disable")
 SUB_VMS = _env("SUB_VMS", 8)  # a submission client's VMs' worth of slots at once
-BOAT_TRIES = _env("BOAT_TRIES", 3)  # boat failures (a VM lost, a row missing, no VM ready) before an item goes to Modal
+BOAT_TRIES = _env("BOAT_TRIES", 3)  # boat failures before an item is terminal LOST; never another provider
 DRAIN_STEP = _env("DRAIN_STEP", 0.25)  # past their hold, the VMs above the floor shed by at most this share (rounded up) a window
 DRAIN_EVERY = _env("DRAIN_EVERY", 300.0)  # the staged drain's window: until this long after its last shed
 FLOOR_ALWAYS = _env("FLOOR_ALWAYS", 0) not in (0, "0", "")  # the floor held with no treadmill alive too
@@ -1795,6 +1795,8 @@ class Scheduler:
     def _validate_submission(cls, msg):
         if not isinstance(msg, dict):
             raise ValueError("submission must be an object")
+        from .config import reject_removed_backend
+        reject_removed_backend(msg.get("backend", "auto"), (spec for spec in msg.get("items", []) if isinstance(spec, dict)))
         enhanced = bool(msg.get("strict_once") or msg.get("retain_journals"))
         if enhanced:
             cls._valid_batch(msg.get("batch"))
@@ -5061,8 +5063,7 @@ class Scheduler:
     def _boat_failed(self, it: Item, vm_id: str | None, why: str, strike: str | None = None):
         """One of boat's failures of an item (a VM lost or stopped, its row missing, its preparation failed, its VM not
         reached after a restart; or, as `strike`, a wait in which boat failed a start of its image): queued again, never
-        on a VM that failed it, until boat has failed it BOAT_TRIES times; then its row says lost (its client runs it
-        once on Modal, or reports it failed). The decision is rules.ItemFate's (one strike per VM, charged only to an
+        on a VM that failed it, until boat has failed it BOAT_TRIES times; then its row is terminal LOST (no provider fallback). The decision is rules.ItemFate's (one strike per VM, charged only to an
         item last placed on that VM). Under self.lock."""
         if it.batch.admission_closed or it.owned.closed:
             if it.state != "done":
@@ -5088,10 +5089,8 @@ class Scheduler:
         if durable_item(it) or required_agent_capabilities(it.spec):
             self._owned_failed(it, f"boat failed it {it.fails} times (last: {why}); no fallback")
             return
-        self.m["to_modal"][n] = self.m["to_modal"].get(n, 0) + 1
-        self._h().record_modal(time.time(), f"{it.batch.id}/{it.name}", it.fails, len(it.avoid), BOAT_TRIES)
-        log(f"{it.batch.id}: {it.name}: boat failed it {it.fails} times ({why}): back to its client" + (" for Modal" if it.batch.on_lost else ""))
-        threading.Thread(target=it.batch.deliver, args=({"name": it.name, "code": -1, "seconds": -1, "lost": True, "boat_fails": it.fails,
+        log(f"{it.batch.id}: {it.name}: boat failed it {it.fails} times ({why}): terminal LOST; no fallback")
+        threading.Thread(target=it.batch.deliver, args=({"name": it.name, "code": -1, "seconds": -1, "lost": True, "status": "LOST", "terminal": True, "boat_fails": it.fails,
                                                          "error": f"boat failed it {it.fails} times (last: {why})"},), daemon=True).start()
 
     def _lost_vm(self, vm: VMState):

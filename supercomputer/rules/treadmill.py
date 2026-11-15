@@ -95,12 +95,11 @@ def elastic(floor: int, max_vms: int, pool_now: int) -> int:
 
 
 class BatchFate:
-    """A batch's end (Batch.go): items boat didn't return go to Modal only when they are few (MODAL_MAX) and boat ran
-    the batch (it lost them); a batch boat refused whole, or too many lost, runs again later; with Modal off they are
-    recorded failed; Modal failing too fails them. A failed batch records nothing (its `after` doesn't run)."""
+    """A batch retries only unserved work; exhausted native items remain terminal.
+    Terminal failures are recorded, not re-submitted or moved to a provider.
+    """
 
-    # gdp: law a batch boat refused whole never goes to Modal: route != "modal" or not self.boat_err
-    # gdp: law items go to Modal only when few: route != "modal" or self.todo <= MODAL_MAX
+    # gdp: law a batch never selects Modal: route != "modal"
     # gdp: law a failed batch records nothing: not recorded or not failed
     # gdp: law before boat's end nothing is decided: ended or (route == "done" and not failed and not recorded and self.todo == 0 and not self.boat_err)
 
@@ -122,19 +121,15 @@ class BatchFate:
         self.boat_err = boat_err
         if todo <= 0:
             self.route = "done"
-        elif todo > MODAL_MAX or boat_err:
+        elif boat_err:
             self.route = "again"
             self.failed = True
-        elif not modal:
-            self.route = "failed"
-            self.failed = True
         else:
-            self.route = "modal"
+            self.route = "failed"  # terminal results are recordable; only "again" needs retry
         return self.route
 
     def modal_failed(self) -> None:
-        if self.route == "modal" and not self.recorded:
-            self.failed = True
+        return  # compatibility no-op: Modal is never selected
 
     # gdp: law a batch records its results only when it didn't fail: not result or not failed
     def record(self) -> bool:

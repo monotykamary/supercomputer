@@ -52,9 +52,7 @@ controller and actual worker `runtime_pins_protocol:1`. See `docs/runtime-pins.m
   free slots before sweeps and filler, a filler's slot after {sub_preempt} s. A job needing several slots (`cpu` over 2) gets them set aside on one VM.
 - `sweep` / `filler`: the treadmill's chains / its soundness fill. Never pick these for your own work.
 
-**Fallback:** boat first. An item boat fails (a VM lost, a row missing, no VM ready) is retried on boat, on another
-VM, up to 3 times; only then does it run once on Modal. `--backend modal` stays on Modal. GPU jobs (`"gpu"`) go to
-RunPod first, then Modal.
+**Retries, no provider fallback:** boat first for CPU jobs in every class. An item boat fails (a VM lost, a row missing, no VM ready) is retried on another boat VM within its three-failure budget. Exhaustion is terminal `FAILED`/`LOST` with receipts, never Modal. GPU jobs (`"gpu"`) run only on RunPod, with at most two pod attempts and no retry after no-capacity. `--backend modal` and job `"backend":"modal"` are refused at submit: `Modal support removed; use boat or runpod`.
 
 **Single attempt (native):** add `--strict-once --max-attempts 1 --backend boat` for an ordinary jobs batch,
 or use `boat.session(..., strict_once=True, max_attempts=1)`. There is at most one physical attempt per
@@ -67,9 +65,9 @@ on admission/preparation failure. Full custody, hash-binding and cleanup contrac
 **Shell hygiene:** one background waiter per thing, killed by its exact PID; never `pkill` or `pgrep -f` loops.
 
 **Cleanup:** `supercomputer status` (the pool), `supercomputer reap` (dead clients' leases, orphaned Modal apps and
-pods); `modal app list` after any Modal fallback. Never stop or delete VMs another client or project leased.
+pods). Legacy Modal-app cleanup remains until every machine has none, then is removable. No new Modal execution. Never stop or delete VMs another client or project leased.
 
-**Money:** no limits, be smart. No VM-hour or dollar caps: warm slots and lower classes first, then free starts,
+**Money:** CPU capacity and retries are boat-only; GPU spend is RunPod-only, with no Modal fallback charges. No limits, be smart. No VM-hour or dollar caps: warm slots and lower classes first, then free starts,
 then paid ones (~$0.03-0.07). The pool grows only when queued work beyond held and coming capacity pays for a new VM
 (the larger start-or-hold opportunity cost divided by its VM-hour price), gates for what finishes them within {gate_horizon} min; idle VMs go; chains stop when they stop gaining.
 No VM ceiling ({max_vms}); {bringup} VMs coming up at once is only the scheduler's own load guard.
@@ -81,8 +79,8 @@ them (`supercomputer policy floor_by_image=<image>=0` drops it for a project fin
 floor ({floor}) run filler up to {hold} min after their last real work, then go; a released VM stops 60 s later. No metering tricks, one account, no shared keys.
 Leave free starts for the account's other projects (the reserve), and never touch their VMs.
 
-**Data:** volumes live on boat (`supercomputer store push|pull|ls`), named snapshots with sha256 manifests, mirrored
-to RunPod and Modal on demand, pulls cached by hash.
+**Data:** volumes live on boat (`supercomputer store push|pull|ls`), named snapshots with sha256 manifests, available
+to RunPod; legacy Modal volume imports are recovery-only, pulls cached by hash.
 
 **Explicit roots:** an explicit nested non-repository root is refused with both the requested and enclosing root
 named; it is never silently widened to the parent checkout. An omitted root keeps the usual current-repository

@@ -1,21 +1,8 @@
-"""One interface over three providers: boat.dev VMs for CPU work (boat.py), RunPod pods for GPU work (runpod.py),
-Modal for the rest and as the fallback of both.
+"""One interface over boat.dev CPU workers and RunPod GPU workers.
 
-    --backend modal     Modal, as always (the default until it's flipped)
-    --backend auto      CPU work on boat, GPU work on RunPod; Modal takes over when the primary can't serve
-    --backend boat | runpod                   force one, no fallback
-
-Fallback is per batch where it can be (the whole batch moves before anything starts) and per job when a VM or pod dies
-under it (that job once more on the primary, then on Modal). The reasons: the provider's API unreachable or erroring,
-its billing (credit, balance), no capacity (boat's active-VM or start limits leaving no VM within --max-wait, a pool
-image that isn't built; RunPod out of every GPU type in the list), a VM or pod lost mid-job. Every fallback is logged
-with its reason, in the final line and in <out>/backends.json; a job's results are the same whichever provider ran it.
-Whatever happens, each provider's cleanup runs: boat VMs released (stopped after --idle), pods deleted, the Modal app
-stopped (its id and this client's pid in LIVE while it runs: `supercomputer reap` stops it if this client dies).
-
-The compare runners write their entrypoint's body as `run(ex, ...)` with `ex.remote(fn, *args)` and
-`ex.starmap(fn, args)` (results as they finish, an exception for a failed call); `python3 <runner> --backend ...`
-gives it the right `ex` (`fanout.cli`), and `modal run <runner>` still runs it on Modal.
+Auto selects boat for CPU work and RunPod for GPU work. Provider failures retain
+bounded retries on the same provider, then fail with their receipts. Modal is
+never an execution route; legacy entry points refuse it explicitly.
 """
 import contextlib
 import importlib.util
@@ -36,7 +23,7 @@ from .rules.agent_capabilities import required_agent_capabilities
 from .config import project
 
 HERE = pathlib.Path(__file__).resolve().parent
-BACKENDS = ["modal", "auto", "boat", "runpod"]
+BACKENDS = ["auto", "boat", "runpod", "modal"]  # modal is parsed only to give an explicit removal error
 
 
 def log(*a):
@@ -61,93 +48,53 @@ def modal_real() -> bool:
 
 
 def reexec_with_modal():
-    """Plain python3 without the Modal client: run again under the interpreter the `modal` CLI uses, so Modal can take
-    over a batch. (Without one, Modal is simply not a fallback.)"""
-    reexeced = bool(os.environ.get("GDPW_REEXEC") or os.environ.get("SUPERCOMPUTER_REEXEC"))
-    if modal_real() or reexeced:
-        return
-    # (installed with uv, the Modal client is a dependency: it imports here when needed, and the `modal` CLI's
-    # interpreter would not have this package; found, not imported, so a command that never needs it stays quick)
-    if "modal" not in sys.modules and importlib.util.find_spec("modal") is not None:
-        return
-    exe = shutil.which("modal")
-    if not exe:
-        return
-    with contextlib.suppress(Exception):
-        first = pathlib.Path(exe).read_text(errors="replace").splitlines()[0]
-        py = first[2:].strip().split()[0] if first.startswith("#!") else ""
-        # (a venv's python is often a symlink to the same interpreter: compare the paths, not what they resolve to;
-        # the decision rules.fallback.reexec_modal's)
-        if fallback.reexec_modal(modal_real(), reexeced, bool(py) and os.path.exists(py), os.path.abspath(py or ".") == os.path.abspath(sys.executable)):
-            os.environ["GDPW_REEXEC"] = os.environ["SUPERCOMPUTER_REEXEC"] = "1"
-            os.execv(py, [py, *sys.argv])
+    """Compatibility no-op: never switch to a removed provider's interpreter."""
+    return None
 
 
 class ModalCtx:
-    """The runner's Modal app, running: the one `modal run` started, or one started here (and stopped on exit), its
-    id and this client's pid in LIVE while it runs (`supercomputer reap` stops it if this client dies)."""
-
-    _refs: dict = {}  # id(app) -> rules.fallback.ModalRef: who holds it, whether this process started it
-    _ctxs: dict = {}  # id(app) -> its run context, for an app this process started
+    """Legacy import compatibility only; new Modal execution is refused."""
 
     def __init__(self, app):
-        self.app, self.ctx, self.ticket = app, None, None
-
-    def __enter__(self):
-        if not modal_real():
-            raise RuntimeError("the Modal client isn't installed here, so Modal can't take this over")
-        # (rules.fallback.ModalRef: an app started here shared, stopped when the last holder exits; one `modal run`
-        # started used as it is, never stopped here)
-        ref = ModalCtx._refs.setdefault(id(self.app), fallback.ModalRef(getattr(self.app, "app_id", None) is not None))
-        was_ours = ref.ours
-        ref.enter()
-        if ref.ours and not was_ours:
-            self.ctx = self.app.run()
-            self.ctx.__enter__()
-            ModalCtx._ctxs[id(self.app)] = self.ctx
-        elif ref.ours:
-            self.ctx = ModalCtx._ctxs[id(self.app)]
-        live = config.live_dir()
-        self.ticket = live / f"{self.app.app_id}"
-        self.ticket.write_text(str(os.getpid()))
-        if self.ctx:
-            log(f"Modal app {self.app.app_id}")
-        return self
-
-    def __exit__(self, *exc):
-        ref = ModalCtx._refs.get(id(self.app))
-        if ref is None:
-            return False
-        was_running = ref.running
-        ref.exit()
-        if ref.holders > 0:
-            return False
-        if self.ticket:
-            self.ticket.unlink(missing_ok=True)
-        if self.ctx and was_running and not ref.running:
-            ModalCtx._ctxs.pop(id(self.app), None)
-            self.ctx.__exit__(*exc)
-        return False
+        raise ValueError(config.MODAL_REMOVED)
 
 
 # ----------------------------------------------------------------------------------------------------- a jobs file
-def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend: str = "modal", vms: int = 0, idle: int | None = None, teardown: bool = False,
+def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, backend: str = "auto", vms: int = 0, idle: int | None = None, teardown: bool = False,
              durations: str = "", vm_type: str = "large", max_vms: int = 0, max_wait: int = 120, tar: bytes | None = None, gpu_modal=None, strict_once: bool = False, max_attempts: int = 1):
-    """A jobs file's batch on its backend. modal_jobs(jobs, on_done) runs jobs on Modal (inside the running app) and
-    returns {name: {code, seconds, out, err}}. Writes <out>/<name>.log and <out>/summary.tsv (name, exit, seconds,
-    backend) and prints the final line, with where the jobs ran and why any moved. A job that declares a GPU ("gpu":
-    a type or true) runs on a RunPod pod (one for all of them), else on Modal (runpod.py, gpu_jobs)."""
+    """Run CPU jobs only on boat and GPU jobs only on RunPod.
+
+    Legacy Modal callback arguments are accepted for API compatibility but are
+    never called. Failed providers retain their terminal rows and receipts.
+    """
+    config.reject_removed_backend(backend, spec)
+    if backend not in ("auto", "boat", "runpod"):
+        raise ValueError(f"--backend is auto, boat or runpod, not {backend}")
     boat._validate_strict_options(strict_once, max_attempts)
     if strict_once:
         _strict_native(spec, backend)
-    if backend not in ("modal", "auto", "boat", "runpod"):
-        raise SystemExit(f"--backend is modal, auto, boat or runpod, not {backend}")
+    images = project().images
+    for job in spec:
+        effective = job.get("backend") or backend
+        if effective not in ("auto", "boat", "runpod"):
+            raise ValueError(f"unknown job backend: {effective}")
+        required = required_agent_capabilities(job)
+        foreign = bool(job.get("image") and job["image"] not in images)
+        if ("cpu_model" in job or "distinct_vm_group" in job or required) and (effective not in ("auto", "boat") or job.get("gpu") or foreign):
+            raise ValueError("placement constraints require a boat CPU job; no fallback is permitted")
+        if job.get("gpu"):
+            if effective == "boat":
+                raise ValueError("GPU jobs require runpod or auto; boat runs CPU jobs")
+        elif effective == "runpod":
+            raise ValueError("runpod requires a GPU job; use boat or auto for CPU jobs")
+        if not job.get("gpu") and job.get("image") and job["image"] not in images:
+            raise ValueError(f"unknown boat image {job['image']!r}; {config.MODAL_REMOVED}")
     outdir = pathlib.Path(out)
     outdir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     rows: dict[str, dict] = {}
     where: dict[str, str] = {}
-    moved: dict[str, str] = {}  # job -> why it went to Modal
+    reasons: dict[str, str] = {}
     bsum = None
     lock = threading.Lock()
 
@@ -155,97 +102,70 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs, backend
         with lock:
             print(f"{name:40} exit {row.get('code', -1):>3}  {row.get('seconds', -1):>8} s", flush=True)
 
-    for j in spec:
-        required = required_agent_capabilities(j)
-        if ("cpu_model" in j or "distinct_vm_group" in j or required) and (backend not in ("auto", "boat") or j.get("gpu") or j.get("backend") not in (None, "boat")
-                                 or (j.get("image") and j["image"] not in project().images)):
-            raise ValueError("placement constraints require a boat CPU job and a boat image; no fallback is permitted")
-    gpu = [j for j in spec if j.get("gpu")]
+    gpu = [job for job in spec if job.get("gpu")]
     if gpu:
         from . import runpod
-        got, w, why = runpod.gpu_jobs(gpu, out, pre, cmd, backend=backend, on_done=printer, gpu_modal=gpu_modal)
+        # Per-job routing has already been checked. GPU jobs never reach boat.
+        got, locations, failures = runpod.gpu_jobs(gpu, out, pre, cmd, backend="runpod" if backend == "runpod" else "auto", on_done=printer)
         rows.update(got)
-        where.update(w)
-        moved.update(why)
-        spec_cpu = [j for j in spec if not j.get("gpu")]
-    else:
-        spec_cpu = list(spec)
-    todo = list(spec_cpu)
-    # (a job on an image boat doesn't have, or one that says "backend": "modal": Modal's, whatever the backend)
-    images = project().images
-    own = [j for j in spec_cpu if (j.get("image") and j["image"] not in images) or j.get("backend") == "modal"]
-    if own:
-        moved.update({j["name"]: f"its image ({j['image']}) is Modal's" if j.get("image") else "it asks for Modal" for j in own})
-    if backend in ("auto", "boat") and len(own) < len(spec_cpu):
-        from . import scheduler as _sch
-        # (with the scheduler, starts are its call, by class: gates and interactive checks may pay for them, and what
-        # it can't place within --max-wait comes back here for Modal; this machine checks only boat's API and image:
-        # rules.fallback.preflight_on)
-        # (Modal only for what boat failed 3 times on distinct VMs, or a job Modal owns: rules.fallback.lost_route; a
-        # batch boat couldn't take now (its preflight, Unavailable: an image, a tree, the scheduler) and every other job
-        # boat didn't return run again on boat, 3 passes a minute apart, then fail with why: never Modal for those)
-        mine = [j for j in spec_cpu if j not in own]
-        for k in range(1 if strict_once else 3):
-            if not mine:
-                break
-            if k:
-                log(f"{len(mine)} jobs boat didn't run, not for 3 boat failures ({'; '.join(sorted({str(moved.get(j['name'], ''))[:80] for j in mine})[:2])}): again on boat in 60 s")
-                time.sleep(60)
-            if not strict_once and fallback.preflight_on(backend, _sch.enabled(), bool(_sch.enabled() and _sch.controller())):
-                reason, info = boat.preflight3(1, vm_type, starts=not _sch.enabled())
-            else:
-                reason, info = None, {}
-            if reason is None:
-                try:
-                    got, bsum = boat.boat_jobs(mine, out, pre, cmd, vms=vms, idle=idle, teardown=teardown, durations=durations, vm_type=vm_type, max_vms=max_vms,
-                                               on_lost=None if strict_once else lambda n, why: moved.__setitem__(n, why), max_wait=max_wait if backend == "auto" else 0, on_done=printer, tar=tar,
-                                               **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
-                except boat.Unavailable as e:
-                    if strict_once:
-                        raise
-                    got = {}
-                    moved.update({j["name"]: str(e) for j in mine})
-                rows.update(got)
-                where.update({n: "boat" for n in got})
-            else:
-                moved.update({j["name"]: reason for j in mine})
-                log(f"boat can't take this batch now ({reason})")
-            mine = [] if strict_once else [j for j in mine if j["name"] not in rows and fallback.lost_route(False, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto") == "boat"]
-        todo = []
-        for j in [j for j in spec_cpu if j["name"] not in rows]:
-            r = "failed" if strict_once or "cpu_model" in j or "distinct_vm_group" in j or required_agent_capabilities(j) else fallback.lost_route(j in own, boat.boat_fails_of(moved.get(j["name"])), 3, backend == "auto")
-            if r == "modal":
-                todo.append(j)
-            else:  # (boat failed it 3 times under --backend boat, or boat couldn't run it at all: failed, with why)
-                rows[j["name"]] = {"code": -1, "seconds": -1, "out": "", "err": moved.get(j["name"], "never ran"),
-                                   **({"strict_once": True, "status": "LOST", "terminal": True, "identity_unavailable": True} if strict_once else {})}
-                where[j["name"]] = "boat"
-    if todo:
-        with ModalCtx(app):
-            got = modal_jobs(todo, printer)
-        rows.update(got)
-        where.update({n: "modal" for n in got})
-    order = [j["name"] for j in boat_order(spec)]
+        where.update(locations)
+        reasons.update(failures)
+    cpu = [job for job in spec if not job.get("gpu")]
+    pending = list(cpu)
+    from . import scheduler as _sch
+    for attempt in range(1 if strict_once else 3):
+        if not pending:
+            break
+        if attempt:
+            log(f"{len(pending)} unserved CPU jobs: retrying on boat in 60 s")
+            time.sleep(60)
+        if not strict_once and fallback.preflight_on(backend, _sch.enabled(), bool(_sch.enabled() and _sch.controller())):
+            reason, _ = boat.preflight3(1, vm_type, starts=not _sch.enabled())
+        else:
+            reason = None
+        if reason is None:
+            try:
+                got, bsum = boat.boat_jobs(pending, out, pre, cmd, vms=vms, idle=idle, teardown=teardown, durations=durations, vm_type=vm_type, max_vms=max_vms,
+                                           on_lost=None, max_wait=max_wait if backend == "auto" else 0, on_done=printer, tar=tar,
+                                           **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
+            except boat.Unavailable as error:
+                if strict_once:
+                    raise
+                got = {}
+                reasons.update({job["name"]: str(error) for job in pending})
+            rows.update(got)
+            where.update({name: "boat" for name in got})
+        else:
+            reasons.update({job["name"]: reason for job in pending})
+        pending = [job for job in pending if job["name"] not in rows]
+    for job in pending:
+        rows[job["name"]] = {"code": -1, "seconds": -1, "out": "", "err": reasons.get(job["name"], "boat never ran the job"),
+                             "status": "LOST" if strict_once else "FAILED", "terminal": True, "identity_unavailable": True}
+        where[job["name"]] = "boat"
+    order = [job["name"] for job in boat_order(spec)]
     for name in order:
-        r = rows.get(name, {"code": -1, "seconds": -1, "out": "", "err": "never ran"})
-        (outdir / f"{name}.log").write_text(r.get("out", "") + ("\n--- stderr ---\n" + r.get("err", "") if r.get("err", "").strip() else ""))
-    placed = {n: rows[n]["placement"] for n in order if isinstance(rows.get(n, {}).get("placement"), dict)}
-    if placed:  # (where each job ran: the VM type, its CPU, its vCPUs, alone or beside how many others: a timing claim's label)
+        row = rows.get(name, {"code": -1, "seconds": -1, "out": "", "err": "never ran", "status": "FAILED", "terminal": True})
+        if row.get("lost"):
+            row.setdefault("status", "LOST")
+            row.setdefault("terminal", True)
+        (outdir / f"{name}.log").write_text(row.get("out", "") + ("\n--- stderr ---\n" + row.get("err", "") if row.get("err", "").strip() else ""))
+    placed = {name: rows[name]["placement"] for name in order if isinstance(rows.get(name, {}).get("placement"), dict)}
+    if placed:
         (outdir / "placement.json").write_text(json.dumps(placed, indent=1))
-    (outdir / "summary.tsv").write_text("".join(f"{n}\t{rows.get(n, {}).get('code', -1)}\t{rows.get(n, {}).get('seconds', -1)}\t{where.get(n, '-')}\n" for n in order))
+    (outdir / "summary.tsv").write_text("".join(f"{name}\t{rows.get(name, {}).get('code', -1)}\t{rows.get(name, {}).get('seconds', -1)}\t{where.get(name, '-')}\n" for name in order))
     wall = round(time.time() - t0, 1)
-    done = [rows.get(n, {"code": -1, "seconds": -1}) for n in order]
-    failed = sum(type(r.get("code")) is not int or r["code"] != 0 for r in done)
-    line = f"{len(done)} jobs, {failed} failed, {wall} s wall, {round(sum(max(r.get('seconds', 0), 0) for r in done), 1)} s of job time"
-    tail, why = where_line(where, moved)
-    print(line + (f"; {tail}" if backend != "modal" else ""))
+    done = [rows.get(name, {"code": -1, "seconds": -1}) for name in order]
+    failed = sum(type(row.get("code")) is not int or row["code"] != 0 for row in done)
+    line = f"{len(done)} jobs, {failed} failed, {wall} s wall, {round(sum(max(row.get('seconds', 0), 0) for row in done), 1)} s of job time"
+    tail, _ = where_line(where, {})
+    print(line + (f"; {tail}" if tail else ""))
     timed = [p for p in placed.values() if p.get("exclusive")]
     if timed:
         kinds = sorted({f"{p['type']} ({p['cpu'] or '?'}, {p['vcpus']} of {p['vm_vcpus']} vCPUs pinned)" for p in timed})
         print(f"timing: {len(timed)} jobs each alone on its VM ({max(p['co_tenants'] for p in timed)} co-tenants): {'; '.join(kinds)}")
     if bsum:
         print(boat.summary_line(bsum))
-    (outdir / "backends.json").write_text(json.dumps({"backend": backend, "wall_s": wall, "where": count(where), "fallbacks": why, "boat": bsum}, indent=1))
+    (outdir / "backends.json").write_text(json.dumps({"backend": backend, "wall_s": wall, "where": count(where), "fallbacks": [], "failures": reasons, "boat": bsum}, indent=1))
     return 3 if failed else 0
 
 
@@ -290,22 +210,12 @@ def where_line(where: dict, moved: dict) -> tuple[str, list]:
 
 # ----------------------------------------------------------------------------------------------- the compare runners
 class ModalEx:
-    """Modal, as the runners always did (`modal run`, the app already running)."""
+    """Legacy name retained only to give callers a clear removal error."""
 
     backend = "modal"
 
     def __init__(self, app):
-        self.m = ModalCtx(app).__enter__()
-
-    def remote(self, fn, *args):
-        return fn.remote(*args)
-
-    def starmap(self, fn, args: list, **_):
-        return fn.starmap(args, order_outputs=False, return_exceptions=True)
-
-    def close(self):
-        self.m.__exit__(None, None, None)
-        return {}
+        raise ValueError(config.MODAL_REMOVED)
 
 
 class CallFailed(RuntimeError):
@@ -423,8 +333,7 @@ class BoatEx:
 
 
 class AutoEx:
-    """boat first; Modal for the whole batch when boat failed it 3 times (its API, 3 tries), and for each call boat
-    failed 3 times (the scheduler's count: a VM lost, a row missing, no VM ready)."""
+    """Boat-only callable execution; exhausted calls fail without changing provider."""
 
     backend = "auto"
     strict_once = False  # Preserve legacy/unpickled instances that predate the opt-in field.
@@ -436,12 +345,12 @@ class AutoEx:
         cfg = {} if self.strict_once else getattr(agent.import_runner(str(pathlib.Path(runner).resolve())), "BOAT", {})
         self.no_fallback = self.strict_once or bool(required_agent_capabilities(cfg))
         self.app, self.modal, self.bx = app, None, None
-        self.where = {"boat": 0, "modal": 0}
+        self.where = {"boat": 0}
         self.why: dict[str, int] = {}
         from . import scheduler as _sch
         self.reason, _ = (None, {}) if self.no_fallback or (_sch.enabled() and _sch.controller()) else boat.preflight3(1, opts.get("vm_type", boat.VM_TYPE), starts=not _sch.enabled())
-        # (boat's failures of this batch's calls, a call's own failure never one: Modal takes the rest only at the
-        # third; rules.fallback.AutoFallback)
+        # Boat owns physical retries; exhaustion is terminal. A call's own
+        # failure never spends another call's retry budget.
         self.fb = fallback.AutoFallback(3)
         self._mk = lambda: BoatEx(runner, build=False, max_wait=max_wait, **opts)
         if self.reason is None:
@@ -471,99 +380,69 @@ class AutoEx:
     boat_fails = property(lambda self: self.fb.boat_fails)
 
     def _modal(self):
-        if self.modal is None:
-            self.modal = ModalCtx(self.app).__enter__()
-        return self.modal
+        raise ValueError(config.MODAL_REMOVED)
 
     def _moved(self, k: int, reason: str):
-        self.why[reason] = self.why.get(reason, 0) + k
+        raise ValueError(config.MODAL_REMOVED)
 
     def remote(self, fn, *args):
-        if self.strict_once or getattr(self, "no_fallback", False):
+        if getattr(self, "strict_once", False) or getattr(self, "no_fallback", False):
             result = self.bx.remote(fn, *args)
             self.where["boat"] += 1
             return result
-        tries = 0
-        while self.bx or (not self.fb.on_modal and self._boat()):
+        for attempt in range(6):
+            if not self._boat():
+                raise RuntimeError(f"boat can't run this call now ({self.reason})")
             try:
-                r = self.bx.remote(fn, *args)
+                result = self.bx.remote(fn, *args)
                 self.fb.outcome("ok")
                 self.where["boat"] += 1
-                return r
+                return result
             except CallFailed:
-                self.fb.outcome("own")  # (its own failure: its result, raised; never boat's)
+                self.fb.outcome("own")
                 self.where["boat"] += 1
                 raise
-            except Exception as e:
-                tries += 1
-                if fallback.lost_route(False, boat.boat_fails_of(str(e)), 3, True) == "boat":  # (not 3 real boat failures: boat again)
-                    if tries >= 6:
-                        raise
-                    log(f"boat didn't return a call ({str(e)[:160]}): again on boat")
-                    time.sleep(5 * tries)
-                    continue
-                if self.fb.outcome("lost") == "again":
-                    log(f"boat failed a call ({str(e)[:160]}; {self.boat_fails} of 3): again on boat")
-                    time.sleep(5 * self.boat_fails)
-                    continue
-                self.reason = f"boat failed 3 times (last: {str(e)[:200]})"
-                log(f"{self.reason}: Modal runs the rest of this batch")
-                with contextlib.suppress(Exception):
-                    self.bx.close()
-                self.bx = None
-        if not self.fb.on_modal:  # (boat couldn't take the batch at all: never Modal for that)
-            raise RuntimeError(f"boat can't run this call now ({self.reason})")
-        self._modal()
-        self._moved(1, self.reason)
-        self.where["modal"] += 1
-        return fn.remote(*args)
+            except Exception as error:
+                failures = boat.boat_fails_of(str(error))
+                if fallback.lost_route(False, failures, 3, False) == "failed":
+                    self.fb.refused()
+                    raise
+                if attempt == 5:
+                    raise
+                log(f"boat did not return the call ({str(error)[:160]}): retrying on boat")
+                time.sleep(5 * (attempt + 1))
 
     def starmap(self, fn, args: list, **_):
-        if self.strict_once or getattr(self, "no_fallback", False):
+        if getattr(self, "strict_once", False) or getattr(self, "no_fallback", False):
             for result in self.bx.starmap(fn, args):
                 self.where["boat"] += 1
                 yield result
             return
-        rest, to_modal = list(args), []
-        for _ in range(3):  # (calls boat lost but not for 3 real boat failures: boat again, 3 passes; rules.fallback.lost_route)
-            if not rest or not self._boat():
+        pending = list(args)
+        for _ in range(3):
+            if not pending or not self._boat():
                 break
-            lost: list = []
-            for r in self.bx.starmap(fn, rest, on_lost=lambda a, why: lost.append((a, why))):
+            lost = []
+            for result in self.bx.starmap(fn, pending, on_lost=lambda item, why: lost.append((item, why))):
                 self.where["boat"] += 1
-                yield r
-            rest = []
-            for a, why in lost:
-                if fallback.lost_route(False, boat.boat_fails_of(why), 3, True) == "modal":
-                    to_modal.append(a)
-                    self._moved(1, why)
+                yield result
+            pending = []
+            for item, why in lost:
+                if fallback.lost_route(False, boat.boat_fails_of(why), 3, False) == "failed":
+                    self.where["boat"] += 1
+                    yield RuntimeError(why)
                 else:
-                    rest.append(a)
-        for _ in rest:  # (boat couldn't run them, not for 3 real boat failures: their failure, never Modal)
-            yield RuntimeError(f"boat couldn't run this call ({self.reason or 'lost, not for 3 boat failures'})")
-        rest = to_modal
-        if rest:
-            self._modal()
-            log(f"{len(rest)} calls of {fname(fn)} on Modal")
-            for r in fn.starmap(rest, order_outputs=False, return_exceptions=True):
-                self.where["modal"] += 1
-                yield r
+                    pending.append(item)
+        for _ in pending:
+            self.where["boat"] += 1
+            yield RuntimeError(f"boat couldn't run this call ({self.reason or 'no returned row'})")
 
     def close(self):
         if getattr(self, "closed", None) is not None:
             return self.closed
-        s = {}
-        try:
-            if self.bx:
-                s = self.bx.close()
-        finally:
-            if self.modal:
-                self.modal.__exit__(None, None, None)
-        text = ", ".join(f"{k} calls on {b}" for b, k in self.where.items() if k)
-        if self.why:
-            text += " (fallback: " + "; ".join(f"{k}: {r}" for r, k in self.why.items()) + ")"
-        print(text, flush=True)
-        self.closed = {**s, "where": self.where, "fallbacks": [{"calls": k, "to": "modal", "reason": r} for r, k in self.why.items()]}
+        summary = self.bx.close() if self.bx else {}
+        print(", ".join(f"{n} calls on {backend}" for backend, n in self.where.items() if n), flush=True)
+        self.closed = {**summary, "where": self.where, "fallbacks": []}
         return self.closed
 
 
@@ -572,7 +451,6 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
     plus the pool's."""
     import argparse
     import signal
-    reexec_with_modal()
     ap = argparse.ArgumentParser(description=(doc or "").split("\n\n")[0])
     ap.add_argument("--backend", default=os.environ.get("SUPERCOMPUTER_BACKEND") or backend, choices=["modal", "auto", "boat"],
                     help=f"where its calls run (default {backend}: the runner's own, or $SUPERCOMPUTER_BACKEND)")
@@ -582,7 +460,7 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
     ap.add_argument("--teardown", action="store_true", help="delete the batch's VMs at the end instead of stopping them")
     ap.add_argument("--vm-type", default="large", choices=["small", "default", "large", "xlarge"])
     ap.add_argument("--durations", default="", help="an earlier results.jsonl: the longest calls start first")
-    ap.add_argument("--max-wait", type=int, default=120, help="auto: seconds to wait for a boat VM before Modal takes the batch")
+    ap.add_argument("--max-wait", type=int, default=120, help="auto: seconds to wait for a boat VM before reporting failure")
     ap.add_argument("--class", dest="sc_class", default="", choices=["", *__import__("supercomputer.scheduler", fromlist=["CLASSES"]).CLASSES],
                     help="the scheduler's priority class (default $SUPERCOMPUTER_CLASS, else submission; the bar sets gate)")
     ap.add_argument("--timing", dest="sc_timing", action="store_true", help="each call alone on its VM (a timing claim; $SUPERCOMPUTER_TIMING=1)")
@@ -598,8 +476,10 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
         else:
             ap.add_argument(flag, type=type(p.default), default=p.default, dest=p.name)
     a = ap.parse_args()
-    if a.strict_once and a.backend == "modal":
-        ap.error("--strict-once requires --backend auto or boat; Modal cannot honor it")
+    try:
+        config.reject_removed_backend(a.backend)
+    except ValueError as error:
+        ap.error(str(error))
     if a.sc_class:
         os.environ["SUPERCOMPUTER_CLASS"] = a.sc_class
     if a.sc_timing:
@@ -615,15 +495,7 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
     opts = dict(vms=a.vms, idle=a.idle, teardown=a.teardown, vm_type=a.vm_type, max_vms=a.max_vms, durations=a.durations)
     if a.strict_once:
         opts.update(strict_once=True, max_attempts=a.max_attempts)
-    if a.backend == "modal":
-        if required_agent_capabilities(getattr(mod, "BOAT", {})):
-            ap.error("runtime pins and agent requirements need the native boat backend; no Modal fallback")
-        with ModalCtx(mod.app):
-            ex = ModalEx.__new__(ModalEx)
-            ex.m = contextlib.nullcontext()
-            ex.close = lambda: {}
-            return run(ex, **kw)
-    ex = BoatEx(runner, max_wait=0, **opts) if a.backend == "boat" else AutoEx(runner, mod.app, max_wait=a.max_wait, **opts)
+    ex = BoatEx(runner, max_wait=0, **opts) if a.backend == "boat" else AutoEx(runner, getattr(mod, "app", None), max_wait=a.max_wait, **opts)
     s = {}
     try:
         run(ex, **kw)
@@ -636,45 +508,29 @@ def cli(run, runner: str, doc: str = "", backend: str = "auto"):
 
 
 # -------------------------------------------------------------------------------------------------------- GPU runners
-def gpu_call(runner: str, fn: str, args: list, app, modal_fn, backend: str = "auto", gpus: str = "", label: str = "gpu") -> tuple[dict, dict]:
-    """A GPU runner's function: on RunPod (auto, runpod), on Modal when RunPod can't (auto) or when asked (modal).
-    Returns the function's result (the same either way) and where it ran and why."""
+def gpu_call(runner: str, fn: str, args: list, app=None, modal_fn=None, backend: str = "auto", gpus: str = "", label: str = "gpu") -> tuple[dict, dict]:
+    """Run a GPU call only on RunPod; exhausted pod retries raise the failure."""
+    config.reject_removed_backend(backend)
+    if backend not in ("auto", "runpod"):
+        raise ValueError("GPU jobs require runpod or auto")
     from . import runpod
-    meta: dict = {"backend": None, "fallback": None}
-    if backend in ("auto", "runpod"):
-        reason = runpod.preflight() if backend == "auto" else None
-        if reason is None:
-            tries = fallback.GpuTries()  # (two pods at most; none after "no capacity")
-            while tries.next_pod():
-                try:
-                    r = runpod.call(runner, fn, args, gpus, label=label)
-                    tries.ended("ok")
-                    meta.update(backend="runpod", runpod=r.pop("runpod", None))
-                    return r, meta
-                except runpod.NoCapacity as e:
-                    tries.ended("no_capacity")
-                    reason = f"runpod has no GPU in the list ({str(e)[:300]})"
-                except KeyboardInterrupt:
-                    raise
-                except Exception as e:
-                    tries.ended("failed")
-                    reason = f"runpod pod failed ({str(e)[:300]})"
-                    log(f"{reason}" + ("; once more on a new pod" if tries.pods < 2 else ""))
-                    if backend == "runpod" and tries.pods >= 2:
-                        raise
-        if fallback.gpu_leftover(backend) == "failed":
-            raise RuntimeError(reason)
-        log(f"{reason}: Modal runs it")
-        meta["fallback"] = reason
-    with ModalCtx(app):
-        call = modal_fn.spawn(*args)
-        try:
-            r = call.get()
-        finally:
-            with contextlib.suppress(Exception):
-                call.cancel()
-    meta["backend"] = "modal"
-    return r, meta
+    reason = runpod.preflight() if backend == "auto" else None
+    if reason is None:
+        tries = fallback.GpuTries()
+        while tries.next_pod():
+            try:
+                result = runpod.call(runner, fn, args, gpus, label=label)
+                tries.ended("ok")
+                return result, {"backend": "runpod", "fallback": None, "runpod": result.pop("runpod", None)}
+            except runpod.NoCapacity as error:
+                tries.ended("no_capacity")
+                reason = f"runpod has no GPU in the list ({str(error)[:300]})"
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                tries.ended("failed")
+                reason = f"runpod pod failed ({str(error)[:300]})"
+    raise RuntimeError(reason or "RunPod did not return a result")
 
 
 def gpu_cli(main, runner: str):
@@ -693,6 +549,7 @@ def gpu_cli(main, runner: str):
         else:
             ap.add_argument(flag, type=type(p.default), default="auto" if p.name == "backend" else p.default, dest=p.name)
     a = ap.parse_args()
+    config.reject_removed_backend(getattr(a, "backend", "auto"))
 
     def h(sig, frame):
         raise KeyboardInterrupt(f"signal {sig}")

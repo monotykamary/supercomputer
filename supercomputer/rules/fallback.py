@@ -1,42 +1,22 @@
-"""Where work runs: boat first, RunPod for GPUs, Modal when they can't; the decisions of fanout.py and runpod.py.
+"""Boat CPU retries and RunPod GPU outcomes; no execution route reaches Modal.
 
-    job_route      a CPU job of a jobs file: boat, Modal, or failed (run_jobs)
-    preflight_on   whether a batch asks boat's preflight first
-    needs_modal    whether `supercomputer run` loads the Modal client
-    row_outcome    a call's row: its result, its own failure, or boat losing it
-    AutoFallback   AutoEx: boat for each call until boat failed 3 times, then Modal for the rest
-    GpuTries       gpu_jobs and gpu_call: at most two pods, none after "no capacity", then Modal (or failed)
-    PodCreation    Pod.__enter__: pods made that never came up, at most MAX_TRIES, within MAX_WAIT
-    job_outcome    Pod.job: a job's exit, a timeout, or the pod lost
-    runpod_ready   runpod.preflight: its API and its balance
-    pod_reap       runpod.reap: a pod kept, deleted or not ours
-    ModalRef       ModalCtx: an app started here stopped when its last holder exits, never one started elsewhere
-    reexec_modal   fanout.reexec_with_modal: re-run under the Modal CLI's Python, once
+Legacy ModalRef models remain for cleanup compatibility, not new dispatch.
 """
 from typing import Literal
 
 Backend = Literal["modal", "auto", "boat", "runpod"]
-Where = Literal["boat", "modal", "failed"]
+Where = Literal["boat", "failed"]
 Outcome = Literal["ok", "own", "lost"]
 
 
-# gdp: law --backend boat never sends a job to Modal but Modal's own: result != "modal" or backend != "boat" or own
-# gdp: law --backend modal never runs a job on boat: result != "boat" or backend == "auto" or backend == "boat"
-# gdp: law a job boat ran stays boat's: result == "boat" or not boat_ran or own or (backend != "auto" and backend != "boat")
-# gdp: law a job boat didn't run is failed only under --backend boat: result != "failed" or backend == "boat"
+# gdp: law no CPU route selects Modal: result == "boat" or result == "failed"
+# gdp: law a returned boat job stays on boat: result != "boat" or (boat_ran and not own and (backend == "auto" or backend == "boat"))
+# gdp: law an unavailable CPU job fails closed: result != "failed" or not boat_ran or own or (backend != "auto" and backend != "boat")
 def job_route(backend: Backend, own: bool, boat_refused: bool, boat_ran: bool) -> Where:
-    """A CPU job of a jobs file (run_jobs): Modal's own (its image boat lacks, or "backend": "modal") on Modal; under
-    auto and boat, on boat unless the preflight refused the batch (auto); one boat didn't finish failed under boat, on
-    Modal under auto; under modal and runpod (its CPU jobs) on Modal."""
-    if own:
-        return "modal"
-    if backend == "auto" or backend == "boat":
-        if boat_ran:
-            return "boat"
-        if backend == "boat":
-            return "failed"
-        return "modal"
-    return "modal"
+    """Unknown/legacy images and unsupported backends fail; successful CPU work stays on boat."""
+    if not own and (backend == "auto" or backend == "boat") and boat_ran:
+        return "boat"
+    return "failed"
 
 
 # gdp: law only auto asks boat's preflight, and not where the controller's scheduler takes the batch: not result or (backend == "auto" and not (scheduler and controller))
@@ -44,10 +24,10 @@ def preflight_on(backend: Backend, scheduler: bool, controller: bool) -> bool:
     return backend == "auto" and not (scheduler and controller)
 
 
-# gdp: law --backend boat with no job of Modal's never loads the Modal client: not result or backend != "boat" or modal_job
+# gdp: law removed Modal execution never loads its client: result == False
 def needs_modal(backend: Backend, modal_job: bool) -> bool:
-    """`supercomputer run`: the Modal app loaded where any job may go to Modal."""
-    return backend != "boat" or modal_job
+    """Compatibility hook for older callers; Modal is never an execution backend."""
+    return False
 
 
 # gdp: law a row with a result and exit 0 is the call's result: result == "ok" or not (has_result and code == 0)
@@ -63,25 +43,29 @@ def row_outcome(has_result: bool, code: int, ran: bool, lost: bool) -> Outcome:
 
 
 class AutoFallback:
-    """AutoEx: each call on boat; a call boat loses runs again on boat, until boat has failed this batch's calls 3
-    times; then Modal takes the rest of the batch. A call's own failure is its result, never boat's."""
+    """Bounded boat-only call retries. Own failures are raised, never retried."""
 
-    # gdp: law Modal takes the batch only after 3 boat failures: not on_modal or boat_fails >= tries
-    # gdp: law a call goes to Modal only once boat failed the batch 3 times: result != "modal" or boat_fails >= tries
+    # gdp: law Modal is never enabled: on_modal == False
+    # gdp: law boat failures stay within the retry budget: boat_fails <= tries
+    # gdp: law exhausted calls stop: not stopped or boat_fails >= tries
+    # gdp: law an available retry has budget left: stopped or boat_fails < tries
 
     def __init__(self, tries: int):
         if tries < 1:
             raise ValueError("tries is at least 1")
         self.tries = tries
         self.boat_fails = 0
-        self.on_modal = False
+        self.on_modal = False  # legacy serialized field; never enabled
+        self.stopped = False
 
     # gdp: law a call's own failure is never a boat failure: outcome != "own" or boat_fails == old(boat_fails)
-    # gdp: law a call's own failure is its result, never retried nor moved: outcome != "own" or result == "raise" or old(on_modal)
-    def outcome(self, outcome: Outcome) -> Literal["done", "raise", "again", "modal"]:
-        """A call's outcome on boat: done, raised (its own failure), again on boat, or on Modal from now on."""
-        if self.on_modal:
-            return "modal"
+    # gdp: law a call's own failure is raised: outcome != "own" or result == "raise"
+    # gdp: law retries stay on boat: result != "again" or boat_fails < tries
+    def outcome(self, outcome: Outcome) -> Literal["done", "raise", "again"]:
+        if self.on_modal:  # legacy state must never enable execution
+            self.on_modal = False
+        if self.stopped:
+            return "raise"
         if outcome == "ok":
             return "done"
         if outcome == "own":
@@ -89,14 +73,14 @@ class AutoFallback:
         self.boat_fails += 1
         if self.boat_fails < self.tries:
             return "again"
-        self.on_modal = True
-        return "modal"
+        self.stopped = True
+        return "raise"
 
-    # gdp: law with boat refused, every call is Modal's: on_modal and boat_fails >= tries
+    # gdp: law refused work stops without enabling Modal: stopped and on_modal == False
     def refused(self) -> None:
-        """The preflight refused the batch (or boat had no session for it): Modal from the first call."""
-        self.on_modal = True
         self.boat_fails = self.tries
+        self.stopped = True
+        self.on_modal = False
 
 
 class GpuTries:
@@ -125,13 +109,10 @@ class GpuTries:
             self.stopped = True
 
 
-# gdp: law --backend runpod never sends a GPU job to Modal: result != "modal" or backend != "runpod"
-# gdp: law a GPU job is failed only under --backend runpod: result != "failed" or backend == "runpod"
+# gdp: law an unserved GPU job fails instead of changing provider: result == "failed"
 def gpu_leftover(backend: Backend) -> Where:
-    """A GPU job no pod ran: failed under --backend runpod, else on Modal."""
-    if backend == "runpod":
-        return "failed"
-    return "modal"
+    """RunPod is the only GPU backend, including when it cannot serve a job."""
+    return "failed"
 
 
 class PodCreation:
@@ -224,22 +205,20 @@ class ModalRef:
             self.stopped = True
 
 
-# gdp: law it re-runs under the Modal CLI's Python at most once: not result or not reexeced
+# gdp: law removed Modal execution never reexecs its interpreter: result == False
 def reexec_modal(modal_real: bool, reexeced: bool, modal_python: bool, same_python: bool) -> bool:
-    """fanout.reexec_with_modal: re-run under the Python the Modal CLI runs on, where this one lacks the client."""
-    return not modal_real and not reexeced and modal_python and not same_python
+    """Legacy compatibility hook: keep the current interpreter."""
+    return False
 
 
-# gdp: law no client path reaches Modal but through boat_tries boat failures on distinct VMs (or a job Modal owns): result != "modal" or own or failures >= tries
-# gdp: law work boat failed fewer times goes back to boat, whatever kept it off (a tree, an image, a scheduler hiccup): result == "boat" or own or failures >= tries
-def lost_route(own: bool, failures: int, tries: int, modal_on: bool) -> Literal["modal", "boat", "failed"]:
-    """Where a client sends work boat didn't return (the treadmill's Batch, run, AutoEx): `failures` the scheduler's
-    count of real boat failures of it, on distinct VMs (its lost row's boat_fails; 0 for anything else: Unavailable,
-    a tree, an image, a scheduler that didn't answer). Modal only at `tries` of them, or a job Modal owns (its image,
-    "backend": "modal"); else boat again (11-01 05:03: a sweep's item on Modal for "boat couldn't run them", a tree
-    missing at the treadmill's shutdown)."""
-    if own:
-        return "modal"
-    if failures >= tries:
-        return "modal" if modal_on else "failed"
+# gdp: law exhausted work never selects Modal: result == "boat" or result == "failed"
+# gdp: law work below its boat failure budget stays on boat: result == "boat" or own or failures >= tries
+# gdp: law exhausted or unsupported work is terminal: result != "boat" or (not own and failures < tries)
+def lost_route(own: bool, failures: int, tries: int, modal_on: bool) -> Literal["boat", "failed"]:
+    """Preserve the boat retry budget, but never route exhausted work to another provider.
+
+    own/modal_on are retained for older callers; legacy Modal-only work fails closed.
+    """
+    if own or failures >= tries:
+        return "failed"
     return "boat"

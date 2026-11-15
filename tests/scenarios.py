@@ -55,6 +55,33 @@ def scenario(fix: str, want: list, seconds: float, about: str):
     return deco
 
 
+@scenario('Modal execution removed', ['lost', 'clients', 'modal', 'threads'], 1600,
+          'an item loses three distinct boat VMs, reports terminal LOST, and never increments a Modal handoff')
+def exhausted_boat_never_modal(code):
+    from tests.sim.harness import items
+    sim = _sim(code)
+    _warm(sim, 5)
+    sim.scheduler()
+    bid = sim.batch('exhausted-boat', 'gate', items('lost', 1, 1200), after=10, on_lost=False)
+    stopped = []
+    def lose_running():
+        for vm in sim.w.vms.values():
+            if vm.id not in stopped and any(p['batch'] == bid and p['alive'] for p in vm.procs.values()):
+                stopped.append(vm.id)
+                sim.w.stop(vm, 'boat')
+                break
+    for when in range(30, 1250, 30):
+        sim.at(when, lose_running)
+    def extra(sim, metrics):
+        row = sim.clients[bid]['items'].get('lost0') or {}
+        handoffs = sum(sum(s.m.get('to_modal', {}).values()) for _, s in sim.w.sched_procs if s)
+        metrics['exhausted_boat'] = {'stopped': stopped, 'row': row, 'modal_handoffs': handoffs}
+        return {'three_distinct_boat_failures': len(stopped) == 3 and row.get('boat_fails') == 3,
+                'terminal_lost': row.get('status') == 'LOST' and row.get('terminal') is True and row.get('code') == -1,
+                'no_modal_handoff': handoffs == 0}
+    return sim, {'extra': extra}
+
+
 @scenario("11-08 legacy rollback/reload", ["lost", "clients", "orphans", "strikes", "modal", "threads"], 1600,
           "an old legacy admission with running items and null rollback placement records survives a switch; every original run keeps its worker process")
 def legacy_admission_handoff(code):

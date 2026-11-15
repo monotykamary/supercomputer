@@ -69,46 +69,22 @@ def test_own_failure_is_the_calls():
     assert ex.remote(Fn()) == 42
 
 
-def test_three_boat_failures_then_modal():
-    ex = auto(["lost", "lost", "lost"])
-    assert ex.remote(Fn()) == "on modal"
-    assert ex.boat_fails == 3 and ex.bx is None and ex.where["modal"] == 1
+def test_three_boat_failures_are_terminal():
+    ex = auto(['lost'])
+    try:
+        ex.remote(Fn())
+        raise AssertionError('exhausted call did not fail')
+    except RuntimeError as error:
+        assert 'boat failed it 3 times' in str(error)
+    assert ex.boat_fails == 3 and ex.where['modal'] == 0
 
 
-def test_modal_app_refcount():
-    """An app started here stops when its last holder exits; one started elsewhere is never stopped here."""
-    fanout.modal_real = lambda: True
-    events = []
-
-    class Ctx:
-        def __enter__(self):
-            events.append("start")
-
-        def __exit__(self, *e):
-            events.append("stop")
-
-    class App:
-        app_id = None
-
-        def run(self):
-            self.app_id = "ap-test"
-            return Ctx()
-    app = App()
-    a, b = fanout.ModalCtx(app), fanout.ModalCtx(app)
-    a.__enter__(); b.__enter__()
-    a.__exit__(None, None, None)
-    assert events == ["start"], events
-    b.__exit__(None, None, None)
-    assert events == ["start", "stop"], events
-
-    class Elsewhere:
-        app_id = "ap-modal-run"
-
-        def run(self):
-            raise AssertionError("started again")
-    c = fanout.ModalCtx(Elsewhere())
-    c.__enter__(); c.__exit__(None, None, None)
-    assert events == ["start", "stop"]
+def test_modal_app_is_refused():
+    try:
+        fanout.ModalCtx(object())
+        raise AssertionError('Modal was enabled')
+    except ValueError as error:
+        assert 'Modal support removed; use boat or runpod' in str(error)
 
 
 def test_cache_first_solve_and_seen():

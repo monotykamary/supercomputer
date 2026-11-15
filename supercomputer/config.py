@@ -30,10 +30,10 @@ A repo's file, at its root (or $SUPERCOMPUTER_CONFIG; a worktree with none reads
     salt = "leanprover/lean4:v4.34.0\\n"
     modal_volume = "gdp-wired-olean" # (optional) where Modal's jobs keep it: fetched when this machine has less
     [modal]
-    module = "supercomputer/run.py"  # the repo's own Modal app: `app`, `modal_jobs(spec, pre, cmd, on_done)`
+    module = "supercomputer/run.py"  # legacy only: ignored for execution; migrate old hooks to boat/RunPod
     image = {apt = ["curl"], run = ["curl -fsSL https://bun.sh/install | bash"], env = {PATH = "..."}}  # else this
     [gpu]
-    image = {apt = [...], run = [...]}   # the GPU jobs' setup (RunPod runs `run` once per pod, Modal builds it)
+    image = {apt = [...], run = [...]}   # GPU setup: RunPod runs `run` once per pod
     hooks = "supercomputer/hooks.py"     # optional: layers(root), job_item(item, job), ...
 """
 import contextlib
@@ -70,6 +70,15 @@ def env(name: str, default: str = "") -> str:
     from .rules import ops
     a, b = os.environ.get(f"SUPERCOMPUTER_{name}") or "", os.environ.get(f"GDPW_BOAT_{name}") or ""
     return {1: a, 2: b, 3: default}[ops.precedence(a != "", b != "")]  # (the first given wins: rules.ops.precedence)
+
+
+MODAL_REMOVED = "Modal support removed; use boat or runpod"
+
+
+def reject_removed_backend(backend: str = "auto", jobs=()):
+    """Reject legacy routes before provider imports, synchronization or submission."""
+    if backend == "modal" or any(job.get("backend") == "modal" for job in jobs):
+        raise ValueError(MODAL_REMOVED)
 
 
 def git_root(d: pathlib.Path) -> pathlib.Path:

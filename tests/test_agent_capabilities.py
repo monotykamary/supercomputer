@@ -361,7 +361,7 @@ def test_outer_fanout_rejects_backend_gpu_and_foreign_image_bypasses():
                 fanout.run_jobs(None, [{"name": "cap", "cmd": "true", "required_agent_capabilities": CAPS, **extra}],
                                 out, "", lambda x: x, modal, backend=backend)
             except ValueError as error:
-                assert "no fallback" in str(error)
+                assert ("Modal support removed; use boat or runpod" if backend == "modal" or extra.get("backend") == "modal" else "no fallback") in str(error)
             else:
                 raise AssertionError(f"capability requirement bypassed through {backend}/{extra}")
             modal.assert_not_called()
@@ -370,9 +370,10 @@ def test_outer_fanout_rejects_backend_gpu_and_foreign_image_bypasses():
 def test_outer_fanout_three_strikes_never_route_capability_job_to_modal():
     from supercomputer import fanout
     def failed(jobs, *args, on_lost=None, **kwargs):
-        for job in jobs:
-            on_lost(job["name"], "boat failed it 3 times (last: its row lost on bx_a)")
-        return {}, {}
+        assert on_lost is None
+        return {job["name"]: {"code": -1, "seconds": -1, "lost": True, "boat_fails": 3,
+                              "status": "LOST", "terminal": True, "error": "boat failed it 3 times (last: its row lost on bx_a)"}
+                for job in jobs}, {}
     with tempfile.TemporaryDirectory() as out, patch.object(fanout, "project", return_value=SimpleNamespace(images={})), \
             patch.object(fanout.fallback, "preflight_on", return_value=False), \
             patch.object(boat, "boat_jobs", side_effect=failed), patch.object(fanout.time, "sleep"):

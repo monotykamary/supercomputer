@@ -1,13 +1,14 @@
 [project]
 name = "supercomputer"
 version = "0.1.0"
-description = "One job runner over boat.dev VMs (a warm, shared pool), RunPod for GPU jobs, and Modal as the fallback."
+description = "One job runner over boat.dev VMs (a warm, shared pool) and RunPod for GPU jobs; no provider fallback."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "monotykamary" }]
 requires-python = ">=3.12"
-# The tool itself is the standard library; the Modal client is the fallback of every batch.
+# The tool itself is standard-library-only. Temporarily retain the Modal CLI
+# solely for legacy app cleanup/recovery; remove it once all old apps are gone.
 dependencies = ["modal>=1.6"]
 
 [project.urls]

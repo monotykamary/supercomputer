@@ -365,23 +365,9 @@ def tree_check(snap: str, name: str, manifest: dict, links: dict) -> dict:
 
 # ---------------------------------------------------------------------------------------------------------- Modal
 def modal_run(entry: str, args: list[str], timeout: int) -> int:
-    """`modal run modal_volumes.py::<entry>`, its client waited on (and killed) by its exact PID."""
-    TMP.mkdir(parents=True, exist_ok=True)
-    p = subprocess.Popen(["modal", "run", str(HERE / "modal_volumes.py") + "::" + entry, *args], start_new_session=True)
-    ticket_f = TMP / f"modal-{p.pid}.pid"
-    ticket_f.write_text(str(p.pid))
-    try:
-        return p.wait(timeout=timeout)
-    except BaseException:
-        with contextlib.suppress(Exception):
-            os.kill(p.pid, signal.SIGINT)
-            p.wait(30)
-        with contextlib.suppress(Exception):
-            os.kill(p.pid, signal.SIGKILL)
-        raise
-    finally:
-        ticket_f.unlink(missing_ok=True)
-
+    """Legacy migration helper: creating new Modal apps is no longer supported."""
+    from .config import MODAL_REMOVED
+    raise ValueError(MODAL_REMOVED + "; recover existing data with `supercomputer store push NAME modal:VOLUME`")
 
 def inventory(names: list[str]) -> list:
     TMP.mkdir(parents=True, exist_ok=True)

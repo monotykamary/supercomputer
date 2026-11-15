@@ -25,31 +25,21 @@ from . import config
 
 def _run(a):
     from . import boat, controller, fanout, treadmill
+    spec = json.loads(pathlib.Path(a.jobs).read_text())
+    try:
+        config.reject_removed_backend(a.backend, spec)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     strict_once = getattr(a, "strict_once", False)
     if strict_once and a.backend not in ("auto", "boat"):
         raise SystemExit("--strict-once requires the native boat backend")
     if strict_once and getattr(a, "max_attempts", 1) != 1:
         raise SystemExit("--strict-once requires --max-attempts 1")
-    if not strict_once:
-        fanout.reexec_with_modal()
     controller.maybe_sync()
     p = config.project()
-    spec = json.loads(pathlib.Path(a.jobs).read_text())
     pre = p.cfg.get("run", {}).get("pre", "") + "".join(f"export {kv}; " for kv in a.env)
     cmd = lambda c: c
-    mod = p.modal.get("module")
     app, mjobs = None, None
-    from .rules import fallback
-    if not strict_once and fallback.needs_modal(a.backend, any(j.get("backend") == "modal" or j.get("image") and j["image"] not in p.images for j in spec)):
-        try:
-            if mod and (p.root / mod).exists():
-                m = treadmill.import_real(p.root / mod)
-                app, mjobs = m.app, (lambda js, on_done: m.modal_jobs(js, pre, cmd, on_done))
-            else:
-                from . import modal_run as m
-                app, mjobs = m.app, (lambda js, on_done: m.modal_jobs(js, pre, cmd, on_done))
-        except ImportError as e:  # (no Modal client: boat only)
-            boat.log(f"(no Modal here: {e})")
     if a.sc_class:
         os.environ["SUPERCOMPUTER_CLASS"] = a.sc_class
     if a.timing:
@@ -73,6 +63,8 @@ def _remote_queue(a):
     import tarfile
     import time
     from . import boat, controller, scheduler
+    if a.qcmd == "add":
+        config.reject_removed_backend("auto", json.loads(pathlib.Path(a.jobs).read_text()))
     controller.maybe_sync()
     c = scheduler.connect()
     if not getattr(c, "remote", None):
@@ -167,6 +159,8 @@ def _reap(a):
     live = config.live_dir()
     import socket
     from .rules import ops
+    bundled_modal = pathlib.Path(sys.executable).parent / "modal"
+    modal_cli = shutil.which("modal") or (str(bundled_modal) if bundled_modal.is_file() else None)
     for t in sorted(live.glob("ap-*")):
         pid = int(t.read_text().strip() or 0)
         # (a Modal app's ticket is this machine's: its client's pid checked here; with a host of "" it was presumed
@@ -174,16 +168,26 @@ def _reap(a):
         if not ops.reap_modal(not boat.pid_alive(pid, socket.gethostname())):
             print(f"live: {t.name} (client {pid})")
         else:
-            subprocess.run(["modal", "app", "stop", "-y", t.name], capture_output=True)
+            if not modal_cli:
+                print(f"pending legacy cleanup: {t.name} (Modal CLI unavailable; ticket retained)")
+                continue
+            result = subprocess.run([modal_cli, "app", "stop", "-y", t.name], capture_output=True)
+            if result.returncode:
+                print(f"pending legacy cleanup: {t.name} (stop failed; ticket retained)")
+                continue
             t.unlink(missing_ok=True)
             print(f"stopped orphan {t.name}")
-    if shutil.which("modal"):
-        out = subprocess.run(["modal", "app", "list", "--json"], capture_output=True, text=True).stdout
+    if modal_cli:
+        listing = subprocess.run([modal_cli, "app", "list", "--json"], capture_output=True, text=True)
         try:
-            up = [x for x in json.loads(out or "[]") if x["state"] not in ("stopped", "stopping...")]
-            print(f"{len(up)} Modal apps up" + "".join(f"\n  {x['app_id']} {x['description']} {x['state']} tasks={x['tasks']}" for x in up))
+            if listing.returncode:
+                raise RuntimeError("inventory failed")
+            up = [x for x in json.loads(listing.stdout) if x["state"] not in ("stopped", "stopping...")]
+            print(f"{len(up)} legacy Modal apps up" + "".join(f"\n  {x['app_id']} {x['description']} {x['state']} tasks={x['tasks']}" for x in up))
+            if not up and not any(live.glob("ap-*")):
+                print("Legacy Modal cleanup is removable once every machine confirms no apps remain.")
         except Exception:
-            pass
+            print("Legacy Modal inventory unverified; cleanup remains pending.")
     if os.path.exists(boat.BOAT) or shutil.which("boat"):
         boat.reap()
     if shutil.which("runpodctl"):
@@ -199,7 +203,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="supercomputer", description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n", 1)[1])
     ap.add_argument("--repo", default="", help="the repo (default: the current directory's git root)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run", help="a jobs file on boat (GPU jobs on RunPod), Modal for what they can't")
+    r = sub.add_parser("run", help="a jobs file on boat (GPU jobs on RunPod); no provider fallback")
     r.add_argument("--jobs", required=True)
     r.add_argument("--out", required=True)
     r.add_argument("--backend", default="auto", choices=["auto", "boat", "modal", "runpod"])
@@ -401,7 +405,7 @@ def main(argv=None):
                 if x.cmd == "status":
                     print((treadmill.TM / "status.json").read_text() if (treadmill.TM / "status.json").exists() else "not running")
                 else:
-                    treadmill.Treadmill(x.vms, x.budget_vmh, x.quiet, not x.no_modal, x.max_wait, x.max_vms, x.step_vms, x.backlog_hours).run(x.hours)
+                    treadmill.Treadmill(x.vms, x.budget_vmh, x.quiet, False, x.max_wait, x.max_vms, x.step_vms, x.backlog_hours).run(x.hours)
     elif a.cmd == "cache":
         from . import blobcache
         blobcache.main(a.args)

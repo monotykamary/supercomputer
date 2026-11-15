@@ -1,7 +1,7 @@
 <p>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.svg">
-  <img alt="supercomputer: one job runner over boat.dev, RunPod and Modal" src="assets/hero-light.svg" width="100%">
+  <img alt="supercomputer: one job runner over boat.dev and RunPod" src="assets/hero-light.svg" width="100%">
 </picture>
 </p>
 
@@ -13,7 +13,7 @@
 
 Your laptop shouldn't run the test suite, the benchmark, or the sweep your agent just kicked off. **supercomputer**
 sends them to a warm pool of [boat.dev](https://boat.dev) VMs shared by every repo on your machine, puts GPU jobs on
-RunPod, and falls back to Modal when either can't take them. One scheduler places every batch, keeps the VMs busy
+RunPod. Retries stay on the same provider; exhausted work is terminal, never sent to Modal. One scheduler places every batch, keeps the VMs busy
 while there's work, and lets them go when there isn't.
 
 - **One command from any repo.** A jobs file in, logs and a summary out. The repo's tree ships by hash, so a changed
@@ -25,7 +25,7 @@ while there's work, and lets them go when there isn't.
 ## Install
 
 You need [uv](https://docs.astral.sh/uv/) (Python 3.12+), the [boat CLI](https://docs.boat.dev/cli-reference) signed
-in with `boat login`, and optionally Modal (`modal token new`) and RunPod (`runpodctl`) for the fallbacks.
+in with `boat login`, and optionally RunPod (`runpodctl`) for GPU jobs. Modal is not an execution backend.
 
 ```sh
 uv tool install git+https://github.com/monotykamary/supercomputer
@@ -92,8 +92,8 @@ To recover a finished admission after its client exits, use
 | `distinct_vm_group_scope` | opt in with `"durable"`: share distinct-VM history across batches and clients of the same scheduler |
 | `distinct_vm_group_generation` | optional nonblank generation from `open`/`get`; valid only with durable scope; pins this epoch and refuses expired or mismatched epochs |
 | `runtime` | exact Bun/Lean version + executable SHA-256, verified inside the job before payload; native boat only ([contract](docs/runtime-pins.md)) |
-| `gpu` | goes to RunPod, then Modal |
-| `backend` | `boat`, `runpod` or `modal` only, no fallback |
+| `gpu` | runs on RunPod only; exhausted pod retries fail |
+| `backend` | `auto`, `boat` (CPU) or `runpod` (GPU); `modal` is refused |
 
 ## Durable distinct-VM groups (opt in)
 
@@ -134,7 +134,7 @@ boot/epoch fencing pair. See [multi-client lifecycle details](docs/multi-client.
 <p>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/flow-dark.svg">
-  <img alt="jobs.json goes to the scheduler on your machine, which places it on boat.dev VMs, RunPod for GPU jobs, or Modal after three boat failures" src="assets/flow-light.svg" width="100%">
+  <img alt="jobs.json goes to boat.dev for CPU jobs or RunPod for GPU jobs; exhausted retries fail without changing providers" src="assets/flow-light.svg" width="100%">
 </picture>
 </p>
 
@@ -178,8 +178,9 @@ finishing or foreign work. Unknown models are never accepted as matches. New dra
 request: the tree by id, then the jobs. The agent keeps every file it was sent by content, so the next tree costs only
 its changed files.
 
-**Fallback.** An item boat fails (a VM lost, a row missing, no VM ready) is retried on another VM, up to 3 times;
-only then does it run once on Modal. GPU jobs go to RunPod first, then Modal.
+**Retries, not fallback.** CPU jobs run on boat. An item boat fails (a VM lost, a row missing, no VM ready) is retried on another boat VM within the existing three-failure budget; exhaustion returns terminal `FAILED`/`LOST` with its receipts. GPU jobs run only on RunPod (at most two pod attempts; no retry after no-capacity). Neither path ever falls back to Modal.
+
+`--backend modal` and a job's `"backend":"modal"` are refused at submit with `Modal support removed; use boat or runpod`, never silently rerouted. `supercomputer reap` retains legacy Modal-app cleanup until all machines report none; that cleanup and its temporary Modal CLI dependency can then be removed. Existing `[modal]` config and `modal_gpu` settings no longer enable execution. Read-only legacy volume recovery may still need the Modal CLI.
 
 **Busy, never parked.** A VM with nothing to run is released and stops 60 s later. VMs above the floor run filler for
 at most 45 minutes after their last real work. One account, no metering tricks, a reserve of free starts left for your
@@ -196,11 +197,11 @@ Higher classes take lower classes' slots at once; within a class, clients are se
 | `submission` | experiments | up to 8 VMs per client while others wait, a filler's slot after 45 s |
 | `sweep`, `filler` | the treadmill's chains and soundness fill | whatever is left |
 
-A small batch defaults to `interactive`, a bigger one to `submission`.
+A small batch defaults to `interactive`, a bigger one to `submission`. Every CPU class stays on boat, including after retry exhaustion. Free/paid starts and VM-hour accounting describe boat; GPU spend is RunPod-only, with no fallback-provider charges.
 
 ## A repo's config
 
-A repo works with no config: its directory name, a base image (curl, git, build-essential) and Modal's slim image.
+A repo works with no config: its directory name and a boat base image (curl, git, build-essential). GPU setup is read from `[gpu]` for RunPod.
 Add `supercomputer.toml` at its root for more:
 
 ```toml
@@ -266,7 +267,7 @@ Read `supercomputer --skill` before first use in a session.
 | `policy [k=v ...]` | the scheduler's knobs, in force within a tick |
 | `queue add\|ls\|results` | the treadmill's queue of ideas |
 | `store push\|pull\|ls ...` | volumes on boat: named snapshots, sha256 manifests, pulls cached by hash |
-| `volumes ...`, `runpod ...` | a Modal volume straight to boat; RunPod's pods |
+| `runpod ...` | RunPod's pods; recover legacy volume data with `store push NAME modal:VOLUME` (new Modal-app migration helpers are refused) |
 
 `/status` serves an immutable published view without waiting on the scheduler
 lock. Its additive `status_snapshot` metadata reports capture/publication time,

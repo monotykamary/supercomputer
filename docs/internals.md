@@ -9,15 +9,15 @@ Where things live, how a VM is brought up and kept warm, and every environment k
 | `supercomputer/config.py` | LIVE (the shared state), a repo's `supercomputer.toml` and hooks (`Project`) |
 | `supercomputer/boat.py` | the boat backend: the pool and its registry, the starts ledger and pacing, demand, the image's layers, the warm agents' client, a batch (`Session`), `boat_jobs` |
 | `supercomputer/agent.py` | the VM side (stdlib only, shipped to each VM and pod): items in mount namespaces, the build caches, the warm agent (`daemon`) |
-| `supercomputer/fanout.py` | one interface over the providers: `run_jobs` (a jobs file), `BoatEx`/`AutoEx`/`cli` (a Modal runner's `ex.remote`/`ex.starmap`), `gpu_call` |
-| `supercomputer/runpod.py` | the RunPod backend: a pod per batch, GPU jobs and runner functions, deleted when the batch ends; Modal fallback |
-| `supercomputer/modal_run.py` | the Modal app for a repo that has none (and for GPU jobs): its image from the repo's config |
+| `supercomputer/fanout.py` | one interface over the providers: `run_jobs` (a jobs file), `BoatEx`/`AutoEx`/`cli` (a locally imported legacy runner's `ex.remote`/`ex.starmap`), `gpu_call` |
+| `supercomputer/runpod.py` | the RunPod backend: a pod per batch, GPU jobs and runner functions, deleted when the batch ends; no provider fallback |
+| `supercomputer/modal_run.py` | compatibility stub: every execution request raises the Modal removal error |
 | `supercomputer/scheduler.py` | the one queue: classes, placement, the plan, holds, adoption, re-attach, the breaker (its decisions through `rules/`) |
-| `supercomputer/rules/` | every decision of the tool, apart from threads, I/O and the providers' APIs, each with its laws (`# gdp: law`): `scheduler.py` (an item's fate, the pool's starts and breaker, a VM's owner, hold and release, generations, the watchdog, the handoff), `boat.py` (leases and the registry, starts accounting, bring-up, the local session), `treadmill.py`, `fallback.py` (boat, RunPod, Modal), `ops.py` (the controller, config, migration), `agent.py` (the VM agent, the file itself), `integrity.py` (hashes and manifests); `COVERAGE.md`: every function of the tool, in a rule or I/O and why |
+| `supercomputer/rules/` | every decision of the tool, apart from threads, I/O and the providers' APIs, each with its laws (`# gdp: law`): `scheduler.py` (an item's fate, the pool's starts and breaker, a VM's owner, hold and release, generations, the watchdog, the handoff), `boat.py` (leases and the registry, starts accounting, bring-up, the local session), `treadmill.py`, `fallback.py` (bounded boat/RunPod retries, no Modal dispatch), `ops.py` (the controller, config, migration), `agent.py` (the VM agent, the file itself), `integrity.py` (hashes and manifests); `COVERAGE.md`: every function of the tool, in a rule or I/O and why |
 | `tests/` | `check_laws.sh` (the laws; the pre-commit hook runs it), `broken_*.py` (the bugs they rule out, kept refuted with a run), `test_*wiring.py` (the code's decisions through the rules, no provider called) |
 | `supercomputer/treadmill.py` | the generic treadmill: batches, result cache, the queue, the controller, the digest |
 | `supercomputer/store.py` | volumes on boat: named snapshots with sha256 manifests, token-gated serving, pulls cached by hash |
-| `supercomputer/modal_volumes.py`, `volumes.py` | a Modal volume's inventory and its copy straight to boat |
+| `supercomputer/modal_volumes.py`, `volumes.py` | legacy Modal volume recovery helpers; no automatic job fallback |
 | `supercomputer/migrate.py` | a repo's old pool directory into the shared one (done for gdp-wired: its `supercomputer/.live` links here) |
 | `live/` | the shared state (in `$SUPERCOMPUTER_HOME`, never in git): `boat-pool.json` (+ `.lock`), `boat-starts.jsonl`, `agents/` (0700), `store/`, `durations/`, `index/`, caches by name (`olean/`), Modal app and RunPod tickets, `builds/` |
 
@@ -26,9 +26,11 @@ Where things live, how a VM is brought up and kept warm, and every environment k
 See `config.py`'s docstring for every key. In short: `name` (the tree is `/src/<name>` and `/work/<name>` on a VM),
 `[boat]` (snapshot prefixes, the PATH, env and mount points jobs need, ignore patterns on top of `.gitignore`, the image's
 layers or a `hooks` module's `layers(root)`, `images` for jobs that name one), `[[cache]]` (a build cache keyed by the
-hash of its sources: gdp-wired's Lean library), `[modal]` (the repo's own Modal module, else `image` for this tool's),
-`[gpu]` (the pods' setup, their check, the Modal GPU), `[treadmill]` (its module and directory), `[run] pre`.
-A repo with no file gets defaults: its directory name, a base image (curl, git, build-essential), Modal's slim image.
+hash of its sources: gdp-wired's Lean library), legacy `[modal]` (ignored for execution),
+`[gpu]` (RunPod setup and checks; legacy `modal_gpu` ignored), `[treadmill]` (its module and directory), `[run] pre`.
+A repo with no file gets defaults: its directory name and a boat base image (curl, git, build-essential).
+
+The Modal CLI dependency is temporarily retained for `reap` of legacy app tickets and read-only volume recovery. New Modal jobs are refused, including callable runners and GPU paths. Remove legacy cleanup once all machine inventories are empty.
 
 ## Warm agents: small checks in seconds
 

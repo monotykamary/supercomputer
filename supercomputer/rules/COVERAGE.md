@@ -420,14 +420,12 @@ wiring).
 | Batch.unpacked | I/O: extracts a tree once (a latch on a file) |
 | Batch.backlog | in backlog: "a batch through the scheduler never grows itself" |
 | Batch.grow | in StepPlan.grow (its k); the session's ensure is I/O |
-| Batch.go | in BatchFate: "a batch boat refused whole never goes to Modal", "items go to Modal only when few", "with Modal off, nothing goes to Modal", "a failed batch records nothing", "a batch records its results only when it didn't fail", "before boat's end nothing is decided"; in chain_class: "the queue's submissions are submissions at the scheduler", "the treadmill's work is never above a submission" |
+| Batch.go | in BatchFate: "a batch never selects Modal", "a failed batch records nothing", "before boat's end nothing is decided"; in lost_route: exhausted work is terminal, unserved work retries on boat; native terminal rows retained separately from retryable work |
 | Batch.go.row | in PendingSlots.back |
 | py_item | I/O: an item's fields from the runner's BOAT setting (the larger weight a copy) |
 | sh_item | I/O: an item's fields |
 | import_real | I/O: imports a module by path |
-| modal_app | I/O: runs a Modal app, one at a time (a lock), its ticket |
-| on_modal | I/O: items to Modal through the runner's module or the repo's (routing by the item's kind, no state) |
-| on_modal.done | I/O: a row and its logs |
+| modal_app / on_modal | compatibility stubs: raise the explicit Modal removal error before any provider call |
 | tree_key | I/O: sha256 of a tar |
 | job_key | out: the result cache's identity, a sha256 of the tree key and the job's command and resources: a hash, whose law (one key per tree and command) is sha256's, not linear arithmetic |
 | submit | in submit_refusal: "a job on Modal's own image or a GPU never enters the queue", "a name taken is never overwritten" |
@@ -461,44 +459,28 @@ wiring).
 | digest | I/O |
 | repo_module | I/O: imports the repo's treadmill module |
 
-## fanout.py (34) — rules/fallback.py
+## fanout.py — rules/fallback.py; removed Modal execution
 
 | def | where |
 | --- | --- |
-| log | I/O |
-| fname | I/O: a function's name |
-| modal_real | I/O: whether the Modal client is importable |
-| reexec_with_modal | in reexec_modal: "it re-runs under the Modal CLI's Python at most once" |
-| ModalCtx.\_\_init\_\_ | I/O |
-| ModalCtx.\_\_enter\_\_ | in ModalRef.enter: "an app held here is running", "an app of ours was started here", "an app of ours runs", "an app started elsewhere keeps running", "an app started elsewhere is never ours" |
-| ModalCtx.\_\_exit\_\_ | in ModalRef.exit: "an app started here is stopped only when its last holder exits", "an app started elsewhere is never stopped here" |
-| run_jobs | in job_route: "--backend boat never sends a job to Modal but Modal's own", "--backend modal never runs a job on boat", "a job boat ran stays boat's", "a job boat didn't run is failed only under --backend boat"; in preflight_on: "only auto asks boat's preflight, and not where the controller's scheduler takes the batch"; GPU jobs through runpod.gpu_jobs |
-| run_jobs.printer | I/O |
-| boat_order | I/O: the summary's order |
-| count | I/O: a tally |
-| where_line | I/O: the summary's text |
-| ModalEx.\_\_init\_\_ | I/O |
-| ModalEx.remote | I/O: Modal's call |
-| ModalEx.starmap | I/O |
-| ModalEx.close | I/O |
-| BoatEx.\_\_init\_\_ | I/O: its session and the runner's BOAT setting |
-| BoatEx.\_est | out: an estimate for the order of calls (longest first), arithmetic, decides no state |
-| BoatEx.remote | in row_outcome: "a row with a result and exit 0 is the call's result", "a row boat lost is boat's, never the call's own failure" (its own failure now CallFailed) |
-| BoatEx.starmap | in row_outcome (each row); plan_vms is boat.py's |
-| BoatEx.starmap.done | in row_outcome |
-| BoatEx.starmap.go | I/O: the session's run in a thread |
-| BoatEx.close | I/O |
-| AutoEx.\_\_init\_\_ | in preflight_on; in AutoFallback.refused: "with boat refused, every call is Modal's" |
-| AutoEx.\_modal | I/O: the Modal context, once |
-| AutoEx.\_moved | I/O: a tally of reasons |
-| AutoEx.remote | in AutoFallback.outcome: "Modal takes the batch only after 3 boat failures", "a call goes to Modal only once boat failed the batch 3 times", "a call's own failure is never a boat failure", "a call's own failure is its result, never retried nor moved" |
-| AutoEx.starmap | in AutoFallback (the batch on Modal once refused); each call lost twice to Modal is the session's on_lost (boat.py's) |
-| AutoEx.close | I/O |
-| cli | out: dispatch on --backend (modal: ModalEx; boat: BoatEx with no Modal fallback; auto: AutoEx); the routes it builds are job_route's and AutoFallback's |
-| cli.h | I/O: a signal handler |
-| gpu_call | in GpuTries: "at most two pods a batch", "no pod after RunPod said it has no capacity, nor after the jobs are done"; in gpu_leftover: "--backend runpod never sends a GPU job to Modal" |
-| gpu_cli | I/O: flags |
-| gpu_cli.h | I/O |
+| log / fname | I/O: logging and runner names |
+| modal_real | legacy compatibility inspection only; never enables dispatch |
+| reexec_with_modal | compatibility no-op; never switches interpreter |
+| ModalCtx.__init__ / ModalEx.__init__ | explicit removal error; no app created |
+| run_jobs | boat CPU / RunPod GPU partition; removed backend rejected before submission; native returned failure rows retained without resubmission; three bounded boat availability passes; GPU retries through GpuTries |
+| run_jobs.printer | I/O: output |
+| _strict_native | validation: strict work must remain native, no GPU or foreign image |
+| boat_order / count / where_line | I/O: output ordering and historical summaries, never execution |
+| BoatEx.__init__ / BoatEx._est | I/O: session and estimate from runner metadata |
+| BoatEx.remote / BoatEx.starmap / BoatEx.starmap.done | row_outcome: own failures distinguished from lost rows |
+| BoatEx.starmap.go / BoatEx.close | I/O: session execution, close |
+| AutoEx.__init__ / AutoEx._boat | bounded boat availability retries only |
+| AutoEx._modal / AutoEx._moved | explicit removal errors; compatibility names only |
+| AutoEx.remote / AutoEx.starmap | lost_route: exhausted work fails, other losses retry on boat; AutoFallback retains own-failure accounting |
+| AutoEx.close | I/O: close boat session; no Modal context |
+| cli / cli.h | I/O: flags and signals; Modal rejected before runner construction |
+| gpu_call | GpuTries: at most two pods, no pod after no-capacity; exhaustion raises without another provider |
+| gpu_cli / gpu_cli.h | I/O: flags and signals; removed backend refused |
 
 ## runpod.py (29) — rules/fallback.py, rules/ops.py
 
@@ -530,7 +512,7 @@ wiring).
 | signals_as_interrupt.h | I/O |
 | call | I/O: a pod for one call |
 | gpu_list | out: an ordered list (the jobs' named types first, then the rest), outside the subset (lists) |
-| gpu_jobs | in GpuTries and gpu_leftover: "a GPU job is failed only under --backend runpod" |
+| gpu_jobs | in GpuTries and gpu_leftover: at most two pods, no pod after no-capacity, every unserved GPU job is terminal failed |
 | modal_gpu_jobs | I/O |
 | reap | in pod_reap: "a pod whose client lives is never deleted", "a pod not named as ours is never touched" (the ticket's host now this machine's where a ticket has none) |
 
@@ -589,18 +571,9 @@ wiring).
 | \_reap | in reap_modal: "an orphan Modal app (its client's pid gone) is stopped", "a Modal app whose client lives is never stopped" (was pid_alive(pid, ""): never stopped) |
 | main | I/O: dispatch, the reap's alarm |
 
-## modal_run.py (8) — rules/ops.py
+## modal_run.py — removed execution backend
 
-| def | where |
-| --- | --- |
-| \_allowed | I/O: the tree's files |
-| \_allowed.ignore | I/O |
-| \_image | I/O: Modal's image |
-| \_run | I/O on Modal (TimeoutExpired as 124: the runtime's classification, as job_outcome's timeout) |
-| sh | I/O |
-| sh_gpu | I/O |
-| modal_jobs | I/O |
-| \_modal_gpu | in modal_gpu: "a RunPod type with a Modal match maps to it", "the default GPU only where no other is named" |
+`modal_jobs` is a compatibility stub that raises the explicit removal error. It imports no Modal client, builds no image and launches no app.
 
 ## skill.py (3) — rules/ops.py
 
@@ -737,7 +710,7 @@ Defs: 135; deciding (in a rule): 46; I/O: 89.
 | `keypair` | I/O, no decision: makes the key pair when absent (a file's existence, no state rule) |
 | `decrypt_check` | in rules/integrity.py: Checks.decrypted, with law "a decryption passes only when every hash, the magic and the MAC match" (fix: the magic is a check, not an assert dropped under -O) |
 | `tree_check` | I/O, no decision: the snapshot's listing against the manifest, as counts (a listing boat cut short judged on what it lists); CopyGates.tree_ok decides |
-| `modal_run` | I/O, no decision: `modal run`, waited on by its PID |
+| `modal_run` | explicit removal error before creating an app; use read-only store import for legacy data |
 | `inventory` | I/O, no decision: modal_run of the inventory |
 | `record_path` | I/O, no decision: a path |
 | `done` | in rules/integrity.py: Serving.copy_again's input (a record and its snapshot ready) |

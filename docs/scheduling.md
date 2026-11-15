@@ -39,9 +39,9 @@ it does not repeatedly resume the missing ID or count a refused resume as a star
 blocks, not money thresholds; prepaid balance information includes both plan hours and purchased-pack hours.
 
 **Where capacity comes from,** in order: a free slot on a held VM, a lower class's slot, a free start, a paid start
-(every class may pay; boat's limits read live from `boat limits` `startLimitsWithWallet`). Modal only once boat has
-failed an item 3 times (a VM lost, its row missing, its preparation failed, no VM ready within the batch's max wait),
-retried on another VM each time; a batch run with `--backend modal` stays on Modal.
+(every class may pay; boat's limits read live from `boat limits` `startLimitsWithWallet`). CPU jobs stay on boat: after three boat failures (a VM lost, its row missing, preparation failed or no VM ready), with another boat VM tried each time, the item is terminal `FAILED`/`LOST` with its receipts. GPU work stays on RunPod and fails when its pod retry budget is exhausted. No class changes providers on failure.
+
+`--backend modal` and job `backend: "modal"` are refused before submission: `Modal support removed; use boat or runpod`. There are no Modal execution charges. Legacy `reap` cleanup remains until all old apps are gone, after which it is removable.
 
 **Growth is earned by marginal work,** evaluated on every queue change (`_plan`), never on a timer.
 For each VM type, let `S` be its slots and `R` its VM-hour price. The economic break-even is
@@ -180,7 +180,7 @@ and the breaker survive too.
   tolerate a torn last line. A `kill -9` loses nothing: the next scheduler takes everything back.
 
 **What it reports.** `supercomputer status` (and `scheduler status`): per class the queue, VMs held, waits
-p50/p95, starts free/paid, preemptions, boat's failures and items sent to Modal; the pool against its target, starts
+p50/p95, starts free/paid, preemptions, boat's failures and a legacy Modal counter (no new handoffs); the pool against its target, starts
 per 100 items and items placed on VMs already up. The digest adds the day's VM-hours and dollars (VM-hours at the
 $0.036 overage price, nothing billed while prepaid hours last; extra starts from the wallet and the invoice), the
 VM-hours by class, the filler hours VMs above the floor ran during holds, how often MAX_VMS held growth, and the gaps between waves of real work (to tune HOLD).
@@ -190,7 +190,7 @@ A repo whose checkout has no `supercomputer.toml` yet is read from `repos/<main 
 
 **Held to its laws.** The decisions above, and every other the tool makes, are `supercomputer/rules/`'s (an item's fate, the pool's starts and breaker,
 a VM's owner, hold and release, the policy generation), each class with its laws as `# gdp: law` comments ("an item goes
-to Modal only after boat_tries boat failures", "a wait is no boat failure unless boat failed a start of its image during
+terminal LOST after boat_tries boat failures (never to another provider)", "a wait is no boat failure unless boat failed a start of its image during
 it", "an item's boat failures are on distinct VMs", "no VM is up without an owner after a tick", "a VM running items is
 never released", "no start while the breaker is open (but one probe)", ...). A policy change runs, before it lands:
 
