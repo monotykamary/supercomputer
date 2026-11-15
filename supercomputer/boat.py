@@ -3419,7 +3419,7 @@ class Scheduled(Session):
                 if row.get("vm"):
                     self.vm_ids.add(row["vm"])
                     self.run_names[row.get("run_name", row["name"])] = row["name"]
-                if row.get("lost") and on_lost and not strict_once and not it.get("cpu_model") and not required_agent_capabilities(it) and it.get("distinct_vm_group_scope") != "durable":
+                if row.get("lost") and on_lost and not getattr(self, "retain_terminal_rows", False) and not strict_once and not it.get("cpu_model") and not required_agent_capabilities(it) and it.get("distinct_vm_group_scope") != "durable":
                     on_lost(it, row.get("error", "lost"))
                 else:
                     on_done(it, self._strict_row(bid, row) if strict_once else row)
@@ -3445,6 +3445,8 @@ class Scheduled(Session):
                     if strict_once:
                         row.update(strict_once=True, status="LOST", terminal=True, identity_unavailable=True)
                         row = self._strict_row(bid, row)
+                    else:
+                        row.update(lost=True, status="LOST", terminal=True, identity_unavailable=True)
                     on_done(by[name], row)
             left.clear()
 
@@ -3848,9 +3850,9 @@ def preflight(want: int = 1, vm_type: str = VM_TYPE, starts: bool = True) -> tup
 
 
 def preflight3(want: int = 1, vm_type: str = VM_TYPE, starts: bool = True) -> tuple[str | None, dict]:
-    """preflight(), asked again on boat's API errors (3 tries, 15 and 45 s apart): Modal takes a batch only once boat
-    has failed it 3 times (the user, 10-31). A missing image or billing block is no failure to retry: said at once."""
-    asks = R.Preflight3()  # (rules.boat.Preflight3: Modal for boat's API errors only after 3 tries)
+    """preflight(), retried on boat API errors (3 tries, 15 and 45 s apart), then failed.
+    A missing image or billing block is no failure to retry: said at once."""
+    asks = R.Preflight3()
     for k in range(3):
         reason, info = preflight(want, vm_type, starts)
         if asks.ask("ok" if reason is None else "api" if "API unreachable" in reason else "none") != "asking":
@@ -3956,9 +3958,10 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
 
 
 def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int | None = None, teardown: bool = False, durations: str = "", vm_type: str = VM_TYPE,
-              max_vms: int = 0, on_lost=None, max_wait: int = 0, on_done=None, tar: bytes | None = None, klass: str | None = None, strict_once: bool = False, max_attempts: int = 1) -> tuple[dict, dict]:
+              max_vms: int = 0, on_lost=None, max_wait: int = 0, on_done=None, tar: bytes | None = None, klass: str | None = None, strict_once: bool = False, max_attempts: int = 1, retain_terminal_rows: bool = False) -> tuple[dict, dict]:
     """supercomputer/run.py's jobs on the pool: {name: {code, seconds, out, err}} for those that ran, and the batch's figures.
-    A job lost twice (its VM died) goes to on_lost(name, reason), as does every job when boat can't serve the batch."""
+    on_lost(name, reason) reports unserved work without disabling boat provisioning.
+    With retain_terminal_rows, native terminal receipts stay in rows; only missing rows use on_lost."""
     config.reject_removed_backend("auto", spec)
     _validate_strict_options(strict_once, max_attempts)
     if strict_once:
@@ -3971,31 +3974,26 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
     rows: dict[str, dict] = {}
     sess = None
     summary = {}
-    # a tiny batch (auto only): on a VM already up, else on Modal; a start for it would buy little
+    # Small batches keep interactive priority but may provision boat capacity.
     slot_s = int(sum(it["weight"] * it["est"] for it in items))
     small = len(items) <= TINY[0] or slot_s < TINY[1] * 60
-    # (with the scheduler, a tiny batch goes to boat too, as an interactive check: Modal only after boat fails 3 times)
+    # A loss-report callback is notification, never permission to change provider.
     sched_on = __import__("supercomputer.scheduler", fromlist=["enabled"]).enabled()
     if strict_once and not sched_on:
         raise Unavailable("strict_once requires the scheduler; refusing the legacy retrying path")
     from .rules.agent_capabilities import required_agent_capabilities
     if any("cpu_model" in it or "distinct_vm_group" in it or required_agent_capabilities(it) for it in items) and not sched_on:
         raise Unavailable("placement constraints require the scheduler; refusing the legacy unconstrained path")
-    tiny = on_lost is not None and small and not sched_on
     try:
-        remote = bool(getattr(__import__("supercomputer.scheduler", fromlist=["controller"]), "controller")())
-        # (rules.boat.route: a tiny batch with a fallback, the scheduler off, on a VM already up, else Modal)
-        if tiny and R.route(len(items), slot_s, True, sched_on, remote, bool(remote or warm_up(vm_type) or warm_agents(vm_type) or scheduler_holds(image_name()))) == "modal":
-            ledger(batch=None, label=f"run {outdir.name}", starts=0, vms=0, slots=0, jobs=len(items), to="modal", why="tiny, no VM up", acct=False)
-            raise Unavailable(f"a tiny batch ({len(items)} jobs): no boat VM up, and a start isn't worth it")
         with signals_as_interrupt():
             # (its class: --class or $SUPERCOMPUTER_CLASS; else a small batch is interactive, a bigger one a submission)
             given = klass or env("CLASS")  # (rules.boat.batch_class: given, else interactive when small, a submission else)
             sess = session(f"run {outdir.name}", klass=given or R.batch_class(False, "submission", small), idle=idle, teardown=teardown, vm_type=vm_type,
-                           build=on_lost is None, tar=tar, **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
+                           build=True, tar=tar, **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
             sess.output_dir = outdir
+            sess.retain_terminal_rows = retain_terminal_rows
             sess.max_starts = max_vms
-            sess.warm_only = tiny
+            sess.warm_only = False
             sess.early = not teardown
             plain = [it for it in items if not it.get("vm_type")]
             bigs: dict[str, int] = {}
@@ -4004,7 +4002,7 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
                     bigs[it["vm_type"]] = bigs.get(it["vm_type"], 0) + 1
             if getattr(sess, "scheduled", False):  # (the scheduler sizes it)
                 n = 0
-            elif small and not vms and (tiny or warm_agents(vm_type)):  # (the VMs up: no API call to size it)
+            elif small and not vms and warm_agents(vm_type):  # (the VMs up: no API call to size it)
                 n = max(1, min(max(warm_up(vm_type), warm_agents(vm_type)), math.ceil(sum(it["weight"] for it in plain) / cap_slots)))
             else:
                 n = plan_vms(plain, cap_slots, vms, max_vms)

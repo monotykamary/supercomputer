@@ -367,6 +367,7 @@ class Submission:
         rows = {n: json.loads((cache / f"{k}.json").read_text()) for n, k in keys.items() if (cache / f"{k}.json").exists()}
         terminal_path = self.d / "terminal-results.json"
         terminal = json.loads(terminal_path.read_text()) if terminal_path.exists() else {}
+        terminal_lock = threading.Lock()
         rows.update(terminal)
         todo = [j for j in spec if j["name"] not in rows]
         items, _ = boat.job_items(todo, "", lambda c: c, boat.VM_TYPE, {})
@@ -375,10 +376,13 @@ class Submission:
         self.save()
 
         def on_row(it, row):
-            rows[it["name"]] = dict(row, where=row.get("where", "boat"))
-            if row.get("terminal") and not row.get("retry"):
-                terminal[it["name"]] = rows[it["name"]]
-                terminal_path.write_text(json.dumps(terminal, indent=1))
+            with terminal_lock:
+                rows[it["name"]] = dict(row, where=row.get("where", "boat"))
+                if row.get("terminal") and not row.get("retry"):
+                    terminal[it["name"]] = rows[it["name"]]
+                    temp = terminal_path.with_suffix(".tmp")
+                    temp.write_text(json.dumps(terminal, indent=1))
+                    temp.replace(terminal_path)
 
         def after(logs):
             out = self.d / "out"

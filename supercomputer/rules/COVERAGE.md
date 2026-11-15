@@ -372,11 +372,11 @@ Scheduled.run's dropped items (DropsUnreported), the ledger's undercount of resu
 | 2305 | `last_durations` | **in rules/boat.py**: `durations_source`, laws “durations covering under half of the jobs are never used”; “a tiny batch searches no runs” |
 | 2309 | `last_durations.tsv` | I/O, no decision: parses a summary |
 | 2338 | `preflight` | **in rules/boat.py**: `preflight`, laws “a warm agent up is enough, no refusal and no API call”; “a batch waits for another's release only with no starts, room, and VMs leased by others”; “with the scheduler deciding, capacity never refuses a batch” |
-| 2393 | `preflight3` | **in rules/boat.py**: `Preflight3`, laws “boat's API failing sends a batch to Modal only after 3 tries”; “preflight is asked at most 3 times” |
+| 2393 | `preflight3` | **in rules/boat.py**: `Preflight3`, laws “boat API errors exhaust only after 3 tries”; “preflight is asked at most 3 times” |
 | 2407 | `warm_up` | **in rules/boat.py**: `Entry.lease_live (as a count)`, laws “a VM another batch released joins only while it is up for 20 s more” |
 | 2415 | `warm_agents` | **in rules/boat.py**: `Entry.lease_warm (as a count)`, laws “a warm lease never takes a VM about to stop” |
 | 2425 | `job_items` | **in rules/boat.py**: `weight`, laws “a job gets the slots its CPUs and memory need, one at least” (the bigger VM type for a job past a VM's slots: a table lookup, left) |
-| 2464 | `boat_jobs` | **in rules/boat.py**: `route, batch_class`, laws “only a tiny batch with a fallback goes to Modal without trying boat”; “with the scheduler on every batch goes to boat first”; “a tiny batch takes boat's VM already up”; “a small batch is an interactive check, a bigger one a submission, unless its class is given” |
+| 2464 | `boat_jobs` | **in rules/boat.py**: `batch_class`; small batches keep interactive priority without disabling cold provisioning. Loss callbacks report missing work; retained terminal receipts remain in the result stream. `route` is a boat-only compatibility helper. |
 | 2515 | `boat_jobs.done` | I/O, no decision: records a row |
 | 2559 | `summary_line` | I/O, no decision: text |
 | 2571 | `status` | I/O, no decision: reconcile and print |

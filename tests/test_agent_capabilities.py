@@ -370,7 +370,7 @@ def test_outer_fanout_rejects_backend_gpu_and_foreign_image_bypasses():
 def test_outer_fanout_three_strikes_never_route_capability_job_to_modal():
     from supercomputer import fanout
     def failed(jobs, *args, on_lost=None, **kwargs):
-        assert on_lost is None
+        assert callable(on_lost)
         return {job["name"]: {"code": -1, "seconds": -1, "lost": True, "boat_fails": 3,
                               "status": "LOST", "terminal": True, "error": "boat failed it 3 times (last: its row lost on bx_a)"}
                 for job in jobs}, {}

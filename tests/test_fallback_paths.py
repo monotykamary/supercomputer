@@ -75,6 +75,57 @@ class NoModalTests(unittest.TestCase):
         self.assertEqual(meta['where'], {'boat': 1})
         modal.assert_not_called()
 
+    def test_reporting_callback_does_not_disable_cold_provisioning(self):
+        for size in (1, 5):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as out:
+                jobs = [{'name': f'j{i}', 'cmd': 'true'} for i in range(size)]
+                items = [dict(job, kind='sh', weight=1, est=1200) for job in jobs]
+                fake = Mock(scheduled=False, batch='cold', image='image', phases={})
+                fake.collect.return_value = {}
+                fake.close.return_value = {}
+                fake.run.side_effect = lambda its, done, **kw: [done(it, {'code': 0, 'seconds': 1}) for it in its]
+                with patch.object(scheduler, 'enabled', return_value=False), \
+                        patch.object(boat, 'job_items', return_value=(items, [j['name'] for j in jobs])), \
+                        patch.object(boat, 'last_durations', return_value={}), patch.object(boat, 'note_durations'), \
+                        patch.object(boat, 'warm_agents', return_value=0), patch.object(boat, 'warm_up', return_value=0), \
+                        patch.object(boat, 'plan_vms', return_value=1), patch.object(boat, 'session', return_value=fake) as make:
+                    rows, _ = boat.boat_jobs(jobs, out, '', lambda c: c, on_lost=Mock(), retain_terminal_rows=True)
+                self.assertEqual(len(rows), size)
+                self.assertIs(make.call_args.kwargs['build'], True)
+                self.assertIs(fake.warm_only, False)
+                fake.ensure.assert_called_once_with(1, boat.VM_TYPE)
+
+    def test_partial_availability_error_does_not_replay_completed_job(self):
+        calls = []
+        def native(jobs, *args, on_done=None, on_lost=None, **kwargs):
+            calls.append([job['name'] for job in jobs])
+            self.assertTrue(kwargs['retain_terminal_rows'])
+            if len(calls) == 1:
+                on_done('done', {'code': 0, 'seconds': 1, 'out': 'accepted', 'err': ''})
+                raise boat.Unavailable('remaining VM lost')
+            row = {'code': 0, 'seconds': 1, 'out': '', 'err': ''}
+            on_done('rest', row)
+            return {'rest': row}, {}
+        with patch.object(boat, 'boat_jobs', side_effect=native):
+            code, meta = self.run_jobs([{'name': 'done', 'cmd': 'true'}, {'name': 'rest', 'cmd': 'true'}])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [['done', 'rest'], ['rest']])
+        self.assertEqual(meta['where'], {'boat': 2})
+        self.assertNotIn('done', meta['failures'])
+
+    def test_missing_scheduler_row_retries_only_on_boat(self):
+        def missing(jobs, *args, on_lost=None, **kwargs):
+            on_lost('missing', 'the scheduler finished the batch without its row')
+            return {}, {}
+        modal = Mock(side_effect=AssertionError('Modal invoked'))
+        with patch.object(boat, 'boat_jobs', side_effect=missing) as native:
+            code, meta = self.run_jobs([{'name': 'missing', 'cmd': 'true'}], modal_jobs=modal)
+        self.assertEqual(code, 3)
+        self.assertEqual(native.call_count, 3)
+        self.assertEqual(meta['where'], {'boat': 1})
+        self.assertIn('without its row', meta['failures']['missing'])
+        modal.assert_not_called()
+
     def test_cli_refuses_modal_before_sync(self):
         for backend, job_backend, strict in [('modal', None, False), ('auto', 'modal', False), ('modal', None, True)]:
             with self.subTest(backend=backend, job_backend=job_backend, strict=strict), tempfile.TemporaryDirectory() as d:

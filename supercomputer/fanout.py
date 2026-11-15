@@ -102,6 +102,21 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, ba
         with lock:
             print(f"{name:40} exit {row.get('code', -1):>3}  {row.get('seconds', -1):>8} s", flush=True)
 
+    def boat_done(name, row):
+        # Keep accepted rows even if a later collection/preparation step raises.
+        with lock:
+            rows[name] = row
+            where[name] = "boat"
+        printer(name, row)
+
+    def lost(name, reason):
+        reasons[name] = reason
+        if fallback.lost_route(False, boat.boat_fails_of(reason), 3, False) == "failed":
+            rows[name] = {"code": -1, "seconds": -1, "error": reason, "out": "", "err": reason,
+                          "lost": True, "status": "LOST", "terminal": True, "identity_unavailable": True,
+                          "boat_fails": boat.boat_fails_of(reason)}
+            where[name] = "boat"
+
     gpu = [job for job in spec if job.get("gpu")]
     if gpu:
         from . import runpod
@@ -126,13 +141,13 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, ba
         if reason is None:
             try:
                 got, bsum = boat.boat_jobs(pending, out, pre, cmd, vms=vms, idle=idle, teardown=teardown, durations=durations, vm_type=vm_type, max_vms=max_vms,
-                                           on_lost=None, max_wait=max_wait if backend == "auto" else 0, on_done=printer, tar=tar,
-                                           **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
+                                           on_lost=None if strict_once else lost, max_wait=max_wait if backend == "auto" else 0, on_done=boat_done, tar=tar,
+                                           **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {"retain_terminal_rows": True}))
             except boat.Unavailable as error:
                 if strict_once:
                     raise
                 got = {}
-                reasons.update({job["name"]: str(error) for job in pending})
+                reasons.update({job["name"]: str(error) for job in pending if job["name"] not in rows})
             rows.update(got)
             where.update({name: "boat" for name in got})
         else:

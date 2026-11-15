@@ -110,6 +110,18 @@ class StrictAdmission(unittest.TestCase):
         lost.assert_called_once()
         done.assert_not_called()
 
+    def test_terminal_retention_keeps_full_legacy_row(self):
+        row = {'name': 'one', 'code': -1, 'seconds': -1, 'lost': True,
+               'status': 'LOST', 'terminal': True, 'boat_fails': 3,
+               'placement': {'vm': 'final-vm', 'boot_id': 'final-boot'}}
+        s = session(strict=False, poll=lambda _: {'rows': [row], 'done': True})
+        s.retain_terminal_rows = True
+        done, lost = Mock(), Mock()
+        s.run([ITEM], done, on_lost=lost)
+        lost.assert_not_called()
+        done.assert_called_once()
+        self.assertEqual(done.call_args.args[1], row)
+
     def test_stale_lost_row_never_invokes_fallback_and_keeps_identity(self):
         row = {"name": "one", "code": -1, "lost": True, "status": "LOST", "terminal": True,
                "strict_once": True, "launch_identity": {"nonce": "n"},

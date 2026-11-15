@@ -682,15 +682,15 @@ def preflight(warm: int, api_ok: bool, can_start: bool, credit: bool, image_ok: 
 
 
 class Preflight3:
-    """preflight3: preflight asked again on boat's API errors, 3 tries; Modal only once boat has failed it 3 times. A
-    missing image or a billing block is no failure to retry."""
+    """preflight3: retry boat API errors up to three times, then fail closed.
+    A missing image or a billing block is no failure to retry."""
 
-    # gdp: law boat's API failing sends a batch to Modal only after 3 tries: not (outcome == "modal") or tries >= 3 or not api_error_last
+    # gdp: law boat API errors exhaust only after 3 tries: outcome != "failed" or tries >= 3 or not api_error_last
     # gdp: law preflight is asked at most 3 times: tries <= 3
 
     def __init__(self):
         self.tries = 0
-        self.outcome: Literal["asking", "boat", "modal"] = "asking"
+        self.outcome: Literal["asking", "boat", "failed"] = "asking"
         self.api_error_last = False
 
     def ask(self, verdict: Verdict) -> str:
@@ -701,21 +701,13 @@ class Preflight3:
         if verdict == "ok" or verdict == "wait":
             self.outcome = "boat"
         elif verdict != "api" or self.tries >= 3:
-            self.outcome = "modal"
+            self.outcome = "failed"
         return self.outcome
 
 
-# gdp: law only a tiny batch with a fallback goes to Modal without trying boat: result == "boat" or (on_lost and (n_items <= 4 or slot_s < 600) and not scheduler)
-# gdp: law with the scheduler on every batch goes to boat first: not scheduler or result == "boat"
-# gdp: law a tiny batch takes boat's VM already up: not (remote or warm) or result == "boat"
-def route(n_items: int, slot_s: int, on_lost: bool, scheduler: bool, remote: bool, warm: bool) -> Literal["boat", "modal"]:
-    """boat_jobs: a tiny batch (TINY: 4 jobs or fewer, or under 10 slot-minutes) with a fallback, the scheduler off,
-    runs on a VM already up (the controller's, a warm one, one a scheduler holds), else on Modal: a start for it would
-    buy little."""
-    small = n_items <= 4 or slot_s < 600
-    tiny = on_lost and small and not scheduler
-    if tiny and not (remote or warm):
-        return "modal"
+# gdp: law every CPU batch stays on boat even without a warm VM: result == "boat"
+def route(n_items: int, slot_s: int, on_lost: bool, scheduler: bool, remote: bool, warm: bool) -> Literal["boat"]:
+    """Compatibility route: loss callbacks never disable cold boat provisioning."""
     return "boat"
 
 
