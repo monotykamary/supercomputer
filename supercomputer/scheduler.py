@@ -75,6 +75,7 @@ PORT = int(os.environ.get("SUPERCOMPUTER_SCHEDULER_PORT", "8790"))
 STRICT_FRONT_AVOID_S = 900.0  # a VM whose front failed a strict pre-launch: no strict placement there this long
 AGENT_DRAIN_MAX_S = 1800.0  # a loaded old-agent VM drained for its upgrade at most this long, then let be
 CLEANUP_RETRY_WAIT_S = 1.0  # a strict cleanup retry's agent wait, each pending item (the terminal path's receipt asks the same)
+CLEANUP_RETRY_MAX_WAIT_S = 16.0  # ... doubled while the agent says its lease lock stayed held, to this (a few of its ticks)
 ORPHAN_S = 21600  # a batch no client has polled for this long is closed (its client is gone; a laptop asleep comes back sooner)
 def _cpu_now() -> float:
     """This thread's CPU seconds (0 where the clock has none: the simulator's)."""
@@ -2245,16 +2246,22 @@ class Scheduler:
             if receipt is None and placed and vm is not None and identity:
                 try:
                     remaining = max(0, deadline - time.monotonic())
-                    if item_wait is not None:  # (a retry: each pending item its own agent wait. 11-16 20:52-20:59, 1tj32g
-                        # and dp7cpi: the batch's one 1 s deadline was gone by the RPCs, each ask answered in 30-100 ms
-                        # with 0 s, the agent's lease lock tried once while a tick or prep held it on VMs busy with
-                        # gates: "lease lock timed out" at every sweep, 42 cleanups pending for up to 7 min)
-                        remaining = max(remaining, item_wait)
+                    if item_wait is not None:  # (a retry: each pending item its own agent wait, doubled while the agent
+                        # answers that its lease lock stayed held. 11-16 20:52-21:03, 1tj32g, dp7cpi, zuxv9p: the batch's
+                        # one 1 s deadline was gone by the RPCs, each ask went out with 0 s and was answered in 30-100 ms
+                        # "lease lock timed out". The lock is held through every vtick, a pass over every retained job
+                        # (bx_ekvw4s47: 14,155 in 4,523 batch dirs, ~2.5 s a pass, its tick thread at 100% CPU), so a
+                        # 0 s or 1 s try rarely lands between ticks: 44 cleanups pending for up to 11 min)
+                        remaining = max(remaining, min(CLEANUP_RETRY_MAX_WAIT_S,
+                                                       item_wait * 2 ** getattr(it, "cleanup_lock_busy", 0)))
                     args = (bid, name, remaining, identity, True) if rebound else (bid, name, remaining, identity)
                     receipt = vm.client.rpc("cancelitem", *args, timeout=max(1, remaining + 2))
                 except Exception as e:  # (its kind kept: 11-16, six xlarge held for days by one opaque line a minute)
                     receipt = {"ok": False, "error": f"cancel RPC failed or timed out: {type(e).__name__}: {e}"[:300]}
             matched = self._matching_receipt(receipt, bid, name, identity)
+            if item_wait is not None and not cached and placed and vm is not None and identity:
+                busy = isinstance(receipt, dict) and receipt.get("error") in ("lease lock timed out", "lease file lock timed out")
+                it.cleanup_lock_busy = getattr(it, "cleanup_lock_busy", 0) + 1 if busy else 0
             with self.lock:
                 if getattr(self, "handing_off", False):
                     return {"ok": False, "complete": False, "batch": bid, "error": "scheduler handoff; cleanup continues after it"}

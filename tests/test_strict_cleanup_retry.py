@@ -86,6 +86,33 @@ class StrictCleanupRetry(unittest.TestCase):
         self.assertTrue(self.it.owned.reaped)
         self.assertTrue(self.s.close_receipt(self.b.id)["cleanup_complete"])
 
+    def test_a_retry_doubles_its_wait_while_the_agent_lease_lock_stays_held(self):
+        # 11-16 bx_ekvw4s47: every vtick holds the lease lock through a ~2.5 s pass over 14,155 retained jobs. A fake
+        # agent whose ticks hold it 0.3 s: 0.1 and 0.2 s lose, the doubled 0.4 s wins. Any other failure does not double.
+        self.place_without_thread()
+        self.b.t_poll = time.time()
+        self.vm.client.rpc.side_effect = RuntimeError("timed out")
+        self.assertFalse(self.s.cancel(self.b.id)["cleanup_complete"])
+        waits, transport = [], [True]
+        def agent(cmd, batch, name, wait, identity, *rest, timeout=None):
+            waits.append(wait)
+            if transport[0]:
+                transport[0] = False
+                raise RuntimeError("front failed")
+            if wait < 0.3:
+                return {"ok": False, "reaped": False, "namespace_absent": False, "identity": None,
+                        "batch": batch, "name": name, "error": "lease lock timed out"}
+            return self.good_receipt()
+        self.vm.client.rpc.side_effect = agent
+        with patch.object(S, "CLEANUP_RETRY_WAIT_S", 0.1), patch.object(S, "CLEANUP_RETRY_MAX_WAIT_S", 0.4):
+            for _ in range(5):
+                self._sweep()
+                if self.it.owned.reaped:
+                    break
+        self.assertEqual(waits, [0.1, 0.1, 0.2, 0.4])
+        self.assertTrue(self.it.owned.reaped)
+        self.assertTrue(self.s.close_receipt(self.b.id)["cleanup_complete"])
+
     def test_status_queues_nothing_of_a_batch_closed_to_admission(self):
         self.assertEqual(self.s._queued_by_class(), {self.b.klass: 1})
         self.b.admission_closed = True
