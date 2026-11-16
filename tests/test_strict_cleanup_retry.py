@@ -5,6 +5,7 @@ matching receipt; ambiguous evidence still holds the slots. Run on boat, like al
 import json
 import time
 import unittest
+from unittest.mock import patch
 
 import test_owned_scheduler as fixture
 from supercomputer import scheduler as S
@@ -58,6 +59,32 @@ class StrictCleanupRetry(unittest.TestCase):
         args = self.vm.client.rpc.call_args
         self.assertEqual(args.args[0], "cancelitem")
         self.assertLessEqual(args.args[3], S.CLEANUP_RETRY_WAIT_S)
+
+    def test_a_retry_gives_each_pending_item_its_own_agent_wait(self):
+        # 11-16 20:52-20:59, 1tj32g and dp7cpi: the retry's one 1 s deadline was spent before the RPC (the fence's
+        # rewrite, locks, walking the items), so every ask carried 0 s and an agent busy with a tick or prep refused
+        # its lease lock at once, each sweep. The fake agent waits as the real one: a lock held 20 ms by a tick.
+        self.place_without_thread()
+        self.b.t_poll = time.time()
+        self.vm.client.rpc.side_effect = RuntimeError("timed out")
+        self.assertFalse(self.s.cancel(self.b.id)["cleanup_complete"])
+        waits = []
+        def agent(cmd, batch, name, wait, identity, *rest, timeout=None):
+            waits.append(wait)
+            if wait < 0.02:
+                return {"ok": False, "reaped": False, "namespace_absent": False, "identity": None,
+                        "batch": batch, "name": name, "error": "lease lock timed out"}
+            return self.good_receipt()
+        self.vm.client.rpc.side_effect = agent
+        real = self.s._persist_fence
+        def slow_fence(b):  # (the budget gone before the first RPC)
+            real(b)
+            time.sleep(0.2)
+        with patch.object(S, "CLEANUP_RETRY_WAIT_S", 0.1), patch.object(self.s, "_persist_fence", side_effect=slow_fence):
+            self._sweep()
+        self.assertEqual(waits, [0.1])
+        self.assertTrue(self.it.owned.reaped)
+        self.assertTrue(self.s.close_receipt(self.b.id)["cleanup_complete"])
 
     def test_status_queues_nothing_of_a_batch_closed_to_admission(self):
         self.assertEqual(self.s._queued_by_class(), {self.b.klass: 1})

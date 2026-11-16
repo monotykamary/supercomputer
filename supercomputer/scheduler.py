@@ -74,7 +74,7 @@ BLOBS = DIR / "blobs"
 PORT = int(os.environ.get("SUPERCOMPUTER_SCHEDULER_PORT", "8790"))
 STRICT_FRONT_AVOID_S = 900.0  # a VM whose front failed a strict pre-launch: no strict placement there this long
 AGENT_DRAIN_MAX_S = 1800.0  # a loaded old-agent VM drained for its upgrade at most this long, then let be
-CLEANUP_RETRY_WAIT_S = 1.0  # a strict cleanup retry's agent wait (the terminal path's receipt asks the same)
+CLEANUP_RETRY_WAIT_S = 1.0  # a strict cleanup retry's agent wait, each pending item (the terminal path's receipt asks the same)
 ORPHAN_S = 21600  # a batch no client has polled for this long is closed (its client is gone; a laptop asleep comes back sooner)
 def _cpu_now() -> float:
     """This thread's CPU seconds (0 where the clock has none: the simulator's)."""
@@ -2176,7 +2176,7 @@ class Scheduler:
                 and cls._matching_receipt(evidence.get("receipt"), it.batch.id,
                                           pl.get("run_name"), it.launch_identity))
 
-    def cancel(self, bid, wait_seconds=10):
+    def cancel(self, bid, wait_seconds=10, item_wait=None):
         self._valid_batch(bid)
         if getattr(self, "recovery_blocked", False):
             return {"ok": False, "complete": False, "error": "recovery quarantined; ownership held"}
@@ -2200,9 +2200,9 @@ class Scheduler:
                 self._persist_fence(b)  # Serialize with completion-marker replacement too.
             items = list(b.items.values())
         with self._unserialized():  # (waits and RPCs to workers: never under the request lock every mutation needs)
-            return self._cancel_items(bid, b, items, deadline)
+            return self._cancel_items(bid, b, items, deadline, item_wait)
 
-    def _cancel_items(self, bid, b, items, deadline):
+    def _cancel_items(self, bid, b, items, deadline, item_wait=None):
         for it in items:
             remaining = max(0, deadline - time.monotonic())
             if not it.start_done.wait(remaining):
@@ -2245,6 +2245,11 @@ class Scheduler:
             if receipt is None and placed and vm is not None and identity:
                 try:
                     remaining = max(0, deadline - time.monotonic())
+                    if item_wait is not None:  # (a retry: each pending item its own agent wait. 11-16 20:52-20:59, 1tj32g
+                        # and dp7cpi: the batch's one 1 s deadline was gone by the RPCs, each ask answered in 30-100 ms
+                        # with 0 s, the agent's lease lock tried once while a tick or prep held it on VMs busy with
+                        # gates: "lease lock timed out" at every sweep, 42 cleanups pending for up to 7 min)
+                        remaining = max(remaining, item_wait)
                     args = (bid, name, remaining, identity, True) if rebound else (bid, name, remaining, identity)
                     receipt = vm.client.rpc("cancelitem", *args, timeout=max(1, remaining + 2))
                 except Exception as e:  # (its kind kept: 11-16, six xlarge held for days by one opaque line a minute)
@@ -2841,7 +2846,7 @@ class Scheduler:
                         log(f"{b.id}: no client has asked for it in {ORPHAN_S} s: closed")  # (a client gone for good)
                     try:
                         if b.strict_once:
-                            self.cancel(b.id, wait_seconds=CLEANUP_RETRY_WAIT_S)
+                            self.cancel(b.id, wait_seconds=CLEANUP_RETRY_WAIT_S, item_wait=CLEANUP_RETRY_WAIT_S)
                         else:
                             self.close(b.id)
                     except Exception as e:
