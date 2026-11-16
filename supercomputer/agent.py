@@ -39,6 +39,7 @@ trusted-workload lifecycle guarantee, not a sandbox against malicious jobs using
 """
 import base64
 import contextlib
+import errno
 import hashlib
 import hmac
 import io
@@ -718,6 +719,27 @@ def _tree_lock(tid: str):
         return _tree_locks.setdefault(tid, threading.Lock())
 
 
+def _tree_file(key: str, p: pathlib.Path):
+    """One file of a tree: a hard link to its blob; the empty file a plain empty file of its own, and any other blob
+    a copy once its links are at the filesystem's limit. 11-16 bx_rejj3ega, bx_pp9ejjmq: the empty blob at ext4's
+    65,000 links (a tree of 72,174 empty files, and 114 kept trees), every tree with an empty file refused EMLINK,
+    two strict batches LOST as owned_dispatch_refused."""
+    src = BLOBS / key
+    if key.rstrip("x") == EMPTY:
+        if not src.exists():
+            raise FileNotFoundError(src)  # (missing as any blob is: sent again)
+        with open(p, "x"):
+            pass
+        os.chmod(p, 0o755 if key.endswith("x") else 0o644)
+        return
+    try:
+        os.link(src, p)
+    except OSError as e:
+        if e.errno != errno.EMLINK:
+            raise
+        shutil.copy2(src, p)
+
+
 def _make_tree(tid: str, files, links) -> dict:
     t0 = time.time()
     dst = TREES / tid
@@ -746,7 +768,7 @@ def _make_tree(tid: str, files, links) -> dict:
             if p.parent not in dirs:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 dirs.add(p.parent)
-            os.link(BLOBS / key, p)
+            _tree_file(key, p)
     except FileNotFoundError:  # (a blob gone under the build: missing, sent again, never a 500; B6's sibling, 05:3x "tree: 500")
         shutil.rmtree(tmp, ignore_errors=True)
         return {"ok": False, "missing": have(sorted(set(files.values()))) or sorted(set(files.values()))}
