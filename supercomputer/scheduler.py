@@ -2166,11 +2166,19 @@ class Scheduler:
             with blobcache.locked(BLOBS):
                 self._persist_fence(b)  # Serialize with completion-marker replacement too.
             items = list(b.items.values())
+        with self._unserialized():  # (waits and RPCs to workers: never under the request lock every mutation needs)
+            return self._cancel_items(bid, b, items, deadline)
+
+    def _cancel_items(self, bid, b, items, deadline):
         for it in items:
             remaining = max(0, deadline - time.monotonic())
             if not it.start_done.wait(remaining):
                 continue
             with self.lock:
+                if getattr(self, "handing_off", False):
+                    return {"ok": False, "complete": False, "batch": bid, "error": "scheduler handoff; cleanup continues after it"}
+                if self.batches.get(bid) is not b:
+                    return self.close_receipt(bid)  # (retired by a concurrent cancel meanwhile)
                 if it.owned.reaped:
                     continue
                 vm = it.vm
@@ -2210,6 +2218,10 @@ class Scheduler:
                     receipt = {"ok": False, "error": f"cancel RPC failed or timed out: {type(e).__name__}: {e}"[:300]}
             matched = self._matching_receipt(receipt, bid, name, identity)
             with self.lock:
+                if getattr(self, "handing_off", False):
+                    return {"ok": False, "complete": False, "batch": bid, "error": "scheduler handoff; cleanup continues after it"}
+                if self.batches.get(bid) is not b:
+                    return self.close_receipt(bid)
                 # Persist evidence first; never acknowledge a reap whose journal failed.
                 self._append_owned(bid, "cancel", {"name": it.name, "run_name": name,
                     "identity": identity, "matched": matched, "unplaced": not placed,
@@ -2226,7 +2238,14 @@ class Scheduler:
                                                 "cancelled": True, "launch_identity": identity})
                 elif it.state != "done":
                     it.state = "cancel_pending"
-        with self.lock:
+        with self._serialized(), self.lock:
+            if getattr(self, "handing_off", False):
+                return {"ok": False, "complete": False, "batch": bid, "error": "scheduler handoff; cleanup continues after it"}
+            if self.batches.get(bid) is not b:
+                # (a concurrent cancel of the same batch, the client's close beside the cleanup worker's, retired it
+                # first: its archive is the receipt; before, its fence write found the admission gone, FileNotFoundError,
+                # 11-16 13:08:58 and 13:12:06, the canary handing a sound code back)
+                return self.close_receipt(bid)
             complete = all(it.owned.reaped for it in items)
             if complete:
                 # Retention is not standing demand. Publish closed only after its
@@ -2250,6 +2269,33 @@ class Scheduler:
                 with blobcache.locked(BLOBS):
                     self._retain_closed(b, receipt)
             return receipt
+
+    @contextlib.contextmanager
+    def _unserialized(self):
+        """The request lock (every HTTP mutation's, one at a time) released by this thread around network waits, held
+        again after. 11-16 ~13:12: a strict /close waited ~50 s an item on unreachable workers while holding it; every
+        submit, /cache/have and /blobs/have queued behind (191 request threads), nothing admitted."""
+        lock = getattr(self, "_request_lock", None)
+        depth = 0
+        owned = getattr(lock, "_is_owned", None)
+        while owned is not None and owned():
+            lock.release()
+            depth += 1
+        try:
+            yield
+        finally:
+            for _ in range(depth):
+                lock.acquire()
+
+    @contextlib.contextmanager
+    def _serialized(self):
+        """The request lock for a mutation's final step, when this thread runs outside it (re-entrant otherwise)."""
+        lock = getattr(self, "_request_lock", None)
+        if lock is None:
+            yield
+            return
+        with lock:
+            yield
 
     def submit(self, msg: dict) -> dict:
         with self.lock:
