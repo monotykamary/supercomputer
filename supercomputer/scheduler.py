@@ -6922,6 +6922,20 @@ def serve(idle_exit: float = 120, takeover: bool = False):
 
 
 # --------------------------------------------------------------------------------------------- the client
+# A mutation refused 503 "scheduler handoff" was never run (http_mutation_allowed is checked before _post), so the same
+# request is retried until a handoff ends: two readiness budgets (target and rollback, 120 s at most each) and margin.
+# (11-16 20:03: a 14 s handoff failed four release gates' /blobs/have and /image-pins/register on their first 503.)
+HANDOFF_RETRY_S = 300.0
+
+
+class HandoffBusy(RuntimeError):
+    """The scheduler refused a mutation while handing off: nothing was done; the same request is safe to send again."""
+
+
+def _handoff_busy(code: int, data) -> bool:
+    return code == 503 and isinstance(data, (bytes, bytearray)) and b"scheduler handoff" in bytes(data[:200])
+
+
 class Client:
     """The scheduler: this machine's (127.0.0.1), or the controller's on boat (LIVE/controller.json: its boat URL,
     boat's cookie and our token, 0600) when it answers."""
@@ -6940,13 +6954,24 @@ class Client:
 
     def req(self, path: str, msg, timeout: float = 60, raw: bool = False, body: bytes | None = None, decode=None):
         data_in = body if body is not None else json.dumps(msg).encode()
+        deadline, wait = time.monotonic() + HANDOFF_RETRY_S, 0.5
+        while True:
+            try:
+                return self._req_once(path, data_in, timeout, raw, decode, body is not None)
+            except HandoffBusy:
+                if time.monotonic() + wait > deadline:
+                    raise
+                time.sleep(wait)
+                wait = min(5.0, wait * 2)
+
+    def _req_once(self, path: str, data_in: bytes, timeout: float, raw: bool, decode, binary: bool):
         if isinstance(self.remote, AgentClient):
             observer = getattr(self, "transport_event", None)
             extra = {"transport_event": observer} if observer is not None else {}
-            code, data, _ = self.remote._req("POST", path, data_in, timeout, "application/octet-stream" if body is not None else "application/json",
+            code, data, _ = self.remote._req("POST", path, data_in, timeout, "application/octet-stream" if binary else "application/json",
                                              **({"decode": decode} if decode is not None else {}), **extra)
             if code != 200:
-                raise RuntimeError(f"the controller: {path}: {code} {data[:300]!r}")
+                raise (HandoffBusy if _handoff_busy(code, data) else RuntimeError)(f"the controller: {path}: {code} {data[:300]!r}")
         else:
             data = self._local(path, data_in, timeout, **({"decode": decode} if decode is not None else {}))
         return data if raw or decode is not None else json.loads(data)
@@ -6979,6 +7004,9 @@ class Client:
                 except BaseException:
                     conn.close()
                     raise
+                if _handoff_busy(r.status, data):
+                    conn.close()  # (the refusing scheduler closes it: never a dead pooled connection for the retry)
+                    raise HandoffBusy(f"the scheduler: {path}: {r.status} {data[:300]!r}")
                 c.append(conn)
                 if r.status != 200:
                     raise RuntimeError(f"the scheduler: {path}: {r.status} {data[:300]!r}")
