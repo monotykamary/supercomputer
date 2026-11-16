@@ -184,6 +184,8 @@ DISK_MIN_MB = int(_env("DISK_MIN_MB", 10240))  # a VM with less free disk (or a 
 DISK_GRACE_S = 120  # its agent's cleaning's time to free it; past it, a VM still low is deleted once empty (rules.disk_replaced)
 SUB_PREEMPT = _env("SUB_PREEMPT", 45.0)  # a submission item waiting this long takes a filler's slot (else at item ends; filler is the cheapest work to kill)
 PREP_MAX = _env("PREP_MAX", 2)  # trees and caches the controller itself sends at once (VMs pull from peers first)
+PREP_SMALL_BYTES = _env("PREP_SMALL_BYTES", 8 << 20)  # a send this small goes at once, never queued behind PREP_MAX's large ones
+PREP_PEER_POLL_S = 5.0  # a large send waiting its turn looks this often for a peer that gained the files meanwhile
 BREAK_READY = _env("BREAK_READY", 480.0)  # a start not ready within this counts as failed
 BREAK_WINDOW, BREAK_MIN, BREAK_RATIO = 1200.0, 4, 0.5  # over 50% of at least 4 recent starts failed: no starts
 BREAK_BACKOFF, BREAK_MAX = 300.0, 3600.0  # the first pause, doubled at each trip in a row
@@ -3608,18 +3610,22 @@ class Scheduler:
                     raise OwnedAgentRefused("strict begin refused: no fallback preparation")
                 r = cl.rpc("tree", t["id"], t["files"], t["links"], timeout=120)
                 if not r.get("ok") and r.get("missing"):
-                    peer, pulled = self._peer(vm, tree=t["id"]), False
-                    if peer:
+                    missing, tried = r["missing"], set()
+                    def tree_peer():  # (a VM that has the tree whole, one not tried yet: it serves this one)
+                        peer = self._peer(vm, tree=t["id"])
+                        if peer is None or peer.id in tried:
+                            return False
+                        tried.add(peer.id)
                         with contextlib.suppress(Exception):
-                            pr = cl.rpc("pull", peer.client.url, peer.client.token, r["missing"], timeout=900)
-                            pulled = pr.get("ok") and not pr.get("missing")
-                    if not pulled:
-                        with self.prep_sem:
-                            while self.shed and not self.stop.is_set():  # (the controller loaded: one send at a time, later)
-                                time.sleep(2)
-                            miss = cl.rpc("have", sorted(set(t["files"].values())), timeout=120).get("missing", r["missing"])
-                            for i in range(0, len(miss), 800):
-                                cl.put("/put", blob_tar(miss[i:i + 800]))
+                            pr = cl.rpc("pull", peer.client.url, peer.client.token, missing, timeout=900)
+                            return bool(pr.get("ok") and not pr.get("missing"))
+                        return False
+                    def send_tree():
+                        miss = cl.rpc("have", sorted(set(t["files"].values())), timeout=120).get("missing", missing)
+                        for i in range(0, len(miss), 800):
+                            cl.put("/put", blob_tar(miss[i:i + 800]))
+                    if not tree_peer():
+                        self._send_from_here(_blob_bytes(missing), send_tree, tree_peer)
                     r = cl.rpc("tree", t["id"], t["files"], t["links"], timeout=120)
                 if not r.get("ok"):
                     raise AgentError(f"tree: {str(r)[:200]}")
@@ -3641,18 +3647,23 @@ class Scheduler:
                         vm.caches.add((c["name"], c["key"]))
                     continue
                 if set(names) - have:
-                    peer = self._peer(vm, cache=(c["name"], c["key"]))
-                    got = set()
-                    if peer:
+                    got, tried = set(), set()
+                    def cache_peer(c=c, names=names, have=have, got=got, tried=tried):
+                        peer = self._peer(vm, cache=(c["name"], c["key"]))
+                        if peer is None or peer.id in tried:
+                            return False
+                        tried.add(peer.id)
                         with contextlib.suppress(Exception):
-                            got = set(cl.rpc("pullcache", peer.client.url, peer.client.token, c["name"], c["key"], timeout=600).get("got", []))
-                    if set(names) - have - got:
-                        with self.prep_sem:
-                            buf = io.BytesIO()
-                            with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
-                                for n in sorted(set(names) - have - got):
-                                    tf.add(local / n, arcname=n)
-                            cl.put(f"/cache?name={c['name']}&key={c['key']}", buf.getvalue())
+                            got |= set(cl.rpc("pullcache", peer.client.url, peer.client.token, c["name"], c["key"], timeout=600).get("got", []))
+                        return not set(names) - have - got
+                    def send_cache(c=c, local=local, names=names, have=have, got=got):
+                        buf = io.BytesIO()
+                        with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
+                            for n in sorted(set(names) - have - got):
+                                tf.add(local / n, arcname=n)
+                        cl.put(f"/cache?name={c['name']}&key={c['key']}", buf.getvalue())
+                    if not cache_peer():
+                        self._send_from_here(_file_bytes(local, set(names) - have - got), send_cache, cache_peer)
                 if names:
                     vm.caches.add((c["name"], c["key"]))
             self._verify_tree(vm, b, t)
@@ -3677,12 +3688,33 @@ class Scheduler:
             names = sorted(f.name for f in local.iterdir() if f.name in outputs) if local.exists() else []
         send = [n for n in names if there.get(n) != _file_sha(local / n)]
         if send:
-            with self.prep_sem:
+            def put():
                 buf = io.BytesIO()
                 with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
                     for n in send:
                         tf.add(local / n, arcname=n)
                 cl.put(f"/cache?name={c['name']}&key={c['key']}&authority=1", buf.getvalue())
+            self._send_from_here(_file_bytes(local, send), put)
+
+    def _send_from_here(self, nbytes: float, send, peer=None) -> bool:
+        """One send from this controller to a VM, in its turn: a small one at once; a large one in one of PREP_MAX turns,
+        and while it waits for one, served by a peer that gained the files since (peer() true: no send, False).
+        (11-16 22:56-23:20: gate 4qjq8b's 719 MB tree placed on ~50 VMs at once, none a peer yet, its sends two at a time
+        at 1-3 MB/s through boat's front; every start behind them waited in prep_sem, p3's tc64tq 20 min for 12 blobs,
+        113 _start_on threads, and 4qjq8b's own later items sent again what a peer then held)"""
+        if nbytes <= PREP_SMALL_BYTES:
+            send()
+            return True
+        while not self.prep_sem.acquire(timeout=PREP_PEER_POLL_S):
+            if peer is not None and peer():
+                return False
+        try:
+            while self.shed and not self.stop.is_set():  # (the controller loaded: one send at a time, later)
+                time.sleep(2)
+            send()
+        finally:
+            self.prep_sem.release()
+        return True
 
     def _verify_tree(self, vm: VMState, b, t: dict):
         """The batch's tree on the VM, each file its client's manifest names a git blob for checked to be that blob
@@ -6440,6 +6472,21 @@ class Scheduler:
 
 
 # --------------------------------------------------------------------------------------------- the blob store
+def _blob_bytes(keys) -> float:
+    """The bytes of these blobs here; one unreadable counts as large (its send waits its turn, as before)."""
+    try:
+        return sum(blobcache.key_path(BLOBS, k).stat().st_size for k in set(keys))
+    except (OSError, ValueError):
+        return math.inf
+
+
+def _file_bytes(local: pathlib.Path, names) -> float:
+    try:
+        return sum((local / n).stat().st_size for n in set(names))
+    except OSError:
+        return math.inf
+
+
 def blob_tar(keys: list[str]) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tf:
