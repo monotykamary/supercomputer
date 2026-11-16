@@ -316,6 +316,23 @@ class LeaseClientTests(unittest.TestCase):
             self.assertEqual(client.rpc('vtick', {'start': []}), {'ok': True})
             transport.assert_called_once()
 
+    def test_cancelitem_front_timeout_replays_over_exec_with_its_identity_and_fence(self):
+        """11-16: five old-agent xlarge held for days, every cancelitem "the warm agent didn't answer (The read
+        operation timed out)" by boat's front while ticks went on. The identity-bound cancel is safe to repeat: sent
+        again from inside the VM, its receipt (the agent's own) the only thing that can complete cleanup."""
+        client = self.client()
+        receipt = {"ok": True, "reaped": True, "namespace_absent": True, "identity": "launch-1", "batch": "b", "name": "n"}
+        def remote(vm, argv, timeout):
+            body = json.loads(base64.b64decode(argv[-2]))
+            self.assertEqual(body['cmd'], 'cancelitem')
+            self.assertEqual(body['args'][:4], ['b', 'n', 1, 'launch-1'])
+            self.assertEqual(body['args'][-1], {'_lease': self.lease})
+            return {'exitCode': 0, 'stdout': json.dumps(receipt)}
+        timeout = B.AgentTransportError("vm: the warm agent didn't answer (The read operation timed out)")
+        with patch.object(client, '_req', side_effect=timeout), patch.object(B, 'exec_', side_effect=remote) as transport:
+            self.assertEqual(client.rpc('cancelitem', 'b', 'n', 1, 'launch-1', timeout=3), receipt)
+            transport.assert_called_once()
+
     def test_unknown_command_cannot_fallback_to_exec(self):
         client = self.client()
         with patch.object(client, '_req', side_effect=B.AgentError('front down')), patch.object(client, '_rpc_exec') as remote:

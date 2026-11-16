@@ -1653,7 +1653,9 @@ class AgentClient:
         error_type = AgentTransportError if _transient_transport_error(last) else AgentError
         raise error_type(f"{self.vm}: the warm agent didn't answer ({last})") from last
 
-    EXEC_OK = {"ping", "vtick", "killitem", "itemlogs", "begin", "prep", "tree", "have", "pull", "pullcache", "upgrade"}
+    # (cancelitem too: identity-bound and idempotent, its receipt the agent's own, the only thing that completes a strict
+    # cleanup; 11-16, five old-agent xlarge held for days, every cancel timed out by boat's front while ticks went on)
+    EXEC_OK = {"ping", "vtick", "killitem", "itemlogs", "begin", "prep", "tree", "have", "pull", "pullcache", "upgrade", "cancelitem"}
 
     def rpc(self, cmd: str, *args, timeout: float = 60, replay_safe: bool = False):
         args = [*args, {"_lease": {**self.lease, "owner": self.owner, "vm_id": self.vm}}] if cmd != "lease" else list(args)
