@@ -72,6 +72,7 @@ NAMES = {v: k for k, v in CLASSES.items()}
 DIR = config.LIVE / "scheduler"
 BLOBS = DIR / "blobs"
 PORT = int(os.environ.get("SUPERCOMPUTER_SCHEDULER_PORT", "8790"))
+CLEANUP_RETRY_WAIT_S = 1.0  # a strict cleanup retry's agent wait (the terminal path's receipt asks the same)
 ORPHAN_S = 21600  # a batch no client has polled for this long is closed (its client is gone; a laptop asleep comes back sooner)
 def _cpu_now() -> float:
     """This thread's CPU seconds (0 where the clock has none: the simulator's)."""
@@ -2205,8 +2206,8 @@ class Scheduler:
                     remaining = max(0, deadline - time.monotonic())
                     args = (bid, name, remaining, identity, True) if rebound else (bid, name, remaining, identity)
                     receipt = vm.client.rpc("cancelitem", *args, timeout=max(1, remaining + 2))
-                except Exception:
-                    receipt = {"ok": False, "error": "cancel RPC failed or timed out"}
+                except Exception as e:  # (its kind kept: 11-16, six xlarge held for days by one opaque line a minute)
+                    receipt = {"ok": False, "error": f"cancel RPC failed or timed out: {type(e).__name__}: {e}"[:300]}
             matched = self._matching_receipt(receipt, bid, name, identity)
             with self.lock:
                 # Persist evidence first; never acknowledge a reap whose journal failed.
@@ -2602,14 +2603,21 @@ class Scheduler:
         self._status_publisher = threading.Thread(target=publish, name='status-publisher', daemon=True)
         self._status_publisher.start()
 
+    def _queued_by_class(self) -> dict:
+        """Queued items a class (the queue counted once, not once a class). A batch closed to admission queues
+        nothing: its unlaunched items never place (11-16: 262jtw's cancelled item counted as queued for hours)."""
+        qk = {}
+        for b in list(self.batches.values()):
+            if not b.admission_closed:
+                qk[b.klass] = qk.get(b.klass, 0) + sum(1 for it in b.items.values() if it.state == "queued")
+        return qk
+
     def _status_read(self) -> dict:
         """Capture live scheduler state for the publisher while Scheduler.lock is held."""
         now = time.time()
         if True:
             live = [v for v in self.vms.values() if not v.dead]
-            per, qk = {}, {}
-            for b in list(self.batches.values()):  # (the queue counted once, not once a class)
-                qk[b.klass] = qk.get(b.klass, 0) + sum(1 for it in b.items.values() if it.state == "queued")
+            per, qk = {}, self._queued_by_class()
             for n, k in CLASSES.items():
                 q = qk.get(k, 0)
                 held = sum(1 for v in live if any(x.batch.klass == k for x in v.running.values()))
@@ -2729,12 +2737,25 @@ class Scheduler:
 
         def run():
             try:
-                for b in [b for b in list(self.batches.values()) if rules.abandoned(time.time(), getattr(b, "t_poll", b.t0), b.left(), ORPHAN_S)]:
+                for b in list(self.batches.values()):
                     if self.stop.is_set() or getattr(self, "handing_off", False):
                         break
-                    log(f"{b.id}: no client has asked for it in {ORPHAN_S} s: closed")  # (a client gone for good)
+                    gone = rules.abandoned(time.time(), getattr(b, "t_poll", b.t0), b.left(), ORPHAN_S)
+                    # (a strict batch closed to admission with a launch whose cleanup isn't confirmed asks again, whoever
+                    # closed it: 2026-11-16, 262jtw's one cancel failed at 07:55, its run reaped by 08:01, its xlarge
+                    # held whole for hours. Only a bound, matching receipt completes it (cancel); a short wait, as the
+                    # terminal path's receipt asks)
+                    pending = (b.strict_once and b.admission_closed and not b.closed
+                               and any(it.owned.placements and not it.owned.reaped for it in b.items.values()))
+                    if not (gone or pending):
+                        continue
+                    if gone:
+                        log(f"{b.id}: no client has asked for it in {ORPHAN_S} s: closed")  # (a client gone for good)
                     try:
-                        self.close(b.id)
+                        if b.strict_once:
+                            self.cancel(b.id, wait_seconds=CLEANUP_RETRY_WAIT_S)
+                        else:
+                            self.close(b.id)
                     except Exception as e:
                         log(f"{b.id}: close: {e!r}"[:400])
             finally:
