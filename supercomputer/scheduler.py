@@ -72,6 +72,8 @@ NAMES = {v: k for k, v in CLASSES.items()}
 DIR = config.LIVE / "scheduler"
 BLOBS = DIR / "blobs"
 PORT = int(os.environ.get("SUPERCOMPUTER_SCHEDULER_PORT", "8790"))
+STRICT_FRONT_AVOID_S = 900.0  # a VM whose front failed a strict pre-launch: no strict placement there this long
+AGENT_DRAIN_MAX_S = 1800.0  # a loaded old-agent VM drained for its upgrade at most this long, then let be
 CLEANUP_RETRY_WAIT_S = 1.0  # a strict cleanup retry's agent wait (the terminal path's receipt asks the same)
 ORPHAN_S = 21600  # a batch no client has polled for this long is closed (its client is gone; a laptop asleep comes back sooner)
 def _cpu_now() -> float:
@@ -556,7 +558,7 @@ def fit_shape(it) -> tuple:
 def vm_fits(shape: tuple, vm, retired: set) -> bool:
     """rules.vm_fits for an item of `shape` on the VM: the one test of placement, preemption and waste."""
     image, _k, _t, _w, vtype, avoid, mem, model, distinct, required = shape
-    return not getattr(vm, "quarantine", "") and not getattr(vm, "upgrading", False) and agent_capabilities_match(dict(required), getattr(vm, "agent_capabilities", {})) and (not distinct or len(distinct) != 4 or distinct[3]) and rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
+    return not getattr(vm, "quarantine", "") and not getattr(vm, "upgrading", False) and not getattr(vm, "agent_draining", 0.0) and agent_capabilities_match(dict(required), getattr(vm, "agent_capabilities", {})) and (not distinct or len(distinct) != 4 or distinct[3]) and rules.distinct_vm_allowed(distinct is not None, vm.id in (distinct[2] if distinct else ())) and rules.cpu_matches(model, getattr(vm, "model", "")) and rules.vm_fits(vm.image == image and vm.ready and not vm.dead, not vtype or vtype == vm.type, mem, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD,
                          bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
 
 
@@ -3015,6 +3017,7 @@ class Scheduler:
                 q = [it for it in self._q_full if it.state == "queued"]
             else:
                 self._full_now, self._t_full = False, now
+                self._agent_drain_tick(now)
                 q = self.queued()
                 self._q_full = q
             self._q_pass, self._any_queued = q, bool(q)
@@ -3134,6 +3137,41 @@ class Scheduler:
             self._retire = set(p.read_text().split()) if p.exists() else set()
         return self._retire
 
+    FRONT_FAILURES = ("502", "upstream unavailable", "didn't answer", "timed out", "timeout")
+
+    def _note_strict_front_failure(self, vm: VMState, error) -> None:
+        """A strict pre-launch that boat's front failed (a 502, a timeout): strict items avoid the VM a while; owned RPC
+        has no exec fallback (11-16 13:03, nzdqwp NOT_STARTED on bx_zfa9fyk2 after three owned_rpc 502s)."""
+        text = str(error).lower()
+        if any(m in text for m in self.FRONT_FAILURES):
+            vm.strict_avoid_until = time.time() + STRICT_FRONT_AVOID_S
+            log(f"{vm.id}: strict pre-launch failed by boat's front ({str(error)[:120]}): no strict placement there for {STRICT_FRONT_AVOID_S:.0f} s")
+
+    @staticmethod
+    def _strict_avoided(it, vm, now: float) -> bool:
+        return bool(it.batch.strict_once) and getattr(vm, "strict_avoid_until", 0.0) > now
+
+    def _agent_drain_tick(self, now: float) -> None:
+        """One loaded VM on an old agent at a time: no new placement there until its items end, then the empty-agent
+        upgrade, then placement again. A drain that outlasts AGENT_DRAIN_MAX_S ends unupgraded (11-16: five xlarge on
+        d235bb2fd3ac, refilled whenever freed, never empty for the upgrade)."""
+        live = [v for v in self.vms.values() if not v.dead]
+        for v in live:
+            since = getattr(v, "agent_draining", 0.0)
+            if since and (v.agent == self.agent_version or now - since > AGENT_DRAIN_MAX_S or not v.ready):
+                v.agent_draining = 0.0
+                v.agent_drain_done = now
+                log(f"{v.id}: agent drain ended ({'upgraded' if v.agent == self.agent_version else 'not upgraded; placement again'})")
+        if any(getattr(v, "agent_draining", 0.0) for v in live):
+            return
+        old = [v for v in live if v.ready and not v.quarantine and v.agent and v.agent != self.agent_version
+               and (v.running or getattr(v, "foreign", 0)) and not getattr(v, "upgrading", False)
+               and now - getattr(v, "agent_drain_done", 0.0) > AGENT_DRAIN_MAX_S]
+        if old:
+            v = min(old, key=lambda v: (v.used(), v.id))  # (the nearest to empty first)
+            v.agent_draining = now
+            log(f"{v.id}: agent {v.agent} drained for its upgrade (no new placement until its {len(v.running)} items end)")
+
     def _slot(self, it: Item) -> VMState | None:
         best = None
         now = time.time()
@@ -3145,7 +3183,7 @@ class Scheduler:
             # (rules.vm_fits, the one test placement, preemption and waste read: its image and type, its memory, never a
             # VM that failed it, one quarantined, retired or not answering; then rules.may_slot: it fits in the slots;
             # a timing item only on an empty VM; no filler past a VM's hold; a VM set aside for another, its need)
-            if not vm_fits(shape, vm, retired):
+            if not vm_fits(shape, vm, retired) or self._strict_avoided(it, vm, now):
                 continue
             if not rules.may_slot(it.batch.klass, it.timing, it.weight, vm.slots - vm.used(), len(vm.running), vm.draining,
                                   self._held(vm, it, now), True, getattr(vm, "prep_fails", 0)):
@@ -3444,6 +3482,7 @@ class Scheduler:
             with self.lock:
                 it.result_error = 'strict preparation NOT_STARTED; cleanup retained: ' + str(e)[:200]
                 self._owned_failed(it, it.result_error, not_started=True)
+                self._note_strict_front_failure(vm, e)
             self.wake.set()
         except AgentCapabilityError as e:
             with self.lock:
@@ -3692,7 +3731,7 @@ class Scheduler:
             best = None
             retired, shape = self.retired(), fit_shape(it)
             for v in self.vms.values():
-                if not vm_fits(shape, v, retired):  # (the one fit: rules.vm_fits)
+                if not vm_fits(shape, v, retired) or self._strict_avoided(it, v, now):  # (the one fit: rules.vm_fits)
                     continue
                 if self._held(v, it, now):
                     continue  # (set aside for another item still waiting)
@@ -4844,7 +4883,7 @@ class Scheduler:
         with vm.lock:
             starts, acks = vm.starts, vm.acks
             vm.starts, vm.acks = [], []
-        if time.time() - vm.t_agent > 600 and not vm.running and not starts:
+        if (time.time() - vm.t_agent > 600 or getattr(vm, "agent_draining", 0.0)) and not vm.running and not starts:
             with contextlib.suppress(Exception):
                 self._check_agent(vm)
         if vm.dead:
