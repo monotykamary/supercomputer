@@ -3798,9 +3798,31 @@ class Scheduler:
                 held_c = sum(x.weight for v in held for x in v.running.values() if x.batch.klass == 3 and x.batch.client == c)
                 binds = contended(first[c]) if contended is not None and c in first else (len(subs) > 1 or any(it.batch.klass <= 2 for it in real))
                 work += rules.sub_demand(w, max(0, SUB_VMS * S - held_c) * B, binds)  # contention placement reads, rules.contends)
-            busy = sum(x.weight * min(B, max(0.0, self.est_of(x) - (now - (x.t_start or now)))) for v in held for x in v.running.values() if x.batch.klass <= 4)
-            cap = max(0.0, sum(rules.usable_slots(v.slots, getattr(v, "foreign", 0), False) * B for v in held) + coming * S * B - busy)
-            n_def = rules.economic_vms(work, cap, S * B)
+            # (a running item's time left within h; one whose cleanup is unconfirmed (its admission closed, its cancel
+            # pending) holds its slots throughout, never "ending now" past its estimate: 2026-11-16 11:00, 6 of 12 xlarge
+            # so held by cancelled strict items, counted free, the xlarge deficit 0 beside 41 queued whole-VM items)
+            def held_s(x, h):
+                if x.state == "cancel_pending" or x.batch.admission_closed:
+                    return h
+                return min(h, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
+            # (a w-slot item runs only in w free slots of one VM: capacity in whole items, never slivers beside others)
+            w_fit = max(1, min(S, min(S if it.timing or distinct else it.weight for it in real)))
+            S_fit = S - S % w_fit
+
+            def room(v, h, slots, top):
+                """The VM's slot-time within h this group's items can use: its slots as what runs there ends, counted
+                only in whole items of w_fit slots (with w_fit 1, its free slot-time as before)."""
+                run = [x for x in v.running.values() if x.batch.klass <= top or x.state == "cancel_pending" or x.batch.admission_closed]
+                w = lambda x: v.slots if x.timing and top < 4 else x.weight
+                ends = sorted((held_s(x, h), w(x)) for x in run)
+                free, t, total = slots - sum(n for _, n in ends), 0.0, 0.0
+                for r, n in ends + [(h, 0)]:
+                    usable = max(0, free)
+                    total += (usable - usable % w_fit) * max(0.0, r - t)
+                    free, t = free + n, max(t, r)
+                return total
+            cap = sum(room(v, B, rules.usable_slots(v.slots, getattr(v, "foreign", 0), False), 4) for v in held) + coming * S_fit * B
+            n_def = rules.economic_vms(work, cap, S_fit * B)
             hi = [it for it in real if it.batch.klass <= 2]
             n_hi = 0
             if hi:
@@ -3814,7 +3836,7 @@ class Scheduler:
                 durations = {sz(it) for it in hi} if not distinct and all(not it.timing and it.weight == 1 for it in hi) else set()
                 whole = next(iter(durations)) if len(durations) == 1 else 0.0
                 new_window = max(60.0, item_s, H - bu)  # preserve one full job despite float cancellation
-                new_capacity = S * (math.floor(new_window / whole) * whole if whole else new_window)
+                new_capacity = S_fit * (math.floor(new_window / whole) * whole if whole else new_window)
                 # the held VMs' slot-time within H a gate can have: free slots and lower classes' at once, the rest
                 # as their items (interactive, gate, submission) end; VMs still coming up, after their bring-up
                 cap_hi = 0.0
@@ -3826,13 +3848,9 @@ class Scheduler:
                     if v.ready and not any(vm_fits(fit_shape(it), v, retired) for it in hi):
                         continue
                     slots = rules.usable_slots(v.slots, getattr(v, "foreign", 0), exclusive)
-                    left = [min(ready_H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
-                            for x in v.running.values() if x.batch.klass <= 3]
-                    if exclusive:
-                        taken = slots * max(left, default=0.0)  # one whole VM, not fragments on several
-                    else:
-                        taken = sum((v.slots if x.timing else x.weight) * min(ready_H, max(0.0, self.est_of(x) - (now - (x.t_start or now))))
-                                    for x in v.running.values() if x.batch.klass <= 3)
+                    left = [held_s(x, ready_H) for x in v.running.values()
+                            if x.batch.klass <= 3 or x.state == "cancel_pending" or x.batch.admission_closed]
+                    taken = slots * max(left, default=0.0)  # (exclusive: one whole VM, not fragments on several)
                     if whole and v.ready:
                         # Uniform one-slot jobs cannot use fractional future gaps.
                         # Count complete jobs after each occupied slot is released.
@@ -3843,13 +3861,15 @@ class Scheduler:
                         # beats buying an otherwise-unused new worker.
                         fits = max(0, slots - used) * math.floor(H / whole)
                         fits += sum((v.slots if x.timing else x.weight) * math.floor(
-                            max(0.0, H - max(0.0, self.est_of(x) - (now - (x.t_start or now)))) / whole)
+                            max(0.0, H - held_s(x, H)) / whole)
                             for x in running)
                         cap_hi += fits * whole
                     elif whole:
                         cap_hi += slots * math.floor(new_window / whole) * whole
-                    else:
+                    elif exclusive:
                         cap_hi += max(0.0, slots * (ready_H if v.ready else max(0.0, H - bu)) - taken)
+                    else:
+                        cap_hi += room(v, ready_H if v.ready else max(0.0, H - bu), slots, 3)
                 cap_hi += coming * new_capacity
                 n_hi = rules.gate_vms(hw, cap_hi, new_capacity)
                 if all(it.batch.klass == 1 for it in hi):  # (a check alone: one VM, and only when none is held)

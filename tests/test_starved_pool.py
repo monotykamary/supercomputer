@@ -114,6 +114,51 @@ def test_capability_groups_neither_hide_nor_drop_each_others_growth():
     assert boat.TYPES["xlarge"][1] - boat.MEM_OVERHEAD >= 30720
 
 
+def _run(s, v, it, since):
+    it.state, it.vm, it.t_start = "running", v, time.time() - since
+    v.running[(it.batch.id, it.name)] = it
+
+
+def test_unconfirmed_cleanups_and_whole_vm_items_earn_growth():
+    """11:00: of 12 xlarge, 6 held whole by cancelled strict items whose cleanup is unconfirmed (past their estimates,
+    counted as ending now) and 6 by 7-slot gates beside a filler item; 10 whole-VM submissions waited 73+ min with
+    the xlarge deficit 0. Slots held so are no capacity, and a slot beside a 7-slot item is none for an 8-slot one."""
+    s = sched()
+    s.pol["start_breaker_enabled"] = False
+    now = time.time()
+    req2 = {"output_files_protocol": 1, "result_files_protocol": 1}
+    gone = _batch(s, "gone", 2, _wide(6, "z", req2, weight=8, memory=30720, est=60), t0=now - 90000)
+    gone.admission_closed = True
+    gate = _batch(s, "gate", 2, _wide(37, "g", req2, est=300), t0=now - 600)
+    fill = _batch(s, "fill", 5, [{"name": f"f{i}"} for i in range(6)])
+    gates = iter(list(gate.items.values())[:6])
+    for i, (z, f) in enumerate(zip(gone.items.values(), fill.items.values())):
+        _run(s, _vm(s, f"z{i}", "xlarge"), z, 80000)
+        z.state = "cancel_pending"
+        v = _vm(s, f"x{i}", "xlarge")
+        _run(s, v, next(gates), 60)
+        _run(s, v, f, 60)
+    _batch(s, "sub", 3, _wide(10, "s", CAPS, weight=8, memory=30720, est=600), t0=now - 4400)
+    plan = S.Scheduler._plan(s, now)
+    sub = next(t for k, t in s.target.items() if "runtime_pins_protocol" in k)
+    assert sub["deficit_vms"] > 0 and sub["want"] > 0, s.target
+    assert plan.get(("img", "xlarge"), (0,))[0] > 0, plan
+
+
+def test_slots_beside_long_real_work_are_no_whole_vm_capacity():
+    """Four xlarge each running a 2-slot item for the whole break-even: their 24 free slots hold no 8-slot item."""
+    s = sched()
+    s.pol["start_breaker_enabled"] = False
+    now = time.time()
+    small = _batch(s, "small", 3, [{"name": f"m{i}", "weight": 2, "est": 7200} for i in range(4)], t0=now - 600)
+    for i, it in enumerate(small.items.values()):
+        _run(s, _vm(s, f"x{i}", "xlarge"), it, 60)
+    _batch(s, "sub", 3, _wide(2, "s", CAPS, weight=8, memory=30720, est=750), t0=now - 4400)
+    S.Scheduler._plan(s, now)
+    sub = next(t for k, t in s.target.items() if k.startswith("img/xlarge"))
+    assert sub["deficit_vms"] > 0, s.target
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):
