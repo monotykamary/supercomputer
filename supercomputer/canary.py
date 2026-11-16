@@ -14,6 +14,7 @@ import shutil
 import time
 
 from . import rules
+from .health import SAMPLED
 
 WATCH_S = 600.0
 BASELINE_S = 3600.0
@@ -187,7 +188,8 @@ class Canary:
             minutes = BASELINE_S / 60
             b = health.check(t0, minutes)
             seen = any(e["t"] <= t0 for v in getattr(health, "ev", {}).values() for e in v)
-            self.baseline = {k for k, v in b.get("targets", {}).items() if v["ok"] and v["value"] is not None and (seen or k in JUDGED_BLIND)}  # (measured and held)
+            self.baseline = {k for k, v in b.get("targets", {}).items() if v["ok"] and v["value"] is not None and (seen or k in JUDGED_BLIND)
+                             and (k not in SAMPLED or health.sampled_held(k, t0 - BASELINE_S, t0))}  # (measured and held, all the hour)
             self.baseline.add("status")
         since = max(t0, self._handoff_checked_at if self._handoff_checked_at is not None else t0)
         r = health.check(now, max(1.0, (now - t0) / 60), released_since=t0, handoff_since=since)

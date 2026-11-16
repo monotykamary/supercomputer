@@ -61,6 +61,11 @@ TARGETS = {
 }
 
 
+# Targets valued by the last sample alone ("now"): held over a window only if no sample in it breached
+# (11-16 18:45: one VM flapping at the disk threshold before a handoff, 10.4 GB at its moment, rejected the new code).
+SAMPLED = {"disk": lambda p: len(p.get("disk_low", [])), "stray": lambda p: p.get("stray", 0)}
+
+
 def _ok(op: str, value, limit) -> bool:
     if value is None:
         return True
@@ -185,6 +190,12 @@ class Health:
             return []
         self.alerted.add("memory")
         return [f"health: memory breached ({v['what']}): {json.dumps(v['detail'], default=str)[:800]}"]
+
+    def sampled_held(self, k: str, lo: float, hi: float) -> bool:
+        """Whether a SAMPLED target held in every sample of [lo, hi], not only the last."""
+        with self.lock:
+            return not any(sum(SAMPLED[k](p) for p in s["per"].values())
+                           for s in self.ev["sample"] if lo <= s["t"] <= hi)
 
     # -- the checks
     def check(self, now: float, minutes: float = 30, env: dict | None = None, released_since: float = 0.0,

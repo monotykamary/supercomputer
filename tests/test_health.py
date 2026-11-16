@@ -164,6 +164,30 @@ def test_canary_judges_only_measured_targets():
     assert c.tick("new", 1180.0, h)[0] == "watch"
 
 
+def test_canary_disk_baseline_is_every_sample_of_the_hour():
+    """11-16 18:45: bx_gyhvpms6 flapped at the 10 GB disk threshold before the handoff (low 18:33, 18:37, 18:38, free
+    at 18:38:25); the baseline read only the last sample, so the same VM's next dip rejected a038ef4289c5 for good.
+    A target valued "now" held in the hour only if no sample of it breached; one that held throughout still gates."""
+    def run(before_low):
+        d = pathlib.Path(tempfile.mkdtemp())
+        (d / "code" / "old" / "supercomputer").mkdir(parents=True)
+        c, h = canary.Canary(d), health.Health()
+        h.record_status(500.0, 0.05)
+        h.record_sample(700.0, {"img": {"slots": 4, "busy": 4, "queued": 1, **({"disk_low": [["v1", 9.6]]} if before_low else {})}})
+        h.record_sample(990.0, {"img": {"slots": 4, "busy": 4, "queued": 1}})  # (free at the handoff's moment)
+        c.handing_off("old", "new", 1000.0)
+        for t in (1050.0, 1110.0, 1170.0):
+            h.record_sample(t, {"img": {"slots": 4, "busy": 4, "queued": 1, "disk_low": [["v1", 9.8]]}})
+        return c, [c.tick("new", t, h)[0] for t in (1060.0, 1120.0, 1180.0)]
+    c, verdicts = run(before_low=True)
+    assert "disk" not in c.baseline and verdicts == ["watch"] * 3 and not c.rejected("new"), (c.baseline, verdicts)
+    c, verdicts = run(before_low=False)
+    assert "disk" in c.baseline and verdicts[:2] == ["watch", "handback"] and c.rejected("new"), (c.baseline, verdicts)
+    h = health.Health()
+    h.record_sample(700.0, {"img": {"stray": 2}})
+    assert not h.sampled_held("stray", 0, 1000) and h.sampled_held("stray", 701, 1000) and h.sampled_held("disk", 0, 1000)
+
+
 def test_reasonless_preparation_strike_is_ours():
     h = health.Health()
     h.record_strike(1000.0, "b/x", "bx_1", "prepare on bx_1 failed: its preparation failed: ")
