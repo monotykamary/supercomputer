@@ -509,6 +509,30 @@ class HandoffDrainWiring(unittest.TestCase):
         self.assertFalse(self.s.canary.handoff_failed.call_args.args[2])
         self.assertTrue(self.place())
 
+    def test_a_readiness_the_saved_code_refuses_too_rejects_no_code(self):
+        """11-16 13:44: 907690f5e631 failed readiness (19 running items the successor's reload saw done), the saved
+        code 0a4ad0999110 the same: the state's verdict, never the candidate's rejection."""
+        import json
+        self.begin_wait()
+        self.vm.ready = True
+        self.s._metrics_save = mock.Mock()
+        self.s._handoff_snapshot = mock.Mock(return_value={"vms": []})
+        child = mock.Mock()
+        child.poll.return_value = 0  # exited after its ACK: no signal sent
+
+        def spawn(*a, **k):
+            of = json.loads((S.DIR / "handoff.json").read_text())["t"]
+            (S.DIR / "handoff.ack").write_text(json.dumps({"pid": 1, "of": of, "taken": [], "missing": [],
+                "admissions": {"ready": False, "items_ready": False}, "items_ready": False}))
+            return child
+        self.popen.side_effect = spawn
+        self.s.handoff()
+        self.assertEqual(self.popen.call_count, 2)  # candidate and saved code, both refused readiness
+        self.assert_open()
+        self.s.canary.handoff_failed.assert_called_once()
+        self.assertTrue(self.s.canary.handoff_failed.call_args.args[2])  # retryable: no rejection
+        self.assertTrue(self.place())
+
 
 if __name__ == "__main__":
     unittest.main()

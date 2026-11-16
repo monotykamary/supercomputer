@@ -1196,14 +1196,25 @@ class Scheduler:
                         else:
                             starting.append((it, vm))  # Legacy agents deduplicate the same run name.
             self.vms[vid] = vm
-        expected_items, invalid_items = {}, 0
+        expected_items, invalid_items, superseded = {}, 0, []
         for v in info.values():
             for x in v.get("items", []):
                 if not named_item(x):
                     invalid_items += 1
                     continue
                 if x["batch"] not in closed:
+                    b = self.batches.get(x["batch"])
+                    it = b.items.get(x["name"]) if b else None
+                    if (it is not None and it.state == "done" and not b.strict_once and not b.retain_journals
+                            and not it.spec.get("distinct_vm_group")):
+                        # (a legacy item whose persisted verdict is already delivered: the parent's run of it is a
+                        # superseded one (a replaced admission's, 11-16 13:44: 19 such items, both successors refused),
+                        # no ownership to carry; its worker reports it as foreign inventory until it ends)
+                        superseded.append([v["id"], b.id, x["name"], x["run_name"]])
+                        continue
                     expected_items[(v["id"], x["batch"], x["name"], x["run_name"])] = x.get("launch_identity")
+        if superseded:
+            log(f"take-over: {len(superseded)} legacy items the old scheduler held whose verdicts are already delivered: not carried (foreign until they end)")
         actual_items = {(v.id, it.batch.id, it.name, it.run_name): it.launch_identity
                         for v in self.vms.values() for it in v.running.values()}
         items_ready = not snap or (invalid_items == 0 and expected_items == actual_items)
@@ -1245,6 +1256,7 @@ class Scheduler:
         if snap:
             self._handoff_ack = {"pid": me, "t": now, "of": snap.get("t"), "taken": taken, "missing": missing,
                                  "admissions": self.recovery, "items_ready": items_ready,
+                                 "superseded_legacy_items": {"count": len(superseded), "first": superseded[:8]},
                                  "distinct_vm_groups": ack_groups,
                                  "image_pins": self._image_pins_manifest(),
                                  **({"durable_distinct_vm_groups": self._durable_snapshot()} if durable else {}),
@@ -2340,6 +2352,15 @@ class Scheduler:
             return {"ok": False, "error": f"batch {b.id} has items queued or running: a submit never replaces it"}
         qd = DIR / "queue"
         qd.mkdir(parents=True, exist_ok=True)
+        if what == "replace":
+            # (the new admission starts its own journals: the one it replaces moves its rows, placements and logs aside,
+            # else a reload (a successor's, a restart's) reads the old rows as the new items' verdicts; 11-16 13:44,
+            # three replaced treadmill batches, 19 running items "done" to both successors, every handoff refused)
+            stamp = getattr(old, "cache_generation", None) or secrets.token_hex(8)
+            for suffix in ("rows", "placed", "attempts", "logs"):
+                path = qd / f"{b.id}.{suffix}"
+                if path.exists():
+                    os.replace(path, qd / f"{b.id}.replaced-{stamp}.{suffix}")
         tmp = qd / f".{b.id}.json.tmp"  # (whole, then renamed in: a crash never leaves half a batch)
         with blobcache.locked(BLOBS):
             missing = [k for k in set(b.tree["files"].values()) if not (BLOBS / k).is_file()]
@@ -6015,6 +6036,7 @@ class Scheduler:
             budget_s = rules.handoff_budget(len(held), item_count, load_ms) / 1000
             snap["readiness_budget"] = {"seconds": budget_s, "vms": len(held),
                                         "items": item_count, "load_ms": load_ms}
+            failures = []
             for attempt, target in enumerate(candidates):
                 snap["t"] = time.time()
                 tmp = DIR / "handoff.json.tmp"
@@ -6056,6 +6078,9 @@ class Scheduler:
                             ack.get("durable_distinct_vm_groups") == snap.get("durable_distinct_vm_groups")) and
                         rules.distinct_history_matches(bool(snap.get("image_pins")),
                             ack.get("image_pins") == snap.get("image_pins"))):
+                    for t, w, r, _acked in failures:  # (a candidate refused before this one was accepted: its own verdict)
+                        if t != self.code:
+                            self.canary.handoff_failed(t, w, r, time.time())
                     _notify_service(ack["pid"])
                     log(f"handoff: serving pid {ack['pid']} holds every VM and running identity; exiting")
                     accepted = True
@@ -6071,9 +6096,18 @@ class Scheduler:
                        else f"handoff to {target} exited {exit_code} before readiness ACK (stderr: {DIR / 'log'})" if ack is None and exit_code is not None
                        else f"handoff to {target} failed readiness: {ack!r}")
                 self.alert(why)
-                if target != self.code:
-                    self.canary.handoff_failed(target, why, retryable, time.time())
-            self.alert("handoff blocked: candidate and saved code failed; resuming old scheduler")
+                if target != self.code and ack is None:
+                    self.canary.handoff_failed(target, why, retryable, time.time())  # (no ACK: the code's, at once)
+                else:
+                    failures.append((target, why, retryable, ack is not None))
+            # (a readiness the saved code, this process's own, fails too is the state's, not the candidate code's: no
+            # rejection, a retry once the state allows; 11-16 13:44, 907690f5e631 rejected for 19 running items the
+            # saved code refused as well)
+            state = any(t == self.code and not r and acked for t, _w, r, acked in failures)
+            for t, w, r, _acked in failures:
+                if t != self.code:
+                    self.canary.handoff_failed(t, w, r or state, time.time())
+            self.alert("handoff blocked: candidate and saved code failed" + (" (the state's, not the code's: no rejection)" if state else "") + "; resuming old scheduler")
         finally:
             try:
                 if rules.handoff_resume(accepted, quiesced):

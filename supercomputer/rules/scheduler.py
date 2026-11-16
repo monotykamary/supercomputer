@@ -1031,11 +1031,14 @@ class Submit:
 
     # gdp: law a submit never replaces a batch with live items: not old(live) or result != "replace"
     # gdp: law a submit under a free id makes the batch: old(exists) or result == "new"
+    # gdp: law an identical submit keeps the batch there, live or done: not old(exists) or not same or result == "keep"
     def admit(self, same: bool) -> Literal["new", "keep", "refuse", "replace"]:
-        """A submit under the id; `same` when it names the same items as the batch already there."""
+        """A submit under the id; `same` when it names the same items as the batch already there. The client's retry
+        of a batch that finished meanwhile keeps it, its rows the answer (11-16 13:15-13:19: three treadmill filler
+        batches, their submits answered only after the client's timeout, admitted again once done: run twice)."""
         if not self.exists:
             self.result = "new"
-        elif self.live and same:
+        elif same:
             self.result = "keep"
         elif self.live:
             self.result = "refuse"
