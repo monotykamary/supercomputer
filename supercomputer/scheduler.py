@@ -3347,7 +3347,13 @@ class Scheduler:
             if r.get("err"):
                 raise RuntimeError(r["err"])
             for row in r.get("done", []):
-                self._accept_finished(vm, row)
+                # (other items' rows, sent back with the start: theirs to import, never this start's failure; one that
+                # fails stays unacknowledged on the agent for the poller's next tick. 2026-11-16 11:51, ibuvsx's strict
+                # item started, then went LOST for another row's "invalid result chunk receipt")
+                try:
+                    self._accept_finished(vm, row)
+                except Exception as e:
+                    log(f"{vm.id}: {row.get('batch')}: {row.get('name')}: result left for the next tick ({str(e)[:160]})")
         except PrelaunchNotStarted as e:
             with self.lock:
                 it.result_error = 'strict preparation NOT_STARTED; cleanup retained: ' + str(e)[:200]
