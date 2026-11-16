@@ -146,7 +146,7 @@ def exec_response(client, body, timeout, decode):
         if result.get('exitCode') != 0:
             if str(result.get('stderr') or '').strip() == 'result relay: worker_connection_refused':
                 raise boat.WorkerEndpointUnavailable('worker-local agent connection refused')
-            raise boat.AgentError('result relay exec failed: ' +
+            raise (boat.AgentTransportError if boat.exec_unreachable(result) else boat.AgentError)('result relay exec failed: ' +
                                   str(result.get('stderr') or result.get('error') or '')[-160:])
         text = result.get('stdout', '')
         if not isinstance(text, str) or len(text) > limit:

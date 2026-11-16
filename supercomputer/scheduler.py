@@ -3498,8 +3498,9 @@ class Scheduler:
             self.wake.set()
         except AgentCapabilityError as e:
             with self.lock:
-                vm.running.pop((b.id, rn), None)
-                self._owned_failed(it, "required agent capabilities could not be verified; payload not launched: " + str(e))
+                if not b.strict_once:  # (a strict placement is held until its bound cleanup receipt, as on every strict
+                    vm.running.pop((b.id, rn), None)  # failure: 11-16 22:09:47, rejj3ega let go "retired, empty" while
+                self._owned_failed(it, "required agent capabilities could not be verified; payload not launched: " + str(e))  # 0171's cleanup pended
             self.wake.set()
         except Exception as e:
             if vm.dead:
@@ -6325,6 +6326,13 @@ class Scheduler:
         try:
             reply = vm.client.ping()
         except Exception as error:
+            if it.batch.strict_once and isinstance(error, boat.AgentError) and prelaunch_transport_retryable(
+                    isinstance(error, boat.AgentTransportError),
+                    error.status if isinstance(error, boat.AgentHTTPError) else 0):
+                # (a strict item's ping lost to typed transport, before any start request: the preparation's own retry
+                # and NOT_STARTED, not a capability verdict. 11-16 22:05-22:09, eoco71 and dmhxxl: boat's front and exec
+                # both refused, the VM and its agent up throughout, three items LOST with their cleanup pending)
+                raise
             raise AgentCapabilityError(f"agent ping failed: {error}") from error
         if not reply.get("ok") or reply.get("stale"):
             raise AgentCapabilityError("agent ping refused")

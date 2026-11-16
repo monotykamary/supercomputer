@@ -51,8 +51,12 @@ payload start has been requested. It uses the existing `boat_tries` preparation
 budget (normally three calls), without a new placement, VM, boot, launch nonce,
 physical-attempt allowance or fallback. Cancellation, shutdown and lease loss do
 not grant a retry. Eligibility uses typed transport evidence, never error text:
-recognized connection/timeouts, incomplete reads and temporary DNS failures, or
-HTTP **408, 429, 502, 503, 504**. Other HTTP statuses (including 400/401/403 and
+recognized connection/timeouts, incomplete reads and temporary DNS failures,
+boat exec's own structured failure to reach the VM's node (`connect ECONNREFUSED
+<node>:<port>` and its kin, with no command output), or HTTP **408, 429, 502,
+503, 504**. A required-agent capability ping lost to such transport is part of
+preparation: it retries and ends NOT_STARTED, never a capability verdict. A strict
+placement stays held until its bound cleanup receipt on every failure path. Other HTTP statuses (including 400/401/403 and
 500), certificate/protocol failures, untyped errors and semantic tree/prep
 negative replies do not retry and retain their existing LOST outcome. Permanent
 owned-protocol/capability refusals likewise keep their existing behavior.

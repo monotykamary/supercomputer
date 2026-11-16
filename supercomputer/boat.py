@@ -47,6 +47,7 @@ import math
 import os
 import pathlib
 import random
+import re
 import secrets
 import selectors
 import signal
@@ -1455,6 +1456,18 @@ def _transient_transport_error(error) -> bool:
             or (isinstance(error, socket.gaierror) and error.errno == socket.EAI_AGAIN))
 
 
+_PROVIDER_UNREACHABLE = re.compile(r"connect (ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH) \S+$")
+
+
+def exec_unreachable(result: dict) -> bool:
+    """boat exec never reached the VM's node: the provider's own structured error, the socket code of its connection
+    (11-16 22:05-22:13, several VMs at once: "connect ECONNREFUSED 5.196.64.98:21036"), no command output. Typed
+    transport evidence; a command's own stderr never is."""
+    error = result.get("error") if isinstance(result, dict) else None
+    return (isinstance(error, str) and bool(_PROVIDER_UNREACHABLE.fullmatch(error.strip()))
+            and not result.get("stdout") and not result.get("stderr"))
+
+
 class WorkerEndpointUnavailable(AgentError):
     """The worker-local agent listener refused the exec relay connection."""
 
@@ -1704,7 +1717,7 @@ class AgentClient:
                     raise AgentError(f"{self.vm}: the agent didn't answer, by boat's front nor by boat exec (its body's part: {str(w.get('stderr') or w.get('error'))[-160:]})")
         r = exec_(self.vm, ["python3", "-c", script, arg, self.token], int(timeout) + 15)
         if r.get("exitCode") != 0:
-            raise AgentError(f"{self.vm}: the agent didn't answer, by boat's front nor by boat exec ({str(r.get('stderr') or r.get('error'))[-160:]})")
+            raise (AgentTransportError if exec_unreachable(r) else AgentError)(f"{self.vm}: the agent didn't answer, by boat's front nor by boat exec ({str(r.get('stderr') or r.get('error'))[-160:]})")
         return 200, r.get("stdout", "").encode()
 
     def raw(self, cmd: str, *args, timeout: float = 120) -> bytes:
