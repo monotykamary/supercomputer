@@ -64,3 +64,15 @@ class BrokenRestoredIdentity:
     # gdp: law a reboot or fork invalidates the copied lease: not result or (b == boot and vm == vm_id)
     def accepts(self, by: str, b: str, e: int, vm: str) -> bool:
         return by == self.holder and e == self.epoch  # broken: boot and sandbox identity omitted
+
+
+class BrokenLeasedDrop:
+    """11-16: dropping leased batch directories by the legacy rule alone would erase another owner's unacknowledged
+    result, or a strict job's owner evidence before its cleanup was answered."""
+
+    def __init__(self, keep_s: int):
+        self.keep_s = keep_s
+
+    # gdp: law under a lease a batch is dropped only when every item of it is retired: not result or retired
+    def drop_retired(self, current: bool, quiet_s: int, live_item: bool, retired: bool) -> bool:
+        return not current and quiet_s > self.keep_s and not live_item  # broken: retired omitted

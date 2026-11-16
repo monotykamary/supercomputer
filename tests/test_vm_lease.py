@@ -87,10 +87,19 @@ class VMLeasePersistence(unittest.TestCase):
         blob = self.rpc("logs", ["batch"], first)
         with tarfile.open(fileobj=io.BytesIO(blob)) as tf:
             self.assertIn("item/out", tf.getnames())
+        def age():
+            for f in [j.parent.parent, j, *j.iterdir()]:
+                os.utime(f, (1, 1))
+        age()
+        A.drop_old_batches("", keep_s=0)
+        self.assertTrue((j / "out").exists())  # (unacknowledged: it survives the transfer)
         self.rpc("vtick", [{"acks": [{"batch": "batch", "name": "item"}], "wait": 0}], first)
         self.assertTrue((j / "acked.json").exists())
-        A.drop_old_batches("", keep_s=0)
-        self.assertTrue((j / "out").exists())
+        age()
+        with mock.patch.object(A.subprocess, "Popen"):
+            A.drop_old_batches("", keep_s=0)
+        self.assertFalse((j / "out").exists())  # (its owner's ack taken, quiet: retired, it goes)
+        self.assertEqual(json.loads((self.root / "dropped-jobs" / "batch.json").read_text())["owners"], {"item": "a"})
 
     def test_boot_and_vm_identity_invalidate_old_fences(self):
         first = self.claim()

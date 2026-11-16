@@ -272,6 +272,15 @@ class BatchDirs:
     def drop(self, current: bool, quiet_s: int, live_item: bool) -> bool:
         return not current and quiet_s > self.keep_s and not live_item
 
+    # gdp: law under a lease a batch is dropped only when every item of it is retired: not result or retired
+    # gdp: law under a lease the batch being prepared is never dropped: not result or not current
+    # gdp: law under a lease a batch with a live item is never dropped: not result or not live_item
+    # gdp: law under a lease a batch is dropped only after keep_s quiet: not result or quiet_s > keep_s
+    def drop_retired(self, current: bool, quiet_s: int, live_item: bool, retired: bool) -> bool:
+        """Under a lease: as drop, and only once every item is retired (its owner's ack taken, and a strict one's
+        cleanup asked and answered with its namespace reaped). Another owner's unacknowledged result stays."""
+        return not current and quiet_s > self.keep_s and not live_item and retired
+
     # gdp: law no item starts in a batch not prepared here: not result or ready
     def may_start(self, ready: bool) -> bool:
         return ready
@@ -933,11 +942,80 @@ def cache_hashes(name: str, key: str) -> dict:
     return {n: _sha256_file(cache_dir(name, key) / n) for n in cache_names(name, key)}
 
 
+DROP_LEASED_MAX = 64  # batch directories dropped a call under a lease (the caller holds the lease lock)
+DROP_LEASED_LOOK = 256  # ... and looked at a call, the quietest first
+
+
+def _dropped_owner(batch: str, name: str):
+    """The owner a dropped batch's job had (its tombstone), or None."""
+    p = ROOT / "dropped-jobs" / f"{batch}.json"
+    try:
+        owner = json.loads(p.read_text()).get("owners", {}).get(name)
+    except (OSError, ValueError, AttributeError):
+        return None
+    return owner if isinstance(owner, str) else None
+
+
+def _retired_owner(j: pathlib.Path):
+    """A job's owner once it is retired: its owner's ack taken (acked.json, no done.json) and, for a strict one, its
+    owned record bound to its identity, reaped and cancelled (a cleanup asked and answered). Else None."""
+    try:
+        if not (j / "acked.json").exists() or (j / "done.json").exists():
+            return None
+        identity = _strict_job_identity(j)
+        if identity is not None:
+            row = json.loads(_owned_path(j.parent.parent.name, j.name).read_text())
+            if row.get("identity") != identity or row.get("reaped") is not True or row.get("cancelled") is not True:
+                return None
+        return _job_owner(j)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None  # unknown evidence keeps the directory
+
+
+def _drop_leased(batch: str, keep_s: float):
+    """Under a lease, retired batches' directories go: a tombstone of their jobs' owners first (a rebound cleanup ask
+    still proves the owner), then renamed out of b/ and removed in the background. 11-16 bx_ekvw4s47 (up 31 h): none
+    ever went, 4,523 directories and 14,155 jobs, and every vtick read them all."""
+    now, rule = time.time(), BatchDirs(int(keep_s))
+    try:
+        olds = sorted((ROOT / "b").iterdir(), key=lambda d: d.stat().st_mtime) if (ROOT / "b").exists() else []
+    except OSError:
+        return
+    trash, dropped = None, 0
+    for old in olds[:DROP_LEASED_LOOK]:
+        if dropped >= DROP_LEASED_MAX:
+            break
+        try:
+            if now - old.stat().st_mtime <= keep_s:
+                break  # (the quietest first: none after it is quiet either)
+            jobs = list(old.glob("jobs/*"))
+            quiet_s = int(now - max(f.stat().st_mtime for f in [old, *jobs]))
+            live = any(alive(int(t)) for j in jobs for t in [(j / "pid").read_text().strip() if (j / "pid").exists() else ""]
+                       if t.isdigit() and not (j / "done.json").exists() and not (j / "acked.json").exists())
+        except (OSError, ValueError):
+            continue
+        owners = {j.name: _retired_owner(j) for j in jobs}
+        if not rule.drop_retired(old.name == batch, quiet_s, live, all(o is not None for o in owners.values())):
+            continue
+        try:
+            _owned_write(ROOT / "dropped-jobs" / f"{old.name}.json", {"batch": old.name, "owners": owners})
+            if trash is None:
+                trash = ROOT / "b-trash" / secrets.token_hex(8)
+                trash.mkdir(parents=True)
+            os.rename(old, trash / old.name)
+            dropped += 1
+        except OSError:
+            continue
+    if trash is not None:
+        subprocess.Popen(["sudo", "-n", "rm", "-rf", str(trash)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def drop_old_batches(batch: str, keep_s: float = 1800):
     # other batches' directories go once nothing of theirs runs and they've been quiet keep_s (the scheduler runs
     # several batches on one VM at once; a client's batch had the VM alone, and a late call of an older one keeps its tree)
     if _lease_enabled():
-        return  # owner results/logs survive lease transfer until explicit owner ack
+        return _drop_leased(batch, keep_s)  # owner results/logs survive lease transfer until explicit owner ack
     now, rule = time.time(), BatchDirs(int(keep_s))
     for old in (ROOT / "b").glob("*") if (ROOT / "b").exists() else []:
         try:
@@ -1282,8 +1360,7 @@ def cancelitem(batch: str, name: str, wait_seconds=10, expected_identity=None, r
     try:
         with _ownership_lock(deadline):
             if require_owned_record and (not _lease_enabled() or not path.exists()
-                    or not (batch_dir(batch) / "jobs" / name).exists()
-                    or not _owner_readable(batch_dir(batch) / "jobs" / name)):
+                    or not _job_owned_by_requester(batch, name)):
                 return _owned_receipt(batch, name, {}, "rebound cleanup requires an owned job and strict record")
             if path.exists():
                 row = json.loads(path.read_text())
@@ -1329,6 +1406,15 @@ def cancelitem(batch: str, name: str, wait_seconds=10, expected_identity=None, r
     except (OSError, ValueError, KeyError, TypeError) as e:
         # Failure to read durable evidence, signal, wait or persist is NOT a successful receipt.
         return _owned_receipt(batch, name, {}, str(e))
+
+
+def _job_owned_by_requester(batch: str, name: str) -> bool:
+    """The job's owner is this request's: from its spec, or the tombstone a retired batch's drop left."""
+    j = batch_dir(batch) / "jobs" / name
+    if j.exists():
+        return _owner_readable(j)
+    owner = _dropped_owner(batch, name)
+    return owner is not None and _lease_enabled() and bool(_request_owner()) and owner == _request_owner()
 
 
 def _reap_children():
@@ -1592,12 +1678,24 @@ def report(d: pathlib.Path) -> tuple[list, list]:
         what = rule.read((j / "acked.json").exists(), dj.exists(), row is not None, bool(pid.isdigit()), live, age)
         if what == "lost":
             time.sleep(0.2)  # (the runner's done.json may be landing)
-            if not dj.exists():
-                err = _read_tail(j / "agent.err", 8000).decode("utf-8", "replace")[-2000:] if (j / "agent.err").exists() else ""
-                lost = {"name": j.name, "code": -1, "seconds": -1, "lost": True, "err": err or "its process gone without a word"}
-                if identity is not None:
-                    lost["launch_identity"] = identity  # a NEW failure, proven from this admission
-                write_json(dj, lost)
+            with lease_lock():  # (the scan runs outside it; its one write is judged again under it, beside start/cancel)
+                pid = (j / "pid").read_text().strip() if (j / "pid").exists() else ""
+                try:
+                    age = int(time.time() - j.stat().st_mtime)
+                except FileNotFoundError:
+                    age = 0
+                again = JobReport(STARTING_S).read((j / "acked.json").exists(), dj.exists(), True, bool(pid.isdigit()),
+                                                   bool(pid.isdigit()) and alive(int(pid)), age)
+                if again == "lost":
+                    err = _read_tail(j / "agent.err", 8000).decode("utf-8", "replace")[-2000:] if (j / "agent.err").exists() else ""
+                    lost = {"name": j.name, "code": -1, "seconds": -1, "lost": True, "err": err or "its process gone without a word"}
+                    if identity is not None:
+                        lost["launch_identity"] = identity  # a NEW failure, proven from this admission
+                    write_json(dj, lost)
+                elif again in ("running", "skip"):  # (started meanwhile, or acked: no lost row)
+                    if again == "running":
+                        running.append(j.name)
+                    continue
             what = "done"
             try:
                 row = json.loads(dj.read_text())
@@ -1618,7 +1716,8 @@ def report(d: pathlib.Path) -> tuple[list, list]:
     return done, running
 
 
-def tick(batch: str, msg: dict) -> dict:
+def _tick_mutate(batch: str, msg: dict):
+    """tick's acks and starts (under the lease lock); an answer here ends the tick."""
     d = batch_dir(batch)
     if not (d / "jobs").exists():
         return {"done": [], "running": [], "load": os.getloadavg()[0], "err": "no such batch here"}
@@ -1630,6 +1729,18 @@ def tick(batch: str, msg: dict) -> dict:
         _ack_job(d / "jobs" / name, ack.get("launch_identity") if isinstance(ack, dict) else None)
     for spec in msg.get("start", []):
         start(d, spec)
+    return None
+
+
+def tick(batch: str, msg: dict) -> dict:
+    return _tick_mutate(batch, msg) or _tick_scan(batch, msg)
+
+
+def _tick_scan(batch: str, msg: dict) -> dict:
+    """tick's report and wait: reads, outside the lease lock (report takes it for its one write)."""
+    d = batch_dir(batch)
+    if not (d / "jobs").exists():
+        return {"done": [], "running": [], "load": os.getloadavg()[0], "err": "no such batch here"}
     wait = float(msg.get("wait", 25))
     t0 = time.time()
     while True:
@@ -1678,6 +1789,11 @@ def kill_item(batch: str, name: str) -> dict:
 def vtick(msg: dict) -> dict:
     """The scheduler's tick for a whole VM: starts and acks by batch, then a wait (<= msg.wait) for any finish; every
     batch's finished items, each with its batch."""
+    return _vtick_mutate(msg) or _vtick_scan(msg)
+
+
+def _vtick_mutate(msg: dict):
+    """vtick's acks and starts (under the lease lock); an answer here ends the tick."""
     for a in msg.get("acks", []):
         _item_ids(a["batch"], a["name"])
         j = batch_dir(a["batch"]) / "jobs" / a["name"]
@@ -1689,6 +1805,13 @@ def vtick(msg: dict) -> dict:
         if not BatchDirs(0).may_start(ready):
             return {"err": f"batch {st['batch']} isn't prepared here", "batch": st["batch"]}
         start(d, st["spec"])
+    return None
+
+
+def _vtick_scan(msg: dict) -> dict:
+    """vtick's pass over every batch here and its wait: reads, outside the lease lock. 11-16 bx_ekvw4s47: held across
+    this pass (14,155 retained jobs, ~2.5 s), the lock was free almost never, and every strict cleanup's cancelitem
+    timed out on it for minutes. report takes the lock for its one write, a lost row judged again under it."""
     wait, t0 = float(msg.get("wait", 20)), time.time()
     batches = [b for b in (ROOT / "b").iterdir()] if (ROOT / "b").exists() else []
     while True:
@@ -2989,6 +3112,10 @@ def _lease_mutation(fn):
                     jobs = ([batch_dir(batch) / "jobs" / args[1]] if len(args) > 1 else list((batch_dir(batch) / "jobs").glob("*")))
                     if any(j.exists() and not _owner_readable(j) for j in jobs):
                         raise LeaseStale("foreign job mutation refused")
+                    if fn.__name__ == "cancelitem" and not jobs[0].exists():
+                        owner = _dropped_owner(batch, args[1])
+                        if owner is not None and owner != _request_owner():
+                            raise LeaseStale("foreign job mutation refused")
                 if fn.__name__ == "cancelitem":
                     # The lease acquisition consumes this request's original deadline.
                     args = list(args)
@@ -3012,12 +3139,16 @@ cancelitem = _lease_mutation(cancelitem)
 prep = _lease_mutation(prep)
 
 
-def _lease_tick(fn):
+def _lease_tick(mutate, scan):
+    """The lease checks, renewal, acks and starts under the lease lock; the scan after it, outside. The holder is
+    judged again after the scan: a lease that moved meanwhile marks the answer stale, as one held through it would."""
     def guarded(*args):
         msg = args[-1]
+        fence = getattr(_lease_local, "fence", None)
         with lease_lock():
-            fence = getattr(_lease_local, "fence", None)
-            if _lease_enabled():
+            enabled = _lease_enabled()
+            current = True
+            if enabled:
                 if msg.get("start"):
                     with lease_guard(fence):
                         pass
@@ -3026,14 +3157,17 @@ def _lease_tick(fn):
                 current = _lease_matches(_lease_record(), fence) and _lease_record().get("state") == "held"
                 if current:
                     lease("renew", fence)
-                result = fn(*args)
-                return result if current else {**result, "stale": True}
-            return fn(*args)
+            early = mutate(*args)
+        result = early if early is not None else scan(*args)
+        if enabled and current:
+            with lease_lock():
+                current = _lease_matches(_lease_record(), fence) and _lease_record().get("state") == "held"
+        return result if current else {**result, "stale": True}
     return guarded
 
 
-tick = _lease_tick(tick)
-vtick = _lease_tick(vtick)
+tick = _lease_tick(_tick_mutate, _tick_scan)
+vtick = _lease_tick(_vtick_mutate, _vtick_scan)
 
 
 def begin(version, batch, tree, context):
