@@ -135,7 +135,8 @@ class OwnedAgentClient:
         if route.startswith("/cache?"):
             from urllib.parse import parse_qs, urlparse
             query = parse_qs(urlparse(route).query)
-            return self.rpc("cacheput", query["name"][0], query["key"][0], encoded)
+            authority = query.get("authority", [""])[0] == "1"
+            return self.rpc("cacheput", query["name"][0], query["key"][0], encoded, *((True,) if authority else ()))
         raise OwnedAgentRefused("unsupported owned upload")
 
 def log(*a):
@@ -482,6 +483,24 @@ class Batch:
         """What its items took against their estimates, once 3 finished (never below 1: estimates aren't trusted
         to be generous, a slow batch grows the pool)."""
         return max(1.0, self.obs_s / self.obs_est) if getattr(self, "obs_n", 0) >= 3 and self.obs_est > 0 else 1.0
+
+
+_sha_memo: dict = {}
+
+
+def _file_sha(p: pathlib.Path) -> str:
+    """A file's sha256, memoized by its size and mtime (a cache's files are written once, renamed in)."""
+    st = p.stat()
+    k = (str(p), st.st_size, st.st_mtime_ns)
+    if k not in _sha_memo:
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        if len(_sha_memo) > 100000:
+            _sha_memo.clear()
+        _sha_memo[k] = h.hexdigest()
+    return _sha_memo[k]
 
 
 def mem_fits(it, vm_type: str) -> bool:
@@ -3546,6 +3565,15 @@ class Scheduler:
                 local = pathlib.Path(c["local"])
                 names = sorted(f.name for f in local.iterdir() if f.name in set(c["outputs"])) if local.exists() else []
                 have = set(r.get("caches", {}).get(c["name"], []))
+                there = r.get("cache_sha", {}).get(c["name"]) if isinstance(r.get("cache_sha"), dict) else None
+                if isinstance(there, dict):
+                    # (one key, one value: this controller's copy, the first write; a VM's own build of a file the
+                    # controller lacks is published here first-write-wins, one whose bytes differ from it replaced
+                    # by it; 2026-11-16, one Lean cache key restored as three oleans)
+                    self._cache_sync(cl, vm, c, local, names, there)
+                    if names or there:
+                        vm.caches.add((c["name"], c["key"]))
+                    continue
                 if set(names) - have:
                     peer = self._peer(vm, cache=(c["name"], c["key"]))
                     got = set()
@@ -3572,6 +3600,23 @@ class Scheduler:
                 if vm.preparing.get(b.id) is ev:  # a waiter to find finished and unprepared once the VM drops the batch)
                     vm.preparing.pop(b.id, None)
             ev.set()
+
+    def _cache_sync(self, cl, vm, c, local: pathlib.Path, names: list, there: dict):
+        """A key's files between this controller (the authority: its first write) and a VM reporting their hashes."""
+        outputs = set(c["outputs"])
+        new = sorted(n for n in there if n in outputs and n not in names)
+        if new:  # (the VM built what no one had published: its bytes are the key's value from now)
+            with contextlib.suppress(Exception):
+                cache_put(local, vm.client.raw("cacheout", c["name"], c["key"], "tar", timeout=300))
+            names = sorted(f.name for f in local.iterdir() if f.name in outputs) if local.exists() else []
+        send = [n for n in names if there.get(n) != _file_sha(local / n)]
+        if send:
+            with self.prep_sem:
+                buf = io.BytesIO()
+                with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tf:
+                    for n in send:
+                        tf.add(local / n, arcname=n)
+                cl.put(f"/cache?name={c['name']}&key={c['key']}&authority=1", buf.getvalue())
 
     def _verify_tree(self, vm: VMState, b, t: dict):
         """The batch's tree on the VM, each file its client's manifest names a git blob for checked to be that blob
@@ -6370,6 +6415,36 @@ def _state_export(s) -> bytes:
     return s._state_archive.get(lambda: statebackup.build(config.LIVE, treadmill.use(), snapshot_guard, metadata, file_backed=True), metadata)
 
 
+def cache_put(d: pathlib.Path, body: bytes) -> dict:
+    """A build cache's files for a key, here, where each key has one immutable value: the first write of a file wins,
+    whole (written, then renamed in); the same bytes again are kept, other bytes refused (2026-11-16: one Lean cache
+    key, three oleans on the controller and two VMs, a dependent's identity check refused)."""
+    d.mkdir(parents=True, exist_ok=True)
+    kept, refused = [], []
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as tf:
+        for m in tf.getmembers():
+            n = pathlib.Path(m.name).name
+            if not m.isfile() or n.startswith(".") or n != m.name.lstrip("./"):
+                continue
+            data = tf.extractfile(m).read()
+            dest = d / n
+            if dest.exists():
+                (kept if dest.read_bytes() == data else refused).append(n)
+                continue
+            tmp = d / f".{n}.{os.getpid()}.{threading.get_ident()}.in"
+            tmp.write_bytes(data)
+            try:
+                os.link(tmp, dest)  # (first write wins: never replaces a file another writer put in meanwhile)
+                kept.append(n)
+            except FileExistsError:
+                (kept if dest.read_bytes() == data else refused).append(n)
+            finally:
+                tmp.unlink(missing_ok=True)
+    if refused:
+        log(f"cache {d.parent.name} {d.name[:12]}: other bytes under one key refused, the first kept: {refused[:4]}")
+    return {"ok": True, "kept": kept, "refused": refused}
+
+
 def raw_post(path: str, body: bytes):
     """The controller's uploads: blobs (a tar named by key), a cache's files, a queue submission, the repos' git."""
     from urllib.parse import parse_qs, urlparse
@@ -6384,11 +6459,7 @@ def raw_post(path: str, body: bytes):
                 n += 1
         return ({"stored": n},)
     if p == "/cache/put":
-        d = config.LIVE / q["name"] / q["key"]
-        d.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as tf:
-            tf.extractall(d, filter="data")
-        return ({"ok": True},)
+        return (cache_put(config.LIVE / q["name"] / q["key"], body),)
     if p == "/queue/add":  # (a jobs file and its tree, for the treadmill here: as `supercomputer queue add` writes)
         from . import treadmill
         tm = treadmill.use()

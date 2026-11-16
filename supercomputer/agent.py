@@ -292,12 +292,16 @@ class Tarballs:
 
 
 class CacheFiles:
-    """A build cache's files for a key: cachein adds a file only when it isn't there (never overwrites one, never a
-    dot-file); caches_out saves an output the job produced that the cache didn't have."""
+    """A build cache's files for a key: cachein adds a file only when it isn't there, or when the authority's (the
+    controller's first write) bytes differ (never a dot-file); caches_out saves an output the job produced that the
+    cache didn't have."""
 
-    # gdp: law a cache file there is never overwritten: not result or not present
-    def take_in(self, present: bool, dotted: bool) -> bool:
-        return not present and not dotted
+    # gdp: law a cache file there is overwritten only by the authority's differing bytes: not result or not present or authority_differs
+    # gdp: law a dot-file is never taken in: not result or not dotted
+    def take_in(self, present: bool, dotted: bool, authority_differs: bool = False) -> bool:
+        """The controller's copy is the key's one value (first write wins there): a VM's own build of the key, other
+        bytes under the same name, gives way to it (2026-11-16: three VMs, three oleans under one Lean cache key)."""
+        return not dotted and (not present or authority_differs)
 
     # gdp: law only an output the job built and the cache lacked is saved: not result or (produced and not had)
     def save(self, produced: bool, had: bool) -> bool:
@@ -889,16 +893,22 @@ def cache_dir(name: str, key: str) -> pathlib.Path:
     return ROOT / "cache" / name / key
 
 
-def cachein(name: str, key: str, tar: str) -> dict:
-    """A build cache's files for a key, into this VM's (each written whole, then renamed in)."""
+def cachein(name: str, key: str, tar: str, authority: bool = False) -> dict:
+    """A build cache's files for a key, into this VM's (each written whole, then renamed in). From the authority (the
+    controller's copy, `authority`), a file whose bytes differ replaces this VM's own; else none is overwritten."""
     d = cache_dir(name, key)
     d.mkdir(parents=True, exist_ok=True)
     got = []
     with tarfile.open(tar) as tf:
         for m in tf.getmembers():
             n = pathlib.Path(m.name).name
-            if m.isfile() and CacheFiles().take_in((d / n).exists(), n.startswith(".")):
-                (d / f".{n}.in").write_bytes(tf.extractfile(m).read())
+            if not m.isfile():
+                continue
+            data = tf.extractfile(m).read()
+            present = (d / n).exists()
+            differs = bool(authority and present and _sha256_file(d / n) != hashlib.sha256(data).hexdigest())
+            if CacheFiles().take_in(present, n.startswith("."), differs):
+                (d / f".{n}.in").write_bytes(data)
                 (d / f".{n}.in").rename(d / n)
                 got.append(n)
     pathlib.Path(tar).unlink(missing_ok=True)
@@ -908,6 +918,19 @@ def cachein(name: str, key: str, tar: str) -> dict:
 def cache_names(name: str, key: str) -> list[str]:
     d = cache_dir(name, key)
     return sorted(f.name for f in d.iterdir() if not f.name.startswith(".")) if d.exists() else []
+
+
+def _sha256_file(p: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def cache_hashes(name: str, key: str) -> dict:
+    """{file: sha256} of a key's files here: what the scheduler compares with the authority's."""
+    return {n: _sha256_file(cache_dir(name, key) / n) for n in cache_names(name, key)}
 
 
 def drop_old_batches(batch: str, keep_s: float = 1800):
@@ -985,7 +1008,7 @@ def prep(batch: str, source: str, ctx_b64: str = "", tid: str = "", sha: str = "
     drop_old_batches(batch)
     d = batch_dir(batch)
     if (d / "ready").exists():
-        return {"ok": True, "again": True, "caches": {c["name"]: cache_names(c["name"], c["key"]) for c in ctx.get("caches", [])}, "cpus": os.cpu_count()}
+        return {"ok": True, "again": True, "caches": {c["name"]: cache_names(c["name"], c["key"]) for c in ctx.get("caches", [])}, "cache_sha": {c["name"]: cache_hashes(c["name"], c["key"]) for c in ctx.get("caches", [])}, "cpus": os.cpu_count()}
     name = ctx.get("name", "repo")
     sudo("mkdir", "-p", "/work", f"/src/{name}", *ctx.get("mounts", []))
     (d / "jobs").mkdir(parents=True, exist_ok=True)
@@ -1036,7 +1059,7 @@ def prep(batch: str, source: str, ctx_b64: str = "", tid: str = "", sha: str = "
                 cachein(c["name"], c["key"], str(tmp))
     (d / "treepath").write_text(str(tree))
     (d / "ready").write_text(str(time.time()))
-    return {"ok": True, "seconds": round(time.time() - t0, 2), "caches": {c["name"]: cache_names(c["name"], c["key"]) for c in ctx.get("caches", [])}, "cpus": os.cpu_count()}
+    return {"ok": True, "seconds": round(time.time() - t0, 2), "caches": {c["name"]: cache_names(c["name"], c["key"]) for c in ctx.get("caches", [])}, "cache_sha": {c["name"]: cache_hashes(c["name"], c["key"]) for c in ctx.get("caches", [])}, "cpus": os.cpu_count()}
 
 
 def serve(directory: str, port: int) -> dict:
@@ -2587,13 +2610,13 @@ def upgrade_busy():
         return True
 
 
-def owned_cacheput(name, key, data):
+def owned_cacheput(name, key, data, authority=False):
     import tempfile
     with tempfile.NamedTemporaryFile(dir=ROOT, suffix=".tar.gz", delete=False) as f:
         filename = f.name
         f.write(base64.b64decode(data, validate=True))
     try:
-        return cachein(name, key, filename)
+        return cachein(name, key, filename, authority is True)
     finally:
         pathlib.Path(filename).unlink(missing_ok=True)
 
@@ -3158,7 +3181,7 @@ def daemon(port: str):
                     q = parse_qs(urlparse(self.path).query)
                     tmp = ROOT / f"cache-in-{threading.get_ident()}.tar.gz"
                     tmp.write_bytes(body)
-                    return self._send(200, cachein(q["name"][0], q["key"][0], str(tmp)))
+                    return self._send(200, cachein(q["name"][0], q["key"][0], str(tmp), q.get("authority", [""])[0] == "1"))
                 msg = json.loads(body or b"{}")
                 cmd, a = msg.get("cmd"), msg.get("args", [])
                 result = rpc_dispatch(cmd, a, token_owner=self.client_owner)

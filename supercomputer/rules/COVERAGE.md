@@ -631,7 +631,7 @@ Defs: 135; deciding (in a rule): 46; I/O: 89.
 | `_quiet.__exit__` | I/O, no decision: swallows an error |
 | `fetch` | I/O, no decision: curl or a move |
 | `cache_dir` | I/O, no decision: a path |
-| `cachein` | in agent.py's rules (also rules/agent.py): CacheFiles.take_in, with law "a cache file there is never overwritten" |
+| `cachein` | in agent.py's rules (also rules/agent.py): CacheFiles.take_in, with laws "a cache file there is overwritten only by the authority's differing bytes" and "a dot-file is never taken in" |
 | `cache_names` | I/O, no decision: a directory's names |
 | `drop_old_batches` | in agent.py's rules (also rules/agent.py): BatchDirs.drop, with laws "the batch being prepared is never dropped", "a batch with a live item is never dropped", "a batch is dropped only after keep_s quiet" |
 | `prep` | in agent.py's rules (also rules/agent.py): Tarballs.stays, with law "at most keep tarballs stay"; its source kinds (tree:, cache:, a URL) are a dispatch on the source's form, refusing a source not on the VM |
