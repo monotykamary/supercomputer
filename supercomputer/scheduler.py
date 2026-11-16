@@ -540,6 +540,16 @@ def vm_fits(shape: tuple, vm, retired: set) -> bool:
                          bool(avoid) and vm.id in avoid, getattr(vm, "prep_fails", 0), vm.id in retired, not vm.failing, not getattr(vm, "disk_low", False))
 
 
+def could_run(shape: tuple, vm) -> bool:
+    """Whether a VM could ever run an item of `shape`, whatever runs there now or its health: its image, its type when the
+    item names one, its slots, its usable memory and its CPU model. What holds an idle VM from release (rules.VMLife):
+    an item no VM of its type can hold never does."""
+    image, _k, timing, weight, vtype, _avoid, mem, model, _distinct, _required = shape
+    return (vm.image == image and (not vtype or vtype == vm.type) and (timing or weight <= vm.slots)
+            and boat.R.fits_memory(mem or 0, boat.TYPES.get(vm.type, (0, 1 << 30))[1], boat.MEM_OVERHEAD)
+            and rules.cpu_matches(model, getattr(vm, "model", "")))
+
+
 class SchedulerAgentClient:
     """Catch lease refusal on every scheduler RPC, before any fallback or kill."""
     def __init__(self, client, scheduler, vm):
@@ -2694,12 +2704,7 @@ class Scheduler:
                 self.stop.wait(min(1.5, 3 * dt))  # its threads and status answered; 08:14, 59% of a core at 180 VMs and 8.8k items queued)
             else:  # (passes at most 4 a second: the wakes of items finishing together are one pass; 09:19, 15 light passes a second)
                 self.stop.wait(max(0.0, 0.25 - dt))
-            # (a batch still running waits 6 hours for its client, a finished one a day: looked at once a minute)
-            if time.time() - getattr(self, "_t_abandon", 0) >= 60:
-                self._t_abandon = time.time()
-                for b in [b for b in list(self.batches.values()) if rules.abandoned(time.time(), getattr(b, "t_poll", b.t0), b.left(), ORPHAN_S)]:
-                    log(f"{b.id}: no client has asked for it in {ORPHAN_S} s: closed")  # (a client gone for good)
-                    self.close(b.id)
+            self._abandon_tick()
             with self.lock:
                 busy = bool(self.batches) or any(v.running for v in self.vms.values()) or not self._pool_settled()
             if not busy:  # (a floor VM held: the scheduler stays to keep it; exiting releases every VM, the floor's too)
@@ -2712,6 +2717,29 @@ class Scheduler:
         while getattr(self, "handing_off", False):  # (a handoff: its thread exits this process once the next one holds every VM;
             time.sleep(1)  # never shutdown()'s let-go meanwhile: before, it raced the handoff's exit, VMs let go to adoption)
         self.shutdown()
+
+    def _abandon_tick(self):
+        """A batch still running waits 6 hours for its client, a finished one a day: looked at once a minute, closed by
+        one worker off the placement thread. A retained (strict) batch's close is its cancel, an RPC an item to VMs that
+        may be gone: 2026-11-16, four such batches of 29-58 items took ~50 s each every minute on this thread, one
+        placement pass every ~215 s, gates queued beside idle VMs."""
+        if getattr(self, "_abandon_busy", False) or getattr(self, "handing_off", False) or time.time() - getattr(self, "_t_abandon", 0) < 60:
+            return
+        self._t_abandon, self._abandon_busy = time.time(), True
+
+        def run():
+            try:
+                for b in [b for b in list(self.batches.values()) if rules.abandoned(time.time(), getattr(b, "t_poll", b.t0), b.left(), ORPHAN_S)]:
+                    if self.stop.is_set() or getattr(self, "handing_off", False):
+                        break
+                    log(f"{b.id}: no client has asked for it in {ORPHAN_S} s: closed")  # (a client gone for good)
+                    try:
+                        self.close(b.id)
+                    except Exception as e:
+                        log(f"{b.id}: close: {e!r}"[:400])
+            finally:
+                self._abandon_busy = False
+        threading.Thread(target=run, name="abandon", daemon=True).start()
 
     def _history_tick(self):
         """One finite maintenance worker; at most 128 manifests per minute."""
@@ -3950,11 +3978,23 @@ class Scheduler:
             if distinct:
                 tgt["distinct_vm_group"] = distinct[1]
                 tgt["distinct_vms_used"] = sorted(used_vms)
-            self.target[f"{image}/{vm_type}" + (f"/{model}" if model else "") + (f"/{distinct[0]}/{distinct[1]}" if distinct else "")] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
+            # (per image and type, and per required agent capabilities: groups differing only in those shared one key, the
+            # last group's numbers shown and its starts asked: 2026-11-16 10:25, a gate group's xlarge want hidden behind
+            # a submission group's want 0)
+            caps = "/caps:" + ",".join(f"{k}={v}" for k, v in required) if required else ""
+            self.target[f"{image}/{vm_type}" + (f"/{model}" if model else "") + (f"/{distinct[0]}/{distinct[1]}" if distinct else "") + caps] = {**tgt, "start": n, "target": len(held) + coming + tgt["want"]}  # (per image and type: 06:53, a small timing pool's numbers stood for the whole pool)
             if n <= 0:
                 continue
             first = min(real, key=lambda it: (it.batch.klass, it.batch.t0)).batch
-            out[(image, vm_type, model, distinct) if distinct else (image, vm_type, model) if model else (image, vm_type)] = (n, first.klass, first, not first.warm_only)
+            key = (image, vm_type, model, distinct) if distinct else (image, vm_type, model) if model else (image, vm_type)
+            if key in out:  # (each group's starts already passed pool.grow: they add up, the most urgent group's batch asks)
+                n0, k0, b0, allow0 = out[key]
+                allow = allow0 or not first.warm_only
+                if (k0, b0.t0) <= (first.klass, first.t0):
+                    first = b0
+                out[key] = (n0 + n, first.klass, first, allow)
+            else:
+                out[key] = (n, first.klass, first, not first.warm_only)
         return out
 
     # -- CPU constraints: additive durable state; old handoff readers ignore it.
@@ -5171,8 +5211,20 @@ class Scheduler:
                 return
             q = self._pass_queue()
             q_classes: dict = {}
+            real_shapes: dict = {}
             for it in q:
                 q_classes.setdefault(it.batch.image, set()).add(it.batch.klass)
+                if it.batch.klass <= 4:
+                    real_shapes.setdefault(it.batch.image, set()).add(fit_shape(it))
+            # (real work queued that this VM could ever run holds it: its image, type, slots, memory and CPU model;
+            # 2026-11-16, 43 large and default VMs held idle beside 49 gate items each asking an xlarge's 28-30 GB)
+            fit_memo: dict = {}
+
+            def real_for(v):
+                key = (v.image, v.type, v.slots, getattr(v, "model", ""))
+                if key not in fit_memo:
+                    fit_memo[key] = any(could_run(sh, v) for sh in real_shapes.get(v.image, ()))
+                return fit_memo[key]
             for image in {v.image for v in self.vms.values()}:
                 vs = [v for v in self.vms.values() if v.image == image and v.ready and not v.dead]
                 for v in vs:
@@ -5184,8 +5236,8 @@ class Scheduler:
                 for v in vs:  # (each VM's hold: rules.VMLife.hold_tick; past it, its drain on its turn: rules.Drain.turn)
                     life = self._life(v, now)
                     real = any(x.batch.klass <= 4 for x in v.running.values())
-                    rq = bool(q_classes.get(image, set()) - {5})  # (real work of the image queued: no drain)
-                    ripe = allow_retirement and v in above and not v.draining and not real and not rq and now - v.t_real > HOLD
+                    rq = real_for(v)  # (real work of the image it could run queued: no drain)
+                    ripe =allow_retirement and v in above and not v.draining and not real and not rq and now - v.t_real > HOLD
                     drain = life.hold_tick(now, int(self.pol.get("generation", 0)), real, v in above, ripe and drains.turn(now, len(above)), rq)
                     v.t_real, v.draining, v.gen = life.t_real, life.draining, life.gen
                     if drain:
@@ -5218,7 +5270,7 @@ class Scheduler:
                     if not allow_retirement or v.starts or now - v.idle_since <= 3 or v in go:
                         continue
                     life, within = self._life(v, now, hold=None if tm else max(HOLD, FLOOR_IDLE)), i < n_floor
-                    rq = bool(q_classes.get(image, set()) - {5})
+                    rq = real_for(v)
                     fq = rules.filler_coming(5 in q_classes.get(image, set()), tm, now - v.t_real, HOLD)  # (a live treadmill's filler is seconds away)
                     if not life.releasable(rq, fq, within, held, now - v.idle_since):
                         continue
