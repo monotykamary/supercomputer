@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import tarfile
 import time
 import uuid
 
@@ -100,11 +101,37 @@ def _verified_stream(directory, name, *, limit=None):
     return decode
 
 
-def _logs(client, bid, directory, timeout):
+def _logs(client, bid, directory, timeout, never_launched_ok=False):
     decode = _verified_stream(directory, 'logs.tar.gz')
     # No VM fallback: fetch only the controller's retained logs, not a later
     # unrelated worker incarnation. A raw archive is never extracted here.
-    return client.req('/logs', {'batch': bid, 'vms': [], 'require_complete': True}, timeout=timeout, decode=decode)
+    return client.req('/logs', {'batch': bid, 'vms': [], 'require_complete': True,
+                                **({'never_launched_ok': True} if never_launched_ok else {})},
+                      timeout=timeout, decode=decode)
+
+
+NEVER_LAUNCHED = "no retained log: never launched (the controller's attempts journal holds no start request)"
+
+
+def _logs_missing(directory, rows_file):
+    """Rows placed but absent from the verified archive. The controller's complete snapshot leaves out only the rows
+    it proved never launched; they are named here, never given empty logs. Member names are read, nothing extracted."""
+    with tarfile.open(directory / 'logs.tar.gz', 'r:gz') as tf:
+        present = {tuple(m.name.split('/', 1)) for m in tf.getmembers() if m.isfile() and '/' in m.name}
+    missing = []
+    with open(rows_file, 'rb') as rows:
+        for line in rows:
+            row = json.loads(line)
+            if row.get('row_file') and not (row.get('vm') or row.get('run_name')):
+                with open(row['row_file'], 'rb') as full:  # (a large row's fields: its verified file)
+                    row = {**json.load(full), **row}
+            run = row.get('run_name') or (row.get('placement') or {}).get('run_name') or row.get('name')
+            if not (row.get('vm') or row.get('run_name')):
+                continue
+            if any((run, stream) not in present for stream in ('out', 'err')):
+                missing.append({'name': row.get('name'), 'run_name': run, 'status': row.get('status'),
+                                'reason': NEVER_LAUNCHED})
+    return missing
 
 
 def fetch(bid: str, out, *, client=None, timeout=120):
@@ -206,7 +233,8 @@ def fetch(bid: str, out, *, client=None, timeout=120):
                         raise ValueError("batch result inventory grew unexpectedly")
                 if count != before['items']:
                     raise RuntimeError("finished batch has missing result rows")
-                logs = _logs(client, bid, directory, timeout)
+                never_launched_ok = caps.get('batch_fetch_never_launched') == 1
+                logs = _logs(client, bid, directory, timeout, never_launched_ok)
                 audit = {}
                 references = before.get('audit', {})
                 if references and (not isinstance(references, dict) or set(references) != set(history.AUDIT_NAMES)):
@@ -221,7 +249,8 @@ def fetch(bid: str, out, *, client=None, timeout=120):
                     raise RuntimeError('closed audit inventory changed during fetch')
                 if any(after[k] != before[k] for k in ('generation', 'admitted_at', 'items', 'rows')):
                     raise RuntimeError("admission changed during fetch")
-            result = {'batch': bid, 'generation': before['generation'], 'read_only': True,
+            missing = _logs_missing(directory, directory / 'rows.jsonl') if never_launched_ok else []
+            result = {'batch': bid, 'generation': before['generation'], 'read_only': True, 'logs_missing': missing,
                       'complete': True, 'closed_by_fetch': False, 'rows': count,
                       'rows_file': str(directory / 'rows.jsonl'), 'rows_sha256': row_hash.hexdigest(),
                       'logs': logs, 'audit': audit, 'pages': pages, 'before': before, 'after': after,

@@ -39,7 +39,12 @@ audit guarantees. The original batch ID and admission generation are preserved.
   header. Every row with a recorded worker/run identity must have both retained
   `out` and `err` streams; missing streams fail instead of producing an empty
   successful archive. Rows rejected before a worker/run exists need no streams.
-  The archive is **not extracted** automatically.
+  A controller advertising `batch_fetch_never_launched: 1` also leaves out a
+  strict row whose identity-bound attempts journal holds no start request (no
+  payload ran, so no log exists); `fetch.json` names each such row in
+  `logs_missing` with its reason, and never makes an empty log for it. A launched
+  row's missing stream still fails the fetch. Archive member names are read,
+  but the archive is **not extracted** automatically.
 - `fetch.json`: successful completion receipt, including before/after admission
   identity, row count, local row-stream checksum and verified log checksum.
 - `batch.json`: the admission identity used to resume partial downloads.

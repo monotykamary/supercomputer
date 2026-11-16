@@ -2025,7 +2025,7 @@ class Scheduler:
                  "code_installed": installed,
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
-                "batch_fetch_protocol": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
+                "batch_fetch_protocol": 1, "batch_fetch_never_launched": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
                 "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -2538,9 +2538,22 @@ class Scheduler:
         self.wake.set()
         return s
 
-    def logs(self, bid: str, vms: list[str], *, require_complete: bool = False) -> bytes:
+    @staticmethod
+    def _never_launched(bid: str, row: dict) -> bool:
+        """A strict row whose complete, identity-bound attempts journal holds no start request: no payload ran, so no
+        log exists to retain. Missing, torn or mismatched evidence is never this."""
+        pl = row.get("placement") if isinstance(row.get("placement"), dict) else {}
+        if row.get("strict_once") is not True:
+            return False
+        binding = {"batch": bid, "name": row.get("name"), "run_name": pl.get("run_name"), "vm": pl.get("vm"),
+                   "boot_id": pl.get("boot_id"), "launch_identity": pl.get("identity")}
+        audit = prelaunch.read(DIR / "queue" / f"{bid}.attempts", binding)
+        return prelaunch_not_started(audit["complete"], audit["reserved"], audit["start_requested"])
+
+    def logs(self, bid: str, vms: list[str], *, require_complete: bool = False, never_launched_ok: bool = False) -> bytes:
         """The batch's logs: each item's, kept here as it finished (they outlive a restart), and the VMs' for any
-        not kept, merged (one tar.gz)."""
+        not kept, merged (one tar.gz). With never_launched_ok, a complete snapshot leaves out the strict rows proven
+        never launched (11-16: alias69's p3-alias69-0171, LOST before any start request, failed a whole fetch 409)."""
         out = io.BytesIO()
         kept = DIR / "queue" / f"{bid}.logs"
         have, included = set(), set()
@@ -2553,7 +2566,8 @@ class Scheduler:
             retained = history.read(DIR / "queue", bid) if b is None else None
             if (b is None and retained is None) or vms:
                 raise ValueError("complete retained logs require an existing admission and no worker fallback")
-            expected = {r.get("run_name") or r.get("name") for r in rows if r.get("vm") or r.get("run_name")}
+            expected = {r.get("run_name") or r.get("name") for r in rows if (r.get("vm") or r.get("run_name"))
+                        and not (never_launched_ok and self._never_launched(bid, r))}
             for name in expected:
                 if not isinstance(name, str) or not name or name in (".", "..") or any(c in name for c in ("/", "\\", "\0")):
                     raise ValueError("invalid retained log run name")
@@ -6800,7 +6814,8 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                 if p == "/logs":
                     if m.get("require_complete") is True:
                         try:
-                            return self._response(200, raw=s.logs(s.batch_of(m), m.get("vms", []), require_complete=True))
+                            flags = {"never_launched_ok": True} if m.get("never_launched_ok") is True else {}
+                            return self._response(200, raw=s.logs(s.batch_of(m), m.get("vms", []), require_complete=True, **flags))
                         except (ValueError, OSError) as e:
                             return self._response(409, {"error": str(e)})
                     return self._response(200, raw=s.logs(s.batch_of(m), m.get("vms", [])))
