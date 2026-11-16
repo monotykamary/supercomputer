@@ -1236,7 +1236,7 @@ def _finish_owned(key, entry, row, code):
         _children.remove(entry["p"])
 
 
-def cancelitem(batch: str, name: str, wait_seconds=10, expected_identity=None) -> dict:
+def cancelitem(batch: str, name: str, wait_seconds=10, expected_identity=None, require_owned_record=False) -> dict:
     """Fence the launch, SIGKILL verified PID1 via pidfd, then wait the owned supervisor.
 
     Linux's PID-namespace init death kills all tasks in that namespace (including nested PID
@@ -1258,6 +1258,10 @@ def cancelitem(batch: str, name: str, wait_seconds=10, expected_identity=None) -
     key, path, row = (batch, name), _owned_path(batch, name), {}
     try:
         with _ownership_lock(deadline):
+            if require_owned_record and (not _lease_enabled() or not path.exists()
+                    or not (batch_dir(batch) / "jobs" / name).exists()
+                    or not _owner_readable(batch_dir(batch) / "jobs" / name)):
+                return _owned_receipt(batch, name, {}, "rebound cleanup requires an owned job and strict record")
             if path.exists():
                 row = json.loads(path.read_text())
             else:
@@ -1267,6 +1271,10 @@ def cancelitem(batch: str, name: str, wait_seconds=10, expected_identity=None) -
                     # runner (or its missing/cleaned-up PID) into positive ownership evidence.
                     return _owned_receipt(batch, name, {}, "no strict ownership record; legacy/unknown launch refused")
                 row = {"identity": expected_identity, "state": "never_started", "reaped": False}
+            if require_owned_record and row.get("state") == "never_started":
+                # Older workers can synthesize this row from absence, so it is
+                # not independently attributable to the original owner.
+                return _owned_receipt(batch, name, {}, "rebound never-started evidence is ambiguous")
             if expected_identity is not None and row.get("identity") != expected_identity:
                 # Do not fence, signal, or return success for another launch's receipt.
                 out = _owned_receipt(batch, name, row, "launch identity mismatch")

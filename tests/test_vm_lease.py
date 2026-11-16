@@ -171,6 +171,25 @@ class VMLeasePersistence(unittest.TestCase):
         self.now = 600
         self.assertTrue(self.claim("b")["ok"])
 
+    def test_rebound_cancel_requires_existing_owned_job_and_record(self):
+        fence = self.claim()
+        args = ["batch", "item", 1, "nonce", True]
+        missing = self.rpc("cancelitem", args, fence)
+        self.assertFalse(missing["namespace_absent"])
+        self.assertFalse(A._owned_path("batch", "item").exists())
+        job = self.job(owner="a")
+        self.assertFalse(self.rpc("cancelitem", args, fence)["namespace_absent"])
+        A._owned_write(A._owned_path("batch", "item"),
+                       {"identity": "nonce", "state": "never_started", "reaped": False})
+        (job / "spec.json").write_text(json.dumps({"name": "item", "owner": "b"}))
+        foreign = self.rpc("cancelitem", args, fence)
+        self.assertTrue(foreign.get("stale"))
+        (job / "spec.json").write_text(json.dumps({"name": "item", "owner": "a"}))
+        self.assertFalse(self.rpc("cancelitem", args, fence)["namespace_absent"])
+        A._owned_write(A._owned_path("batch", "item"),
+                       {"identity": "nonce", "state": "launched", "reaped": True, "contained": True})
+        self.assertTrue(self.rpc("cancelitem", args, fence)["namespace_absent"])
+
     def test_bare_mutations_never_bypass_established_lease(self):
         first = self.claim()
         for cmd, args in (("kill", ["batch"]), ("killitem", ["batch", "item"]),

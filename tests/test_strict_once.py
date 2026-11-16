@@ -71,6 +71,48 @@ class StrictOnceContract(unittest.TestCase):
         self.assert_lost_identity()
         self.assertNotIn(self.vm.id, self.s.vms)
 
+    def test_lost_lease_cleanup_uses_current_same_boot_worker(self):
+        self.place_without_thread()
+        self.s._drop_stale(self.vm)
+        self.assert_lost_identity()
+        self.vm.client.rpc.side_effect = RuntimeError('retired client unavailable')
+        current = S.VMState(self.vm.id, 'test-image', S.boat.VM_TYPE, 'warm')
+        current.ready = True
+        current.lease = {**self.vm.lease, 'epoch': 4}
+        current.client = Mock()
+        current.client.owner = 'fixture-owner'
+        current.client.lease = current.lease
+        current.client.rpc.return_value = self.good_receipt()
+        self.s.vms[current.id] = current
+        receipt = self.s.close(self.b.id)
+        self.assertTrue(receipt['cleanup_complete'])
+        self.assertEqual(self.b.rows[-1]['status'], 'LOST')
+        self.assertEqual(self.it.owned.placements, 1)
+        current.client.rpc.assert_called_once()
+
+    def test_rebound_rejects_wrong_boot_foreign_owner_and_missing_original_owner(self):
+        for case in ("boot", "owner", "missing"):
+            with self.subTest(case=case):
+                self.setUp()
+                self.place_without_thread()
+                self.s._drop_stale(self.vm)
+                current = S.VMState(self.vm.id, "test-image", S.boat.VM_TYPE, "warm")
+                current.ready = True
+                current.lease = dict(self.vm.lease, epoch=4)
+                current.client = Mock(owner="fixture-owner", lease=current.lease)
+                current.client.rpc.return_value = self.good_receipt()
+                if case == "boot":
+                    current.lease["boot"] = "wrong"
+                elif case == "owner":
+                    current.lease.update(owner="foreign", holder="foreign")
+                    current.client.owner = "foreign"
+                else:
+                    self.it.last_placement.pop("owner", None)
+                    self.it.vm = None
+                self.s.vms[current.id] = current
+                self.assertFalse(self.s.close(self.b.id)["cleanup_complete"])
+                current.client.rpc.assert_not_called()
+
     def test_slept_through_loss_is_terminal_not_requeued(self):
         self.place_without_thread()
         self.s.t_wake = S.time.time()

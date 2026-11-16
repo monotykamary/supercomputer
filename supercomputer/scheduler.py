@@ -2164,9 +2164,28 @@ class Scheduler:
                     continue
                 vm = it.vm
                 pl = it.last_placement
-                if vm is None and pl:
-                    vm = self.vms.get(pl["vm"])
-                name = pl["run_name"] if pl and it.vm is None else it.run_name
+                rebound = False
+                current = self.vms.get(pl.get("vm")) if pl else None
+                if current is not None and current is not vm:
+                    # A new client is not evidence of ownership. Require the original
+                    # owner and exact boot, and ask the worker for stronger proof.
+                    old_lease = getattr(vm, "lease", {}) or {}
+                    owner = pl.get("owner") or old_lease.get("owner")
+                    lease = current.lease or {}
+                    if (isinstance(owner, str) and owner and owner == boat.owner_id()
+                            and lease.get("owner") == owner and lease.get("holder") == owner
+                            and getattr(current.client, "owner", None) == owner
+                            and getattr(current.client, "lease", None) == lease
+                            and lease.get("vm_id") == pl.get("vm")
+                            and isinstance(pl.get("boot_id"), str) and pl["boot_id"]
+                            and lease.get("boot") == pl["boot_id"]
+                            and current.ready and not current.dead):
+                        vm, rebound = current, True
+                    else:
+                        vm = None
+                elif vm is None:
+                    vm = None  # no original owner evidence; never infer it from a new lease
+                name = pl["run_name"] if pl else it.run_name
                 identity = it.launch_identity
                 placed = it.owned.placements > 0
                 cached = self._matching_terminal_reap(it, it.terminal_reap)
@@ -2174,8 +2193,8 @@ class Scheduler:
             if receipt is None and placed and vm is not None and identity:
                 try:
                     remaining = max(0, deadline - time.monotonic())
-                    receipt = vm.client.rpc("cancelitem", bid, name, remaining, identity,
-                                            timeout=max(1, remaining + 2))
+                    args = (bid, name, remaining, identity, True) if rebound else (bid, name, remaining, identity)
+                    receipt = vm.client.rpc("cancelitem", *args, timeout=max(1, remaining + 2))
                 except Exception:
                     receipt = {"ok": False, "error": "cancel RPC failed or timed out"}
             matched = self._matching_receipt(receipt, bid, name, identity)
@@ -3047,6 +3066,7 @@ class Scheduler:
             "agent_version": vm.agent, "agent_capabilities": dict(vm.agent_capabilities)}
         if it.batch.strict_once:
             it.last_placement.update(boot_id=vm.lease.get("boot", ""),
+                                     owner=vm.lease.get("owner", ""),
                                      attempt=it.owned.placements, max_attempts=it.batch.max_attempts)
         if group:
             it.last_placement.update(distinct_vm_group=group, boot_id=vm.lease.get("boot", ""))
