@@ -100,8 +100,11 @@ read in the last 6 hours are never tiered.
 
 A run streams the chosen files (`tar | zstd`) to a new boat VM, verifies every
 member there (each payload hashes to its name; the member set and the archive's
-sha256 match what was sent), saves it as the named snapshot `sc-tier-<UTC>`,
-deletes the VM, and only then writes `queue/BATCH.tier`, a hash-bound reference
+sha256 match what was sent), and refuses an empty compressed stream. It saves
+the named snapshot `sc-tier-<UTC>`, boots a second VM from that saved snapshot,
+and verifies the same complete member set, payload sizes/hashes and archive
+sha256 again. Only after this read-back succeeds are the temporary VMs deleted
+and `queue/BATCH.tier` written, a hash-bound reference
 (snapshot, archive path, archive sha256, bytes and entry count, moved_at, and
 each payload's sha256 and size), before removing the local copies. A read of a
 tiered file answers `503 tiered result hydrating`; clients repeat the same read
@@ -109,7 +112,11 @@ tiered file answers `503 tiered result hydrating`; clients repeat the same read
 archive back and installs the files only after the archive's sha256, size and
 entry count and every payload's own sha256 match. A missing or tampered archive
 is `409 tiered result unavailable`: fail closed, never a partial file. The
-reference expires with the batch's closed history.
+reference expires with the batch's closed history. New zero-byte archive
+references are rejected. Legacy zero-byte references remain readable for
+audit/recovery, but cannot authorize deleting or rebinding local originals.
+A failed verification leaves the controller's original payloads untouched;
+it does not repair or replace an existing archive.
 
 | policy | default | effect |
 | --- | --- | --- |

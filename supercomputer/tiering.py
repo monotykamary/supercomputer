@@ -119,6 +119,8 @@ def lookup(queue, bid, sha, size=None):
 def record(queue, bid, archive):
     """Durably add one archive to the batch's reference (before any local payload goes)."""
     archive = _validate_archive(dict(archive))
+    if archive['bytes'] == 0:
+        raise ValueError('cannot record an empty tier archive')
     reference = load(queue, bid) or {'protocol': PROTOCOL, 'batch': bid, 'archives': []}
     if archive not in reference['archives']:
         reference = {**reference, 'archives': reference['archives'] + [archive]}
@@ -131,7 +133,10 @@ def drop_local(queue, bid, payloads):
     reference = load(queue, bid)
     named = {}
     for archive in (reference or {}).get('archives', ()):
-        named.update(archive['payloads'])
+        # Legacy zero-byte references can still be loaded for audit/recovery,
+        # but are never evidence that local originals may be deleted.
+        if archive['bytes'] > 0:
+            named.update(archive['payloads'])
     freed = 0
     store = Path(queue) / f'{bid}.results'
     for sha, size in payloads.items():
@@ -215,7 +220,8 @@ def candidate(queue, bid):
     reference = load(queue, bid)
     tiered = {}
     for archive in (reference or {}).get('archives', ()):
-        tiered.update(archive['payloads'])
+        if archive['bytes'] > 0:
+            tiered.update(archive['payloads'])
     present = {}
     for sha, size in files.items():
         path = queue / f'{bid}.results' / f'{sha}.payload'
@@ -365,12 +371,21 @@ def _copy(source, sink, digest):
     return count
 
 
+def _verify_push(remote, vm, path, want, digest, size):
+    check = remote.verify(vm, path, want)
+    if (check['bad'] or check['missing'] or check['rc'] or check['entries'] != len(want)
+            or check['bytes'] != sum(entry_size for _, entry_size in want.values())
+            or check['sha256'] != digest or size <= 0):
+        raise RuntimeError(f'tier: the archive VM copy differs: {check}')
+
+
 def push(remote, queue, name, chosen, now=None):
     """Archive the chosen batches' files into one new snapshot; return the archive record per batch.
 
     Nothing local changes here. The archive is verified on the VM (every member's
     own sha256 and size, the exact member set, and the archive's sha256 as sent)
-    before the snapshot is saved."""
+    before the snapshot is saved, then read back from a VM booted from that
+    snapshot before returning any record."""
     queue = Path(queue)
     now = time.time() if now is None else now
     want = {f"{c['batch']}.results/{sha}.payload": (sha, size) for c in chosen for sha, size in c['payloads'].items()}
@@ -397,15 +412,19 @@ def push(remote, queue, name, chosen, now=None):
         for stream in (zstd.stdout, sink.stderr):
             with contextlib.suppress(OSError, AttributeError):
                 stream.close()
-        if any(codes):
-            raise RuntimeError(f'tier: archive stream failed {codes}')
-        check = remote.verify(vm, path, want)
-        if (check['bad'] or check['missing'] or check['rc'] or check['entries'] != len(want)
-                or check['sha256'] != digest.hexdigest()):
-            raise RuntimeError(f'tier: the archive VM\'s copy differs: {check}')
+        if any(codes) or size <= 0:
+            raise RuntimeError(f'tier: archive stream failed or empty ({size} bytes, {codes})')
+        _verify_push(remote, vm, path, want, digest.hexdigest(), size)
         manifest = {os.path.basename(path): [size, digest.hexdigest()]}
         remote.put(vm, f'/store/{name}/manifest.json', json.dumps(manifest).encode())
         remote.snapshot(vm, name)
+        # A successful write and pre-snapshot check do not establish that the
+        # saved snapshot contains a readable copy. Check the actual restore path.
+        snapshot_vm = remote.new_vm(name, ttl=2 * 3600)
+        try:
+            _verify_push(remote, snapshot_vm, path, want, digest.hexdigest(), size)
+        finally:
+            remote.delete(snapshot_vm)
     finally:
         remote.delete(vm)
         listing.unlink(missing_ok=True)

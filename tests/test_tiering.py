@@ -162,7 +162,72 @@ class Tiering(unittest.TestCase):
         self.assertEqual(archive['snapshot'], 'sc-tier-test')
         self.assertEqual(archive['entries'], 2)
         self.assertEqual(set(archive['payloads']), set(made['good']))
-        self.assertEqual(self.remote.deleted, ['vm1'])  # the archive VM is deleted after the snapshot
+        self.assertEqual(self.remote.deleted, ['vm2', 'vm1'])  # snapshot readback and writer VMs are deleted
+
+    def test_empty_stream_never_records_or_deletes_originals(self):
+        made = self.make_closed()
+        chosen = tiering.select(self.q, time.time(), min_age_s=0, max_bytes=10 ** 12)
+        # A broken client-side stream that completes successfully with zero bytes
+        # must not publish a reference, even if its process reports success.
+        def lost_stream(source, sink, digest):
+            for _ in iter(lambda: source.read(1 << 20), b''):
+                pass  # consume producer output but transmit nothing
+            return 0
+
+        with patch.object(tiering, '_copy', side_effect=lost_stream):
+            with self.assertRaises(RuntimeError):
+                tiering.push(self.remote, self.q, 'sc-tier-test', chosen)
+        self.assertIsNone(tiering.load(self.q, self.bid))
+        for sha in made['good']:
+            self.assertTrue(self.payload_path(sha).exists())
+
+    def test_snapshot_readback_must_match_before_record_or_deletion(self):
+        made = self.make_closed()
+        chosen = tiering.select(self.q, time.time(), min_age_s=0, max_bytes=10 ** 12)
+        original = self.remote.snapshot
+
+        def damaged_snapshot(vm, name):
+            original(vm, name)
+            archive = next(self.remote.snapshots[name].rglob('*.tar.zst'))
+            archive.write_bytes(b'')
+
+        with patch.object(self.remote, 'snapshot', side_effect=damaged_snapshot):
+            with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                tiering.push(self.remote, self.q, 'sc-tier-test', chosen)
+        self.assertIsNone(tiering.load(self.q, self.bid))
+        self.assertEqual(self.remote.deleted, ['vm2', 'vm1'])
+        for sha in made['good']:
+            self.assertTrue(self.payload_path(sha).exists())
+
+    def test_pre_snapshot_payload_mismatch_fails_without_reference(self):
+        made = self.make_closed()
+        chosen = tiering.select(self.q, time.time(), min_age_s=0, max_bytes=10 ** 12)
+        sha = next(iter(made['good']))
+        original = self.payload_path(sha).read_bytes()
+        self.payload_path(sha).write_bytes(bytes([original[0] ^ 1]) + original[1:])  # same size, wrong SHA
+        with self.assertRaises(RuntimeError):
+            tiering.push(self.remote, self.q, 'sc-tier-test', chosen)
+        self.assertIsNone(tiering.load(self.q, self.bid))
+        for sha in made['good']:
+            self.assertTrue(self.payload_path(sha).exists())
+
+    def test_legacy_empty_reference_loads_but_cannot_authorize_deletion(self):
+        made = self.make_closed()
+        sha = next(iter(made['good']))
+        archive = {'snapshot': 'sc-tier-legacy', 'path': '/store/legacy/legacy.tar.zst',
+                   'sha256': '0' * 64, 'bytes': 0, 'entries': 1, 'moved_at': time.time(),
+                   'payloads': {sha: len(made['good'][sha])}}
+        with self.assertRaisesRegex(ValueError, 'empty tier archive'):
+            tiering.record(self.q, self.bid, archive)
+        self.assertIsNone(tiering.load(self.q, self.bid))
+        tiering.reference_path(self.q, self.bid).write_text(json.dumps(
+            {'protocol': tiering.PROTOCOL, 'batch': self.bid, 'archives': [archive]}))
+        self.assertEqual(tiering.load(self.q, self.bid)['archives'][0], archive)
+        with self.assertRaisesRegex(ValueError, 'not bound'):
+            tiering.drop_local(self.q, self.bid, archive['payloads'])
+        self.assertTrue(self.payload_path(sha).exists())
+        candidate = tiering.candidate(self.q, self.bid)
+        self.assertNotIn(sha, candidate['rebound'])
 
     def test_tier_then_hydrate_round_trips_byte_identical(self):
         made = self.make_closed()
