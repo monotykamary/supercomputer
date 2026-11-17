@@ -93,7 +93,12 @@ knob: legacy saved values are ignored and cannot be set. Status reports the econ
 `break_even_s`. Only the explicit `SUPERCOMPUTER_HORIZON` environment override remains, for controlled comparisons
 and forensic replay of old policies (two historical placement scenarios used 900 seconds). It is unset by default,
 is never inferred from a saved policy, and disables the economic guarantee by substituting the requested window;
-it is not a way to tune production growth. The new gate and steady-submission scenarios exercise economics, not
+it is not a way to tune production growth. The production lever for latency is `break_even_by_class` (policy, runtime): e.g.
+`supercomputer policy break_even_by_class=submission=300,gate=300,interactive=300`. A named class's queued work,
+with every class above it, is judged against that shorter window as well as against the economics, and the larger
+deficit stands (`rules.growth.class_break_even_s`: never longer than the economics). Unnamed classes (sweeps, by
+default) keep the economics, so a treadmill wave does not buy a VM for every 5 minutes of its work. Status shows
+each target's `by_class`. The new gate and steady-submission scenarios exercise economics, not
 that override.
 - an interactive check alone starts one VM, and none while any VM of its image is held;
 - the existing 3x bring-up usefulness guard (measured, ~10-120 s) still applies to ordinary growth; it cannot veto
