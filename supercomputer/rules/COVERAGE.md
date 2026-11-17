@@ -129,6 +129,7 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `read_policy` | I/O | the policy file read (missing: generation 0); the generation's rule is Policy |
 | `write_policy` | rule | rules.scheduler.Policy.write: each write of the policy raises its generation by exactly one; a knob the policy doesn't have is refused, the generation unchanged |
 | `apply_policy` | rule | rules.scheduler.max_vms_of: a VM with no limit set has none |
+| `_supervise, _watchdog_tick` | rule / threads | rules.scheduler.respawn_due: a dead supervised thread (heartbeat, sampler, status publisher, pollers) started again past its backoff, a live one never, none while stopping or handing off; the thread start itself is I/O |
 | `_break_even_by_class` | validation, not in a rule | break_even_by_class's value checked: classes that grow the pool, finite seconds >= 0, 0 dropped; the window it gives is rules.growth.class_break_even_s |
 | `code_hash` | I/O | the installed modules hashed (by mtime) |
 | `jlines` | I/O | a JSON-lines file, a torn last line skipped |

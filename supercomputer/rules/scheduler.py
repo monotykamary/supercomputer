@@ -874,6 +874,18 @@ def abandoned(now: float, t_poll: float, left: int, orphan_s: int) -> bool:
     return now - t_poll > (orphan_s if left > 0 else 4 * orphan_s)
 
 
+# gdp: law a live thread is never started again: not alive or not result
+# gdp: law no restart while the scheduler stops or hands off: not stopping or not result
+# gdp: law no restart within its backoff: since >= backoff or not result
+# gdp: law a dead thread past its backoff is restarted: alive or stopping or since < backoff or result
+def respawn_due(alive: bool, stopping: bool, since: float, backoff: float) -> bool:
+    """The watchdog's call on one of the scheduler's long-lived threads (heartbeat, sampler, status publisher,
+    pollers): a dead one is started again, once its backoff since its last start passed, never while the scheduler
+    stops or hands the pool over. Before: a thread dead of an exception stayed dead until a manual restart (its
+    work, the canary's handbacks or the lease renewals, silently gone)."""
+    return not alive and not stopping and since >= backoff
+
+
 # gdp: law a restart keeps every VM running items: result or running <= 0 or dead
 def keep_across_restart(running: int, dead: bool) -> bool:
     """A restart (a deploy, the service restarted): a VM running items keeps them (its TTL renewed, its lease let go

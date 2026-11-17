@@ -2770,8 +2770,30 @@ class Scheduler:
                 self._refresh_status()
                 if self.stop.wait(1.0):
                     return
-        self._status_publisher = threading.Thread(target=publish, name='status-publisher', daemon=True)
-        self._status_publisher.start()
+        self._status_publisher = self._supervise('status-publisher', publish)
+
+    def _supervise(self, name: str, target) -> threading.Thread:
+        """One of the scheduler's long-lived threads, started and kept: the watchdog (_watchdog_tick) starts it again
+        if it dies."""
+        t = threading.Thread(target=target, name=name, daemon=True)
+        sup = self.__dict__.setdefault("_supervised", {})
+        prev = sup.get(name)
+        sup[name] = {"thread": t, "target": target, "t": time.time(), "restarts": prev["restarts"] if prev else 0}
+        t.start()
+        return t
+
+    def _watchdog_tick(self, now: float):
+        """A supervised thread dead (of an exception: health's errors has it) started again, its backoff doubling
+        from 5 s to 5 min at each restart (rules.respawn_due); never while stopping or handing off."""
+        stopping = self.stop.is_set() or bool(getattr(self, "handing_off", False))
+        for name, e in list(self.__dict__.get("_supervised", {}).items()):
+            backoff = min(300.0, 5.0 * 2 ** e["restarts"])
+            if rules.respawn_due(e["thread"].is_alive(), stopping, now - e["t"], backoff):
+                e["restarts"] += 1
+                log(f"watchdog: thread {name} was dead: started again (restart {e['restarts']})")
+                t = self._supervise(name, e["target"])
+                if name.startswith("poller-") and getattr(self, "_pollers", None):
+                    self._pollers = [t if x is e["thread"] else x for x in self._pollers]
 
     def _queued_by_class(self) -> dict:
         """Queued items a class (the queue counted once, not once a class). A batch closed to admission queues
@@ -2833,8 +2855,8 @@ class Scheduler:
         while not self._activate_handoff():
             if self.stop.wait(0.05):
                 return
-        threading.Thread(target=self._heartbeat, daemon=True).start()
-        threading.Thread(target=self._sampler, daemon=True).start()
+        self._supervise("heartbeat", self._heartbeat)
+        self._supervise("sampler", self._sampler)
         t_loop = time.time()
         while not self.stop.is_set():
             self.wake.wait(0.5)
@@ -2885,6 +2907,8 @@ class Scheduler:
             else:  # (passes at most 4 a second: the wakes of items finishing together are one pass; 09:19, 15 light passes a second)
                 self.stop.wait(max(0.0, 0.25 - dt))
             self._abandon_tick()
+            with contextlib.suppress(Exception):
+                self._watchdog_tick(time.time())
             with self.lock:
                 busy = bool(self.batches) or any(v.running for v in self.vms.values()) or not self._pool_settled()
             if not busy:  # (a floor VM held: the scheduler stays to keep it; exiting releases every VM, the floor's too)
@@ -5150,9 +5174,7 @@ class Scheduler:
         if not hasattr(self, "_pcond"):
             import itertools
             self._pcond, self._pheap, self._pseq = threading.Condition(), [], itertools.count()
-            self._pollers = [threading.Thread(target=self._poller, name=f"poller-{k}", daemon=True) for k in range(self.POLLERS)]
-            for t in self._pollers:
-                t.start()
+            self._pollers = [self._supervise(f"poller-{k}", self._poller) for k in range(self.POLLERS)]
         return self._pcond
 
     def _poller(self):
