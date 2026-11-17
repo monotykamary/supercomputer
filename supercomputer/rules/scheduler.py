@@ -886,6 +886,35 @@ def boot_ended(listed: bool, complete: bool, stopped: bool) -> bool:
     return (complete and not listed) or (listed and stopped)
 
 
+Supervise = Literal["none", "wait", "handoff", "restart"]
+
+
+# gdp: law no action within the cooldown: since_action >= cooldown or result == "wait"
+# gdp: law an answering scheduler whose loop runs and nothing is poisoned is never touched: not answered or stuck or poisoned or result == "none" or result == "wait"
+# gdp: law a quarantined answering scheduler is never handed off nor restarted: not answered or not busy or result == "wait"
+# gdp: law an answering scheduler gets a hot handoff before any restart: not answered or handoff_age >= 0 or result != "restart"
+# gdp: law a silent scheduler past the miss limit and the cooldown is restarted: answered or misses < miss_limit or since_action < cooldown or result == "restart"
+# gdp: law a handoff that didn't take within its wait becomes a restart: not answered or busy or not (stuck or poisoned) or handoff_age < handoff_wait or since_action < cooldown or result == "restart"
+def supervise_action(answered: bool, misses: int, miss_limit: int, stuck: bool, poisoned: bool, busy: bool,
+                     handoff_age: float, handoff_wait: float, since_action: float, cooldown: float) -> Supervise:
+    """The supervisor process's call on the scheduler it watches (from outside it: a wedged scheduler's own threads
+    can't be trusted to see it). A scheduler that doesn't answer for miss_limit checks is restarted (a signal: it keeps
+    its VMs for the next process, rules.keep_across_restart); one that answers but whose loop is stuck, or that reports
+    a poisoned subsystem, is first asked for a hot handoff to a fresh process, and restarted if no new process took
+    over within handoff_wait; never while its ownership recovery is quarantined, never twice within the cooldown."""
+    if since_action < cooldown:
+        return "wait"
+    if not answered:
+        return "restart" if misses >= miss_limit else "wait"
+    if busy:
+        return "wait"
+    if not stuck and not poisoned:
+        return "none"
+    if handoff_age < 0:
+        return "handoff"
+    return "restart" if handoff_age >= handoff_wait else "wait"
+
+
 # gdp: law a live thread is never started again: not alive or not result
 # gdp: law no restart while the scheduler stops or hands off: not stopping or not result
 # gdp: law no restart within its backoff: since >= backoff or not result

@@ -130,6 +130,7 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `write_policy` | rule | rules.scheduler.Policy.write: each write of the policy raises its generation by exactly one; a knob the policy doesn't have is refused, the generation unchanged |
 | `apply_policy` | rule | rules.scheduler.max_vms_of: a VM with no limit set has none |
 | `_boot_ended` | rule / I/O | rules.scheduler.boot_ended: a placement's boot is over only when boat's complete listing leaves its VM out or calls it stopped; boat's inventory read is I/O |
+| `supervise, _restart_exact, alive_report, _supervisor_tick, _is_supervisor, _is_scheduler` | rule / I/O | rules.scheduler.supervise_action: from a process of its own, a hot handoff for a stuck loop or a poisoned subsystem, a restart of the exact pid for a silent scheduler or a handoff that didn't take, never while recovery is quarantined, one action per cooldown; the HTTP calls, signals and /proc reads are I/O |
 | `_supervise, _watchdog_tick` | rule / threads | rules.scheduler.respawn_due: a dead supervised thread (heartbeat, sampler, status publisher, pollers) started again past its backoff, a live one never, none while stopping or handing off; the thread start itself is I/O |
 | `_break_even_by_class` | validation, not in a rule | break_even_by_class's value checked: classes that grow the pool, finite seconds >= 0, 0 dropped; the window it gives is rules.growth.class_break_even_s |
 | `code_hash` | I/O | the installed modules hashed (by mtime) |

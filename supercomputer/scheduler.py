@@ -183,6 +183,11 @@ FLOOR_IDLE = float(_env("FLOOR_IDLE", 2700.0))  # ...while it had real work with
 FLOOR_BY_IMAGE: dict = {}  # an image's own floor, replacing either (the policy's floor_by_image)
 BREAK_EVEN_BY_CLASS: dict = {}  # a class's shorter break-even, seconds (the policy's break_even_by_class; rules.class_break_even_s)
 DISK_MIN_MB = int(_env("DISK_MIN_MB", 10240))  # a VM with less free disk (or a tenth of a smaller disk) takes nothing (rules.disk_ok)
+# The supervisor (a process of its own beside a controller's scheduler: rules.supervise_action): checked every SUP_EVERY;
+# SUP_MISSES unanswered checks a restart; a main loop SUP_STUCK_S without a pass (or a poisoned subsystem) a hot
+# handoff first, a restart if no new process took over within SUP_HANDOFF_WAIT; one action per SUP_COOLDOWN.
+SUP_EVERY, SUP_MISSES, SUP_STUCK_S, SUP_HANDOFF_WAIT, SUP_COOLDOWN = 15.0, 8, 300.0, 240.0, 300.0
+SUP_POISONED_RESTARTS = 5  # a supervised thread restarted this often by the watchdog: a poisoned subsystem
 RESTART_KEEP_S = _env("RESTART_KEEP_S", 600)  # an idle VM kept across a restart, for the next process to take back; boat stops it past this
 DISK_GRACE_S = 120  # its agent's cleaning's time to free it; past it, a VM still low is deleted once empty (rules.disk_replaced)
 SUB_PREEMPT = _env("SUB_PREEMPT", 45.0)  # a submission item waiting this long takes a filler's slot (else at item ends; filler is the cheapest work to kill)
@@ -210,6 +215,7 @@ def policy_defaults() -> dict:
             # (a class's queued work, with every class above it, judged against a shorter break-even: latency over
             # cost for the classes named, {"submission": 300}; never longer than the economics; unnamed: economics)
             "break_even_by_class": dict(BREAK_EVEN_BY_CLASS),
+            "supervisor": True,  # a controller's scheduler keeps a supervisor process beside it (false: none)
             "cpu_model_max_fruitless": CPU_MODEL_MAX_FRUITLESS, "history_retention_hours": 48.0, "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400,
             # The controller's disk (tiering.py): past tier_disk_pct closed batches older than tier_age_hours go cold (the
             # treadmill's first), past tier_urgent_pct every closed one; past disk_alert_pct an alert and a health breach;
@@ -2816,6 +2822,40 @@ class Scheduler:
         t.start()
         return t
 
+    def alive_report(self) -> dict:
+        """/alive: the supervisor's view, read without the scheduler's lock (a wedged loop may hold it): the main loop's
+        last pass, the subsystems the watchdog couldn't keep up."""
+        now = time.time()
+        sup = dict(self.__dict__.get("_supervised", {}))
+        poisoned = [f"thread {n}: {e['restarts']} restarts" for n, e in sup.items() if e["restarts"] >= SUP_POISONED_RESTARTS]
+        return {"pid": os.getpid(), "code": getattr(self, "code", ""), "pass_age_s": round(now - getattr(self, "_t_alive", now), 1),
+                "handing_off": bool(getattr(self, "handing_off", False)), "recovery_blocked": bool(getattr(self, "recovery_blocked", False)),
+                "poisoned": poisoned}
+
+    def _supervisor_tick(self, now: float):
+        """A controller's scheduler (idle_exit 0) keeps one supervisor process of its own code beside it (once a
+        minute): none alive, one started; one of another code, stopped by its exact pid and started again."""
+        if self.idle_exit or not self.pol.get("supervisor", True) or getattr(self, "handing_off", False) or now - getattr(self, "_t_sup", 0.0) < 60:
+            return
+        self._t_sup = now
+        info = {}
+        with contextlib.suppress(Exception):
+            info = json.loads((DIR / "supervisor.json").read_text())
+        pid = int(info.get("pid") or 0)
+        alive = _is_supervisor(pid)
+        if alive and info.get("code") == self.code:
+            return
+        if alive:
+            log(f"supervisor pid {pid} runs code {info.get('code')}: stopped, one of {self.code} started")
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, 15)
+        pkg = pathlib.Path(__file__).resolve().parents[1]
+        env = {**os.environ, "PYTHONPATH": str(pkg)}
+        DIR.mkdir(parents=True, exist_ok=True)
+        with open(DIR / "log", "a") as lf:
+            subprocess.Popen([sys.executable, "-P", "-m", "supercomputer", "scheduler", "supervise"], stdin=subprocess.DEVNULL,
+                             stdout=lf, stderr=lf, start_new_session=True, close_fds=True, env=env, cwd=str(config.HOME))
+
     def _watchdog_tick(self, now: float):
         """A supervised thread dead (of an exception: health's errors has it) started again, its backoff doubling
         from 5 s to 5 min at each restart (rules.respawn_due); never while stopping or handing off."""
@@ -2883,10 +2923,12 @@ class Scheduler:
 
     # -- the loop
     def run(self):
+        self._t_alive = time.time()
         self._start_status_publisher()
         # ACK means loaded and serving, not permission to mutate the pool.
         # Until the parent exits it may reject us and resume its original state.
         while not self._activate_handoff():
+            self._t_alive = time.time()
             if self.stop.wait(0.05):
                 return
         self._supervise("heartbeat", self._heartbeat)
@@ -2895,6 +2937,7 @@ class Scheduler:
         while not self.stop.is_set():
             self.wake.wait(0.5)
             self.wake.clear()
+            self._t_alive = time.time()  # (the supervisor's heartbeat: /alive's pass_age_s)
             if getattr(self, "handing_off", False):
                 t_loop = time.time()
                 continue
@@ -6193,6 +6236,8 @@ class Scheduler:
             now = time.time()
             self._flush_status_timings()
             with contextlib.suppress(Exception):
+                self._supervisor_tick(now)
+            with contextlib.suppress(Exception):
                 # (a new install, unchanged for 60 s, that imports: rules.Install; no handoff while files are being
                 # written, none of a broken install)
                 back = self.canary.handback_due(self.code, now)
@@ -7080,7 +7125,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         response = self._response(408, {"error": "incomplete request body"})
                     elif not hmac.compare_digest(self.headers.get("X-SC-Token", ""), s.token):
                         response = self._response(403, {"error": "token"})
-                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/logs", "/capabilities", "/results", "/batch/info", "/batch/rows", "/tier/plan", "/tier/status")
+                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/alive", "/logs", "/capabilities", "/results", "/batch/info", "/batch/rows", "/tier/plan", "/tier/status")
                                                            or self.path.split("?")[0] == "/state"):
                         response = self._post(body)
                     else:
@@ -7215,6 +7260,8 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         return self._response(400, {"error": str(e)})
                 if p == "/hint":
                     return self._response(200, s.hint(m))
+                if p == "/alive":
+                    return self._response(200, s.alive_report())
                 if p == "/policy":  # (the controller's own policy, read or set by the code it runs: its knobs)
                     try:
                         return self._response(200, policy_request(m))
@@ -7726,6 +7773,104 @@ def ensure_running() -> Client:
     return Client()
 
 
+def _is_supervisor(pid: int) -> bool:
+    """pid is alive and is a supervisor of this tool (its command line: never a recycled pid's other process)."""
+    try:
+        cmd = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if pid > 0 else []
+    except OSError:
+        return False
+    return b"supercomputer" in cmd and b"supervise" in cmd
+
+
+def _is_scheduler(pid: int) -> bool:
+    try:
+        cmd = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if pid > 0 else []
+    except OSError:
+        return False
+    return b"supercomputer" in cmd and b"serve" in cmd
+
+
+def _restart_exact(pid: int, wait_s: float = 120.0) -> str:
+    """A restart of the scheduler pid (verified by its command line): SIGTERM (it keeps its VMs for the next process:
+    rules.keep_across_restart), SIGKILL past wait_s (its leases stay for the next process to take back); its service
+    (Restart=always) starts the next. Exact pid only."""
+    if not _is_scheduler(pid):
+        return "no scheduler at that pid"
+    os.kill(pid, 15)
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        if not _is_scheduler(pid):
+            return "stopped"
+        time.sleep(1)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, 9)
+    return "killed past its wait"
+
+
+def supervise(once: bool = False, client=None, now=time.time, sleep=time.sleep) -> list:
+    """The supervisor process (one per pool, a lock): watches the scheduler from outside it through /alive and acts
+    by rules.supervise_action: a hot handoff (/reload) for a stuck loop or a poisoned subsystem, a restart of the exact
+    pid for one that doesn't answer or whose handoff didn't take. Receipts in LIVE/scheduler/supervisor.jsonl."""
+    lockf = None
+    if not once:
+        lockf = open(DIR / "supervisor.lock", "a")
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return []
+        (DIR / "supervisor.json").write_text(json.dumps({"pid": os.getpid(), "code": own_code(), "t": time.time()}))
+        log(f"supervisor: watching the scheduler (pid {os.getpid()}, code {own_code()})")
+    st = {"misses": 0, "t_handoff": None, "pid": None, "t_action": 0.0}
+    acts = []
+    while True:
+        if not once:
+            sleep(SUP_EVERY)
+        if read_policy().get("supervisor", True) is False:
+            if once:
+                return acts
+            continue
+        cl = client or Client()
+        try:
+            r = cl.req("/alive", {}, timeout=10)
+            answered = True
+        except Exception:
+            r, answered = {}, False
+        t = now()
+        st["misses"] = 0 if answered else st["misses"] + 1
+        if answered and r.get("pid") != st["pid"]:
+            st["pid"], st["t_handoff"] = r.get("pid"), None  # (a new process: a handoff took, or a restart)
+        stuck = answered and float(r.get("pass_age_s", 0)) > SUP_STUCK_S
+        poisoned = answered and bool(r.get("poisoned"))
+        h_age = -1.0 if st["t_handoff"] is None else t - st["t_handoff"]
+        act = rules.supervise_action(answered, st["misses"], SUP_MISSES, stuck, poisoned, answered and bool(r.get("recovery_blocked")),
+                                     h_age, SUP_HANDOFF_WAIT, t - st["t_action"], SUP_COOLDOWN)
+        if act in ("handoff", "restart"):
+            why = (f"no answer for {st['misses']} checks" if not answered else
+                   f"main loop {r.get('pass_age_s')} s without a pass" if stuck else f"poisoned: {r.get('poisoned')}")
+            if act == "handoff":
+                try:
+                    out = cl.req("/reload", {}, timeout=20)
+                except Exception as e:
+                    out = {"error": str(e)[:200]}
+                st["t_handoff"] = t
+            else:
+                pid = int(r.get("pid") or 0) if answered else 0
+                if not pid:
+                    with contextlib.suppress(Exception):
+                        pid = int((DIR / "pid").read_text())
+                out = _restart_exact(pid)
+                st["t_handoff"], st["misses"] = None, 0
+            st["t_action"] = t
+            rec = {"t": t, "action": act, "why": why, "result": out}
+            acts.append(rec)
+            log(f"supervisor: {act} ({why}): {out}"[:400])
+            with contextlib.suppress(Exception):
+                with open(DIR / "supervisor.jsonl", "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+        if once:
+            return acts
+
+
 def enabled() -> bool:
     return os.environ.get("SUPERCOMPUTER_SCHEDULER", "1") not in ("0", "")
 
@@ -7733,13 +7878,15 @@ def enabled() -> bool:
 def main(argv: list[str]):
     import argparse
     ap = argparse.ArgumentParser(prog="supercomputer scheduler")
-    ap.add_argument("cmd", choices=["serve", "status", "capabilities", "stage", "stop", "forward", "unforward"])
+    ap.add_argument("cmd", choices=["serve", "supervise", "status", "capabilities", "stage", "stop", "forward", "unforward"])
     ap.add_argument("vm", nargs="?", default="")
     ap.add_argument("--idle-exit", type=float, default=120, help="seconds idle before it exits (0: never, the controller's)")
     ap.add_argument("--takeover", action="store_true", help="(a handoff: wait for the old scheduler's lock)")
     a = ap.parse_args(argv)
     if a.cmd == "serve":
         serve(a.idle_exit, a.takeover)
+    elif a.cmd == "supervise":
+        supervise()
     elif a.cmd == "stage":
         print(json.dumps(stage_install(), sort_keys=True))
     elif a.cmd == "capabilities":
