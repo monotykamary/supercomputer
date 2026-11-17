@@ -282,7 +282,7 @@ def main(argv=None):
     sub.add_parser("migrate", help="move a repo's old pool directory (gdp-wired's supercomputer/.live) into the shared one")
     ct = sub.add_parser("controller", help="the scheduler and the treadmill on a boat VM: setup, status, sync, logs, restart, stop")
     ct.add_argument("args", nargs=argparse.REMAINDER)
-    batch = sub.add_parser("batch", help="fetch retained results or recover strict-close evidence; read-only")
+    batch = sub.add_parser("batch", help="fetch results, inspect custody, or explicitly recover a strict namespace")
     batch_commands = batch.add_subparsers(dest="batch_cmd", required=True)
     fetch = batch_commands.add_parser("fetch", help="download a finished batch by ID; never submit or close")
     fetch.add_argument("id")
@@ -293,6 +293,18 @@ def main(argv=None):
     recover.add_argument("id")
     recover.add_argument("--timeout", type=float, default=30, help="whole recovery deadline in seconds")
     recover.add_argument("--attempts", type=int, default=3)
+    ns = batch_commands.add_parser("recover-namespace", help="explicit identity-bound original-boot extinction recovery")
+    ns.add_argument("id")
+    ns.add_argument("--item", required=True)
+    ns.add_argument("--vm", required=True)
+    ns.add_argument("--boot", required=True)
+    ns.add_argument("--identity", required=True)
+    ns.add_argument("--attempt", type=int, default=1)
+    ns.add_argument("--mode", choices=["observe-boot", "reboot-owned-vm"], default="observe-boot")
+    ns.add_argument("--authorize", action="store_true")
+    ns.add_argument("--authorization-reference", required=True)
+    ns.add_argument("--allow-vm-reboot", action="store_true")
+    ns.add_argument("--timeout", type=float, default=300)
     tier = batch_commands.add_parser("tier", help="the controller's cold tiering of closed batches' output files: a dry run "
                                      "(the plan) unless --run; rows, logs, journals and receipts stay on the controller")
     tier.add_argument("--run", action="store_true", help="perform the run (archive, verify, snapshot, then reference)")
@@ -309,6 +321,18 @@ def main(argv=None):
     from . import boat
     if a.cmd == "run":
         return _run(a)
+    elif a.cmd == "batch" and a.batch_cmd == "recover-namespace":
+        from . import scheduler
+        remote = scheduler.controller()
+        if not remote:
+            raise SystemExit("namespace recovery requires the existing remote controller; no local fallback")
+        request = {"protocol": 1, "batch": a.id, "name": a.item, "vm": a.vm,
+                   "boot_id": a.boot, "launch_identity": a.identity, "attempt": a.attempt,
+                   "mode": a.mode, "authorized": a.authorize,
+                   "authorization_reference": a.authorization_reference, "allow_vm_reboot": a.allow_vm_reboot}
+        result = scheduler.Client(remote).req("/namespace-recovery", request, timeout=a.timeout)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") is True and result.get("close", {}).get("cleanup_complete") is True else 1
     elif a.cmd == "batch" and a.batch_cmd in ("tier", "tier-status", "hydrate"):
         try:
             if a.batch_cmd == "tier":

@@ -250,6 +250,72 @@ class IdentityFaultFixtures(OwnedFixture):
         self.assertTrue(row["lost"])
         self.assertFalse(self.cancel()["ok"])
 
+    def test_reaped_unbound_wrapper_retained_without_unsafe_rebind_or_success(self):
+        # Explicit argv fault: real wrapper, no namespace. Its zero exit and
+        # missing GO must never become namespace teardown evidence.
+        real = subprocess.Popen
+        def exited(*args, **kwargs):
+            p = real([sys.executable, "-c", "import sys; sys.stderr.write('diagnostic-tail')"], **kwargs)
+            p.wait(timeout=5)
+            return p
+        with mock.patch.object(A.subprocess, "Popen", side_effect=exited):
+            A.start(self.d, self.spec())
+        key = self.batch, self.name
+        entry = A._owned_children[key]
+        A._reap_children()
+        with mock.patch.object(A, "_bind_namespace", side_effect=AssertionError("rebind after reap")):
+            r = self.cancel()
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["namespace_absent"])
+        self.assertTrue(r["reaped"])
+        self.assertIs(A._owned_children[key], entry)
+        self.assertIn(entry["p"], A._children)
+        row = json.loads(A._owned_path(*key).read_text())
+        self.assertEqual(row["startup_stderr"], "diagnostic-tail")
+        self.assertFalse(row["contained"])
+        self.assertFalse(row["namespace_exited"])
+        self.assertFalse((self.d / "jobs" / self.name / "namespace.go").exists())
+
+    def test_historical_reaped_record_without_capability_remains_unknown(self):
+        A._owned_write(A._owned_path(self.batch, self.name), {
+            "identity": self.nonce, "state": "launched", "reaped": True,
+            "contained": False, "returncode": 1, "cancelled": True,
+            "error": "private namespace handshake unsupported or timed out; payload not authorized"})
+        shutil.rmtree(self.d)
+        with mock.patch.object(A, "_bind_namespace", side_effect=AssertionError("historical rebind")), \
+             mock.patch.object(A.signal, "pidfd_send_signal", side_effect=AssertionError("unknown signal")):
+            r = self.cancel()
+        self.assertTrue(r["reaped"])
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["namespace_absent"])
+
+    def test_explicit_pending_exit_blocks_receipt_and_replacement_but_old_complete_works(self):
+        supervisor = {"pid": 101, "boot": "fixture-boot", "start_ticks": 5}
+        row = {"identity": self.nonce, "state": "launched", "cancelled": True,
+               "reaped": True, "contained": True, "namespace_verified": True,
+               "init": dict(supervisor, pid=102, pidns=99), "supervisor": supervisor}
+        path = A._owned_path(self.batch, self.name)
+        A._owned_write(path, row)
+        self.receipt_ok(A._owned_receipt(self.batch, self.name, row))
+        self.assertFalse(A.strict_unresolved())  # old complete record compatibility
+        row["namespace_exited"] = False
+        A._owned_write(path, row)
+        self.assertFalse(A._owned_receipt(self.batch, self.name, row)["ok"])
+        self.assertTrue(A.strict_unresolved())
+        row["namespace_exited"] = True
+        A._owned_write(path, row)
+        self.receipt_ok(A._owned_receipt(self.batch, self.name, row))
+        self.assertFalse(A.strict_unresolved())
+
+    def test_startup_diagnostic_tail_is_bounded_and_not_exit_evidence(self):
+        j = self.job()
+        (j / "agent.err").write_bytes(b"x" * 8192 + b"last diagnostic")
+        row = {}
+        A._startup_stderr(j, row)
+        self.assertEqual(len(row["startup_stderr"]), 4096)
+        self.assertTrue(row["startup_stderr"].endswith("last diagnostic"))
+        self.assertFalse(A._owned_receipt(self.batch, self.name, row)["ok"])
+
     def test_legacy_kill_apis_cannot_emit_unbound_strict_preemption(self):
         j = self.failure()
         (j / "done.json").unlink()
@@ -463,12 +529,57 @@ class RealPrivateNamespace(OwnedFixture):
         with self.assertRaises(OSError):
             os.fstat(entry["pidfd"])
 
+    def test_real_late_exit_observation_after_supervisor_reap_retains_capability(self):
+        # Real namespace; only the first exit observation is fault-delayed. Wrapper
+        # reap alone must not retire the pidfd or erase verified namespace birth.
+        entry = self.launch("true")
+        entry["p"].wait(timeout=15)
+        key = self.batch, self.name
+        path = A._owned_path(*key)
+        with mock.patch.object(A, "_namespace_exited", return_value=False):
+            A._finish_owned(key, entry, json.loads(path.read_text()), 0)
+            self.assertFalse(self.cancel(timeout=0)["ok"])
+            A._reap_children()
+        row = json.loads(path.read_text())
+        self.assertTrue(row["reaped"])
+        self.assertFalse(row["contained"])
+        self.assertFalse(row["namespace_exited"])
+        self.assertTrue(row["namespace_verified"])
+        self.assertEqual(row["init"], entry["init"])
+        self.assertEqual(row["supervisor"], entry["birth"])
+        self.assertIs(A._owned_children[key], entry)
+        self.assertIn(entry["p"], A._children)
+        os.fstat(entry["pidfd"])
+        A._reap_children()  # now the real pidfd observation can be persisted
+        self.assertNotIn(key, A._owned_children)
+        self.receipt_ok(self.cancel())
+
+    def test_real_exit_persistence_failure_retains_handles_for_retry(self):
+        entry = self.launch("true")
+        entry["p"].wait(timeout=15)
+        key = self.batch, self.name
+        path = A._owned_path(*key)
+        before = path.read_bytes()
+        with mock.patch.object(A, "_owned_write", side_effect=OSError("fault: fsync failed")):
+            with self.assertRaisesRegex(OSError, "fsync failed"):
+                A._finish_owned(key, entry, json.loads(path.read_text()), 0)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertIs(A._owned_children[key], entry)
+        self.assertIn(entry["p"], A._children)
+        os.fstat(entry["pidfd"])
+        A._reap_children()
+        self.receipt_ok(self.cancel())
+
     def test_real_pre_payload_exit_is_failure_not_noop_success(self):
         # Explicit fault: production argv launches a genuine owned namespace, but
         # its PID1 hello is observed with a wrong nonce, so payload is never authorized.
         marker = self.root / "must-not-run"
-        bind = A._bind_namespace
         def stale_hello(j, entry):
+            record = json.loads(A._owned_path(self.batch, self.name).read_text())
+            self.assertEqual(record["supervisor"], entry["birth"])
+            self.assertEqual(record["state"], "launched")
+            self.assertFalse(record["reaped"])
+            self.assertFalse(record["contained"])
             raise ValueError("fault fixture: stale hello nonce")
         with mock.patch.object(A, "_bind_namespace", side_effect=stale_hello):
             A.start(self.d, self.spec(f"touch {marker}"))
@@ -479,11 +590,12 @@ class RealPrivateNamespace(OwnedFixture):
         self.assertEqual(row["launch_identity"], self.nonce)
         self.assertNotEqual(row["code"], 0)
         self.assertTrue(row["lost"])
-        # Recover the real pidfd while the un-authorized PID1 still awaits go;
-        # this is cleanup, not a claim that the failed bind proved containment.
-        entry = A._owned_children[(self.batch, self.name)]
-        bind(j, entry)
-        self.receipt_ok(self.cancel())
+        # Cancellation may recover the real pidfd while the original supervisor
+        # and ancestry remain independently verifiable, but must never publish GO.
+        with mock.patch.object(A.subprocess, "Popen", side_effect=AssertionError("payload retry")):
+            self.receipt_ok(self.cancel())
+        self.assertFalse((j / "namespace.go").exists())
+        self.assertFalse(marker.exists())
 
     def test_real_live_nonce_mismatch_does_not_signal(self):
         entry = self.launch()

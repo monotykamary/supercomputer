@@ -162,7 +162,52 @@ items without a retained positive receipt remain unknown; this fix does not
 retroactively upgrade external audit dispositions or change original rows.
 
 An unreachable/dead worker, timeout, mismatched reply
-or failed custody write is not success. Terminal LOST and pending cleanup can
+or failed custody write is not success.
+
+### Explicit recovery when original namespace custody was lost
+
+A failed pre-payload namespace handshake can leave an exited supervisor without
+verified init/pidfd evidence. Reaping that wrapper, an absent PID, missing job
+files, or a generic `stopped` provider status **does not** establish cleanup.
+Startup now preserves supervisor/namespace provenance and a bounded diagnostic
+tail; unresolved pidfds remain held until namespace exit is positively observed
+and persisted. Old incomplete records are not reinterpreted as successful.
+
+The separate `namespace_recovery_protocol: 1` is an explicitly authorized,
+identity-bound alternative for such historical records:
+
+```sh
+supercomputer batch recover-namespace BATCH --item ITEM --vm VM \
+  --boot ORIGINAL_BOOT --identity ORIGINAL_LAUNCH --attempt 1 \
+  --authorize --authorization-reference OPERATOR_RECORD --mode observe-boot
+```
+
+The default `observe-boot` mode never claims a lease, signals a process, stops,
+resumes, or replaces a worker. It requires fresh authenticated reads from the
+**same immutable provider VM** showing a different kernel boot, the exact
+original reaped-but-uncontained ownership record and its owner tombstone. A
+second nonce-bound native boot read must agree. Other work on that new boot is
+not touched. A stopped VM alone cannot satisfy this mode; any independently
+needed resume must first be authorized and its ownership checked.
+
+The optional `--mode reboot-owned-vm --allow-vm-reboot` mode is destructive to
+that VM's current boot. It refuses unless the authoritative original placement,
+owner, native ownership record, complete job/unknown-ownership inventories and
+fresh exclusive lease all match. It persists an operator-bound intent before
+mutation, takes the existing STOPPING lease fence, rechecks custody under that
+fence, preserves the disk on stop (never a delete fallback), independently
+observes the exact stopped VM, resumes it, and still requires a fresh changed
+native kernel boot. Failure leaves pending evidence, not a successful close or
+permission to repeat a stop. Provider operation labels may be local invocation
+correlation IDs; the changed native boot, not those labels, supplies extinction
+proof. Use this mode only with explicit authority over the entire VM.
+
+Both modes persist a distinct `vm-boot-extinction/v1` proof and controller-owned
+intent before adopting it. The cancellation journal and close attempt expose
+that separate `cleanup_evidence`; they do not forge `contained:true` or a native
+`cancelitem` receipt, rewrite the original LOST/result row, or launch a second
+attempt. Restart validates the proof against its persisted intent and original
+placement. Ordinary native cancellation and `recover-close` remain unchanged. Terminal LOST and pending cleanup can
 coexist; neither permits replacement or re-execution. The public client retains
 each raw per-batch close receipt and aggregate completion. The jobs CLI saves
 results/cleanup metadata and complete custody sidecars under its output path.

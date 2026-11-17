@@ -53,6 +53,7 @@ import urllib.request
 
 from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, prelaunch, resultfiles, resultjournal, resultjson, rules, statebackup, statusview, tiering
 from .rules import tiering as tier_rules
+from . import namespace_recovery_controller as namespace_recovery
 from .rules.prelaunch import prelaunch_can_retry, prelaunch_not_started, prelaunch_transport_retryable
 from .durable_groups import DurableGroups, active as durable_active
 from .image_pins import ImagePins, RETENTION_SECONDS
@@ -1007,6 +1008,15 @@ class Scheduler:
                     it.owned.closed = b.admission_closed
                 for receipt in self._read_journal(qd / f"{b.id}.cancel", enhanced):
                     it = b.items.get(receipt.get("name"))
+                    if receipt.get("source") == "vm-boot-extinction":
+                        proof = receipt.get("proof")
+                        if it and it.owned.closed and namespace_recovery.validated_proof(DIR, it, proof):
+                            it.namespace_recovery = proof
+                            it.owned.cancel()
+                            it.owned.confirm(True)
+                            it.state = "done"
+                            it.fate.delivered()
+                        continue
                     if receipt.get("phase") == "terminal":
                         if it and self._matching_terminal_reap(it, receipt):
                             it.terminal_reap = receipt
@@ -2078,7 +2088,7 @@ class Scheduler:
                  "code_installed": installed,
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
-                "batch_fetch_protocol": 1, "batch_fetch_never_launched": 1, "closed_history_protocol": 1, "result_tiering_protocol": 1, "disk_guard_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
+                "batch_fetch_protocol": 1, "batch_fetch_never_launched": 1, "closed_history_protocol": 1, "result_tiering_protocol": 1, "disk_guard_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "namespace_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
                 "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -2087,7 +2097,7 @@ class Scheduler:
                 "result_inline_bytes": resultfiles.INLINE_BYTES,
                 "poll_max_bytes": resultfiles.POLL_BYTES + 2048,
                 "retention_requires_strict_once": True,
-                "paths": ["/cancel", "/snapshot", "/close-receipt", "/capabilities", "/batch/info", "/batch/rows", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close", "/image-pins/register", "/image-pins/list"],
+                "paths": ["/cancel", "/snapshot", "/close-receipt", "/namespace-recovery", "/capabilities", "/batch/info", "/batch/rows", "/distinct-groups/open", "/distinct-groups/get", "/distinct-groups/close", "/image-pins/register", "/image-pins/list"],
                 "namespace_reap_guarantee": "requires matching agent receipt; not inferred from version"}
 
     @classmethod
@@ -2151,6 +2161,7 @@ class Scheduler:
                               "boot_id": (it.last_placement or {}).get("boot_id"),
                               "launch_identity": it.launch_identity,
                               "cleanup_complete": it.owned.reaped,
+                              **({"cleanup_evidence": it.namespace_recovery} if getattr(it, "namespace_recovery", None) else {}),
                               **({"terminal_loss": it.terminal_loss} if getattr(it, "terminal_loss", None) else {})}
                              for it in items if it.owned.placements],
                 "unlaunched": [it.name for it in items if not it.owned.placements],
@@ -3596,7 +3607,8 @@ class Scheduler:
     def _place_locked(self, it: Item, vm: VMState) -> bool:
         """The item placed on the VM, where its fate allows it (rules.ItemFate.place: never a VM boat reports stopped
         or one that failed it)."""
-        if getattr(self, "handing_off", False) or not self._handoff_gate().placement_allowed():
+        if (getattr(self, "handing_off", False) or not self._handoff_gate().placement_allowed()
+                or vm.id in getattr(self, "_namespace_recoveries", {})):
             return False
         if it.batch.admission_closed or it.owned.closed:
             if it.batch.strict_once and any(r.get("name") == it.name for r in it.batch.rows):
@@ -4303,7 +4315,8 @@ class Scheduler:
 
     def _pool_settled(self) -> bool:
         claiming = (getattr(self, "_acquiring", 0) or getattr(self, "_adopt_claims", 0)
-                    or getattr(self, "reattaching", False) or getattr(self, "reattach_pending", ()))
+                    or getattr(self, "reattaching", False) or getattr(self, "reattach_pending", ())
+                    or getattr(self, "_namespace_recoveries", {}))
         return rules.handoff_pool_settled(bool(getattr(self, "asking", ()) or claiming),
             sum(getattr(self, "creating", {}).values()),
             sum(not v.ready for v in self.vms.values() if not v.dead))
@@ -5177,7 +5190,8 @@ class Scheduler:
         try:
             with self.lock:
                 if (getattr(vm, "upgrading", False) or not self._handoff_gate().growth_allowed()
-                        or getattr(self, "handing_off", False)):
+                        or getattr(self, "handing_off", False)
+                        or vm.id in getattr(self, "_namespace_recoveries", {})):
                     return False
                 vm.upgrading, fenced = True, True
             if time.time() - getattr(vm, "t_repair", 0) < 30:
@@ -5216,6 +5230,9 @@ class Scheduler:
                     vm.upgrading = False
             repair_lock.release()
 
+    def recover_namespace(self, request):
+        return namespace_recovery.recover(self, DIR, request)
+
     def recover_worker(self, vm_id, expected_agent):
         """Exact-worker administrative recovery through the controller's ordinary repair path."""
         if not isinstance(vm_id, str) or not isinstance(expected_agent, str) or expected_agent != self.agent_version:
@@ -5224,6 +5241,8 @@ class Scheduler:
             vm = self.vms.get(vm_id)
             if vm is None or vm.dead:
                 raise ValueError("worker is not held by this controller")
+            if vm_id in getattr(self, "_namespace_recoveries", {}):
+                raise ValueError("worker has an active namespace recovery")
             if (getattr(self, "handing_off", False) or getattr(self, "recovery_blocked", False)
                     or not self._handoff_gate().growth_allowed()):
                 raise ValueError("controller ownership is not stable")
@@ -5298,7 +5317,7 @@ class Scheduler:
         """One tick of the VM (a call that waits for nothing): the seconds until its next, None when it's done."""
         if vm.dead:
             return None
-        if getattr(self, "handing_off", False):
+        if getattr(self, "handing_off", False) or vm.id in getattr(self, "_namespace_recoveries", {}):
             return 0.5
         # Heartbeats refresh authority, not operational readiness. Recovery
         # must still run when a heartbeat made the periodic lease timer fresh.
@@ -7265,6 +7284,11 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         return self._response(200, s.rejudge_breaker(actor=m.get("actor", "operator"), reason=m.get("reason", "")))
                     except (ValueError, TypeError, OSError) as e:
                         return self._response(400, {"error": str(e)})
+                if p == "/namespace-recovery":
+                    try:
+                        return self._response(200, s.recover_namespace(m))
+                    except (ValueError, TypeError, OSError, RuntimeError) as e:
+                        return self._response(409, {"ok": False, "error": str(e)})
                 if p == "/workers/recover":
                     try:
                         return self._response(200, s.recover_worker(m.get("vm"), m.get("expected_agent")))

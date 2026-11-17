@@ -1282,8 +1282,11 @@ def _owned_receipt(batch, name, row, error=""):
     rule = OwnedCancellation()
     if row.get("cancelled"):
         rule.cancel()
+    # Older complete records predate namespace_exited; an explicit pending/invalid
+    # exit fact in a new record must override containment provenance.
     rule.observe(row.get("state") != "never_started", bool(row.get("reaped")),
-                 row.get("state") == "never_started", bool(row.get("contained")))
+                 row.get("state") == "never_started",
+                 bool(row.get("contained")) and row.get("namespace_exited", True) is True)
     return {"ok": rule.ok, "reaped": rule.reaped, "namespace_absent": rule.namespace_absent,
             "identity": row.get("identity"), "batch": batch, "name": name,
             "error": error or ("" if rule.ok else "namespace absence unproven (unsupported containment or unknown ownership)")}
@@ -1318,7 +1321,7 @@ def _bind_namespace(j, entry):
     if hello["identity"] != entry["identity"] or hello["batch"] != j.parent.parent.name or hello["name"] != j.name:
         raise ValueError("namespace handshake identity mismatch")
     p = entry["p"]
-    if _process_identity(p.pid) != entry["birth"]:
+    if p.poll() is not None or _process_identity(p.pid) != entry["birth"]:
         raise ValueError("supervisor identity changed")
     for pid in descendants(p.pid):
         try:
@@ -1327,7 +1330,8 @@ def _bind_namespace(j, entry):
                 continue
             fd = os.pidfd_open(pid, 0)
             try:
-                if _namespace_birth(pid) != before or pid not in descendants(p.pid):
+                if (_namespace_birth(pid) != before or pid not in descendants(p.pid)
+                        or p.poll() is not None or _process_identity(p.pid) != entry["birth"]):
                     raise ValueError("init identity changed during pidfd open")
                 signal.pidfd_send_signal(fd, 0)  # verify signal permission before authorizing payload
                 entry.update(pidfd=fd, init=before, contained=True)
@@ -1349,9 +1353,35 @@ def _namespace_exited(entry, wait_seconds=0):
     return any(events & select.POLLIN for _, events in poller.poll(max(0, math.ceil(wait_seconds * 1000))))
 
 
+def _startup_stderr(j, row):
+    """Retain a bounded diagnostic tail; stderr is never ownership/exit evidence."""
+    try:
+        with open(j / "agent.err", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            text = f.read(4096).decode("utf-8", errors="replace")
+        if text:
+            row["startup_stderr"] = text
+    except OSError:
+        pass
+
+
 def _finish_owned(key, entry, row, code):
-    row.update(reaped=True, returncode=code, contained=bool(entry.get("contained") and _namespace_exited(entry)))
-    _owned_write(_owned_path(*key), row)  # persist proof before retiring the only Popen handle
+    # Keep immutable containment provenance separate from the exit barrier. In
+    # particular, reaping sudo must not discard a still-live namespace's pidfd.
+    exited = bool(entry.get("contained") and _namespace_exited(entry))
+    row.update(reaped=True, returncode=code, contained=exited, namespace_exited=exited)
+    if entry.get("birth"):
+        row["supervisor"] = entry["birth"]
+    if entry.get("contained"):
+        row.update(namespace_verified=True, init=entry["init"])
+    if row.get("error"):
+        _startup_stderr(batch_dir(key[0]) / "jobs" / key[1], row)
+    _owned_write(_owned_path(*key), row)
+    # Even an unbound/reaped wrapper remains unknown, not positive teardown.
+    # Persistence failures likewise leave every process-local capability intact.
+    if not exited:
+        return
     if entry.get("pidfd") is not None:
         os.close(entry["pidfd"])
     _owned_children.pop(key, None)
@@ -1410,6 +1440,17 @@ def cancelitem(batch: str, name: str, wait_seconds=10, expected_identity=None, r
                     return _owned_receipt(batch, name, {}, "live ownership identity mismatch")
                 p = entry["p"]
                 code = p.poll()
+                if not entry.get("contained") and code is None and entry.get("birth"):
+                    # Cancellation may recover a failed startup handshake only while
+                    # the original live supervisor and ancestry can still be checked.
+                    # _bind_namespace never publishes GO or retries the payload.
+                    try:
+                        _bind_namespace(batch_dir(batch) / "jobs" / name, entry)
+                    except (OSError, ValueError, KeyError, StopIteration):
+                        pass
+                    if entry.get("contained"):
+                        row.update(namespace_verified=True, init=entry["init"], supervisor=entry["birth"])
+                        _owned_write(path, row)
                 if entry.get("contained") and entry.get("pidfd") is not None:
                     try:
                         signal.pidfd_send_signal(entry["pidfd"], signal.SIGKILL)
@@ -1444,7 +1485,7 @@ def _reap_children():
         with _ownership_lock():
             for key, entry in list(_owned_children.items()):
                 code = entry["p"].poll()
-                if code is None or (entry.get("contained") and not _namespace_exited(entry)):
+                if code is None:
                     continue
                 path = _owned_path(*key)
                 row = json.loads(path.read_text())
@@ -1583,7 +1624,8 @@ def start(d: pathlib.Path, spec: dict):
         (j / "cpus").write_text(json.dumps(cpus if k > 0 else []))
         (j / "taskset").write_text(json.dumps(cpus))
         write_json(j / "spec.json", spec)
-        row = {"identity": identity, "state": "launching", "reaped": False, "contained": False}
+        row = {"identity": identity, "state": "launching", "reaped": False, "contained": False,
+               "namespace_exited": False}
         _owned_write(path, row)  # crash here is unknown, never proof that no child launched
         try:
             argv = _owned_argv(d.name, spec) if strict else [sys.executable, str(ROOT / "agent.py"), "run", d.name, spec["name"]]
@@ -1601,11 +1643,12 @@ def start(d: pathlib.Path, spec: dict):
         entry = {"p": p, "identity": identity, "contained": False}
         _owned_children[(d.name, spec["name"])] = entry
         _children.append(p)
-        (j / "pid").write_text(str(p.pid))
         row["state"] = "launched"
-        _owned_write(path, row)
         try:
             entry["birth"] = _process_identity(p.pid)
+            row["supervisor"] = entry["birth"]
+            _owned_write(path, row)  # retain birth even if the handshake never succeeds
+            (j / "pid").write_text(str(p.pid))
             if strict:
                 deadline = time.monotonic() + 5
                 while p.poll() is None and time.monotonic() < deadline:
@@ -1615,16 +1658,18 @@ def start(d: pathlib.Path, spec: dict):
                     except (OSError, ValueError, KeyError, StopIteration):
                         time.sleep(0.01)
                 if entry.get("contained"):
-                    row.update(contained=True, init=entry["init"], supervisor=entry["birth"])
+                    row.update(contained=True, namespace_verified=True, init=entry["init"], supervisor=entry["birth"])
                     _owned_write(path, row)
                     (j / "namespace.go").write_text(identity)
                 else:
                     row["error"] = "private namespace handshake unsupported or timed out; payload not authorized"
+                    _startup_stderr(j, row)
                     _owned_write(path, row)
                     write_json(j / "done.json", {"name": spec["name"], "code": -1, "seconds": -1,
                                                  "lost": True, "launch_identity": identity, "err": row["error"]})
         except (OSError, ValueError, IndexError) as e:
             row["error"] = f"supervisor identity unavailable: {e!r}"
+            _startup_stderr(j, row)
             _owned_write(path, row)
             write_json(j / "done.json", {"name": spec["name"], "code": -1, "seconds": -1,
                                          "lost": True, "launch_identity": identity, "err": row["error"]})
@@ -2731,7 +2776,9 @@ def strict_unresolved():
             identified = (row.get('state') == 'launched' and _birth_record(init, True)
                           and _birth_record(supervisor) and init['boot'] == supervisor['boot'])
             if not owned_replacement_safe(row.get('state') == 'never_started',
-                                          row.get('reaped') is True, row.get('contained') is True, identified):
+                                          row.get('reaped') is True,
+                                          row.get('contained') is True and row.get('namespace_exited', True) is True,
+                                          identified):
                 return True
         return False
     except (OSError, ValueError, TypeError):
