@@ -899,10 +899,15 @@ def respawn_due(alive: bool, stopping: bool, since: float, backoff: float) -> bo
 
 
 # gdp: law a restart keeps every VM running items: result or running <= 0 or dead
-def keep_across_restart(running: int, dead: bool) -> bool:
-    """A restart (a deploy, the service restarted): a VM running items keeps them (its TTL renewed, its lease let go
-    for the next scheduler to take back); the others are released."""
-    return running > 0 and not dead
+# gdp: law a restart keeps every live VM, idle ones too: not restart or dead or result
+# gdp: law an exit that is no restart lets idle VMs go: restart or running > 0 or not result
+# gdp: law a dead VM is never kept: not dead or not result
+def keep_across_restart(running: int, dead: bool, restart: bool = False) -> bool:
+    """A process exit: a VM running items keeps them (its TTL renewed, its lease kept for the next scheduler of this
+    machine to take back); on a restart (a signal: the service restarted, a deploy) idle VMs are kept too, on a short
+    TTL, for the next process to take back (boat stops them at that TTL if none comes); on an idle exit they go.
+    Before: every restart released every idle VM (11-17 03:25: the pool fell to 6 beside queued work)."""
+    return not dead and (running > 0 or restart)
 
 
 # gdp: law a VM with no limit set has none: limit > 0 or result >= 1000000000

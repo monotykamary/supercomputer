@@ -204,7 +204,7 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `_adopt` | rule + I/O | in-flight release IDs are skipped until their registry update finishes (never counted as incoming capacity); rules.scheduler.VMLife.adopt_tick: no VM is up without an owner after a tick; adoption stops a VM only with its image's queue empty and its hold over |
 | `_check_agent` | decision, plain | an agent whose code hash differs from ours is upgraded in place (between items, by _worker's guard): an equality test |
 | `_heartbeat` | I/O | TTLs renewed every 5 min |
-| `shutdown` | rule | rules.scheduler.keep_across_restart: a restart keeps every VM running items |
+| `shutdown` | rule | rules.scheduler.keep_across_restart: a restart keeps every VM running items, and on a signal every idle one too (a short TTL); an idle exit lets idle VMs go |
 | `blob_tar` | I/O | a tar of blobs |
 | `store_blobs` | decision, same rule as rules.integrity | a blob kept only where its bytes hash to its key: the law of rules.integrity.BlobStore, here a hash test the rules' subset can't compute (sha256) |
 | `raw_post` | decision, same rule as rules.integrity | each blob's bytes must hash to its name: as store_blobs |

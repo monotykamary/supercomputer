@@ -183,6 +183,7 @@ FLOOR_IDLE = float(_env("FLOOR_IDLE", 2700.0))  # ...while it had real work with
 FLOOR_BY_IMAGE: dict = {}  # an image's own floor, replacing either (the policy's floor_by_image)
 BREAK_EVEN_BY_CLASS: dict = {}  # a class's shorter break-even, seconds (the policy's break_even_by_class; rules.class_break_even_s)
 DISK_MIN_MB = int(_env("DISK_MIN_MB", 10240))  # a VM with less free disk (or a tenth of a smaller disk) takes nothing (rules.disk_ok)
+RESTART_KEEP_S = _env("RESTART_KEEP_S", 600)  # an idle VM kept across a restart, for the next process to take back; boat stops it past this
 DISK_GRACE_S = 120  # its agent's cleaning's time to free it; past it, a VM still low is deleted once empty (rules.disk_replaced)
 SUB_PREEMPT = _env("SUB_PREEMPT", 45.0)  # a submission item waiting this long takes a filler's slot (else at item ends; filler is the cheapest work to kill)
 PREP_MAX = _env("PREP_MAX", 2)  # trees and caches the controller itself sends at once (VMs pull from peers first)
@@ -5879,13 +5880,13 @@ class Scheduler:
         for v in go:
             threading.Thread(target=finish_release, args=(v,), daemon=True).start()
 
-    def _let_go(self, vm: VMState, stop: bool = False, keep: bool = False):
+    def _let_go(self, vm: VMState, stop: bool = False, keep: bool = False, keep_ttl: float | None = None):
         if getattr(self, "recovery_blocked", False):
             return
         if not vm.lease:
             self._drop_stale(vm, source='release.missing_fence')
             return
-        ttl = max(boat.BACKSTOP, vm.ttl) if keep else boat.IDLE
+        ttl = (int(keep_ttl) if keep_ttl else max(boat.BACKSTOP, vm.ttl)) if keep else boat.IDLE
         try:
             if keep:
                 if not self._renew_lease(vm):
@@ -6790,13 +6791,15 @@ class Scheduler:
                             v.ttl = max(boat.BACKSTOP, v.ttl)
                             boat.boat("extend", v.id, "--ttl", str(v.ttl), "--json", check=False)
 
-    def shutdown(self):
-        """A restart (a deploy, the service restarted): VMs running items keep them (their TTL renewed, their leases
-        let go for the next process to take back with their items); the others are released."""
+    def shutdown(self, restart: bool = False):
+        """A process exit (rules.keep_across_restart): VMs running items keep them (their TTL renewed, their leases
+        kept for the next process to take back with their items); on a restart (a signal) idle ones too, on
+        RESTART_KEEP_S; on an idle exit the others are released."""
         self.stop.set()
         self._metrics_save()
         for v in list(self.vms.values()):
-            self._let_go(v, keep=rules.keep_across_restart(len(v.running), v.dead))
+            keep = rules.keep_across_restart(len(v.running), v.dead, restart)
+            self._let_go(v, keep=keep, keep_ttl=None if v.running or not keep else RESTART_KEEP_S)
 
 
 # --------------------------------------------------------------------------------------------- the blob store
@@ -7309,8 +7312,8 @@ def serve(idle_exit: float = 120, takeover: bool = False):
     with boat.signals_as_interrupt():
         try:
             s.run()
-        except KeyboardInterrupt:
-            s.shutdown()
+        except KeyboardInterrupt:  # (a signal: the service restarted or a deploy; the next process takes the pool back)
+            s.shutdown(restart=True)
     srv.shutdown()
     (DIR / "pid").unlink(missing_ok=True)
 
