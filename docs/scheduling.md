@@ -238,6 +238,26 @@ stops its own host. Inside a boat VM, reach the controller over its http transpo
 legacy `SUPERCOMPUTER_CONTROLLER_FALLBACK=1` do not override a configured controller. A long-lived local client
 whose scheduler disappears never resurrects it while a controller configuration exists, even if unreadable.
 
+## Self-healing: the watchdog, the supervisor, restarts
+
+- **Policy goes where the scheduler runs.** With a controller configured, `supercomputer policy [k=v ...]` reads and
+  writes the controller's policy through `/policy`, by the code the controller runs (`SUPERCOMPUTER_LOCAL=1` for this
+  machine's own file). A controller older than `/policy` is named, never written around.
+- **The watchdog** (inside the scheduler) starts a dead long-lived thread again (heartbeat, sampler, status
+  publisher, pollers) past a backoff doubling from 5 s to 5 min (`rules.respawn_due`).
+- **The supervisor** (a process of its own beside a controller's scheduler, started and kept by it, one per pool by a
+  lock) watches from outside through `/alive`, which takes no scheduler lock. A main loop 300 s without a pass, or a
+  thread the watchdog restarted 5 times, gets a hot handoff to a fresh process (`/reload`); if no new process took
+  over within 240 s, or the scheduler doesn't answer for 8 checks (2 min), its exact pid is restarted (SIGTERM, then
+  SIGKILL past 120 s; the service starts the next). Never while ownership recovery is quarantined; one action per
+  5 min (`rules.supervise_action`). Receipts: `LIVE/scheduler/supervisor.jsonl`. `supervisor=false` turns it off.
+- **A restart keeps the pool.** A signalled exit keeps idle VMs too, on a 600 s TTL, for the next process to take
+  back warm; only an idle exit lets them go (`rules.keep_across_restart`). A SIGKILL leaves every lease for the next
+  process.
+- **Strict cleanup when the boot is gone.** A retained strict item whose VM boat reports stopped, or leaves out of
+  a complete listing, has its cleanup proven by that (`rules.boot_ended`); a running VM or a partial listing is not
+  evidence.
+
 ## Worker-local failures and ghost recovery
 
 A refused connection to the worker-local agent listener is typed separately from a provider/front failure.
