@@ -3083,8 +3083,10 @@ class Scheduler:
         chosen = tiering.select(DIR / "queue", now, min_age_s=0 if mode == 2 else age_h * 3600, max_bytes=max_bytes,
                                 held=held, reading=reading, cache=t["cache"])
         size = sum(sum(c["payloads"].values()) for c in chosen)
-        if mode == 0 and size < p["tier_min_gb"] * 1e9 and min_age_hours is None:
-            chosen, size = [], 0  # (by age alone, a run waits for at least tier_min_gb: one snapshot per run)
+        if mode < 2 and size < p["tier_min_gb"] * 1e9 and min_age_hours is None:
+            # (short of urgent, a run waits for at least tier_min_gb: each run is a snapshot. 11-17 03:28-03:31: past
+            # 70% every 10 min and every handoff saved one of 0.2-0.4 GB)
+            chosen, size = [], 0
         plan = {"dry_run": bool(dry_run), "disk_used_pct": round(used, 2), "free_bytes": free, "mode": mode,
                 "batches": len(chosen), "files": sum(len(c["payloads"]) for c in chosen), "bytes": size,
                 "low_class_batches": sum(1 for c in chosen if c["klass"] in tiering.LOW_CLASSES),
