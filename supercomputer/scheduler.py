@@ -2995,7 +2995,7 @@ class Scheduler:
             return
         p = read_policy()
         mode = tier_rules.tier_mode(used, p["tier_disk_pct"], p["tier_urgent_pct"], False)
-        self._disk = {"t": now, "used_pct": round(used, 2), "free_bytes": free, "total_bytes": total, "tier_mode": mode}
+        self._ctl_disk = {"t": now, "used_pct": round(used, 2), "free_bytes": free, "total_bytes": total, "tier_mode": mode}
         self._h().record_ctl_disk(now, used, p["disk_alert_pct"], {"free_gb": round(free / 1e9, 2), "tier_mode": mode,
                                   "refuse_filler_pct": p["disk_refuse_filler_pct"], "refuse_pct": p["disk_refuse_pct"]})
         level = (3 if used >= p["disk_refuse_pct"] else 2 if used >= p["disk_refuse_filler_pct"]
@@ -3141,7 +3141,7 @@ class Scheduler:
 
     def tier_status(self):
         t = self._tier_state()
-        return {"disk": getattr(self, "_disk", None), "busy": t["busy"], "hydrating": sorted(t["hydrate"]),
+        return {"disk": getattr(self, "_ctl_disk", None), "busy": t["busy"], "hydrating": sorted(t["hydrate"]),
                 "errors": dict(list(t["errors"].items())[:16]), "unavailable": dict(list(t["unavailable"].items())[:16]),
                 "last": t["last"], "receipts": t["receipts"][-5:]}
 

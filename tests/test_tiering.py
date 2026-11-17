@@ -327,6 +327,17 @@ class DiskGuard(unittest.TestCase):
         self.assertIsNone(self.refusal(92, 3))
         self.assertIn('every new batch', self.refusal(98, 2))
 
+    def test_the_disk_reading_never_shadows_the_vm_disk_method(self):
+        # (11-17 03:25: the reading stored as self._disk replaced Scheduler._disk(vm, d) and every VM tick failed)
+        sched = S.Scheduler.__new__(S.Scheduler)
+        sched.alerts, sched.stop = [], threading.Event()
+        sched._h = lambda: type('H', (), {'record_ctl_disk': lambda *a: None})()
+        sched._tier_tick = lambda mode: None
+        with tempfile.TemporaryDirectory() as tmp, patch.object(S, 'POLICY', pathlib.Path(tmp) / 'policy.json'):
+            sched._disk_tick()
+        self.assertTrue(callable(sched._disk))
+        self.assertIn('used_pct', sched._ctl_disk)
+
     def test_health_reports_the_controller_disk(self):
         from supercomputer import health
         h = health.Health.__new__(health.Health)
