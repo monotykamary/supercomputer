@@ -43,7 +43,10 @@ resident workers (including stopped/uncertain workers), and pending creations.
 
 `live/scheduler/image-pins.json` uses strict versioned records, atomic replacement,
 file and directory fsync, and local interprocess locking. Corrupt, regressed,
-missing previously-observed state, or uncertain writes fail closed. The file is
+missing previously-observed state, or uncertain writes fail closed. A write that
+failed only because the disk was full (ENOSPC/EDQUOT) recovers by itself: at most
+every 30 s, once 64 MiB are free, the file is re-read and validated and accepted
+only with the same epoch and a revision no older than the last one observed. The file is
 captured with admissions under the state-export guard. Handoffs preserve exact
 pin history and refuse retention-unaware targets when records exist.
 

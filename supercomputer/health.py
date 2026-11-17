@@ -58,6 +58,7 @@ TARGETS = {
     "disk": ("VMs held with their free disk below the threshold (min(10 GB, a tenth of the disk)), now", "==", 0),
     "memory": ("controller memory pressure (high growth or full avg10 >= 10% or some avg10 >= 20%)", "==", 0),
     "billing": ("boat's billing blocks: starts refused or billing inactive (balances are information only)", "==", 0),
+    "ctl_disk": ("the controller's own disk used, percent (tiering from tier_disk_pct; new filler refused from disk_refuse_filler_pct), now", "<", 85.0),
 }
 
 
@@ -180,6 +181,19 @@ class Health:
                   "window_s": MEMORY_KEEP_S, "samples": len(rows), "pressure_samples": bad}
         return {"what": TARGETS["memory"][0], "value": value, "limit": "== 0", "ok": not bad, "detail": detail}
 
+    def record_ctl_disk(self, t: float, used_pct: float, limit: float, detail: dict):
+        """The controller's disk, sampled by the scheduler: only the latest reading counts (not a canary target)."""
+        with self.lock:
+            self.ctl_disk = {"t": t, "used_pct": used_pct, "limit": limit, "detail": dict(detail)}
+
+    def ctl_disk_status(self, now: float) -> dict:
+        d = getattr(self, "ctl_disk", None)
+        known = d is not None and 0 <= now - d["t"] <= 600
+        value = round(d["used_pct"], 1) if known else None
+        limit = d["limit"] if d else TARGETS["ctl_disk"][2]
+        return {"what": TARGETS["ctl_disk"][0], "value": value, "limit": f"< {limit}",
+                "ok": value is None or value < limit, "detail": d["detail"] if known else {}}
+
     def memory_tick(self, now: float) -> list[str]:
         """Fast pressure-only alert check; never advances other health target streaks."""
         v = self.memory_status(now)
@@ -277,8 +291,9 @@ class Health:
                   "waste": {"samples": n_waste, "worst": max((sum(p.get("waste", 0) for p in s["per"].values()) for s in ev["sample"]), default=0),
                             "with_waste": sum(1 for s in ev["sample"] if any(p.get("waste", 0) for p in s["per"].values()))}}
         out = {k: {"what": TARGETS[k][0], "value": vals[k], "limit": f"{TARGETS[k][1]} {TARGETS[k][2]}", "ok": _ok(TARGETS[k][1], vals[k], TARGETS[k][2]),
-                   "detail": detail[k]} for k in TARGETS if k != "memory"}
+                   "detail": detail[k]} for k in TARGETS if k not in ("memory", "ctl_disk")}
         out["memory"] = self.memory_status(now)
+        out["ctl_disk"] = self.ctl_disk_status(now)
         out["handoff"]["hard_faults"] = max((e.get("missing", 0) + e.get("orphans", 0) for e in ev["handoff"]), default=0)
         return {"t": now, "minutes": minutes, "ok": all(v["ok"] for v in out.values()), "targets": out,
                 "client_4xx": self.client_errors(now, minutes)}

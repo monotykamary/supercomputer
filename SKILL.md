@@ -111,6 +111,11 @@ new placement. Jobs without the declaration keep legacy behavior. Never infer ca
 or assume Modal fallback exports artifacts. See `docs/agent-capabilities.md` for the complete recipe and
 `docs/result-files.md` for transport/reference formats.
 
+**Cold results:** closed batches' exported output files may be tiered into a boat snapshot when the controller's
+disk fills (rows, logs and receipts stay); a fetch of one waits (503, retried) while it is restored with every sha256
+checked. `supercomputer batch tier` (dry run), `tier-status`, `hydrate ID`. Near a full disk new filler is refused
+first. See `docs/closed-history.md`.
+
 **Recover a finished admission:** `supercomputer batch fetch BATCH_ID --out NEW_DIRECTORY`
 fetches retained rows, logs and exported files by ID with SHA verification, without starting a scheduler,
 submitting, closing or reaping. Requires controller `batch_fetch_protocol:1`; missing/incomplete history

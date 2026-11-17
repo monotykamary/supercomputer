@@ -20,7 +20,7 @@ from . import resultfiles, resultjson
 from .rules.history import history_visible, history_expirable
 
 PROTOCOL = 1
-SUFFIXES = ('rows', 'placed', 'attempts', 'cancel', 'logs', 'results')
+SUFFIXES = ('rows', 'placed', 'attempts', 'cancel', 'logs', 'results', 'tier')
 AUDIT_NAMES = ('snapshot.json', 'close.json', 'rows.json', 'placements.jsonl',
                'attempts.jsonl', 'cancellations.jsonl')
 

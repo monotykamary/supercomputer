@@ -7,6 +7,7 @@
     supercomputer demand <client> [--for 300] [--pid P] [--done]
     supercomputer queue add <jobs.json> [--tree DIR] [--name N] | ls | results <name>
     supercomputer batch fetch <id> --out <dir>
+    supercomputer batch tier [--run] [--max-gb G] [--min-age-hours H] [--urgent] | tier-status | hydrate <id>
     supercomputer treadmill run [...]  |  digest [--day D]
     supercomputer store push|serve|pull|verify|ls|unserve ...
     supercomputer volumes inventory|copy|verify|ls ...
@@ -287,6 +288,15 @@ def main(argv=None):
     recover.add_argument("id")
     recover.add_argument("--timeout", type=float, default=30, help="whole recovery deadline in seconds")
     recover.add_argument("--attempts", type=int, default=3)
+    tier = batch_commands.add_parser("tier", help="the controller's cold tiering of closed batches' output files: a dry run "
+                                     "(the plan) unless --run; rows, logs, journals and receipts stay on the controller")
+    tier.add_argument("--run", action="store_true", help="perform the run (archive, verify, snapshot, then reference)")
+    tier.add_argument("--max-gb", type=float, help="at most this many GB of files in this run (default the policy's tier_max_gb)")
+    tier.add_argument("--min-age-hours", type=float, help="only batches closed at least this long ago (default tier_age_hours)")
+    tier.add_argument("--urgent", action="store_true", help="every closed batch, whatever its age")
+    batch_commands.add_parser("tier-status", help="the controller's disk, tier runs and hydrations")
+    hydrate = batch_commands.add_parser("hydrate", help="restore a tiered batch's files from its snapshot ahead of a fetch")
+    hydrate.add_argument("id")
     sc = sub.add_parser("scheduler", help="the scheduler: serve (started by clients on demand), status, stop")
     sc.add_argument("args", nargs=argparse.REMAINDER)
     a = ap.parse_args(argv)
@@ -294,6 +304,18 @@ def main(argv=None):
     from . import boat
     if a.cmd == "run":
         return _run(a)
+    elif a.cmd == "batch" and a.batch_cmd in ("tier", "tier-status", "hydrate"):
+        try:
+            if a.batch_cmd == "tier":
+                result = boat.tier("run" if a.run else "plan", max_gb=a.max_gb, min_age_hours=a.min_age_hours,
+                                   urgent=True if a.urgent else None)
+            else:
+                result = boat.tier("status") if a.batch_cmd == "tier-status" else boat.tier("hydrate", batch=a.id)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise SystemExit(f"batch {a.batch_cmd}: {exc}") from exc
+        print(json.dumps(result, indent=2))
+        if result.get("ok") is False:
+            raise SystemExit(1)
     elif a.cmd == "batch":
         from . import batchfetch
         try:

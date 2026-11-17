@@ -51,7 +51,8 @@ import threading
 import time
 import urllib.request
 
-from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, prelaunch, resultfiles, resultjournal, resultjson, rules, statebackup, statusview
+from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, prelaunch, resultfiles, resultjournal, resultjson, rules, statebackup, statusview, tiering
+from .rules import tiering as tier_rules
 from .rules.prelaunch import prelaunch_can_retry, prelaunch_not_started, prelaunch_transport_retryable
 from .durable_groups import DurableGroups, active as durable_active
 from .image_pins import ImagePins, RETENTION_SECONDS
@@ -204,7 +205,13 @@ def policy_defaults() -> dict:
             "ttl_s": boat.BACKSTOP, "bringup": BRINGUP_MAX, "sub_vms": SUB_VMS, "sub_preempt_s": SUB_PREEMPT, "boat_tries": BOAT_TRIES, "classes": list(CLASSES),
             "drain_step": DRAIN_STEP, "drain_every_s": DRAIN_EVERY, "floor_always": bool(FLOOR_ALWAYS),
             "floor_default": FLOOR_DEFAULT, "floor_idle_s": FLOOR_IDLE, "floor_by_image": dict(FLOOR_BY_IMAGE),
-            "cpu_model_max_fruitless": CPU_MODEL_MAX_FRUITLESS, "history_retention_hours": 48.0, "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400}
+            "cpu_model_max_fruitless": CPU_MODEL_MAX_FRUITLESS, "history_retention_hours": 48.0, "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400,
+            # The controller's disk (tiering.py): past tier_disk_pct closed batches older than tier_age_hours go cold (the
+            # treadmill's first), past tier_urgent_pct every closed one; past disk_alert_pct an alert and a health breach;
+            # past disk_refuse_filler_pct new sweep/filler admissions are refused, past disk_refuse_pct all of them.
+            # (11-17 02:20: the disk full at 147 GB, every /submit 500 with ENOSPC and the image-pin registry poisoned.)
+            "tier_disk_pct": 70.0, "tier_urgent_pct": 80.0, "tier_age_hours": 24.0, "tier_min_gb": 2.0, "tier_max_gb": 40.0,
+            "disk_alert_pct": 85.0, "disk_refuse_filler_pct": 90.0, "disk_refuse_pct": 97.0}
 
 
 def read_policy() -> dict:
@@ -238,6 +245,11 @@ def write_policy(changes: dict) -> dict:
         raise ValueError("cpu_model_max_fruitless must be positive")
     if not math.isfinite(p["history_retention_hours"]) or p["history_retention_hours"] < 0:
         raise ValueError("history_retention_hours must be finite and nonnegative")
+    disk = [p[k] for k in ("tier_disk_pct", "tier_urgent_pct", "disk_alert_pct", "disk_refuse_filler_pct", "disk_refuse_pct")]
+    if (not all(math.isfinite(x) and 0 < x <= 100 for x in disk) or disk != sorted(disk)
+            or not all(math.isfinite(p[k]) and p[k] >= 0 for k in ("tier_age_hours", "tier_min_gb", "tier_max_gb"))):
+        raise ValueError("disk thresholds must rise: tier_disk_pct <= tier_urgent_pct <= disk_alert_pct <= "
+                         "disk_refuse_filler_pct <= disk_refuse_pct <= 100; tier ages and sizes nonnegative")
     p["generation"] = pol.generation
     p["t"] = round(time.time(), 1)
     POLICY.parent.mkdir(parents=True, exist_ok=True)
@@ -2027,7 +2039,7 @@ class Scheduler:
                  "code_installed": installed,
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
-                "batch_fetch_protocol": 1, "batch_fetch_never_launched": 1, "closed_history_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
+                "batch_fetch_protocol": 1, "batch_fetch_never_launched": 1, "closed_history_protocol": 1, "result_tiering_protocol": 1, "disk_guard_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
                 "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -2355,6 +2367,11 @@ class Scheduler:
         self._validate_submission(msg)
         msg = {**msg, 'result_files_protocol': 1}
         b = Batch(msg)
+        if b.id not in self.batches and not (DIR / "queue" / f"{b.id}.json").exists():
+            refusal = self._disk_refusal(b.klass)
+            if refusal:
+                log(f"{b.id} ({b.client}): {refusal}")
+                return {"ok": False, "error": refusal, "disk_full": True}
         if not hasattr(self, "_durably_closed"):
             self._durably_closed = self._scheduled_closes()
         if b.id in self._durably_closed or (DIR / "queue" / f"{b.id}.retired").exists() or (DIR / "queue" / f"{b.id}.closed").exists():
@@ -2487,7 +2504,22 @@ class Scheduler:
         if bid not in self.batches and ((q / f"{bid}.retired").exists() or (q / f"{bid}.closed").exists()):
             if history.read(q, bid) is None:
                 raise ValueError("closed history missing or expired")
-        return self._result_store(bid).read(ref, offset, length)
+        self._tier_reading(bid)
+        try:
+            return self._result_store(bid).read(ref, offset, length)
+        except FileNotFoundError:
+            ref = resultfiles.validate_ref(ref)
+            if tiering.lookup(q, bid, ref["sha256"], ref["bytes"]) is None:
+                raise
+            t = self._tier_state()
+            if bid in t["unavailable"]:
+                raise tiering.Unavailable(t["unavailable"][bid])
+            if bid not in t["hydrate"]:
+                t["hydrate"].add(bid)
+                self._disk_at = 0
+                self.wake.set()
+            raise tiering.Hydrating("tiered result hydrating; retry the same endpoint"
+                                    + (f" (last attempt: {t['errors'][bid]})" if bid in t["errors"] else ""))
 
     @staticmethod
     def batch_of(m) -> str | None:
@@ -2806,6 +2838,8 @@ class Scheduler:
                 self._policy_tick()
             self._blob_cache_tick()
             self._history_tick()
+            with contextlib.suppress(Exception):
+                self._disk_tick()
             t_s = time.time()
             # (a full pass (the queue ordered, preemption, waits, the plan, the release) at most every FULL_S, or at once
             # when a batch comes or goes; between them a light one places what's queued on the slots items freed, in the
@@ -2926,6 +2960,202 @@ class Scheduler:
             finally:
                 self._history_busy = False
         threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------------------------------------ the controller's disk and cold tiering
+    def _disk_reading(self):
+        """The queue's filesystem now: (used percent, free bytes, total bytes); statvfs, cheap."""
+        import shutil
+        u = shutil.disk_usage(DIR)
+        return (100.0 * (u.total - u.free) / u.total if u.total else 0.0), u.free, u.total
+
+    def _disk_refusal(self, klass):
+        """Why a new admission of this class is refused for disk, or None (rules.tiering.admission_refused)."""
+        try:
+            used, free, _ = self._disk_reading()
+        except OSError:
+            return None  # an unreadable statvfs refuses nothing; the write itself still fails closed
+        p = read_policy()
+        if not tier_rules.admission_refused(klass in tiering.LOW_CLASSES, used, p["disk_refuse_filler_pct"], p["disk_refuse_pct"]):
+            return None
+        which = "every new batch" if used >= p["disk_refuse_pct"] else "new sweep/filler batches"
+        return (f"controller disk {used:.1f}% used ({free / 1e9:.1f} GB free): {which} refused until tiering frees it "
+                f"(disk_refuse_filler_pct {p['disk_refuse_filler_pct']}, disk_refuse_pct {p['disk_refuse_pct']})")
+
+    def _disk_tick(self):
+        """Every 30 s: the reading for health and alerts; the tier worker when the disk or the age says so, or a
+        hydration waits. Never on the placement thread's critical path (statvfs only)."""
+        now = time.time()
+        if now - getattr(self, "_disk_at", 0) < 30:
+            return
+        self._disk_at = now
+        try:
+            used, free, total = self._disk_reading()
+        except OSError as e:
+            log(f"disk: {e!r}")
+            return
+        p = read_policy()
+        mode = tier_rules.tier_mode(used, p["tier_disk_pct"], p["tier_urgent_pct"], False)
+        self._disk = {"t": now, "used_pct": round(used, 2), "free_bytes": free, "total_bytes": total, "tier_mode": mode}
+        self._h().record_ctl_disk(now, used, p["disk_alert_pct"], {"free_gb": round(free / 1e9, 2), "tier_mode": mode,
+                                  "refuse_filler_pct": p["disk_refuse_filler_pct"], "refuse_pct": p["disk_refuse_pct"]})
+        level = (3 if used >= p["disk_refuse_pct"] else 2 if used >= p["disk_refuse_filler_pct"]
+                 else 1 if used >= p["disk_alert_pct"] else 0)
+        last = getattr(self, "_disk_alerted", (0, 0.0))
+        if level and (level > last[0] or now - last[1] >= 1800):
+            self.alert(f"controller disk {used:.1f}% used ({free / 1e9:.1f} GB free)"
+                       + (": every new batch refused" if level == 3 else ": new sweep/filler refused" if level == 2 else "")
+                       + f"; tiering {'urgent' if mode == 2 else 'on' if mode else 'by age'}")
+            self._disk_alerted = (level, now)
+        elif not level:
+            self._disk_alerted = (0, 0.0)
+        self._tier_tick(mode)
+
+    def _tier_state(self):
+        if not hasattr(self, "_tier"):
+            self._tier = {"busy": False, "at": 0.0, "hydrate": set(), "errors": {}, "unavailable": {},
+                          "retry_at": {}, "reads": {}, "cache": {}, "receipts": [], "last": None}
+        return self._tier
+
+    def _tier_reading(self, bid):
+        self._tier_state()["reads"][bid] = time.time()
+
+    def _tier_held(self, now):
+        t = self._tier_state()
+        reading = {bid for bid, at in t["reads"].items() if now - at < 6 * 3600}
+        held = {p.name[:-len(".hold")] for p in (DIR / "queue").glob("*.hold")} | t["hydrate"]
+        return held, reading
+
+    def _tier_tick(self, mode):
+        if (self.stop.is_set() or getattr(self, "handing_off", False) or getattr(self, "recovery_blocked", False)):
+            return
+        t = self._tier_state()
+        now = time.time()
+        waiting = {bid for bid in t["hydrate"] if now >= t["retry_at"].get(bid, 0)}
+        due = now - t["at"] >= (600 if mode else 3600)
+        if t["busy"] or not (waiting or due):
+            return
+        t["busy"] = True
+
+        def run():
+            try:
+                for bid in sorted(waiting):
+                    self._tier_hydrate(bid)
+                if due:
+                    t["at"] = time.time()
+                    self.tier(dry_run=False)
+            except Exception as e:
+                log(f"tier: {e!r}"[:400])
+                t["last"] = {"t": time.time(), "error": repr(e)[:400]}
+            finally:
+                t["busy"] = False
+        threading.Thread(target=run, name="tier", daemon=True).start()
+
+    def _tier_hydrate(self, bid):
+        t = self._tier_state()
+        try:
+            receipt = tiering.hydrate(tiering.BoatRemote(), DIR / "queue", bid)
+            t["hydrate"].discard(bid)
+            t["errors"].pop(bid, None)
+            log(f"{bid}: tiered results restored, every sha256 checked: {receipt}")
+        except tiering.Unavailable as e:
+            t["hydrate"].discard(bid)
+            t["unavailable"][bid] = str(e)
+            self.alert(f"{bid}: tiered results cannot be restored (fail closed): {e}")
+        except Exception as e:
+            t["errors"][bid] = repr(e)[:300]
+            t["retry_at"][bid] = time.time() + 300
+            log(f"{bid}: tier hydration failed, retrying in 5 min: {e!r}"[:400])
+
+    def tier(self, dry_run=True, max_gb=None, min_age_hours=None, urgent=False):
+        """Plan (dry run) or perform one tier run: closed batches' exported files into one new boat snapshot.
+
+        The plan reads only immutable closed history; the archive is pushed without the lock; each batch is
+        re-checked under the lock before its durable reference is written and only then are its local copies
+        removed. Returns a receipt with the batches, bytes and the snapshot."""
+        now = time.time()
+        p = read_policy()
+        used, free, total = self._disk_reading()
+        mode = 2 if urgent else tier_rules.tier_mode(used, p["tier_disk_pct"], p["tier_urgent_pct"], False)
+        age_h = p["tier_age_hours"] if min_age_hours is None else float(min_age_hours)
+        max_bytes = int((p["tier_max_gb"] if max_gb is None else float(max_gb)) * 1e9)
+        t = self._tier_state()
+        held, reading = self._tier_held(now)
+        chosen = tiering.select(DIR / "queue", now, min_age_s=0 if mode == 2 else age_h * 3600, max_bytes=max_bytes,
+                                held=held, reading=reading, cache=t["cache"])
+        size = sum(sum(c["payloads"].values()) for c in chosen)
+        if mode == 0 and size < p["tier_min_gb"] * 1e9 and min_age_hours is None:
+            chosen, size = [], 0  # (by age alone, a run waits for at least tier_min_gb: one snapshot per run)
+        plan = {"dry_run": bool(dry_run), "disk_used_pct": round(used, 2), "free_bytes": free, "mode": mode,
+                "batches": len(chosen), "files": sum(len(c["payloads"]) for c in chosen), "bytes": size,
+                "low_class_batches": sum(1 for c in chosen if c["klass"] in tiering.LOW_CLASSES),
+                "first": [{"batch": c["batch"], "klass": c["klass"], "files": len(c["payloads"]),
+                           "bytes": sum(c["payloads"].values())} for c in chosen[:8]]}
+        if dry_run or not chosen:
+            return plan
+        name = "sc-tier-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime(now))
+        log(f"tier: {plan['batches']} batches, {plan['files']} files, {size / 1e9:.2f} GB into {name}")
+        archives = tiering.push(tiering.BoatRemote(), DIR / "queue", name, chosen, now)
+        freed, skipped = 0, []
+        for c in chosen:
+            bid = c["batch"]
+            with self.lock:
+                held, reading = self._tier_held(time.time())
+                q = DIR / "queue"
+                if not tier_rules.tier_allowed((q / f"{bid}.closed").exists(), (q / f"{bid}.json").exists(), bid in held, bid in reading):
+                    skipped.append(bid)
+                    continue
+                tiering.record(q, bid, archives[bid])
+            freed += tiering.drop_local(DIR / "queue", bid, archives[bid]["payloads"])
+            t["cache"].pop(bid, None)
+        receipt = {**plan, "dry_run": False, "snapshot": name, "sha256": next(iter(archives.values()))["sha256"],
+                   "archive_bytes": next(iter(archives.values()))["bytes"], "freed_bytes": freed, "skipped": skipped,
+                   "t": time.time()}
+        t["receipts"] = (t["receipts"] + [receipt])[-20:]
+        t["last"] = receipt
+        with contextlib.suppress(OSError):
+            with open(DIR / "tier-receipts.jsonl", "a") as f:
+                f.write(json.dumps({k: v for k, v in receipt.items() if k != "first"}) + "\n")
+        log(f"tier: {name} saved; {freed / 1e9:.2f} GB freed; skipped (read or reopened meanwhile): {skipped[:8]}")
+        return receipt
+
+    def tier_start(self, **args):
+        """Start one tier run in the worker (never under the request lock: a push takes minutes)."""
+        t = self._tier_state()
+        if t["busy"]:
+            return {"ok": False, "error": "a tier run or hydration is in progress", "status": self.tier_status()}
+        for k in ("max_gb", "min_age_hours"):
+            if k in args and (isinstance(args[k], bool) or not math.isfinite(float(args[k])) or float(args[k]) < 0):
+                raise ValueError(f"{k} must be a finite nonnegative number")
+        t["busy"] = True
+
+        def run():
+            try:
+                t["last"] = self.tier(dry_run=False, **args)
+            except Exception as e:
+                log(f"tier: {e!r}"[:400])
+                t["last"] = {"t": time.time(), "error": repr(e)[:400]}
+            finally:
+                t["busy"] = False
+        threading.Thread(target=run, name="tier", daemon=True).start()
+        return {"ok": True, "started": True}
+
+    def tier_status(self):
+        t = self._tier_state()
+        return {"disk": getattr(self, "_disk", None), "busy": t["busy"], "hydrating": sorted(t["hydrate"]),
+                "errors": dict(list(t["errors"].items())[:16]), "unavailable": dict(list(t["unavailable"].items())[:16]),
+                "last": t["last"], "receipts": t["receipts"][-5:]}
+
+    def tier_hydrate_request(self, bid):
+        self._valid_batch(bid)
+        if tiering.load(DIR / "queue", bid) is None:
+            raise ValueError("batch has no tier reference")
+        t = self._tier_state()
+        t["hydrate"].add(bid)
+        t["retry_at"].pop(bid, None)
+        t["unavailable"].pop(bid, None)
+        self._disk_at = 0  # (the next tick starts it)
+        self.wake.set()
+        return {"ok": True, "batch": bid, "queued": True}
 
     def _blob_cache_tick(self):
         """One bounded maintenance worker, never on the placement thread or during handoff."""
@@ -6749,7 +6979,7 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         response = self._response(408, {"error": "incomplete request body"})
                     elif not hmac.compare_digest(self.headers.get("X-SC-Token", ""), s.token):
                         response = self._response(403, {"error": "token"})
-                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/logs", "/capabilities", "/results", "/batch/info", "/batch/rows")
+                    elif not rules.http_request_serialized(self.path in ("/poll", "/status", "/health", "/logs", "/capabilities", "/results", "/batch/info", "/batch/rows", "/tier/plan", "/tier/status")
                                                            or self.path.split("?")[0] == "/state"):
                         response = self._post(body)
                     else:
@@ -6847,6 +7077,10 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         return self._response(200, raw=s.result_part(m.get('batch'), m.get('ref'), m.get('offset', 0), m.get('length', resultfiles.CHUNK_BYTES)))
                     except (ValueError, TypeError) as e:
                         return self._response(400, {'error': str(e)})
+                    except tiering.Hydrating as e:
+                        return self._response(503, {'error': str(e)})
+                    except tiering.Unavailable as e:
+                        return self._response(409, {'error': 'tiered result unavailable: ' + str(e)})
                     except FileNotFoundError:
                         return self._response(404, {'error': 'result file not found'})
                 if p == "/submit":
@@ -6880,6 +7114,16 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         return self._response(400, {"error": str(e)})
                 if p == "/hint":
                     return self._response(200, s.hint(m))
+                if p in ("/tier/plan", "/tier/run", "/tier/status", "/tier/hydrate"):
+                    try:
+                        if p == "/tier/status":
+                            return self._response(200, s.tier_status())
+                        if p == "/tier/hydrate":
+                            return self._response(200, s.tier_hydrate_request(m.get("batch")))
+                        args = {k: m[k] for k in ("max_gb", "min_age_hours", "urgent") if m.get(k) is not None}
+                        return self._response(200, s.tier(dry_run=True, **args) if p == "/tier/plan" else s.tier_start(**args))
+                    except (ValueError, TypeError) as e:
+                        return self._response(400, {"error": str(e)})
                 if p == "/status":
                     return self._response(200, raw=s.status_response())
                 if p == "/health":
@@ -6983,6 +7227,20 @@ def _handoff_busy(code: int, data) -> bool:
     return code == 503 and isinstance(data, (bytes, bytearray)) and b"scheduler handoff" in bytes(data[:200])
 
 
+# A read of a tiered (cold) result file is answered 503 "tiered result hydrating" while the controller restores it
+# from its snapshot with every sha256 checked (tiering.py): a VM start and the archive's stream, minutes. The same
+# read is repeated until then; a restore that fails verification is a 409, never retried.
+TIER_RETRY_S = 3600.0
+
+
+class TierHydrating(HandoffBusy):
+    """A tiered result is being restored; the same read is safe to send again."""
+
+
+def _tier_busy(code: int, data) -> bool:
+    return code == 503 and isinstance(data, (bytes, bytearray)) and b"tiered result hydrating" in bytes(data[:200])
+
+
 class Client:
     """The scheduler: this machine's (127.0.0.1), or the controller's on boat (LIVE/controller.json: its boat URL,
     boat's cookie and our token, 0600) when it answers."""
@@ -7001,15 +7259,16 @@ class Client:
 
     def req(self, path: str, msg, timeout: float = 60, raw: bool = False, body: bytes | None = None, decode=None):
         data_in = body if body is not None else json.dumps(msg).encode()
-        deadline, wait = time.monotonic() + HANDOFF_RETRY_S, 0.5
+        start, wait = time.monotonic(), 0.5
         while True:
             try:
                 return self._req_once(path, data_in, timeout, raw, decode, body is not None)
-            except HandoffBusy:
-                if time.monotonic() + wait > deadline:
+            except HandoffBusy as busy:
+                tiered = isinstance(busy, TierHydrating)
+                if time.monotonic() + wait > start + (TIER_RETRY_S if tiered else HANDOFF_RETRY_S):
                     raise
                 time.sleep(wait)
-                wait = min(5.0, wait * 2)
+                wait = min(15.0 if tiered else 5.0, wait * 2)
 
     def _req_once(self, path: str, data_in: bytes, timeout: float, raw: bool, decode, binary: bool):
         if isinstance(self.remote, AgentClient):
@@ -7018,7 +7277,7 @@ class Client:
             code, data, _ = self.remote._req("POST", path, data_in, timeout, "application/octet-stream" if binary else "application/json",
                                              **({"decode": decode} if decode is not None else {}), **extra)
             if code != 200:
-                raise (HandoffBusy if _handoff_busy(code, data) else RuntimeError)(f"the controller: {path}: {code} {data[:300]!r}")
+                raise (TierHydrating if _tier_busy(code, data) else HandoffBusy if _handoff_busy(code, data) else RuntimeError)(f"the controller: {path}: {code} {data[:300]!r}")
         else:
             data = self._local(path, data_in, timeout, **({"decode": decode} if decode is not None else {}))
         return data if raw or decode is not None else json.loads(data)
@@ -7051,6 +7310,9 @@ class Client:
                 except BaseException:
                     conn.close()
                     raise
+                if _tier_busy(r.status, data):
+                    c.append(conn)
+                    raise TierHydrating(f"the scheduler: {path}: {r.status} {data[:300]!r}")
                 if _handoff_busy(r.status, data):
                     conn.close()  # (the refusing scheduler closes it: never a dead pooled connection for the retry)
                     raise HandoffBusy(f"the scheduler: {path}: {r.status} {data[:300]!r}")

@@ -19,10 +19,19 @@ Persist/restore this file with controller state. An unreadable/malformed file
 or uncertain write poisons the instance: every operation raises, so callers
 must fail closed, not substitute an empty protected set. Client auto-deletion
 must remain disabled; this registry is not a cross-network deletion lease.
+
+A poison caused only by a full disk (ENOSPC/EDQUOT) recovers by itself: at most
+every RECOVER_S, once the filesystem has RECOVER_FREE_BYTES free, the file is
+re-read and validated under the lock, and accepted only with the same epoch and
+a revision no older than the last one this instance observed. A missing file,
+any other error, or a regression stays poisoned. (11-17 02:20: the controller's
+disk filled, one write failed with ENOSPC, and /submit refused every batch until
+the process was replaced, though the file on disk was intact.)
 """
 
 import contextlib
 import copy
+import errno
 import fcntl
 import json
 import math
@@ -36,6 +45,9 @@ import uuid
 from .rules.image_pins import image_pin_retained
 
 RETENTION_SECONDS = 604800
+RECOVER_S = 30.0
+RECOVER_FREE_BYTES = 64 * 1024 * 1024
+_DISK_FULL = (errno.ENOSPC, errno.EDQUOT)
 MAX_NAME_LENGTH = 256
 MAX_IMAGES = 4096
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", re.ASCII)
@@ -100,10 +112,40 @@ class ImagePins:
         self._data = None
         self._error = None
         self._lock = threading.RLock()
+        self._high_water = None  # (epoch, revision) last observed; never accept older state
+        self._recoverable = False
+        self._recover_at = 0.0
+
+    def _observe(self, data):
+        if data is not None:
+            self._high_water = (data['epoch'], data['revision'])
+
+    def _recover(self):
+        """Clear a disk-full poison once the file reads back valid and not older (see module doc)."""
+        import time
+        if self._error is None or not self._recoverable or time.monotonic() < self._recover_at:
+            return
+        self._recover_at = time.monotonic() + RECOVER_S
+        try:
+            import shutil
+            if shutil.disk_usage(self.path.parent).free < RECOVER_FREE_BYTES:
+                return
+            with self.path.open(encoding='utf-8') as stream:
+                data = json.load(stream, object_pairs_hook=_unique_object)
+            self._validate(data)
+            if self._high_water is not None and (data['epoch'] != self._high_water[0]
+                                                 or data['revision'] < self._high_water[1]):
+                self._recoverable = False  # a regression is never a disk-space symptom
+                return
+        except Exception:
+            return  # still poisoned; a later attempt may succeed
+        self._data, self._error, self._recoverable = data, None, False
+        self._observe(data)
 
     @contextlib.contextmanager
     def _guard(self):
         with self._lock:
+            self._recover()
             if self._error is not None:
                 raise ImagePinsUnavailable('image pin registry unavailable: ' + self._error)
             try:
@@ -118,7 +160,10 @@ class ImagePins:
                 self._poison(error)
 
     def _poison(self, error):
+        self._observe(self._data)
         self._data = None  # Never serve cached pre-write state after uncertainty.
+        self._recoverable = isinstance(error, OSError) and error.errno in _DISK_FULL
+        self._recover_at = 0.0
         self._error = str(error) or type(error).__name__
         raise ImagePinsUnavailable('image pin registry unavailable: ' + self._error) from error
 
@@ -142,6 +187,7 @@ class ImagePins:
             if previous is not None and (data["epoch"] != previous["epoch"] or data["revision"] < previous["revision"]):
                 raise ValueError("image pin registry epoch/revision regressed")
             self._data = data
+            self._observe(data)
             return data
         except Exception as error:
             self._poison(error)

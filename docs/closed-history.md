@@ -87,3 +87,47 @@ The CLI exits nonzero for unconfirmed cleanup. Callers must inspect the returned
 Capabilities: `closed_history_protocol:1`, `close_recovery_protocol:1`, and the
 existing `batch_fetch_protocol:1`. Ordinary request/close retries and the strict
 single-attempt execution contract are otherwise unchanged.
+
+## Cold tiering of output files and the controller's disk guard
+
+Exported output files (the payloads named only inside a row's output-file
+manifest) of **closed, terminal** batches may go cold. Rows, logs, journals,
+close receipts, snapshots and the manifests themselves never leave the
+controller, so history pages, audits and `batch recover-close` read exactly
+what they read before. Failed rows' files (failure receipts), open admissions,
+pending strict cleanup, batches with a `queue/BATCH.hold` marker and batches
+read in the last 6 hours are never tiered.
+
+A run streams the chosen files (`tar | zstd`) to a new boat VM, verifies every
+member there (each payload hashes to its name; the member set and the archive's
+sha256 match what was sent), saves it as the named snapshot `sc-tier-<UTC>`,
+deletes the VM, and only then writes `queue/BATCH.tier`, a hash-bound reference
+(snapshot, archive path, archive sha256, bytes and entry count, moved_at, and
+each payload's sha256 and size), before removing the local copies. A read of a
+tiered file answers `503 tiered result hydrating`; clients repeat the same read
+(up to an hour) while the controller starts a VM from the snapshot, streams the
+archive back and installs the files only after the archive's sha256, size and
+entry count and every payload's own sha256 match. A missing or tampered archive
+is `409 tiered result unavailable`: fail closed, never a partial file. The
+reference expires with the batch's closed history.
+
+| policy | default | effect |
+| --- | --- | --- |
+| `tier_disk_pct` | 70 | tier closed batches older than `tier_age_hours`, the treadmill's (sweep, filler) first, then oldest close first |
+| `tier_urgent_pct` | 80 | tier every closed batch, whatever its age |
+| `tier_age_hours`, `tier_min_gb` | 24, 2 | below the threshold, age alone triggers a run once at least 2 GB are due |
+| `tier_max_gb` | 40 | at most this much per run (one snapshot per run) |
+| `disk_alert_pct` | 85 | alert, and the `ctl_disk` health target breaches |
+| `disk_refuse_filler_pct` | 90 | new sweep/filler admissions refused (`disk_full: true`) |
+| `disk_refuse_pct` | 97 | every new admission refused |
+
+```sh
+supercomputer batch tier                  # the plan: a dry run
+supercomputer batch tier --run [--max-gb 20] [--min-age-hours 24] [--urgent]
+supercomputer batch tier-status           # disk, runs, hydrations
+supercomputer batch hydrate BATCH_ID      # restore ahead of a fetch (a fetch also does it by itself)
+```
+
+Capabilities: `result_tiering_protocol:1`, `disk_guard_protocol:1`. Tier
+snapshots are not deleted automatically; once every reference into one has
+expired it can be removed by an operator.

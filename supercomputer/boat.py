@@ -2967,6 +2967,23 @@ def image_pins(operation: str = "list", *, images: list[str] | None = None,
     return conn.req("/image-pins/" + operation, msg)
 
 
+def tier(operation: str = "plan", **msg) -> dict:
+    """The controller's cold tiering (tiering.py): plan (a dry run, the default), run, status, or hydrate BATCH.
+
+    Never starts a local controller. A run moves only closed batches' exported output files into a new boat
+    snapshot and leaves hash-bound references; rows, logs, journals and close receipts stay on the controller."""
+    if operation not in ("plan", "run", "status", "hydrate"):
+        raise ValueError("tier operation must be plan, run, status or hydrate")
+    from . import scheduler
+    conn = scheduler.current()
+    if conn is None:
+        raise Unavailable("no running scheduler; refusing local startup for tiering")
+    caps = conn.req("/capabilities", {})
+    if type(caps.get("result_tiering_protocol")) is not int or caps["result_tiering_protocol"] != 1:
+        raise Unavailable("scheduler lacks result tiering (result_tiering_protocol 1)")
+    return conn.req("/tier/" + operation, {k: v for k, v in msg.items() if v is not None}, timeout=600)
+
+
 def _validate_strict_options(strict_once: bool, max_attempts: int):
     from .rules.owned_lifecycle import attempt_cap_supported
     if type(strict_once) is not bool:
