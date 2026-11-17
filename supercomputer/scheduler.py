@@ -278,6 +278,16 @@ def write_policy(changes: dict) -> dict:
     return p
 
 
+def policy_request(m: dict) -> dict:
+    """/policy: {"set": {knob: value}} writes the policy (write_policy) where the scheduler runs, by the code it runs;
+    empty, it reads it. Before: `supercomputer policy` wrote the laptop's own file beside a configured controller
+    (11-17 03:48: floor_always and a floor of 48 set where no scheduler read them)."""
+    changes = m.get("set") or {}
+    if not isinstance(changes, dict):
+        raise ValueError("set must be an object of knob: value")
+    return write_policy(changes) if changes else read_policy()
+
+
 def apply_policy(p: dict):
     global MAX_VMS, HOLD, GATE_HORIZON, START_DOLLARS, VM_HOUR_DOLLARS, BRINGUP_MAX, SUB_VMS, SUB_PREEMPT, BOAT_TRIES, DRAIN_STEP, DRAIN_EVERY, FLOOR_ALWAYS, FLOOR_DEFAULT, FLOOR_IDLE, FLOOR_BY_IMAGE, BREAK_EVEN_BY_CLASS
     MAX_VMS = rules.max_vms_of(int(p.get("max_vms") or 0))  # (0 or unset: no limit)
@@ -2239,6 +2249,23 @@ class Scheduler:
         with self._unserialized():  # (waits and RPCs to workers: never under the request lock every mutation needs)
             return self._cancel_items(bid, b, items, deadline, item_wait)
 
+    def _boot_ended(self, vid) -> bool:
+        """rules.boot_ended from boat's inventory (read at most once a minute; unreadable: never ended)."""
+        if not vid or vid in self.vms and not self.vms[vid].dead:
+            return False
+        inv = getattr(self, "_inv_cache", None)
+        if inv is None or time.time() - inv[0] > 60:
+            try:
+                inv = (time.time(), boat.sandboxes())
+            except Exception:
+                inv = (time.time(), None)
+            self._inv_cache = inv
+        listing = inv[1]
+        if listing is None:
+            return False
+        v = listing.get(vid)
+        return rules.boot_ended(v is not None, bool(getattr(listing, "complete", False)), bool(v) and v.get("state") == "stopped")
+
     def _cancel_items(self, bid, b, items, deadline, item_wait=None):
         for it in items:
             remaining = max(0, deadline - time.monotonic())
@@ -2279,6 +2306,12 @@ class Scheduler:
                 placed = it.owned.placements > 0
                 cached = self._matching_terminal_reap(it, it.terminal_reap)
                 receipt = it.terminal_reap["receipt"] if cached else None
+            ended = receipt is None and placed and (vm is None or vm.dead) and bool(identity) and bool(pl) and self._boot_ended(pl.get("vm"))
+            if ended:
+                # (no agent of its boot left to ask, and boat's inventory says that boot is over: its namespace cannot
+                # exist; the receipt says so, bound to the same identity, batch and run)
+                receipt = {"ok": True, "reaped": True, "namespace_absent": True, "identity": identity, "batch": bid,
+                           "name": name, "error": "boot ended (boat: VM stopped or deleted)"}
             if receipt is None and placed and vm is not None and identity:
                 try:
                     remaining = max(0, deadline - time.monotonic())
@@ -2306,7 +2339,7 @@ class Scheduler:
                 # Persist evidence first; never acknowledge a reap whose journal failed.
                 self._append_owned(bid, "cancel", {"name": it.name, "run_name": name,
                     "identity": identity, "matched": matched, "unplaced": not placed,
-                    "source": "terminal-reap" if cached else "cancel-rpc", "receipt": {
+                    "source": "terminal-reap" if cached else "boot-ended" if ended else "cancel-rpc", "receipt": {
                         k: receipt[k] for k in ("ok", "reaped", "namespace_absent", "identity", "batch", "name", "error") if k in receipt
                     } if isinstance(receipt, dict) else None, "t": time.time()})
                 if it.owned.confirm(matched):
@@ -7179,6 +7212,11 @@ def serve(idle_exit: float = 120, takeover: bool = False):
                         return self._response(400, {"error": str(e)})
                 if p == "/hint":
                     return self._response(200, s.hint(m))
+                if p == "/policy":  # (the controller's own policy, read or set by the code it runs: its knobs)
+                    try:
+                        return self._response(200, policy_request(m))
+                    except (SystemExit, ValueError, TypeError) as e:
+                        return self._response(400, {"error": str(e)})
                 if p in ("/tier/plan", "/tier/run", "/tier/status", "/tier/hydrate"):
                     try:
                         if p == "/tier/status":

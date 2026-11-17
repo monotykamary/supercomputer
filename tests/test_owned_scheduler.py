@@ -57,6 +57,11 @@ class OwnedSchedulerTests(unittest.TestCase):
         self.vm.client.lease = self.vm.lease
         self.vm.client.owner = "fixture-owner"
         self.s.vms[self.vm.id] = self.vm
+        # (boat's inventory: the fixture VM up, never a real boat call; rules.boot_ended reads it)
+        inventory = S.boat.Listing({self.vm.id: {"id": self.vm.id, "state": "running"}})
+        inv_patch = patch.object(S.boat, "sandboxes", return_value=inventory)
+        inv_patch.start()
+        self.addCleanup(inv_patch.stop)
         self.write_batch()
 
     def write_batch(self):

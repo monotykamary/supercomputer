@@ -341,7 +341,19 @@ def main(argv=None):
     elif a.cmd == "policy":
         from . import scheduler
         kv = dict(x.split("=", 1) for x in a.set if "=" in x)
-        print(json.dumps(scheduler.write_policy(kv) if kv else scheduler.read_policy(), indent=1))
+        if scheduler.controller_configured() and os.environ.get("SUPERCOMPUTER_LOCAL") != "1":
+            # (the controller's policy, by the code it runs; never this machine's file beside it)
+            cl = scheduler._remote()
+            try:
+                pol = cl.req("/policy", {"set": kv}, timeout=30)
+            except RuntimeError as e:
+                if " 404 " in str(e):
+                    sys.exit("policy: the controller's code predates /policy; on the controller, run write_policy from "
+                             "its active install (~/sc/live/scheduler/code/<active>), not ~/sc/tool")
+                sys.exit(f"policy: {e}")
+            print(json.dumps(pol, indent=1))
+        else:
+            print(json.dumps(scheduler.write_policy(kv) if kv else scheduler.read_policy(), indent=1))
     elif a.cmd == "reap":
         import signal
         signal.signal(signal.SIGALRM, lambda *x: (_ for _ in ()).throw(SystemExit("reap: 180 s passed, stopped (time-boxed)")))
