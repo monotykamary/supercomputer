@@ -894,7 +894,7 @@ Supervise = Literal["none", "wait", "handoff", "restart"]
 # gdp: law a quarantined answering scheduler is never handed off nor restarted: not answered or not busy or result == "wait"
 # gdp: law an answering scheduler gets a hot handoff before any restart: not answered or handoff_age >= 0 or result != "restart"
 # gdp: law a silent scheduler past the miss limit and the cooldown is restarted: answered or misses < miss_limit or since_action < cooldown or result == "restart"
-# gdp: law a handoff that didn't take within its wait becomes a restart: not answered or busy or not (stuck or poisoned) or handoff_age < handoff_wait or since_action < cooldown or result == "restart"
+# gdp: law a handoff that didn't take within its wait becomes a restart: not answered or busy or not (stuck or poisoned) or handoff_age < 0 or handoff_age < handoff_wait or since_action < cooldown or result == "restart"
 def supervise_action(answered: bool, misses: int, miss_limit: int, stuck: bool, poisoned: bool, busy: bool,
                      handoff_age: float, handoff_wait: float, since_action: float, cooldown: float) -> Supervise:
     """The supervisor process's call on the scheduler it watches (from outside it: a wedged scheduler's own threads
