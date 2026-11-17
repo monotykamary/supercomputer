@@ -67,6 +67,31 @@ snapshot, close receipt, frozen rows, and placement/start/cancellation journals.
 The files live under `audit/.payloads`; each inventory entry names its local file
 and SHA-256 reference. No raw journal is interpreted as permission to execute.
 
+## Download guard (default 1 GiB)
+
+Before downloading any output-file body, fetch inventories every terminal row's
+verified output manifest. It refuses if the sum exceeds **1,073,741,824 bytes**,
+printing each item's byte/file count and the ten largest paths. This counts
+logical destination bytes (identical contents at two paths count twice), not
+compressed/network size. Metadata, row/result JSON references and retained logs
+are separate from this output-file limit.
+
+```sh
+supercomputer batch fetch BATCH --out recovered --allow-large
+SUPERCOMPUTER_FETCH_LIMIT=2GiB supercomputer batch fetch BATCH --out recovered
+```
+
+`SUPERCOMPUTER_FETCH_LIMIT` accepts nonnegative integer bytes or an integer with
+`KiB`, `MiB` or `GiB`; zero permits only empty output files. Invalid limits fail
+closed. `--allow-large` explicitly disables this client guard. Python callers use
+`fetch(..., fetch_limit=bytes)` or `fetch(..., allow_large=True)`.
+
+Refusal does **not** delete, modify, close or resubmit the remote batch. Verified
+metadata may be left locally, but no successful `fetch.json` is published. The
+same output directory can be resumed with a larger limit. Existing remote
+history expiry still applies; this guard does not extend retention. Prefer
+exporting only needed results instead of whole build trees.
+
 ## Limits
 
 Fetching does not pin history against expiry or administrative deletion. An

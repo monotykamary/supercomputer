@@ -55,7 +55,7 @@ def _run(a):
     a.vm_type = a.vm_type or os.environ.get("SUPERCOMPUTER_VM") or "large"
     return fanout.run_jobs(app, spec, a.out, pre, cmd, mjobs, backend=a.backend, vms=a.vms, idle=None if a.idle < 0 else a.idle, teardown=a.teardown,
                     durations=a.durations, vm_type=a.vm_type, max_vms=a.max_vms, max_wait=a.max_wait,
-                    strict_once=strict_once, max_attempts=getattr(a, "max_attempts", 1))
+                    strict_once=strict_once, max_attempts=getattr(a, "max_attempts", 1), allow_large=getattr(a, "allow_large", False))
 
 
 def _remote_queue(a):
@@ -72,6 +72,9 @@ def _remote_queue(a):
         raise SystemExit("the controller doesn't answer: `supercomputer queue` needs it (or SUPERCOMPUTER_CONTROLLER=0 for this machine's)")
     if a.qcmd == "add":
         spec = json.loads(pathlib.Path(a.jobs).read_text())
+        from .outputwarnings import warn_broad_outputs
+        for job in spec:
+            warn_broad_outputs(job)
         root = config.select_root(a.tree)
         tar = boat.tree_tarball(root)
         name = a.name or f"{root.name}-{pathlib.Path(a.jobs).stem}-{time.strftime('%m%d-%H%M%S')}"
@@ -207,6 +210,7 @@ def main(argv=None):
     r = sub.add_parser("run", help="a jobs file on boat (GPU jobs on RunPod); no provider fallback")
     r.add_argument("--jobs", required=True)
     r.add_argument("--out", required=True)
+    r.add_argument("--allow-large", action="store_true", help="allow output files above the default 1 GiB fetch limit")
     r.add_argument("--backend", default="auto", choices=["auto", "boat", "modal", "runpod"])
     r.add_argument("--env", action="append", default=[], help="K=V exported before every job's command")
     r.add_argument("--vms", type=int, default=0)
@@ -283,6 +287,7 @@ def main(argv=None):
     fetch = batch_commands.add_parser("fetch", help="download a finished batch by ID; never submit or close")
     fetch.add_argument("id")
     fetch.add_argument("--out", required=True)
+    fetch.add_argument("--allow-large", action="store_true", help="allow output files above the default 1 GiB fetch limit")
     fetch.add_argument("--timeout", type=float, default=120, help="per-request timeout in seconds")
     recover = batch_commands.add_parser("recover-close", help="validate retained strict-close evidence from local custody; read-only")
     recover.add_argument("id")
@@ -319,7 +324,7 @@ def main(argv=None):
     elif a.cmd == "batch":
         from . import batchfetch
         try:
-            result = (batchfetch.fetch(a.id, a.out, timeout=a.timeout) if a.batch_cmd == 'fetch'
+            result = (batchfetch.fetch(a.id, a.out, timeout=a.timeout, **({"allow_large": True} if a.allow_large else {})) if a.batch_cmd == 'fetch'
                       else boat.recover_close(a.id, timeout=a.timeout, attempts=a.attempts))
         except (ValueError, RuntimeError, OSError) as exc:
             raise SystemExit(f"batch fetch: {exc}") from exc

@@ -113,8 +113,11 @@ def child(site, work, scenario):
         outputs = []
         session.run([{'name': 'first'}, {'name': 'second'}],
                     lambda item, value: outputs.append(value))
-        verify(outputs[0])
-        assert outputs[1] == {'name': 'second', 'result': 2}
+        # Output-bearing callbacks wait for the batch inventory; file-free
+        # rows still stream while those output bodies are guarded.
+        assert [value['name'] for value in outputs] == ['second', 'first']
+        verify(outputs[1])
+        assert outputs[0] == {'name': 'second', 'result': 2}
         # A retry/read must never resubmit an already-owned batch.
         assert counts == dict(submit=1, poll=2, reconnect=1, close=0), counts
         session.close()

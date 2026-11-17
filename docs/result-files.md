@@ -23,6 +23,34 @@ runs/x/JOB.files/proofs/proof.bin
 ```
 
 Each download is SHA-256 verified and atomically published. A manifest is retained under `runs/x/.payloads/`.
+
+Client collection defaults to a **1 GiB total output-file limit per batch**. Both
+`run` and `batch fetch` accept `--allow-large`; `SUPERCOMPUTER_FETCH_LIMIT` sets a
+nonnegative byte limit (integer `KiB`/`MiB`/`GiB` suffixes are also accepted).
+Programmatic sessions accept `allow_large=True` or `fetch_limit=bytes`. Exactly
+the limit is accepted; only a larger total is refused. Duplicate contents at
+different output paths count once per destination.
+
+Automatic sessions inventory the whole batch before copying its first output
+body. Output-bearing callbacks wait for that inventory; callbacks for rows
+without output files continue to stream. A refusal prints per-item sizes and
+the largest paths, leaving verified metadata locally and remote outputs intact.
+It is a collection failure, not permission to rerun jobs. Normal scheduled-session
+close still releases resources and retains results according to the existing
+history policy; recover the printed batch ID with `batch fetch --allow-large`
+before history expires. Legacy direct sessions have no retained scheduler
+admission: on a size refusal their unacknowledged output-bearing VMs are stopped,
+not deleted (even with `teardown=True`), and their IDs are printed. Resume those
+VM disks and export the needed files before reusing them; `batch fetch` does not
+recover a direct session. This is not a permanent backup or a retention extension.
+The guard does not limit row/result JSON or log archives.
+
+At CLI submission, obvious whole-tree output declarations (`.lake`, build
+folders, `node_modules`, root globs) produce one stderr warning per job. Because
+native shell jobs export through `SUPERCOMPUTER_OUTPUT_DIR`, a narrow recursive
+`cp`/`rsync`-to-export heuristic also catches common accidental whole-tree copies.
+This warning is advisory, not shell analysis; a local `run --out` folder is not
+an output declaration.
 Programmatic callbacks receive `output_files_ref`, `output_files_manifest` (local filename) and `output_files_dir`.
 `collect()` continues to return bounded stdout/stderr; output files are a separate transport. Only native boat agents
 and controllers advertising `output_files_protocol: 1` implement this API; an old controller or Modal fallback is

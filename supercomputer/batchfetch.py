@@ -10,9 +10,10 @@ import re
 import stat
 import tarfile
 import time
+import tempfile
 import uuid
 
-from . import clientresults, history, resultfiles
+from . import clientresults, fetchguard, history, resultfiles
 
 
 @contextlib.contextmanager
@@ -134,7 +135,7 @@ def _logs_missing(directory, rows_file):
     return missing
 
 
-def fetch(bid: str, out, *, client=None, timeout=120):
+def fetch(bid: str, out, *, client=None, timeout=120, allow_large=False, fetch_limit=None):
     """Fetch a finished admission without submit, close, cancel, reap or startup.
 
     Every row page, referenced row/result/output payload and the log archive is checked
@@ -143,6 +144,7 @@ def fetch(bid: str, out, *, client=None, timeout=120):
     Use an empty directory, or resume a fetch of this same admission generation.
     """
     from . import scheduler
+    guard = fetchguard.FetchGuard(fetch_limit, allow_large=allow_large, batch=bid)
     scheduler.Scheduler._valid_batch(bid)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be positive and finite")
@@ -198,7 +200,8 @@ def fetch(bid: str, out, *, client=None, timeout=120):
                 return client.req('/results', {'batch': bid, 'ref': ref, 'offset': offset, 'length': length}, timeout=timeout, raw=True)
             names, count, since, row_hash = set(), 0, 0, hashlib.sha256()
             pages = []
-            with _atomic(directory, 'rows.jsonl', binary=True) as output:
+            with tempfile.TemporaryFile(mode='w+b', dir=directory) as inventory, \
+                    _atomic(directory, 'rows.jsonl', binary=True) as output:
                 while True:
                     page_name = f'{since:012d}.json'
                     page_info = client.req('/batch/rows', {'batch': bid, 'since': since}, timeout=timeout,
@@ -223,16 +226,24 @@ def fetch(bid: str, out, *, client=None, timeout=120):
                         if name in names:
                             raise ValueError("duplicate result row")
                         names.add(name)
-                        result = clientresults.download(row, read, directory, verify_cached=True)
+                        result = clientresults.download(row, read, directory, verify_cached=True,
+                                                        guard=guard, download_outputs=False)
                         line = (json.dumps(result, separators=(',', ':')) + '\n').encode()
-                        output.write(line)
-                        row_hash.update(line)
+                        inventory.write(line)
                         count += 1
                     since = next_since
                     if count > before['items']:
                         raise ValueError("batch result inventory grew unexpectedly")
                 if count != before['items']:
                     raise RuntimeError("finished batch has missing result rows")
+                guard.check()  # Complete batch inventory, before downloading ANY output body.
+                inventory.seek(0)
+                for line in inventory:
+                    result = clientresults.download(json.loads(line), read, directory,
+                                                    verify_cached=True, guard=guard)
+                    encoded = (json.dumps(result, separators=(',', ':')) + '\n').encode()
+                    output.write(encoded)
+                    row_hash.update(encoded)
                 never_launched_ok = caps.get('batch_fetch_never_launched') == 1
                 logs = _logs(client, bid, directory, timeout, never_launched_ok)
                 audit = {}

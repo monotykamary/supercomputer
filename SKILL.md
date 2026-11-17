@@ -95,6 +95,14 @@ and transport capacity still apply. Example command:
 mkdir -p "$SUPERCOMPUTER_OUTPUT_DIR/proofs"
 cp proof.bin "$SUPERCOMPUTER_OUTPUT_DIR/proofs/proof.bin"
 ```
+Client collection inventories output manifests before copying file bodies and refuses a batch above **1 GiB**
+(1,073,741,824 logical output bytes), with per-item sizes and the largest paths. Remote outputs are not deleted.
+Override deliberately with `run --allow-large`, `batch fetch --allow-large`, or `SUPERCOMPUTER_FETCH_LIMIT=2GiB`
+(nonnegative integer bytes or KiB/MiB/GiB; zero allows only empty files). A refusal is not a reason to rerun jobs:
+recover the retained batch ID with `batch fetch` and an override before its normal history expiry. Row/result JSON
+and logs are separate. Programmatic sessions accept `allow_large=True` or `fetch_limit=bytes`; output-bearing
+callbacks wait for batch inventory. Prefer exporting results only. Obvious whole-tree output declarations/copies
+(.lake, build folders, node_modules) warn once per job at CLI submission.
 `supercomputer run --jobs jobs.json --out runs/x` downloads files to `runs/x/JOB.files/<relative-path>`, verifies
 SHA-256 before accepting each file, and retains a manifest. `collect()` remains bounded stdout/stderr only.
 Programmatic sessions add `output_files_ref`, `output_files_manifest`, and `output_files_dir` to the result row.

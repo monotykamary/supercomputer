@@ -11,7 +11,7 @@ from pathlib import Path
 import stat
 import uuid
 
-from . import resultfiles, resultjson
+from . import fetchguard, resultfiles, resultjson
 
 CHUNK_BYTES = resultfiles.CHUNK_BYTES
 
@@ -93,13 +93,33 @@ def _copy_file(store, ref, directory, parts):
                 pass
 
 
-def download(row: dict, read: callable, directory: Path, *, verify_cached: bool = False) -> dict:
+def _manifest_entries(manifest):
+    with _directory(manifest.parent) as parent:
+        fd = os.open(manifest.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, 'rb') as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError('manifest is not a regular file')
+            for descriptor in resultjson.iter_array(source):
+                if not isinstance(descriptor, dict) or 'path' not in descriptor:
+                    raise ValueError('invalid output file descriptor')
+                _relative_parts(descriptor['path'])
+                ref = {key: value for key, value in descriptor.items() if key != 'path'}
+                resultfiles.validate_ref(ref)
+                if ref['format'] != 'file':
+                    raise ValueError('output descriptor must reference a file')
+                yield descriptor
+
+
+def download(row: dict, read: callable, directory: Path, *, verify_cached: bool = False,
+             guard=None, download_outputs=True) -> dict:
     """Import verified references and materialize an optional output manifest.
 
     Large result/row JSON remains on disk, never decoded here. The manifest is
     decoded one bounded descriptor at a time. Each output file is independently
     atomic; a later failure may leave earlier, fully verified files in place.
-    No directories are created when the row has no references.
+    No directories are created when the row has no references. Output manifests
+    are inventoried before bodies; download_outputs=False gathers metadata only,
+    allowing the caller to check a complete batch before the first output copy.
     """
     out = dict(row)
     if not any(key in row for key in ('result_ref', 'row_ref', 'output_files_ref')):
@@ -133,6 +153,12 @@ def download(row: dict, read: callable, directory: Path, *, verify_cached: bool 
         if manifest_ref['format'] != 'json':
             raise ValueError('output manifest must be JSON')
         _, manifest = import_ref(manifest_ref)
+        guard = guard if guard is not None else fetchguard.FetchGuard()
+        guard.observe(_name(row), manifest_ref, _manifest_entries(manifest))
+        out['output_files_manifest'] = str(manifest)
+        if not download_outputs:
+            return out
+        guard.check()  # No output body or destination is touched before inventory approval.
         with _directory(files):
             pass
         with _directory(store.root) as parent:
@@ -151,6 +177,5 @@ def download(row: dict, read: callable, directory: Path, *, verify_cached: bool 
                         raise ValueError('output descriptor must reference a file')
                     ref, _ = import_ref(ref)
                     _copy_file(store, ref, files, parts)
-        out['output_files_manifest'] = str(manifest)
         out['output_files_dir'] = str(files)
     return out

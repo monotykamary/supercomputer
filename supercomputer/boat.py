@@ -67,7 +67,7 @@ import weakref
 # may remove or replace this package directory while an existing client waits.
 # Lazy imports at delivery (including error recovery) would then fail or mix
 # code from two installs. Both CLI and programmatic clients import boat first.
-from . import clientresults, config, lease_diagnostics, resultfiles, resultjson, resultrelay
+from . import clientresults, config, fetchguard, lease_diagnostics, outputwarnings, resultfiles, resultjson, resultrelay
 from .config import env, project
 from .rules import boat as R
 
@@ -201,7 +201,7 @@ def _stop_budget(issued: tuple[float, float]) -> float:
     elapsed = max(0.0, _stop_clock() - issued[0], time.monotonic() - issued[1])
     return min(90.0, max(0.0, 270.0 - elapsed))
 
-def stop_vm(vm: str, lease: dict | None = None) -> bool:
+def stop_vm(vm: str, lease: dict | None = None, *, preserve_disk: bool = False) -> bool:
     """Reserve provider capacity BEFORE fencing; never queue past STOP_S."""
     with _sem:
         slot = contextlib.nullcontext()
@@ -211,8 +211,11 @@ def stop_vm(vm: str, lease: dict | None = None) -> bool:
         budget = _stop_budget(issued)
         if budget < 1:
             return False
-        out = boat("stop", vm, "--yes", "--json", check=False, timeout=budget, sem=slot)
+        out = boat("stop", vm, "--yes", "--json", check=preserve_disk, timeout=budget, sem=slot)
         if R.stop_fallback("Final snapshot failed" in out or "stop aborted" in out) == "deleted":
+            if preserve_disk:
+                log(f"{vm}: stop failed; retaining output disk, never falling back to delete")
+                return False
             log(f"{vm}: boat cannot snapshot-stop it; fenced delete fallback")
             budget = _stop_budget(issued)
             if budget < 1:
@@ -1834,7 +1837,10 @@ class Session:
     created, each prepared with the batch's tree."""
 
     def __init__(self, label: str, idle: int | None = None, teardown: bool = False, vm_type: str = VM_TYPE, build: bool = True, oleans: bool = True,
-                 root: pathlib.Path | None = None, tar: bytes | None = None, caches: bool | None = None):
+                 root: pathlib.Path | None = None, tar: bytes | None = None, caches: bool | None = None,
+                 allow_large: bool = False, fetch_limit=None):
+        self.fetch_limit = fetchguard.resolve_limit(fetch_limit, allow_large=allow_large)
+        self.allow_large = allow_large
         self.batch = time.strftime("%Y%m%d-%H%M%S") + "-" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(6))
         self.label, self.idle, self.teardown, self.vm_type = label, idle, teardown, vm_type
         self.proj = project()
@@ -2462,6 +2468,9 @@ class Session:
         on_lost(item, reason) (else it's done with exit -1). With max_wait, if no VM is ready that many seconds after
         the start, or every VM is gone, what hasn't run goes to on_lost too."""
         config.reject_removed_backend("auto", items)
+        if not getattr(self, "_output_warnings_done", False):
+            for item in items:
+                outputwarnings.warn_broad_outputs(item)
         from .rules.agent_capabilities import required_agent_capabilities
         for it in items:
             required_agent_capabilities(it)
@@ -2475,6 +2484,9 @@ class Session:
         fate_of = lambda it: fates[it.get("orig", it["name"])]
         end = R.RunEnd()  # (when a run with no VM left revives, gives up or raises: rules.boat.RunEnd)
         lock = threading.Lock()
+        output_guard = fetchguard.FetchGuard(getattr(self, "fetch_limit", None),
+            allow_large=getattr(self, "allow_large", False), batch=self.batch)
+        pending_outputs, output_errors, output_acks = [], [], {}
         left = {"n": len(items)}
         self._enough = lambda without=None: len(queue) <= sum(v.slots for v in list(self.vms.values()) if not v.dead and not v.released and v is not without)
         started_threads, active, revived = set(), set(), False
@@ -2511,8 +2523,17 @@ class Session:
                     else:
                         on_done(orig, {"name": orig["name"], "code": -1, "seconds": -1, "error": lost_reason})
                 else:
-                    row = self._download_results(row, lambda ref, offset, count: self._result_chunk(client, row.get('batch', self.batch), row['name'], ref, offset, count)) if client is not None else row
-                    on_done(orig, {**row, "name": orig["name"]})
+                    source_row = row
+                    reader = lambda ref, offset, count: self._result_chunk(client, source_row.get('batch', self.batch), source_row['name'], ref, offset, count)
+                    row = self._download_results(row, reader, guard=output_guard, download_outputs=False) if client is not None else row
+                    if client is not None and 'output_files_ref' in row:
+                        with lock:
+                            pending_outputs.append((orig, row, reader))
+                    else:
+                        on_done(orig, {**row, "name": orig["name"]})
+            except Exception as exc:
+                with lock:
+                    output_errors.append(exc)
             finally:
                 with lock:
                     left["n"] -= 1
@@ -2561,7 +2582,7 @@ class Session:
                     with lock:
                         empty = not queue
                     if empty:
-                        if self.early and vm is not self.seed_vm and not vm.dead:
+                        if self.early and not pending_outputs and vm is not self.seed_vm and not vm.dead:
                             self._let_go(vm)
                         break
                     time.sleep(0.5 if vm.http else 2)  # what's left doesn't fit this VM now
@@ -2603,7 +2624,10 @@ class Session:
                     continue
                 for row in r.get("done", []):
                     name = row["name"]
-                    acks.append(name)
+                    if "output_files_ref" in row:
+                        output_acks.setdefault(vm.id, set()).add(name)
+                    else:
+                        acks.append(name)
                     if name in running:
                         it, t = running.pop(name)
                         vm.busy.append([t, time.time()])
@@ -2695,6 +2719,25 @@ class Session:
                 raise Unavailable("no VM left to run on" + (f" ({self.last_error})" if self.last_error else ""))
         all_done.wait(5)
         self._enough = None
+        if output_errors:
+            raise output_errors[0]
+        try:
+            output_guard.check()
+        except fetchguard.FetchLimitExceeded as exc:
+            self._output_fetch_refused = True
+            retained = ', '.join(sorted(output_acks))
+            raise fetchguard.FetchLimitExceeded(str(exc) + '\nLegacy cleanup preserves output disks and attempts non-destructive stops (including teardown): '
+                + retained + '. Resume stopped VM disks to export their unacknowledged results; these are not scheduler admissions.') from exc
+        for orig, row, reader in pending_outputs:
+            row = self._download_results(row, reader, guard=output_guard)
+            on_done(orig, {**row, "name": orig["name"]})
+        # resultpart refuses acknowledged legacy rows. ACK only after every
+        # body has been copied, never while another item is still running.
+        for vm in list(self.ready):
+            names = output_acks.get(vm.id)
+            if names and not vm.dead:
+                with contextlib.suppress(Exception):
+                    self._tick(vm, {"start": [], "acks": sorted(names), "wait": 0})
 
     @staticmethod
     def _result_chunk(client, bid, name, ref, offset, count):
@@ -2707,9 +2750,16 @@ class Session:
             raise ValueError('oversized result chunk')
         return data
 
-    def _download_results(self, row, reader):
+    def _download_results(self, row, reader, *, guard=None, download_outputs=True):
         directory = pathlib.Path(getattr(self, 'output_dir', config.HOME / 'results' / self.batch))
-        return clientresults.download(row, reader, directory)
+        if guard is None:
+            # Legacy direct sessions also account cumulatively across their batch.
+            if not hasattr(self, '_output_fetch_guard') or self._output_fetch_guard.batch != self.batch:
+                self._output_fetch_guard = fetchguard.FetchGuard(getattr(self, 'fetch_limit', None),
+                    allow_large=getattr(self, 'allow_large', False), batch=self.batch)
+            guard = self._output_fetch_guard
+        return clientresults.download(row, reader, directory, guard=guard, download_outputs=download_outputs)
+
 
     def call(self, module: str, fn: str, args, extra: dict | None = None, limit: int = 600):
         """One function of a runner on one of the session's VMs (the first ready), its result."""
@@ -2843,9 +2893,16 @@ class Session:
                 v.letting_go.join(timeout=60)
         vms = [v for v in list(self.vms.values()) if not v.skipped]
         keep = [v for v in vms if not v.released]  # (those let go early are the pool's already)
-        idle = self.idle if self.idle is not None else IDLE
+        preserve_outputs = getattr(self, "_output_fetch_refused", False)
+        if preserve_outputs:
+            # Legacy results have no controller spool. Stop (preserve disk),
+            # never delete their only copy, even when teardown was requested.
+            self.teardown = False
+        idle = 0 if preserve_outputs else self.idle if self.idle is not None else IDLE
         self.idle_used = idle
-        ttl = self.warm_ttls([v for v in keep if not v.dead]) if self.idle is None and not self.teardown else {}
+        ttl = {} if preserve_outputs else self.warm_ttls([v for v in keep if not v.dead]) if self.idle is None and not self.teardown else {}
+
+        output_stops = {}
 
         def wind(vm: VM):
             if kill and vm.t_ready and not vm.dead:
@@ -2864,13 +2921,21 @@ class Session:
                 if delete_vm(vm.id, vm.lease):
                     forget_agent(vm.id)
             elif ttl.get(vm.id, idle) <= 0:
-                stop_vm(vm.id, vm.lease)
+                if preserve_outputs:
+                    try:
+                        output_stops[vm.id] = stop_vm(vm.id, vm.lease, preserve_disk=True)
+                    except Exception:
+                        output_stops[vm.id] = False
+                else:
+                    stop_vm(vm.id, vm.lease)
             else:
                 shrink_ttl(vm.id, ttl.get(vm.id, idle), vm.lease)
         ts = [threading.Thread(target=wind, args=(vm,)) for vm in keep]
         [t.start() for t in ts]
         [t.join(timeout=400) for t in ts]
-        self._release([v.id for v in keep], deleted=self.teardown, idle=idle, up={v.id for v in keep if not v.dead}, ttl=ttl)
+        released = [v for v in keep if not preserve_outputs or output_stops.get(v.id)]
+        self._release([v.id for v in released], deleted=self.teardown, idle=idle,
+                      up=set() if preserve_outputs else {v.id for v in keep if not v.dead}, ttl=ttl)
         held = sum((v.t_end or time.time()) - v.t_request for v in vms if v.t_running)  # (a VM that never ran bills nothing)
         busy = sum(union(v.busy) for v in vms)
         ready_held = sum((v.t_end or time.time()) - v.t_ready for v in vms if v.t_ready)
@@ -2892,6 +2957,9 @@ class Session:
         ledger(batch=self.batch, label=self.label, project=self.proj.name, starts=s["starts"], created=s["created"], resumed=s["resumed"], warm=s["leased_running"],
                agents=s["warm"], vms=len(vms), slots=sum(v.slots for v in vms if v.t_ready), types=s["types"], kept=len(ttl), early=s["let_go_early"], unused=s["unused"],
                failed=self.counts["failed"], wall_s=round(time.time() - self.t0, 1), acct=bool(starts))
+        if preserve_outputs:
+            s["output_files_retained_on_stopped_vms"] = sorted(vm for vm, ok in output_stops.items() if ok)
+            s["output_files_stop_pending"] = [v.id for v in keep if not output_stops.get(v.id)]
         return s
 
     def warm_ttls(self, vms: list, held: int = 0) -> dict:
@@ -3279,6 +3347,9 @@ class Scheduled(Session):
     def _run(self, items: list[dict], on_done, on_start=None, on_lost=None, max_wait: int = 0, *,
              strict_once: bool | None = None, max_attempts: int | None = None):
         config.reject_removed_backend("auto", items)
+        if not getattr(self, "_output_warnings_done", False):
+            for item in items:
+                outputwarnings.warn_broad_outputs(item)
         strict_once = getattr(self, "strict_once", False) if strict_once is None else strict_once
         max_attempts = getattr(self, "max_attempts", 1) if max_attempts is None else max_attempts
         _validate_strict_options(strict_once, max_attempts)
@@ -3411,6 +3482,9 @@ class Scheduled(Session):
                 submit()
         self.submitted = True
         since, left, reread = 0, set(by), 0
+        output_guard = fetchguard.FetchGuard(getattr(self, "fetch_limit", None),
+            allow_large=getattr(self, "allow_large", False), batch=bid)
+        pending_outputs = []
         reports = R.Reports(len(left))  # (every item reported once, none dropped at the end: rules.boat.Reports)
         while left:
             if self.stop.is_set():
@@ -3442,7 +3516,8 @@ class Scheduled(Session):
                         self.client = self.sched.ensure_running()
                 continue
             for row in r.get("rows", []):
-                row = self._download_results(row, lambda ref, offset, count: self._request(bid, '/results', {'batch':bid, 'ref':ref, 'offset':offset, 'length':count}, timeout=120, raw=True))
+                row = self._download_results(row, lambda ref, offset, count: self._request(bid, '/results', {'batch':bid, 'ref':ref, 'offset':offset, 'length':count}, timeout=120, raw=True),
+                                             guard=output_guard, download_outputs=False)
                 since += 1
                 it = by.get(row["name"])
                 if it is None or not reports.row(row["name"] in left):
@@ -3454,7 +3529,11 @@ class Scheduled(Session):
                 if row.get("lost") and on_lost and not getattr(self, "retain_terminal_rows", False) and not strict_once and not it.get("cpu_model") and not required_agent_capabilities(it) and it.get("distinct_vm_group_scope") != "durable":
                     on_lost(it, row.get("error", "lost"))
                 else:
-                    on_done(it, self._strict_row(bid, row) if strict_once else row)
+                    row = self._strict_row(bid, row) if strict_once else row
+                    if "output_files_ref" in row:
+                        pending_outputs.append((it, row))
+                    else:
+                        on_done(it, row)
             if r.get("done") and not r.get("rows"):
                 # (done with items unreported: their rows read again from the first, a few times, before they count as
                 # lost; a scheduler before rules.Delivery said done with a row not yet delivered)
@@ -3481,6 +3560,15 @@ class Scheduled(Session):
                         row.update(lost=True, status="LOST", terminal=True, identity_unavailable=True)
                     on_done(by[name], row)
             left.clear()
+        # Streaming polls reveal sizes only as jobs finish. Delay output-bearing
+        # callbacks until every manifest is inventoried, so an over-limit batch
+        # never downloads even its first output body. Rows without files stream.
+        output_guard.check()
+        for it, row in pending_outputs:
+            row = self._download_results(row, lambda ref, offset, count: self._request(bid, '/results',
+                {'batch': bid, 'ref': ref, 'offset': offset, 'length': count}, timeout=120, raw=True),
+                guard=output_guard)
+            on_done(it, row)
 
     def collect(self) -> dict[str, dict]:
         if not self.client or not self.vm_ids:
@@ -3990,7 +4078,7 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
 
 
 def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int | None = None, teardown: bool = False, durations: str = "", vm_type: str = VM_TYPE,
-              max_vms: int = 0, on_lost=None, max_wait: int = 0, on_done=None, tar: bytes | None = None, klass: str | None = None, strict_once: bool = False, max_attempts: int = 1, retain_terminal_rows: bool = False) -> tuple[dict, dict]:
+              max_vms: int = 0, on_lost=None, max_wait: int = 0, on_done=None, tar: bytes | None = None, klass: str | None = None, strict_once: bool = False, max_attempts: int = 1, retain_terminal_rows: bool = False, allow_large: bool = False) -> tuple[dict, dict]:
     """supercomputer/run.py's jobs on the pool: {name: {code, seconds, out, err}} for those that ran, and the batch's figures.
     on_lost(name, reason) reports unserved work without disabling boat provisioning.
     With retain_terminal_rows, native terminal receipts stay in rows; only missing rows use on_lost."""
@@ -4000,6 +4088,8 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
         from .fanout import _strict_native
         _strict_native(spec, "boat")
     outdir = pathlib.Path(out)
+    for job in spec:
+        outputwarnings.warn_broad_outputs(job)
     past = last_durations(outdir, {j["name"] for j in spec}, durations)
     items, order = job_items(spec, pre, cmd, vm_type, past)
     cap_slots = TYPES[vm_type][0] // SLOT_CPU
@@ -4021,8 +4111,10 @@ def boat_jobs(spec: list[dict], out: str, pre: str, cmd, vms: int = 0, idle: int
             # (its class: --class or $SUPERCOMPUTER_CLASS; else a small batch is interactive, a bigger one a submission)
             given = klass or env("CLASS")  # (rules.boat.batch_class: given, else interactive when small, a submission else)
             sess = session(f"run {outdir.name}", klass=given or R.batch_class(False, "submission", small), idle=idle, teardown=teardown, vm_type=vm_type,
-                           build=True, tar=tar, **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
+                           build=True, tar=tar, **({"allow_large": True} if allow_large else {}),
+                           **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {}))
             sess.output_dir = outdir
+            sess._output_warnings_done = True
             sess.retain_terminal_rows = retain_terminal_rows
             sess.max_starts = max_vms
             sess.warm_only = False

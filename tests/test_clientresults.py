@@ -70,7 +70,7 @@ class DownloadTests(unittest.TestCase):
         with patch.object(resultjson, 'iter_array', wraps=resultjson.iter_array) as iterator, \
              patch('json.load', side_effect=AssertionError('bulk load')):
             out = cr.download(row, self.read, self.dest)
-        iterator.assert_called_once()
+        self.assertEqual(iterator.call_count, 2)  # preflight, then verified transfer
         directory = pathlib.Path(out['output_files_dir'])
         self.assertTrue(directory.is_absolute())
         self.assertEqual(directory.name, 'job.雪.files')

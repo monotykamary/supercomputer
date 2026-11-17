@@ -61,7 +61,7 @@ class ModalCtx:
 
 # ----------------------------------------------------------------------------------------------------- a jobs file
 def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, backend: str = "auto", vms: int = 0, idle: int | None = None, teardown: bool = False,
-             durations: str = "", vm_type: str = "large", max_vms: int = 0, max_wait: int = 120, tar: bytes | None = None, gpu_modal=None, strict_once: bool = False, max_attempts: int = 1):
+             durations: str = "", vm_type: str = "large", max_vms: int = 0, max_wait: int = 120, tar: bytes | None = None, gpu_modal=None, strict_once: bool = False, max_attempts: int = 1, allow_large: bool = False):
     """Run CPU jobs only on boat and GPU jobs only on RunPod.
 
     Legacy Modal callback arguments are accepted for API compatibility but are
@@ -141,7 +141,7 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, ba
         if reason is None:
             try:
                 got, bsum = boat.boat_jobs(pending, out, pre, cmd, vms=vms, idle=idle, teardown=teardown, durations=durations, vm_type=vm_type, max_vms=max_vms,
-                                           on_lost=None if strict_once else lost, max_wait=max_wait if backend == "auto" else 0, on_done=boat_done, tar=tar,
+                                           on_lost=None if strict_once else lost, max_wait=max_wait if backend == "auto" else 0, on_done=boat_done, tar=tar, **({"allow_large": True} if allow_large else {}),
                                            **({"strict_once": True, "max_attempts": max_attempts} if strict_once else {"retain_terminal_rows": True}))
             except boat.Unavailable as error:
                 if strict_once:
