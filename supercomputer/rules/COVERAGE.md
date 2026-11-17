@@ -129,6 +129,7 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `read_policy` | I/O | the policy file read (missing: generation 0); the generation's rule is Policy |
 | `write_policy` | rule | rules.scheduler.Policy.write: each write of the policy raises its generation by exactly one; a knob the policy doesn't have is refused, the generation unchanged |
 | `apply_policy` | rule | rules.scheduler.max_vms_of: a VM with no limit set has none |
+| `_break_even_by_class` | validation, not in a rule | break_even_by_class's value checked: classes that grow the pool, finite seconds >= 0, 0 dropped; the window it gives is rules.growth.class_break_even_s |
 | `code_hash` | I/O | the installed modules hashed (by mtime) |
 | `jlines` | I/O | a JSON-lines file, a torn last line skipped |
 | `vm_slots, vm_mult, pct` | I/O | arithmetic of a VM type and a percentile: no state |
@@ -173,7 +174,7 @@ why), or a decision not in a rule (with why: what the rules' subset can't state)
 | `_preempt_for` | rule | rules.scheduler.victims: a submission's item is never taken for another's; only interactive checks and gates take a sweep's slot; a submission takes a filler's only after sub_preempt_s |
 | `est_key, est_of, _learn` | decision, not in a rule | estimates (a moving average, a median, a scale): arithmetic with division of observed values; they size growth, they decide no state |
 | `_in_flight` | I/O | a count |
-| `_plan` | rule (the starts) / decision, not in a rule (the demand) | rules.scheduler.Pool.grow (starts are bounded by the bring-up cap; starts never take the pool past max_vms; no start while the breaker is open but one probe; one probe at a time); rules.growth.economic_start and gate_start prove marginal-work and deadline admission; gate_window consumes the batch deadline rather than resetting it; economic_vms floors fully funded VM workloads and gate_vms ceilings the deadline deficit (division by measured values boundary-tested in test_growth.py); break_even_s derives the economic window from hold and opportunity prices; 3x bring-up still guards ordinary growth |
+| `_plan` | rule (the starts) / decision, not in a rule (the demand) | rules.scheduler.Pool.grow (starts are bounded by the bring-up cap; starts never take the pool past max_vms; no start while the breaker is open but one probe; one probe at a time); rules.growth.economic_start and gate_start prove marginal-work and deadline admission; gate_window consumes the batch deadline rather than resetting it; economic_vms floors fully funded VM workloads and gate_vms ceilings the deadline deficit (division by measured values boundary-tested in test_growth.py); break_even_s derives the economic window from hold and opportunity prices; class_break_even_s shortens it for the classes break_even_by_class names, never lengthens it; 3x bring-up still guards ordinary growth |
 | `_ask` | I/O | acquisition off the loop, with a backoff |
 | `_acquire` | rule | rules.scheduler.Acquire: the starts of one acquisition never exceed its budget; never more than it wants; warm VMs come before any start |
 | `_bring` | I/O | a VM recorded and brought up |

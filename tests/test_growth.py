@@ -181,3 +181,61 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             test()
             print("ok", name)
+
+
+def test_class_break_even_rule():
+    assert G.class_break_even_s(1500, 0) == 1500
+    assert G.class_break_even_s(1500, 300) == 300
+    assert G.class_break_even_s(1500, 9000) == 1500
+    for args in ((0, 300), (1500, math.inf), (math.nan, 0)):
+        try:
+            G.class_break_even_s(*args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(args)
+
+
+def test_break_even_by_class_policy():
+    import json
+    S.POLICY.write_text(json.dumps({"hold_s": 2700}))
+    p = S.write_policy({"break_even_by_class": "submission=300,gate=120,interactive=0"})
+    assert p["break_even_by_class"] == {"submission": 300.0, "gate": 120.0}, p["break_even_by_class"]
+    assert S.write_policy({"break_even_by_class": '{"submission": 240}'})["break_even_by_class"] == {"submission": 240.0}
+    for bad in ("filler=300", "nope=1", "submission=-1", "submission=inf"):
+        try:
+            S.write_policy({"break_even_by_class": bad})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    saved = dict(S.BREAK_EVEN_BY_CLASS)
+    try:
+        S.apply_policy({**S.read_policy(), "break_even_by_class": {"filler": 1}})  # a hand-edited bad value: economics
+        assert S.BREAK_EVEN_BY_CLASS == {}
+    finally:
+        S.BREAK_EVEN_BY_CLASS = saved
+
+
+def test_submission_break_even_by_class_grows_beside_held_capacity():
+    """11-17 03:50: 13 submission items, ~20 min of work for the held VM; at the 1500 s economics no start, with
+    submission=300 the VMs that clear it in 5 min. Sweeps keep the economics: the same work as a sweep starts none."""
+    saved = dict(S.BREAK_EVEN_BY_CLASS)
+    try:
+        for klass, want in ((3, True), (4, False)):
+            S.BREAK_EVEN_BY_CLASS = {}
+            s = sched()
+            b = batch(s, klass=klass, n=40)
+            for it in b.items.values():
+                it.est = 60
+            vm(s, "held")
+            assert s._plan(S.time.time()) == {}, "economics: the held VM clears it within break-even"
+            S.BREAK_EVEN_BY_CLASS = {"submission": 300.0}
+            plan = s._plan(S.time.time())
+            n = sum(x for x, *_ in plan.values())
+            assert (n > 0) == want, (klass, plan, s.target)
+            if want:
+                (tgt,) = s.target.values()
+                assert tgt["by_class"]["submission"]["break_even_s"] == 300.0, tgt
+    finally:
+        S.BREAK_EVEN_BY_CLASS = saved

@@ -181,6 +181,7 @@ FLOOR_ALWAYS = _env("FLOOR_ALWAYS", 0) not in (0, "0", "")  # the floor held wit
 FLOOR_DEFAULT = int(_env("FLOOR_DEFAULT", 1))  # an image without a treadmill keeps this many VMs between bursts (no churn)...
 FLOOR_IDLE = float(_env("FLOOR_IDLE", 2700.0))  # ...while it had real work within this; past it none (a project that stopped)
 FLOOR_BY_IMAGE: dict = {}  # an image's own floor, replacing either (the policy's floor_by_image)
+BREAK_EVEN_BY_CLASS: dict = {}  # a class's shorter break-even, seconds (the policy's break_even_by_class; rules.class_break_even_s)
 DISK_MIN_MB = int(_env("DISK_MIN_MB", 10240))  # a VM with less free disk (or a tenth of a smaller disk) takes nothing (rules.disk_ok)
 DISK_GRACE_S = 120  # its agent's cleaning's time to free it; past it, a VM still low is deleted once empty (rules.disk_replaced)
 SUB_PREEMPT = _env("SUB_PREEMPT", 45.0)  # a submission item waiting this long takes a filler's slot (else at item ends; filler is the cheapest work to kill)
@@ -205,6 +206,9 @@ def policy_defaults() -> dict:
             "ttl_s": boat.BACKSTOP, "bringup": BRINGUP_MAX, "sub_vms": SUB_VMS, "sub_preempt_s": SUB_PREEMPT, "boat_tries": BOAT_TRIES, "classes": list(CLASSES),
             "drain_step": DRAIN_STEP, "drain_every_s": DRAIN_EVERY, "floor_always": bool(FLOOR_ALWAYS),
             "floor_default": FLOOR_DEFAULT, "floor_idle_s": FLOOR_IDLE, "floor_by_image": dict(FLOOR_BY_IMAGE),
+            # (a class's queued work, with every class above it, judged against a shorter break-even: latency over
+            # cost for the classes named, {"submission": 300}; never longer than the economics; unnamed: economics)
+            "break_even_by_class": dict(BREAK_EVEN_BY_CLASS),
             "cpu_model_max_fruitless": CPU_MODEL_MAX_FRUITLESS, "history_retention_hours": 48.0, "blob_cache_bytes": 8 * 1024 ** 3, "blob_cache_grace_s": 3600, "blob_cache_max_age_s": 7 * 86400,
             # The controller's disk (tiering.py): past tier_disk_pct closed batches older than tier_age_hours go cold (the
             # treadmill's first), past tier_urgent_pct every closed one; past disk_alert_pct an alert and a health breach;
@@ -222,6 +226,21 @@ def read_policy() -> dict:
     return {**policy_defaults(), "generation": 0}
 
 
+def _break_even_by_class(v: dict) -> dict:
+    """break_even_by_class's value checked: classes that grow the pool (filler never does), finite positive seconds;
+    0 drops a class back to the economics."""
+    out = {}
+    for a, b in v.items():
+        if str(a) not in CLASSES or CLASSES[str(a)] > 4:
+            raise ValueError(f"break_even_by_class: {a!r} is not a class that grows the pool (interactive, gate, submission, sweep)")
+        x = float(b)
+        if not math.isfinite(x) or x < 0:
+            raise ValueError(f"break_even_by_class: {a} must be finite seconds >= 0")
+        if x > 0:
+            out[str(a)] = x
+    return out
+
+
 def write_policy(changes: dict) -> dict:
     """The policy with `changes`, its generation one more; written whole, then renamed in (never half a file)."""
     p = read_policy()
@@ -234,8 +253,8 @@ def write_policy(changes: dict) -> dict:
             raise ValueError("history_retention_hours must be numeric")
         d = policy_defaults()[k]
         if isinstance(d, dict):  # (floor_by_image={"img": 0}, or img=n,img2=m)
-            v = v if isinstance(v, dict) else json.loads(v) if str(v).strip().startswith("{") else {a: int(b) for a, b in (x.split("=", 1) for x in str(v).split(",") if x)}
-            p[k] = {str(a): int(b) for a, b in v.items()}
+            v = v if isinstance(v, dict) else json.loads(v) if str(v).strip().startswith("{") else dict(x.split("=", 1) for x in str(v).split(",") if x)
+            p[k] = _break_even_by_class(v) if k == "break_even_by_class" else {str(a): int(b) for a, b in v.items()}
             continue
         p[k] = (str(v).lower() in ("1", "true", "yes")) if isinstance(d, bool) else type(d)(v) if not isinstance(d, list) else v
     rules.break_even_s(float(p["hold_s"]), float(p["start_dollars"]), float(p["vm_hour_dollars"]))
@@ -260,7 +279,7 @@ def write_policy(changes: dict) -> dict:
 
 
 def apply_policy(p: dict):
-    global MAX_VMS, HOLD, GATE_HORIZON, START_DOLLARS, VM_HOUR_DOLLARS, BRINGUP_MAX, SUB_VMS, SUB_PREEMPT, BOAT_TRIES, DRAIN_STEP, DRAIN_EVERY, FLOOR_ALWAYS, FLOOR_DEFAULT, FLOOR_IDLE, FLOOR_BY_IMAGE
+    global MAX_VMS, HOLD, GATE_HORIZON, START_DOLLARS, VM_HOUR_DOLLARS, BRINGUP_MAX, SUB_VMS, SUB_PREEMPT, BOAT_TRIES, DRAIN_STEP, DRAIN_EVERY, FLOOR_ALWAYS, FLOOR_DEFAULT, FLOOR_IDLE, FLOOR_BY_IMAGE, BREAK_EVEN_BY_CLASS
     MAX_VMS = rules.max_vms_of(int(p.get("max_vms") or 0))  # (0 or unset: no limit)
     HOLD, GATE_HORIZON = float(p["hold_s"]), float(p["gate_horizon_s"])
     START_DOLLARS, VM_HOUR_DOLLARS = float(p.get("start_dollars", START_DOLLARS)), float(p.get("vm_hour_dollars", VM_HOUR_DOLLARS))
@@ -270,6 +289,9 @@ def apply_policy(p: dict):
     FLOOR_ALWAYS = p.get("floor_always") in (True, 1, "1", "true", "True")
     FLOOR_DEFAULT, FLOOR_IDLE = max(0, int(p.get("floor_default", 1))), max(0.0, float(p.get("floor_idle_s", 2700.0)))
     FLOOR_BY_IMAGE = {str(a): int(b) for a, b in (p.get("floor_by_image") or {}).items()}
+    with contextlib.suppress(Exception):  # (a hand-edited bad value: the economics, never a dead policy tick)
+        BREAK_EVEN_BY_CLASS = {}
+        BREAK_EVEN_BY_CLASS = _break_even_by_class(p.get("break_even_by_class") or {})
 
 
 _code_cache: dict = {}
@@ -4252,21 +4274,24 @@ class Scheduler:
                 else:
                     e = self.est_of(it)
                 return (S if it.timing or distinct else it.weight) * e
-            work, subs = 0.0, {}
-            for it in real:
-                if it.batch.klass == 3:
-                    subs[it.batch.client] = subs.get(it.batch.client, 0.0) + sz(it)
-                else:
-                    work += sz(it)
-            contended = getattr(self, "_contended", None)
-            first = {}
-            for it in real:
-                if it.batch.klass == 3:
-                    first.setdefault(it.batch.client, it)
-            for c, w in subs.items():  # (a client's work past its share is demand while its share doesn't bind: the same
-                held_c = sum(x.weight for v in held for x in v.running.values() if x.batch.klass == 3 and x.batch.client == c)
-                binds = contended(first[c]) if contended is not None and c in first else (len(subs) > 1 or any(it.batch.klass <= 2 for it in real))
-                work += rules.sub_demand(w, max(0, SUB_VMS * S - held_c) * B, binds)  # contention placement reads, rules.contends)
+            def demand(items, B, held=held, S=S, sz=sz):
+                work, subs = 0.0, {}
+                for it in items:
+                    if it.batch.klass == 3:
+                        subs[it.batch.client] = subs.get(it.batch.client, 0.0) + sz(it)
+                    else:
+                        work += sz(it)
+                contended = getattr(self, "_contended", None)
+                first = {}
+                for it in items:
+                    if it.batch.klass == 3:
+                        first.setdefault(it.batch.client, it)
+                for c, w in subs.items():  # (a client's work past its share is demand while its share doesn't bind: the same
+                    held_c = sum(x.weight for v in held for x in v.running.values() if x.batch.klass == 3 and x.batch.client == c)
+                    binds = contended(first[c]) if contended is not None and c in first else (len(subs) > 1 or any(it.batch.klass <= 2 for it in items))
+                    work += rules.sub_demand(w, max(0, SUB_VMS * S - held_c) * B, binds)  # contention placement reads, rules.contends)
+                return work
+            work = demand(real, B)
             # (a running item's time left within h; one whose cleanup is unconfirmed (its admission closed, its cancel
             # pending) holds its slots throughout, never "ending now" past its estimate: 2026-11-16 11:00, 6 of 12 xlarge
             # so held by cancelled strict items, counted free, the xlarge deficit 0 beside 41 queued whole-VM items)
@@ -4292,6 +4317,20 @@ class Scheduler:
                 return total
             cap = sum(room(v, B, rules.usable_slots(v.slots, getattr(v, "foreign", 0), False), 4) for v in held) + coming * S_fit * B
             n_def = rules.economic_vms(work, cap, S_fit * B)
+            # (a class with a shorter break-even (the policy's break_even_by_class): its queued work and every class's
+            # above it, against what the held pool (what runs there, sweeps' too, until it ends) clears within that; a
+            # deficit there is a start, the economics' deficit for everything else still standing: 11-17 03:50, 13
+            # submission timing items queued ~20 min beside 4 idle xlarge, want 0 at 1500 s)
+            class_b = {}
+            for k_name, b_k in BREAK_EVEN_BY_CLASS.items():
+                k, B_k = CLASSES[k_name], rules.class_break_even_s(B, b_k)
+                mine = [it for it in real if it.batch.klass <= k]
+                if B_k >= B or not any(it.batch.klass == k for it in mine):
+                    continue
+                cap_k = sum(room(v, B_k, rules.usable_slots(v.slots, getattr(v, "foreign", 0), False), 4) for v in held) + coming * S_fit * B_k
+                n_k = rules.economic_vms(demand(mine, B_k), cap_k, S_fit * B_k)
+                class_b[k_name] = {"break_even_s": B_k, "deficit_vms": n_k}
+                n_def = max(n_def, n_k)
             hi = [it for it in real if it.batch.klass <= 2]
             n_hi = 0
             if hi:
@@ -4425,6 +4464,8 @@ class Scheduler:
                 if n > earned and free_fit:
                     self._h().record_needless(now, n - earned, image, vm_type)
             tgt = {"held": len(held), "coming": coming, "deficit_vms": n_def, "gate_vms": n_hi, "want": n, "work_slot_h": round(work / 3600, 2), "break_even_s": B, "growth_source": "legacy override" if BREAK_EVEN_OVERRIDE_S else "economics", "why": ""}
+            if class_b:
+                tgt["by_class"] = class_b
             fresh_target = False
             if model:
                 draw_key = (image, vm_type, model)

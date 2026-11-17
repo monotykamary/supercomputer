@@ -19,6 +19,17 @@ def break_even_s(hold_s: float, start_dollars: float, vm_hour_dollars: float, vm
     return max(hold_s, 3600.0 * start_dollars / vm_hour_dollars) / vm_multiplier
 
 
+# gdp: law a class's break-even never exceeds the economics: result <= economic
+# gdp: law an unset class keeps the economics: override > 0 or result == economic
+# gdp: law a set class shorter than the economics gets its own: override <= 0 or override >= economic or result == override
+def class_break_even_s(economic: float, override: float) -> float:
+    """A class's break-even: its policy override when shorter (latency over cost for the classes named, the
+    economics' guarantee for the rest), never a longer one."""
+    if not math.isfinite(economic) or economic <= 0 or not math.isfinite(override):
+        raise ValueError("finite positive economics and a finite override required")
+    return min(economic, override) if override > 0 else economic
+
+
 # gdp: law no needless start when held and coming capacity clears the queue: work > capacity or not result
 # gdp: law every economic start has a full VM of marginal work: not result or work - capacity >= vm_work
 # gdp: law a full VM of marginal work earns a start: work - capacity < vm_work or result
