@@ -2256,6 +2256,11 @@ class Scheduler:
         with self._unserialized():  # (waits and RPCs to workers: never under the request lock every mutation needs)
             return self._cancel_items(bid, b, items, deadline, item_wait)
 
+    def _cleanup_unaskable(self, b) -> bool:
+        """Every placed, unreaped item of a strict batch has no agent of its boot left (rules.boot_ended)."""
+        pend = [it for it in b.items.values() if it.owned.placements and not it.owned.reaped]
+        return bool(pend) and all((it.last_placement or {}).get("vm") and self._boot_ended(it.last_placement["vm"]) for it in pend)
+
     def _boot_ended(self, vid) -> bool:
         """rules.boot_ended from boat's inventory (read at most once a minute; unreadable: never ended)."""
         if not vid or vid in self.vms and not self.vms[vid].dead:
@@ -2313,12 +2318,6 @@ class Scheduler:
                 placed = it.owned.placements > 0
                 cached = self._matching_terminal_reap(it, it.terminal_reap)
                 receipt = it.terminal_reap["receipt"] if cached else None
-            ended = receipt is None and placed and (vm is None or vm.dead) and bool(identity) and bool(pl) and self._boot_ended(pl.get("vm"))
-            if ended:
-                # (no agent of its boot left to ask, and boat's inventory says that boot is over: its namespace cannot
-                # exist; the receipt says so, bound to the same identity, batch and run)
-                receipt = {"ok": True, "reaped": True, "namespace_absent": True, "identity": identity, "batch": bid,
-                           "name": name, "error": "boot ended (boat: VM stopped or deleted)"}
             if receipt is None and placed and vm is not None and identity:
                 try:
                     remaining = max(0, deadline - time.monotonic())
@@ -2346,7 +2345,7 @@ class Scheduler:
                 # Persist evidence first; never acknowledge a reap whose journal failed.
                 self._append_owned(bid, "cancel", {"name": it.name, "run_name": name,
                     "identity": identity, "matched": matched, "unplaced": not placed,
-                    "source": "terminal-reap" if cached else "boot-ended" if ended else "cancel-rpc", "receipt": {
+                    "source": "terminal-reap" if cached else "cancel-rpc", "receipt": {
                         k: receipt[k] for k in ("ok", "reaped", "namespace_absent", "identity", "batch", "name", "error") if k in receipt
                     } if isinstance(receipt, dict) else None, "t": time.time()})
                 if it.owned.confirm(matched):
@@ -3022,7 +3021,20 @@ class Scheduler:
                                and any(it.owned.placements and not it.owned.reaped for it in b.items.values()))
                     if not (gone or pending):
                         continue
-                    if gone:
+                    quiet = self.__dict__.setdefault("_abandon_quiet", {})
+                    if time.time() < quiet.get(b.id, 0.0):
+                        continue
+                    if pending and self._cleanup_unaskable(b):
+                        # (no agent of any pending item's boot is left to ask: boat says each of those VMs is stopped
+                        # or gone. A cancel can't prove their cleanup and never fabricates it (strict_once_vm_loss);
+                        # the batch stays retained, cleanup incomplete, and is looked at again hourly, not every
+                        # minute: 11-17, ~30 such batches, 14,506 journal lines in one, a log line each a minute)
+                        if b.id not in quiet:
+                            log(f"{b.id}: cleanup unprovable (the boots of its pending items are over); retained, cleanup incomplete, rechecked hourly")
+                        quiet[b.id] = time.time() + 3600
+                        continue
+                    if gone and b.id not in getattr(self, "_abandon_logged", set()):
+                        self._abandon_logged = getattr(self, "_abandon_logged", set()) | {b.id}
                         log(f"{b.id}: no client has asked for it in {ORPHAN_S} s: closed")  # (a client gone for good)
                     try:
                         if b.strict_once:

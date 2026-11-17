@@ -1,7 +1,9 @@
-"""11-17: ~30 retained strict batches whose VMs boat had long stopped or deleted asked for a cancel receipt every
-minute for days (14,506 journal lines in one), never closed: no agent of their boot was left to answer. boat's
-inventory saying that boot is over (the VM stopped, or absent from a complete listing) is the evidence
-(rules.boot_ended); a VM still running, or a partial listing, is not. Run on boat, like all test_*.py."""
+"""11-17: ~30 retained strict batches whose VMs boat had long stopped or deleted were asked for a cancel receipt
+every minute for days (14,506 journal lines in one, a log line each a minute). No agent of their boot is left to
+answer; their cleanup is never fabricated (strict_once_vm_loss: cleanup_complete stays false), but boat's inventory
+saying those boots are over (rules.boot_ended) makes the cleanup worker ask hourly, not every minute. A running VM, a
+partial or failed listing is not that. Run on boat, like all test_*.py."""
+import time
 import unittest
 from unittest.mock import patch
 
@@ -27,30 +29,42 @@ class BootEndedCleanup(unittest.TestCase):
         out.complete = complete
         return out
 
-    def test_deleted_vm_completes_cleanup(self):
+    def test_gone_vm_is_never_a_fabricated_cleanup(self):
         with self.gone(self.listing({})):
             r = self.s.cancel(self.b.id, 0)
-        self.assertTrue(r["cleanup_complete"], r)
-        self.assertFalse(self.vm.client.rpc.called)
-        self.assertNotIn(self.b.id, self.s.batches)
+            self.assertFalse(r.get("cleanup_complete") or r.get("complete"), r)
+            self.assertIn(self.b.id, self.s.batches)
+            self.assertTrue(self.s._cleanup_unaskable(self.b))
 
-    def test_stopped_vm_completes_cleanup(self):
+    def test_stopped_vm_is_unaskable(self):
         with self.gone(self.listing({self.vm.id: {"id": self.vm.id, "state": "stopped"}})):
-            r = self.s.cancel(self.b.id, 0)
-        self.assertTrue(r["cleanup_complete"], r)
+            self.s.cancel(self.b.id, 0)
+            self.assertTrue(self.s._cleanup_unaskable(self.b))
 
-    def test_running_vm_or_partial_listing_is_no_evidence(self):
+    def test_running_vm_or_partial_listing_is_still_asked(self):
         with self.gone(self.listing({self.vm.id: {"id": self.vm.id, "state": "running"}})):
-            r = self.s.cancel(self.b.id, 0)
-        self.assertFalse(r.get("complete") or r.get("cleanup_complete"), r)
+            self.s.cancel(self.b.id, 0)
+            self.assertFalse(self.s._cleanup_unaskable(self.b))
         self.s._inv_cache = None
         with patch.object(S.boat, "sandboxes", return_value=self.listing({}, complete=False)):
-            r = self.s.cancel(self.b.id, 0)
-        self.assertFalse(r.get("complete") or r.get("cleanup_complete"), r)
+            self.assertFalse(self.s._cleanup_unaskable(self.b))
         self.s._inv_cache = None
         with patch.object(S.boat, "sandboxes", side_effect=RuntimeError("boat down")):
-            r = self.s.cancel(self.b.id, 0)
-        self.assertFalse(r.get("complete") or r.get("cleanup_complete"), r)
+            self.assertFalse(self.s._cleanup_unaskable(self.b))
+
+    def test_abandon_worker_asks_hourly_not_every_minute(self):
+        with self.gone(self.listing({})):
+            self.s.cancel(self.b.id, 0)
+            calls = []
+            self.s.cancel = lambda *a, **k: calls.append(a) or {}
+            self.s.close = lambda *a, **k: calls.append(a) or {}
+            self.s.handing_off = False
+            for _ in range(2):
+                self.s._t_abandon = 0
+                with patch.object(S.threading, "Thread", lambda target, **k: type("T", (), {"start": lambda self: target()})()):
+                    self.s._abandon_tick()
+            self.assertEqual(calls, [])
+            self.assertGreater(self.s._abandon_quiet[self.b.id], time.time() + 3000)
 
     def test_rule(self):
         R = S.rules

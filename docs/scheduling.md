@@ -254,9 +254,10 @@ whose scheduler disappears never resurrects it while a controller configuration 
 - **A restart keeps the pool.** A signalled exit keeps idle VMs too, on a 600 s TTL, for the next process to take
   back warm; only an idle exit lets them go (`rules.keep_across_restart`). A SIGKILL leaves every lease for the next
   process.
-- **Strict cleanup when the boot is gone.** A retained strict item whose VM boat reports stopped, or leaves out of
-  a complete listing, has its cleanup proven by that (`rules.boot_ended`); a running VM or a partial listing is not
-  evidence.
+- **Strict cleanup when the boot is gone.** A retained strict batch whose pending items' VMs boat reports stopped,
+  or leaves out of a complete listing (`rules.boot_ended`), has no agent left to answer its cancel: it stays
+  retained with cleanup incomplete (a missing VM's cleanup is never fabricated) and is asked again hourly, not every
+  minute; "no client has asked" is logged once a batch.
 
 ## Worker-local failures and ghost recovery
 

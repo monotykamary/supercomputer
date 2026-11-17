@@ -879,10 +879,10 @@ def abandoned(now: float, t_poll: float, left: int, orphan_s: int) -> bool:
 # gdp: law a VM a complete listing leaves out has no boot: listed or not complete or result
 # gdp: law a stopped VM's boot has ended: not listed or not stopped or result
 def boot_ended(listed: bool, complete: bool, stopped: bool) -> bool:
-    """Whether boat's inventory proves a placement's boot is over (the VM deleted: absent from a complete listing; or
-    stopped), so its job namespace cannot exist: a strict item's cleanup evidence when no agent of that boot is left
-    to ask. Before: a retained strict batch whose VMs were gone asked for a receipt every minute for days (11-17:
-    ~30 batches, 14,506 cancel journal lines in one), never closed."""
+    """Whether boat's inventory says a placement's boot is over (the VM deleted: absent from a complete listing; or
+    stopped): no agent of that boot is left to ask for a cleanup receipt. Never a receipt itself (a missing VM's
+    cleanup is not fabricated); it only stops a retained strict batch's cancel being asked every minute (11-17: ~30
+    batches, 14,506 cancel journal lines in one), rechecked hourly instead."""
     return (complete and not listed) or (listed and stopped)
 
 
