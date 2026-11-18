@@ -54,6 +54,7 @@ import urllib.request
 from . import blobcache, boat, canary, config, health, history, lease_diagnostics, memorypressure, prelaunch, resultfiles, resultjournal, resultjson, rules, statebackup, statusview, tiering
 from .rules import tiering as tier_rules
 from . import namespace_recovery_controller as namespace_recovery
+from . import worker_loss
 from .rules.prelaunch import prelaunch_can_retry, prelaunch_not_started, prelaunch_transport_retryable
 from .durable_groups import DurableGroups, active as durable_active
 from .image_pins import ImagePins, RETENTION_SECONDS
@@ -352,7 +353,8 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
             "required_agent_capabilities_protocol": capabilities.get("required_agent_capabilities_protocol") == 1,
             "runtime_pins_protocol": type(capabilities.get("runtime_pins_protocol")) is int and capabilities["runtime_pins_protocol"] == 1,
             "resource_limits_protocol": type(capabilities.get("resource_limits_protocol")) is int and capabilities["resource_limits_protocol"] == 1,
-            "image_pins_protocol": type(capabilities.get("image_pins_protocol")) is int and capabilities["image_pins_protocol"] == 1}
+            "image_pins_protocol": type(capabilities.get("image_pins_protocol")) is int and capabilities["image_pins_protocol"] == 1,
+            "same_boot_namespace_recovery_protocol": capabilities.get("same_boot_namespace_recovery_protocol") == 1}
 
 
 def stage_install() -> dict:
@@ -450,6 +452,7 @@ class Item:
         self.last_placement = None
         self.terminal_reap = None  # durable native proof captured before result ACK / VM release
         self.terminal_loss = None  # diagnostic only: VM loss never proves namespace reap
+        self.worker_loss = None  # proven original launch is gone; separate from cleanup adoption
         self.state = "queued"  # queued | starting | running | preempting | done | cancel_pending
         self.vm = None
         self.tries = 0
@@ -1006,11 +1009,20 @@ class Scheduler:
                     if b.strict_once and it.owned.placements > 1:
                         raise ValueError("strict admission has multiple placements; quarantined")
                     it.owned.closed = b.admission_closed
+                if b.strict_once:
+                    for row in rows:
+                        it = b.items.get(row.get('name'))
+                        if it and row.get('terminal_reason') == 'worker-lost':
+                            if not worker_loss.matches(row.get('worker_loss'), namespace_recovery.binding_for(it)):
+                                raise ValueError('invalid worker-lost evidence')
+                            it.worker_loss = row['worker_loss']
+                            it.owned.cancel()
                 for receipt in self._read_journal(qd / f"{b.id}.cancel", enhanced):
                     it = b.items.get(receipt.get("name"))
-                    if receipt.get("source") == "vm-boot-extinction":
+                    if receipt.get("source") in ("vm-boot-extinction", worker_loss.SOURCE):
                         proof = receipt.get("proof")
-                        if it and it.owned.closed and namespace_recovery.validated_proof(DIR, it, proof):
+                        if (it and b.admission_closed
+                                and namespace_recovery.validated_proof(DIR, it, proof, receipt['source'])):
                             it.namespace_recovery = proof
                             it.owned.cancel()
                             it.owned.confirm(True)
@@ -1098,6 +1110,17 @@ class Scheduler:
                    and type(row.get("attempt")) is int and row["attempt"] == it.owned.placements)
         return rules.terminal_handoff_hold(it.batch.strict_once, it.state == "done", matched, it.batch.closed)
 
+    @staticmethod
+    def _restore_worker_loss_hold(vm, it):
+        """A cold start restores custody only on an already renewed exact original boot."""
+        pl = it.last_placement
+        key = (it.batch.id, pl['run_name'])
+        if (it.state == 'done' and not it.owned.reaped and it.worker_loss
+                and vm.id == pl['vm'] and vm.lease.get('boot') == pl['boot_id']
+                and vm.lease.get('owner') == pl['owner'] and key not in vm.running):
+            it.vm, it.run_name = vm, pl['run_name']
+            vm.running[key] = it
+
     def _take_pool(self):
         """At the start, before serving: every VM the previous scheduler held, in one write of the registry
         (rules.take_over), each held here at once, ready, as the handoff's snapshot (or the registry and the hold
@@ -1116,6 +1139,12 @@ class Scheduler:
             (DIR / "handoff.json").rename(DIR / "handoff.used.json")  # (read once: never taken for a later start's)
         old = int(snap.get("from_pid") or 0)
         info = {v["id"]: v for v in snap.get("vms", [])}
+        cold_loss_holds = {}
+        if not snap:
+            for batch in self.batches.values():
+                for item in batch.items.values():
+                    if getattr(item, 'worker_loss', None) and not item.owned.reaped:
+                        cold_loss_holds.setdefault(item.last_placement['vm'], []).append(item)
         # Refresh closes at the handoff, not at an observer's earlier baseline.
         closed = self._read_client_closes()
         for bid in closed:
@@ -1280,6 +1309,8 @@ class Scheduler:
                             it.state = "running"  # Observe only: never resend a strict start after restart.
                         else:
                             starting.append((it, vm))  # Legacy agents deduplicate the same run name.
+            for item in cold_loss_holds.get(vid, ()):
+                self._restore_worker_loss_hold(vm, item)
             self.vms[vid] = vm
         expected_items, invalid_items, superseded = {}, 0, []
         for v in info.values():
@@ -2015,13 +2046,14 @@ class Scheduler:
         finally:
             os.close(fd)
 
-    def _owned_failed(self, it, why, *, not_started=False):
+    def _owned_failed(self, it, why, *, not_started=False, loss_evidence=None):
         if it.state == "done" and any(r.get("name") == it.name for r in it.batch.rows):
             return
         # `lost` is a legacy retry request. A strict LOST is terminal, never that flag.
         evidence = durable_receipt(it)
         if it.batch.strict_once:
-            it.owned.cancel()  # A late report must not reopen a terminal attempt.
+            if loss_evidence is None:
+                it.owned.cancel()  # A late report must not reopen a terminal attempt.
             placement = dict(it.last_placement or {})
             evidence = {"status": "LOST", "terminal": True, "max_attempts": it.batch.max_attempts,
                         "attempts": it.owned.placements, "placement": placement,
@@ -2034,12 +2066,17 @@ class Scheduler:
             audit = self._prelaunch_evidence(it)
             if prelaunch_not_started(audit['complete'], audit['reserved'], audit['start_requested']):
                 evidence.update(status='NOT_STARTED', prelaunch_evidence=audit)
+        if loss_evidence is not None:
+            evidence.update(terminal_reason='worker-lost', worker_loss=loss_evidence)
         diagnostic = getattr(it.vm, 'lease_relinquishment', None)
         if isinstance(diagnostic, dict):
             evidence['lease_relinquishment'] = diagnostic
         self._deliver_owned(it.batch, {"name": it.name, "code": -1, "seconds": -1,
                           "error": why, "strict_once": it.batch.strict_once,
                           "launch_identity": it.launch_identity, **evidence})
+        if loss_evidence is not None:
+            it.worker_loss = loss_evidence
+            it.owned.cancel()  # Fence late results only after the loss row is durable.
         it.state = "done"
         it.fate.delivered()
 
@@ -2088,7 +2125,7 @@ class Scheduler:
                  "code_installed": installed,
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
-                "batch_fetch_protocol": 1, "batch_fetch_never_launched": 1, "closed_history_protocol": 1, "result_tiering_protocol": 1, "disk_guard_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "namespace_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
+                "batch_fetch_protocol": 1, "batch_fetch_never_launched": 1, "closed_history_protocol": 1, "result_tiering_protocol": 1, "disk_guard_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "namespace_recovery_protocol": 1, "same_boot_namespace_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
                 "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
                 "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
@@ -5313,6 +5350,64 @@ class Scheduler:
         vm._fails = 0
         self._poll_add(vm)
 
+    def _check_unreachable_item(self, vm, *, transport=None):
+        """Observe at most one exact original launch per unreachable VM per minute.
+
+        No provider lifecycle action, worker signal, ACK, or retry is authorized.
+        Keep the hold until ordinary close or separately authorized recovery.
+        """
+        now = time.monotonic()
+        with self.lock:
+            if not vm.running:
+                return
+            since = getattr(vm, '_item_failure_since', None)
+            if since is None:
+                since = vm._item_failure_since = now
+            blocked = (vm.dead or self.stop.is_set() or self.vms.get(vm.id) is not vm
+                       or getattr(self, 'handing_off', False) or getattr(self, 'recovery_blocked', False)
+                       or vm.id in getattr(self, '_namespace_recoveries', {}))
+            if blocked or not rules.worker_loss_allowed(True, bool(vm.quarantine), int(now - since), True):
+                return
+            if now < getattr(vm, '_next_item_loss_probe', 0):
+                return
+            candidates = sorted(key for key, it in vm.running.items()
+                                if it.batch.strict_once and it.state in ('running', 'cancel_pending')
+                                and it.start_done.is_set() and not it.owned.reaped)
+            if not candidates:
+                return
+            key = next((key for key in candidates if key > getattr(vm, '_last_item_loss_probe', ('', ''))),
+                       candidates[0])
+            vm._last_item_loss_probe = key
+            vm._next_item_loss_probe = now + worker_loss.PROBE_INTERVAL_S
+            it = vm.running[key]
+            try:
+                binding = namespace_recovery.binding_for(it)
+            except ValueError:
+                return
+            if (key != (binding['batch'], binding['run_name']) or binding['vm'] != vm.id
+                    or binding['owner'] != boat.owner_id()):
+                return
+        try:
+            evidence = worker_loss.probe(transport or namespace_recovery.NativeTransport(), binding)
+        except (OSError, ValueError, RuntimeError, IndexError):
+            return  # SSH/permission/timeout/parse failure is not absence.
+        with self.lock:
+            if not rules.worker_loss_allowed(it.start_done.is_set(), bool(vm.quarantine),
+                                             int(time.monotonic() - since), evidence is not None):
+                return
+            if (self.stop.is_set() or getattr(self, 'handing_off', False) or getattr(self, 'recovery_blocked', False)
+                    or vm.id in getattr(self, '_namespace_recoveries', {}) or vm.dead
+                    or self.vms.get(vm.id) is not vm or vm.running.get(key) is not it
+                    or self.batches.get(it.batch.id) is not it.batch or it.state not in ('running', 'cancel_pending')
+                    or not it.start_done.is_set() or it.owned.reaped
+                    or getattr(vm, '_item_failure_since', None) != since
+                    or namespace_recovery.binding_for(it) != binding):
+                return
+            self._owned_failed(it, 'worker-lost: original supervisor and private PID namespace absent',
+                               loss_evidence=evidence)
+            self.wake.set()
+        log(f'{vm.id}: worker-lost {binding["batch"]}/{binding["run_name"]}; cleanup custody retained')
+
     def _tick(self, vm: VMState) -> float | None:
         """One tick of the VM (a call that waits for nothing): the seconds until its next, None when it's done."""
         if vm.dead:
@@ -5335,6 +5430,7 @@ class Scheduler:
                                               error=error, operation='lease/renew')
                     self._lost_vm(vm)
                     return None
+                self._check_unreachable_item(vm)
                 return 5.0
             with self.lock:
                 if vm.dead or self.stop.is_set() or (getattr(vm, "renewal_pending", False) and self.vms.get(vm.id) is not vm):
@@ -5387,6 +5483,7 @@ class Scheduler:
                 return None
             r["done"] = owned_done + r.get("done", [])
             vm._fails, vm.failing = 0, 0
+            vm._item_failure_since = None
             if vm.quarantine:
                 log(f"{vm.id}: worker quarantine cleared by a successful tick")
                 vm.quarantine, vm.quarantine_since = "", 0.0
@@ -5425,6 +5522,8 @@ class Scheduler:
                 self._note_lease_relinquish(vm, source='tick.provider_lost', error=e, operation='rpc/vtick')
                 self._lost_vm(vm)
                 return None
+            # Preserve every existing retry/ack before probing or writing a loss row.
+            self._check_unreachable_item(vm)
             return float(min(20, 2 * fails))
         if self.stop.is_set():
             return None  # The successor owns observations after the frozen snapshot.
@@ -5709,8 +5808,9 @@ class Scheduler:
             if it is None:
                 b = self.batches.get(key[0])
                 if b and b.strict_once:
-                    prior = next((x for x in b.items.values() if x.run_name == key[1]), None)
-                    return bool(prior and prior.last_placement
+                    prior = next((x for x in b.items.values() if (x.last_placement or {}).get('run_name') == key[1]), None)
+                    return bool(prior and (not getattr(prior, 'worker_loss', None) or prior.owned.reaped)
+                                and prior.last_placement
                                 and prior.last_placement.get("vm") == vm.id
                                 and self._result_identity_matches(prior, row)
                                 and any(r.get("name") == prior.name for r in b.rows))
@@ -6537,6 +6637,13 @@ class Scheduler:
                 required_durable = bool(self._durable_snapshot()) or any(durable_item(it) for b in self.batches.values() for it in b.items.values())
                 if not all(rules.distinct_history_matches(required_durable, prepared[target].get("durable_distinct_vm_group") is True) for target in candidates):
                     self.alert("handoff refused: durable distinct VM groups require a durable-group-aware successor")
+                    return
+                required_same_boot = any((getattr(it, 'worker_loss', None) or
+                                          (getattr(it, 'namespace_recovery', None) or {}).get('kind') == worker_loss.SOURCE)
+                                         for b in self.batches.values() for it in b.items.values())
+                if required_same_boot and not all(prepared[target].get('same_boot_namespace_recovery_protocol') is True
+                                                  for target in candidates):
+                    self.alert('handoff refused: retained worker-loss custody requires a same-boot-aware successor')
                     return
                 required_image_pins = bool(self._image_pins_manifest()["records"])
                 if required_image_pins and not all(prepared[target].get("image_pins_protocol") is True for target in candidates):

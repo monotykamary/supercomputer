@@ -33,3 +33,10 @@ def ghost_slot(strict: bool, complete: bool, recorded: bool, live: bool, descend
 # gdp: law live or unknown legacy work forbids an agent upgrade: not result or not live_or_unknown or same_agent
 def worker_repair_allowed(strict: bool, live_or_unknown: bool, same_agent: bool) -> bool:
     return not strict and (not live_or_unknown or same_agent)
+
+
+# gdp: law worker loss requires settled launch: not result or start_settled
+# gdp: law worker loss requires quarantine or sustained failure: not result or quarantined or failure_age >= 120
+# gdp: law worker loss requires matching absence evidence: not result or absence_proven
+def worker_loss_allowed(start_settled: bool, quarantined: bool, failure_age: int, absence_proven: bool) -> bool:
+    return start_settled and (quarantined or failure_age >= 120) and absence_proven

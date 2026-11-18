@@ -24,3 +24,8 @@ def upgrade_owned(strict: bool, live_or_unknown: bool, same_agent: bool) -> bool
 # gdp: law an isolated worker failure is not a pool outage: not result or failing >= 2
 def one_worker_outage(ready: int, failing: int) -> bool:
     return ready >= 2 and failing * 2 >= ready
+
+
+# gdp: law worker loss requires matching absence evidence: not result or absence_proven
+def infer_loss_from_unreachability(start_settled: bool, quarantined: bool, failure_age: int, absence_proven: bool) -> bool:
+    return start_settled and (quarantined or failure_age >= 120)

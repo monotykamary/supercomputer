@@ -4,9 +4,12 @@ No PID scan, unqualified missing VM, or successful stop invocation is an
 extinction proof. The recovery engine requires a fresh changed kernel boot.
 """
 import base64
+from contextlib import nullcontext
 import hashlib
 import json
+from pathlib import Path
 import re
+import subprocess
 import time
 import uuid
 
@@ -67,21 +70,38 @@ class NativeTransport:
             raise TimeoutError('namespace recovery deadline expired')
         return min(cap, left)
 
-    def _exec(self, vm, script, data, deadline):
+    def _exec(self, vm, script, data, deadline, *, privileged=False):
         # Only immutable provider IDs, never aliases, names, hostnames or an
         # address copied from a snapshot. Authenticate the provider binding
         # independently of the guest-writable lease file before every read.
         if not isinstance(vm, str) or not re.fullmatch(r'bx_[A-Za-z0-9]+', vm):
             raise ValueError('immutable provider VM ID required')
-        observed = boat.bj('info', vm, timeout=self._remaining(deadline, 15)).get('sandbox', {})
+        if privileged:  # The bounded native probe already owns a provider CLI slot.
+            observed = json.loads(boat.boat('info', vm, '--json', sem=nullcontext(),
+                                            timeout=self._remaining(deadline, 15))).get('sandbox', {})
+        else:
+            observed = boat.bj('info', vm, timeout=self._remaining(deadline, 15)).get('sandbox', {})
         if observed.get('id') != vm or observed.get('access') != 'owner':
             raise ValueError('provider VM identity/ownership did not match')
         encoded = base64.b64encode(script.encode()).decode()
         request = base64.b64encode(json.dumps(data).encode()).decode()
-        out = boat.boat('ssh', vm, '--', 'python3', '-c',
+        python = ('sudo', '-n', 'python3', '-I') if privileged else ('python3',)
+        out = boat.boat('ssh', vm, '--', *python, '-c',
                         'import base64,sys;exec(base64.b64decode(sys.argv[1]))', encoded, request,
-                        timeout=self._remaining(deadline))
+                        timeout=self._remaining(deadline), sem=nullcontext() if privileged else None)
         return json.loads(out.strip().splitlines()[-1])
+
+    def read_namespace_absence(self, binding, nonce, *, deadline, allow_published=False):
+        source = Path(__file__).with_name('worker_loss_probe.py').read_text()
+        if not boat._sem.acquire(timeout=self._remaining(deadline)):
+            raise TimeoutError('native namespace probe could not obtain an SSH slot')
+        try:
+            data = {'binding': binding, 'nonce': nonce, 'allow_published': allow_published}
+            return self._exec(binding['vm'], source, data, deadline, privileged=True)
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError('native namespace probe timed out') from error
+        finally:
+            boat._sem.release()
 
     def read_capsule(self, binding, nonce, fence=None, *, deadline):
         # Fence validation belongs to the engine, against this fresh native

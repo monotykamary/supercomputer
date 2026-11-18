@@ -8,7 +8,7 @@ import hashlib
 import os
 import re
 
-from . import boat, history, namespace_recovery
+from . import boat, history, namespace_recovery, worker_loss
 from .namespace_recovery_transport import NativeTransport
 
 
@@ -30,18 +30,59 @@ def _storage(root, value, suffix=''):
     return root / 'namespace-recovery' / (value + suffix + '.json')
 
 
-def validated_proof(root, item, proof):
+def _live_intent_id(binding):
+    return namespace_recovery.digest({'binding': binding, 'source': worker_loss.SOURCE})
+
+
+def _valid_live_proof(proof, binding, intent):
+    key = _live_intent_id(binding)
+    return (intent.get('kind') == 'same-boot-namespace-intent/v1' and intent.get('binding') == binding
+            and intent.get('intent_id') == key and isinstance(intent.get('reference'), str)
+            and bool(intent['reference'].strip()) and proof.get('intent_id') == key
+            and proof.get('reference') == intent['reference'] and proof.get('kind') == worker_loss.SOURCE
+            and worker_loss.matches(proof.get('evidence'), binding, allow_published=True))
+
+
+def _recover_live(transport, binding, reference, load_intent, persist_intent, persist_proof, root):
+    key = _live_intent_id(binding)
+    intent = load_intent(key)
+    if intent is not None:
+        try:
+            stored = history.load(_storage(root, key, '.proof'))
+        except FileNotFoundError:
+            pass
+        else:
+            if _valid_live_proof(stored, binding, intent):
+                return stored
+            raise ValueError('persisted same-boot proof did not validate')
+    evidence = worker_loss.probe(transport, binding, allow_published=True)
+    if evidence is None:
+        raise namespace_recovery.RecoveryError('original supervisor and private PID namespace absence unproven')
+    intent = {'kind': 'same-boot-namespace-intent/v1', 'intent_id': key,
+              'binding': binding, 'reference': reference}
+    proof = {'kind': worker_loss.SOURCE, 'intent_id': key, 'reference': reference, 'evidence': evidence}
+    persist_intent(intent)
+    persist_proof(proof)
+    return proof
+
+
+def validated_proof(root, item, proof, source='vm-boot-extinction'):
     try:
         intent_id = proof['intent_id']
         intent = history.load(_storage(root, intent_id))
         stored = history.load(_storage(root, intent_id, '.proof'))
-        return stored == proof and namespace_recovery.validate_proof(proof, binding_for(item), intent)
+        binding = binding_for(item)
+        if stored != proof:
+            return False
+        if source == worker_loss.SOURCE:
+            return _valid_live_proof(proof, binding, intent)
+        return source == 'vm-boot-extinction' and namespace_recovery.validate_proof(proof, binding, intent)
     except (KeyError, ValueError, TypeError, OSError):
         return False
 
 
 def recover(scheduler, root, request, transport=None):
-    if (request.get('protocol') != 1 or request.get('mode') not in ('observe-boot', 'reboot-owned-vm')
+    if (request.get('protocol') != 1 or request.get('mode') not in ('observe-boot', 'observe-namespace', 'reboot-owned-vm')
             or request.get('authorized') is not True
             or not isinstance(request.get('authorization_reference'), str)
             or not request['authorization_reference'].strip()):
@@ -111,8 +152,13 @@ def recover(scheduler, root, request, transport=None):
             existing = load_intent(namespace_recovery.intent_id(binding))
             if existing and existing.get('state') == 'pending' and existing.get('method') != 'observed-boot-replacement':
                 # A pending stop intent can only be observed, never stopped again.
+                if mode == 'observe-namespace':
+                    raise ValueError('pending reboot intent must be resolved via boot observation')
                 proof = namespace_recovery.verify_pending_boot(transport or NativeTransport(), binding=binding,
                     persist_intent=persist_intent, load_intent=load_intent, persist_proof=persist_proof)
+            elif mode == 'observe-namespace':
+                proof = _recover_live(transport or NativeTransport(), binding, request['authorization_reference'],
+                                      load_intent, persist_intent, persist_proof, root)
             else:
                 proof = fn(transport or NativeTransport(), binding=binding, authorization=authorization,
                            persist_intent=persist_intent, load_intent=load_intent, persist_proof=persist_proof)
@@ -120,11 +166,12 @@ def recover(scheduler, root, request, transport=None):
             if (getattr(scheduler, 'handing_off', False) or getattr(scheduler, 'recovery_blocked', False)
                     or scheduler.batches.get(bid) is not batch or binding_for(item) != binding):
                 raise ValueError('original placement changed while recovering')
-            if not validated_proof(root, item, proof):
-                raise ValueError('durable boot-extinction proof did not validate')
+            source = worker_loss.SOURCE if mode == 'observe-namespace' else 'vm-boot-extinction'
+            if not validated_proof(root, item, proof, source):
+                raise ValueError('durable namespace recovery proof did not validate')
             scheduler._append_owned(bid, 'cancel', {'name': name, 'run_name': binding['run_name'],
                 'identity': binding['launch_identity'], 'admission_closed': True, 'matched': True,
-                'source': 'vm-boot-extinction', 'proof': proof})
+                'source': source, 'proof': proof})
             item.namespace_recovery = proof
             item.owned.cancel()
             item.owned.confirm(True)

@@ -164,6 +164,31 @@ retroactively upgrade external audit dispositions or change original rows.
 An unreachable/dead worker, timeout, mismatched reply
 or failed custody write is not success.
 
+### Proven worker loss on a live boot
+
+A worker endpoint quarantine, or 120 seconds of continuing worker failures,
+allows a bounded, read-only check on at most one settled strict attempt per
+worker per minute. The controller uses provider-authenticated SSH to the exact
+VM, independently of the agent RPC. The check must bind the durable strict
+launch and worker boot, find both the original supervisor and verified private
+PID1 birth identities gone in an unrestricted initial procfs view, and see no
+member of that PID namespace. Missing birth records, PID visibility or permissions
+are unknown, not evidence of absence. A live supervisor, namespace member or
+already-published result vetoes the transition. Legacy
+jobs, which lack this provenance, do not use this path.
+
+The controller persists a `LOST` result with `terminal_reason: "worker-lost"`
+and `worker_loss` evidence before fencing that attempt. No payload is retried
+and no VM is stopped or repaired by this check. Terminal loss does not close the
+admission or prove cleanup; custody is retained. After strict close has fenced
+the admission, `recover-namespace --mode observe-namespace` (with the same
+original identity and explicit authorization shown below) can collect a fresh
+same-boot observation. It records separate `same-boot-namespace-absence`
+cleanup evidence, without signaling processes, mutating worker state, or
+requiring a different boot. An unresolved sibling retains its own custody and
+keeps the batch close incomplete. An unverified namespace still requires the
+original boot-extinction path below.
+
 ### Explicit recovery when original namespace custody was lost
 
 A failed pre-payload namespace handshake can leave an exited supervisor without
