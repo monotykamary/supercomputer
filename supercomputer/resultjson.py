@@ -16,7 +16,7 @@ _METADATA_BYTES = 4096
 _WRAPPER_BYTES = 16 * 1024 * 1024
 _FIELDS = frozenset(('batch', 'name', 'run_name', 'code', 'seconds', 'vm',
                      'placement', 'launch_identity', 'lost', 'preempted',
-                     'error', 'result_ref', 'output_files_ref'))
+                     'error', 'result_ref', 'output_files_ref', 'toolchain'))
 _SPECIAL = re.compile(rb'["\\\x00-\x1f]')
 # Consume runs of ordinary bytes AND complete escapes in C. The fallback below
 # handles a single escape split across input chunks and reports malformed ones.
@@ -290,6 +290,31 @@ class _Reader:
                 return projection
         finally:
             self.row_depth -= 1
+
+
+def read_toolchain(stream):
+    """Read only the bounded toolchain field of a verified, possibly huge row."""
+    reader = _Reader(stream)
+    reader.row_depth = 1  # skipped row fields do not consume the envelope budget
+    reader.space()
+    reader.expect(b'{')
+    reader.space()
+    while reader.peek() != b'}':
+        with reader.capture(_METADATA_BYTES) as key:
+            reader.string()
+        reader.space()
+        reader.expect(b':')
+        if key.data == b'"toolchain"':
+            with reader.capture(256 * 1024) as field:
+                reader.value(False)
+            return json.loads(field.data) if field.data is not None else None
+        reader.value(False)
+        reader.space()
+        if reader.peek() == b'}':
+            break
+        reader.expect(b',')
+        reader.space()
+    return None
 
 
 def load_response(stream, store_for_batch):

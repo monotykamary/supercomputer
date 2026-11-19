@@ -12,12 +12,13 @@ import math
 import os
 import pathlib
 import queue
+import shlex
 import shutil
 import sys
 import threading
 import time
 
-from . import boat, config
+from . import boat, config, toolchain
 from .rules import fallback
 from .rules.agent_capabilities import required_agent_capabilities
 from .config import project
@@ -61,7 +62,7 @@ class ModalCtx:
 
 # ----------------------------------------------------------------------------------------------------- a jobs file
 def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, backend: str = "auto", vms: int = 0, idle: int | None = None, teardown: bool = False,
-             durations: str = "", vm_type: str = "large", max_vms: int = 0, max_wait: int = 120, tar: bytes | None = None, gpu_modal=None, strict_once: bool = False, max_attempts: int = 1, allow_large: bool = False):
+             durations: str = "", vm_type: str = "large", max_vms: int = 0, max_wait: int = 120, tar: bytes | None = None, gpu_modal=None, strict_once: bool = False, max_attempts: int = 1, allow_large: bool = False, cli_env=None):
     """Run CPU jobs only on boat and GPU jobs only on RunPod.
 
     Legacy Modal callback arguments are accepted for API compatibility but are
@@ -121,12 +122,13 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, ba
     if gpu:
         from . import runpod
         # Per-job routing has already been checked. GPU jobs never reach boat.
-        got, locations, failures = runpod.gpu_jobs(gpu, out, pre, cmd, backend="runpod" if backend == "runpod" else "auto", on_done=printer)
+        gpu_pre = pre + "".join(f"export {key}={shlex.quote(value)}; " for key, value in (cli_env or {}).items())
+        got, locations, failures = runpod.gpu_jobs(gpu, out, gpu_pre, cmd, backend="runpod" if backend == "runpod" else "auto", on_done=printer)
         rows.update(got)
         where.update(locations)
         reasons.update(failures)
     cpu = [job for job in spec if not job.get("gpu")]
-    pending = list(cpu)
+    pending = [{**job, "env": {**job.get("env", {}), **cli_env}} for job in cpu] if cli_env else list(cpu)
     from . import scheduler as _sch
     for attempt in range(1 if strict_once else 3):
         if not pending:
@@ -167,6 +169,19 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, ba
     placed = {name: rows[name]["placement"] for name in order if isinstance(rows.get(name, {}).get("placement"), dict)}
     if placed:
         (outdir / "placement.json").write_text(json.dumps(placed, indent=1))
+    assessment = toolchain.BatchToolchains()
+    receipts = {}
+    for name in order:
+        if where.get(name) == "boat":
+            row = rows.get(name, {})
+            assessment.observe({**row, "name": name})
+            if "toolchain" in row:
+                receipts[name] = row["toolchain"]
+    toolchains = assessment.summary() if cpu else None
+    if cpu:
+        (outdir / "toolchain.json").write_text(json.dumps({"batch": toolchains, "jobs": receipts}, indent=2) + "\n")
+        if toolchains["mixed"]:
+            log("mixed launch toolchains: see toolchain.json; native job exits are unchanged")
     (outdir / "summary.tsv").write_text("".join(f"{name}\t{rows.get(name, {}).get('code', -1)}\t{rows.get(name, {}).get('seconds', -1)}\t{where.get(name, '-')}\n" for name in order))
     wall = round(time.time() - t0, 1)
     done = [rows.get(name, {"code": -1, "seconds": -1}) for name in order]
@@ -180,8 +195,8 @@ def run_jobs(app, spec: list[dict], out: str, pre: str, cmd, modal_jobs=None, ba
         print(f"timing: {len(timed)} jobs each alone on its VM ({max(p['co_tenants'] for p in timed)} co-tenants): {'; '.join(kinds)}")
     if bsum:
         print(boat.summary_line(bsum))
-    (outdir / "backends.json").write_text(json.dumps({"backend": backend, "wall_s": wall, "where": count(where), "fallbacks": [], "failures": reasons, "boat": bsum}, indent=1))
-    return 3 if failed else 0
+    (outdir / "backends.json").write_text(json.dumps({"backend": backend, "wall_s": wall, "where": count(where), "fallbacks": [], "failures": reasons, "boat": bsum, "toolchain": toolchains}, indent=1))
+    return 3 if failed or (toolchains and toolchains["mixed"]) else 0
 
 
 def _strict_native(spec: list[dict], backend: str):

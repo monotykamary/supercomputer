@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import sys
 
 from . import config
@@ -38,7 +39,13 @@ def _run(a):
         raise SystemExit("--strict-once requires --max-attempts 1")
     controller.maybe_sync()
     p = config.project()
-    pre = p.cfg.get("run", {}).get("pre", "") + "".join(f"export {kv}; " for kv in a.env)
+    pre = p.cfg.get("run", {}).get("pre", "")
+    overrides = {}
+    for assignment in a.env:
+        key, separator, value = assignment.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or "\0" in value:
+            raise SystemExit("--env requires a literal NAME=VALUE assignment")
+        overrides[key] = value
     cmd = lambda c: c
     app, mjobs = None, None
     if a.sc_class:
@@ -55,7 +62,7 @@ def _run(a):
     a.vm_type = a.vm_type or os.environ.get("SUPERCOMPUTER_VM") or "large"
     return fanout.run_jobs(app, spec, a.out, pre, cmd, mjobs, backend=a.backend, vms=a.vms, idle=None if a.idle < 0 else a.idle, teardown=a.teardown,
                     durations=a.durations, vm_type=a.vm_type, max_vms=a.max_vms, max_wait=a.max_wait,
-                    strict_once=strict_once, max_attempts=getattr(a, "max_attempts", 1), allow_large=getattr(a, "allow_large", False))
+                    strict_once=strict_once, max_attempts=getattr(a, "max_attempts", 1), allow_large=getattr(a, "allow_large", False), cli_env=overrides)
 
 
 def _remote_queue(a):
@@ -212,7 +219,7 @@ def main(argv=None):
     r.add_argument("--out", required=True)
     r.add_argument("--allow-large", action="store_true", help="allow output files above the default 1 GiB fetch limit")
     r.add_argument("--backend", default="auto", choices=["auto", "boat", "modal", "runpod"])
-    r.add_argument("--env", action="append", default=[], help="K=V exported before every job's command")
+    r.add_argument("--env", action="append", default=[], help="literal K=V in each job environment (no shell expansion)")
     r.add_argument("--vms", type=int, default=0)
     r.add_argument("--max-vms", type=int, default=0)
     r.add_argument("--idle", type=int, default=-1)

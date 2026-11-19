@@ -7,7 +7,7 @@ only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README a
 - `supercomputer run --jobs jobs.json --out runs/x [--class C] [--timing] [--data DIR[:DEST]] [--env K=V]`
 - jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?, "distinct_vm_group"?, "distinct_vm_group_scope"?, "distinct_vm_group_generation"?, "required_agent_capabilities"?, "runtime"?}]`;
   `cmd` runs under bash in `<repo>/<cwd>`; logs in `<out>/<name>.log`, `<out>/summary.tsv` (name, exit, seconds, where).
-  The CLI exits 0 only when every job has a native exit code of 0; a failed or missing result exits 3 after retaining the logs and summary. Exit 1 denotes a collector error. Nonzero alone is not infrastructure failure: intentional negative controls remain data; inspect the native codes.
+  The CLI exits 0 only when every job has a native exit code of 0 and there is no detected mixed toolchain. Failed, missing and mixed results exit 3 after retaining the logs and summary. Exit 1 denotes a collector error. Nonzero alone is not infrastructure failure: intentional negative controls remain data; inspect the native codes.
 - The tree ships without node_modules: start a bun job with `bun install --frozen-lockfile && ...`.
 - `--timing`: each job alone on its VM; `<out>/placement.json` is the label a timing claim needs.
 - `--vm-type T` (or a job's `"vm_type"`): every job placed on type T only (a timing claim's fixed hardware); unnamed, the smallest
@@ -38,6 +38,11 @@ and pins live batches without a TTL before acknowledging admission. `supercomput
 pins plus locally known resident workers and pending creations. Neither command starts a local controller.
 Unknown history or inventory never authorizes deletion. Old credentialed clients must also be updated
 in the operator-authorized gap; a new controller alone cannot fence their old pruner. See `docs/image-retention.md`.
+
+**Image toolchains (native):** declare tools in `[boat.tools]` in `supercomputer.toml`, e.g. `node = { version = "v24.22.1" }`
+(or `git = {}` to observe only). Updated workers record the actual launch PATH, resolved paths and versions;
+image pins fail before the payload, and mixed fingerprints exit 3 with native job exits unchanged. See
+`<out>/toolchain.json`, `batch fetch` receipts, and `docs/image-toolchains.md`.
 
 **Runtime pins (native):** a job may declare `"runtime":{"bun":{"version":"1.4.3","sha256":"..."},"lean":{"version":"4.34.0","sha256":"..."}}`.
 Use 64-hex digests of the selected executable files, not archives or an Elan proxy; put the actual Lean toolchain

@@ -2486,8 +2486,11 @@ class Session:
             for item in items:
                 outputwarnings.warn_broad_outputs(item)
         from .rules.agent_capabilities import required_agent_capabilities
+        items = [config.with_image_tools(getattr(self, "proj", None), it) for it in items]
         for it in items:
-            required_agent_capabilities(it)
+            required = required_agent_capabilities(it)
+            if "toolchain_protocol" in required:
+                raise Unavailable("image tools require the scheduler; refusing an unverified legacy worker")
             if "runtime" in it:
                 raise Unavailable("runtime pins require the scheduler; refusing the legacy unverified path")
             if it.get("enforce_memory") is True:
@@ -3374,9 +3377,14 @@ class Scheduled(Session):
         if not items:
             return
         from .rules.agent_capabilities import required_agent_capabilities
+        items = [config.with_image_tools(getattr(self, "proj", None), it) for it in items]
         for it in items:
             _validate_durable_item(it)
             required_agent_capabilities(it)
+        # Bind the requirement to /submit too. A capability-aware predecessor
+        # may take over after /capabilities but before admission.
+        items = [{**it, "required_agent_capabilities": required_agent_capabilities(it)}
+                 if it.get("image_tools") else it for it in items]
         def next_bid():
             with self._bid_lock:  # one id per intentional run, never per reconnect
                 bid = self.batch if not self.bids else time.strftime("%Y%m%d-%H%M%S") + "-" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(6))
@@ -3399,6 +3407,8 @@ class Scheduled(Session):
                 raise Unavailable("scheduler lacks strict_once_protocol:1; refusing a retrying submission")
             if any("runtime" in it for it in items) and (type(caps.get("runtime_pins_protocol")) is not int or caps["runtime_pins_protocol"] != 1):
                 raise Unavailable("scheduler lacks runtime_pins_protocol:1; refusing unverified runtime pins")
+            if any("toolchain_protocol" in required_agent_capabilities(it) for it in items) and (type(caps.get("toolchain_protocol")) is not int or caps["toolchain_protocol"] != 1):
+                raise Unavailable("scheduler lacks toolchain_protocol:1; refusing unverified image tools")
             if any(it.get('enforce_memory') is True for it in items) and (type(caps.get('resource_limits_protocol')) is not int or caps['resource_limits_protocol'] != 1):
                 raise Unavailable('scheduler lacks resource_limits_protocol:1; refusing unenforced memory')
             if any(required_agent_capabilities(it) for it in items) and caps.get("required_agent_capabilities_protocol") != 1:
@@ -4081,9 +4091,10 @@ def job_items(spec: list[dict], pre: str, cmd, vm_type: str, past: dict) -> tupl
                     raise SystemExit(f"{j['name']} asks for {cpu} vCPU and {memory} MB: no boat VM type has that usable ({MEM_OVERHEAD} MB of each is its OS's)")
                 it["vm_type"] = big
             # Hooks may rebuild the execution spec, but cannot silently erase a user pin.
-            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"):
+            for field in ("cpu_model", "cpu_model_max_fruitless", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "image_tools", "enforce_memory", "memory_limit_mode"):
                 if field in j:
                     it[field] = j[field]
+            it = config.with_image_tools(project(), it, im)
             _validate_durable_item(it)
             required_agent_capabilities(it)
             items.append(it)

@@ -352,6 +352,7 @@ def prepare_snapshot(pkg: pathlib.Path) -> dict:
             "result_files_protocol": capabilities.get("result_files_protocol") == 1,
             "required_agent_capabilities_protocol": capabilities.get("required_agent_capabilities_protocol") == 1,
             "runtime_pins_protocol": type(capabilities.get("runtime_pins_protocol")) is int and capabilities["runtime_pins_protocol"] == 1,
+            "toolchain_protocol": type(capabilities.get("toolchain_protocol")) is int and capabilities["toolchain_protocol"] == 1,
             "resource_limits_protocol": type(capabilities.get("resource_limits_protocol")) is int and capabilities["resource_limits_protocol"] == 1,
             "image_pins_protocol": type(capabilities.get("image_pins_protocol")) is int and capabilities["image_pins_protocol"] == 1,
             "same_boot_namespace_recovery_protocol": capabilities.get("same_boot_namespace_recovery_protocol") == 1}
@@ -2139,8 +2140,8 @@ class Scheduler:
                 "submit_flags": ["strict_once", "retain_journals", "max_attempts"],
                 "strict_once_protocol": 1, "strict_once_max_attempts": 1,
                 "batch_fetch_protocol": 1, "batch_fetch_never_launched": 1, "closed_history_protocol": 1, "result_tiering_protocol": 1, "disk_guard_protocol": 1, "close_recovery_protocol": 1, "worker_recovery_protocol": 1, "namespace_recovery_protocol": 1, "same_boot_namespace_recovery_protocol": 1, "breaker_rejudge_protocol": 1, "start_breaker_opt_in": True,
-                "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1,
-                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
+                "required_agent_capabilities_protocol": 1, "runtime_pins_protocol": 1, "toolchain_protocol": 1, "resource_limits_protocol": 1,
+                "item_constraints": ["cpu_model", "distinct_vm_group", "distinct_vm_group_scope", "distinct_vm_group_generation", "required_agent_capabilities", "runtime", "image_tools", "enforce_memory", "memory_limit_mode"], "cpu_model_exact": True, "distinct_vm_group": True, "distinct_vm_group_protocol": 1,
                 "distinct_vm_group_scope": "durable", "durable_distinct_vm_group_protocol": 1,
                 "result_files_protocol": 1, "output_files_protocol": 1,
                 "image_pins_protocol": 1, "snapshot_auto_delete": False,
@@ -2517,7 +2518,9 @@ class Scheduler:
                 previous = old.items[name].spec
                 if ("runtime" in item.spec or "runtime" in previous) and item.spec.get("runtime") != previous.get("runtime"):
                     return {"ok": False, "error": "runtime pins differ from the existing admission; use a new batch id"}
-                from .agent import normalize_memory_limit
+                from .agent import normalize_image_tools, normalize_memory_limit
+                if normalize_image_tools(item.spec.get("image_tools", {})) != normalize_image_tools(previous.get("image_tools", {})):
+                    return {"ok": False, "error": "image tools differ from the existing admission; use a new batch id"}
                 if normalize_memory_limit(item.spec) != normalize_memory_limit(previous):
                     return {"ok": False, "error": "memory enforcement differs from the existing admission; use a new batch id"}
             return {"ok": True, "kept": True}
@@ -6708,6 +6711,11 @@ class Scheduler:
                                        for b in self.batches.values() for it in b.items.values())
                 if required_runtime and not all(prepared[target].get("runtime_pins_protocol") is True for target in candidates):
                     self.alert("handoff refused: runtime pins require a runtime-aware successor")
+                    return
+                required_tools = any(it.spec.get("image_tools")
+                                     for b in self.batches.values() for it in b.items.values())
+                if required_tools and not all(prepared[target].get("toolchain_protocol") is True for target in candidates):
+                    self.alert("handoff refused: image tools require a toolchain-aware successor")
                     return
                 required_memory = any(it.spec.get("enforce_memory") is True
                                       for b in self.batches.values() for it in b.items.values())

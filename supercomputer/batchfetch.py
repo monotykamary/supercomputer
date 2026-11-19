@@ -13,7 +13,7 @@ import time
 import tempfile
 import uuid
 
-from . import clientresults, fetchguard, history, resultfiles
+from . import clientresults, fetchguard, history, resultfiles, toolchain
 
 
 @contextlib.contextmanager
@@ -200,6 +200,7 @@ def fetch(bid: str, out, *, client=None, timeout=120, allow_large=False, fetch_l
                 return client.req('/results', {'batch': bid, 'ref': ref, 'offset': offset, 'length': length}, timeout=timeout, raw=True)
             names, count, since, row_hash = set(), 0, 0, hashlib.sha256()
             pages = []
+            assessment = toolchain.BatchToolchains()
             with tempfile.TemporaryFile(mode='w+b', dir=directory) as inventory, \
                     _atomic(directory, 'rows.jsonl', binary=True) as output:
                 while True:
@@ -228,6 +229,7 @@ def fetch(bid: str, out, *, client=None, timeout=120, allow_large=False, fetch_l
                         names.add(name)
                         result = clientresults.download(row, read, directory, verify_cached=True,
                                                         guard=guard, download_outputs=False)
+                        assessment.observe(result)
                         line = (json.dumps(result, separators=(',', ':')) + '\n').encode()
                         inventory.write(line)
                         count += 1
@@ -265,6 +267,7 @@ def fetch(bid: str, out, *, client=None, timeout=120, allow_large=False, fetch_l
                       'complete': True, 'closed_by_fetch': False, 'rows': count,
                       'rows_file': str(directory / 'rows.jsonl'), 'rows_sha256': row_hash.hexdigest(),
                       'logs': logs, 'audit': audit, 'pages': pages, 'before': before, 'after': after,
+                      'toolchain': assessment.summary(),
                       'started_at': started, 'finished_at': time.time()}
             _json_file(directory, 'fetch.json', result)
             return result

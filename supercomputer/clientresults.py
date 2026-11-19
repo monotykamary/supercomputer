@@ -144,8 +144,13 @@ def download(row: dict, read: callable, directory: Path, *, verify_cached: bool 
 
     for key, target in (('result_ref', 'result_file'), ('row_ref', 'row_file')):
         if key in row:
-            _, path = import_ref(row[key])
+            ref, path = import_ref(row[key])
             out[target] = str(path)
+            if key == "row_ref" and "toolchain" not in row:
+                with store.open(ref) as source:
+                    receipt = resultjson.read_toolchain(source)
+                if isinstance(receipt, dict):
+                    out["toolchain"] = receipt
 
     if 'output_files_ref' in row:
         files = directory / (_name(row) + '.files')

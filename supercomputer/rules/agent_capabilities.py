@@ -43,6 +43,10 @@ def required_agent_capabilities(spec) -> dict[str, int]:
         from ..agent import normalize_runtime_pins
         normalize_runtime_pins(spec["runtime"])
         required["runtime_pins_protocol"] = max(1, required.get("runtime_pins_protocol", 0))
+    if "image_tools" in spec:
+        from ..agent import normalize_image_tools
+        if normalize_image_tools(spec["image_tools"]):
+            required["toolchain_protocol"] = max(1, required.get("toolchain_protocol", 0))
     return required
 
 

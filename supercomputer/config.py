@@ -15,6 +15,7 @@ A repo's file, at its root (or $SUPERCOMPUTER_CONFIG; a worktree with none reads
     vm_type = "large"
     path = ["~/.bun/bin"]            # before the PATH of every job on a VM
     env = { JAVA_HOME = "/usr/lib/jvm/temurin-17" }  # in every job's environment on a VM (a job's own env, an image's, win)
+    tools = {node = {version = "v24.22.1"}, git = {}}  # launch receipts and optional exact pins
     mounts = ["/bench"]              # directories a job's runner mounts (made on each VM)
     ignore = ["**/node_modules/**"]  # left out of the shipped tree, on top of .gitignore
     layers = [{name = "tools", script = "sudo apt-get install -y ..."}]   # or hooks.layers(root)
@@ -150,6 +151,7 @@ class Project:
         self.env = {str(k): str(v) for k, v in b.get("env", {}).items()}  # (every item's on boat: e.g. a JAVA_HOME the image has, before its older javac)
         self.mounts = list(b.get("mounts", []))
         self.ignore = list(b.get("ignore", DEFAULT_IGNORE))
+        self.image_tools = b.get("tools", {})
         self.images = b.get("images", {})
         self.caches = [dict(x) for x in c.get("cache", [])]
         self.modal = c.get("modal", {})
@@ -190,6 +192,20 @@ class Project:
 
     def cache_outputs(self, cache: dict) -> list[str]:
         return [cache["outputs"].format(m=m) for m in cache.get("modules", [])]
+
+
+def with_image_tools(proj, spec, profile=None):
+    """Apply the default and named image declarations without allowing a pin to be erased."""
+    from .agent import normalize_image_tools
+    tools = {}
+    for layer in (getattr(proj, "image_tools", {}), (profile or {}).get("tools", {}), spec.get("image_tools", {})):
+        for name, declaration in normalize_image_tools(layer).items():
+            previous = tools.get(name)
+            if previous and declaration and previous != declaration:
+                raise ValueError(f"conflicting image tool declarations for {name}")
+            if not previous:
+                tools[name] = declaration
+    return {**spec, "image_tools": normalize_image_tools(tools)} if tools else spec
 
 
 BASE_LAYER = r"""

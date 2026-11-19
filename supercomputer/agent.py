@@ -49,6 +49,7 @@ import pathlib
 import pwd
 import re
 import secrets
+import selectors
 import math
 import shutil
 import signal
@@ -64,7 +65,7 @@ from typing import Literal
 ROOT = pathlib.Path.home() / ".sc"
 HOME = str(pathlib.Path.home())
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1, "runtime_pins_protocol": 1, "resource_limits_protocol": 1, "owned_rpc_idempotency_protocol": 1}
+AGENT_CAPABILITIES = {"output_files_protocol": 1, "result_files_protocol": 1, "runtime_pins_protocol": 1, "toolchain_protocol": 1, "resource_limits_protocol": 1, "owned_rpc_idempotency_protocol": 1}
 VERSION = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]  # (its code: the scheduler upgrades a stale one in place)
 
 
@@ -1565,6 +1566,7 @@ def _legacy_start(d: pathlib.Path, spec: dict):
 
 
 def start(d: pathlib.Path, spec: dict):
+    normalize_image_tools(spec.get("image_tools", {}))
     if "runtime" in spec:
         normalize_runtime_pins(spec["runtime"])
     if _lease_enabled():
@@ -2046,6 +2048,161 @@ def runtime_exec(spec_file, receipt_file, argv):
     os.execvpe(argv[0], argv, os.environ)
 
 
+# Image tools complement the existing Bun/Lean runtime pins. Keep the schema
+# in this standalone module so clients, controllers and workers agree.
+_MAX_TOOL_PATH = 8192
+_MAX_EXEC_PATH = 1536
+_MAX_TOOL_VERSION = 512
+
+
+def normalize_image_tools(value):
+    if not isinstance(value, dict) or len(value) > 8:
+        raise ValueError("image_tools must map at most eight executable names to declarations")
+    tools = {}
+    for name, pin in value.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,47}", name):
+            raise ValueError("image_tools names must be bare executable names")
+        if not isinstance(pin, dict) or set(pin) - {"version", "sha256"} or ("sha256" in pin and "version" not in pin):
+            raise ValueError(f"image_tools.{name} needs an empty declaration or an exact version with optional sha256")
+        if "version" in pin and (not isinstance(pin["version"], str) or not pin["version"]
+                                 or len(pin["version"]) > _MAX_TOOL_VERSION or pin["version"].strip() != pin["version"]):
+            raise ValueError(f"image_tools.{name}.version must be trimmed --version output (1–512 characters)")
+        if "sha256" in pin and (not isinstance(pin["sha256"], str) or not re.fullmatch(r"[0-9a-fA-F]{64}", pin["sha256"])):
+            raise ValueError(f"image_tools.{name}.sha256 must contain exactly 64 hexadecimal digits")
+        tools[name] = dict(pin)
+        if "sha256" in pin:
+            tools[name]["sha256"] = pin["sha256"].lower()
+    return tools
+
+
+def _image_tool_probe(executable):
+    argv = [str(executable), "--version"]
+    deadline = time.monotonic() + 2
+    output = bytearray()
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as probe:
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(probe.stdout, selectors.EVENT_READ)
+                while True:
+                    if not ready.select(max(0, deadline - time.monotonic())):
+                        raise subprocess.TimeoutExpired(argv, 2)
+                    chunk = os.read(probe.stdout.fileno(), 16385 - len(output))
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if len(output) > 16384:
+                        raise ValueError("image tool version output exceeded 16 KiB")
+            return probe.wait(timeout=max(0, deadline - time.monotonic())), output.decode("utf-8").strip()
+        except BaseException:
+            if probe.poll() is None:
+                probe.kill()
+            raise
+
+
+def _observe_image_tool(name, pin, lookup, runtime, entry):
+    selected = shutil.which(name, path=lookup)
+    if selected is None:
+        return "missing"
+    executable = pathlib.Path(selected).absolute()
+    real = executable.resolve(strict=True)
+    if any(len(str(p)) > _MAX_EXEC_PATH for p in (executable, real)):
+        return "path_too_long"
+    entry.update(path=str(executable), realpath=str(real))
+    if runtime is not None and not (runtime.get("stable") and runtime.get("version_matches")):
+        return "runtime_refused"  # do not probe a file refused by a runtime pin
+    before = real.stat()
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode)
+    if "sha256" in pin:
+        entry["sha256"], _ = _runtime_hash(real)
+        if entry["sha256"] != pin["sha256"]:
+            return "hash_mismatch"  # do not execute a hash mismatch
+    code, text = _image_tool_probe(executable)
+    entry.update(version_exit=code, version=text[:_MAX_TOOL_VERSION] if code == 0 else None)
+    if code != 0 or not text or len(text) > _MAX_TOOL_VERSION:
+        return "version_unavailable"
+    if (identity(before) != identity(real.stat()) or shutil.which(name, path=lookup) != selected
+            or executable.resolve(strict=True) != real):
+        return "changed_during_probe"
+    return "version_mismatch" if pin and text != pin["version"] else "observed"
+
+
+def observe_toolchain(spec, runtime_receipt=None):
+    """Observe the exec environment, after env -i, namespace mounts and chdir."""
+    declared = normalize_image_tools(spec.get("image_tools", {}))
+    path = os.environ.get("PATH", os.defpath)
+    lookup = path or "."  # an explicitly empty PATH is a single cwd entry
+    observed, refused = {}, []
+    startup_env = [key for key in ("BASH_ENV", "EXECIGNORE")
+                   if spec.get("kind") == "sh" and os.environ.get(key)]
+    enforced = {name for name, pin in declared.items() if pin} | set(spec.get("runtime", {}))
+    pinned_startup = bool(startup_env and enforced)
+    # Detect exported shell functions rather than claiming a PATH pin covers them.
+    shadowed = sorted(name for name in {"node", *declared, *enforced} if spec.get("kind") == "sh"
+                      and f"BASH_FUNC_{name}%%" in os.environ)
+    refused = sorted(enforced if pinned_startup else enforced.intersection(shadowed))
+    for name, pin in sorted({"node": {}, **declared}.items()):
+        entry = observed[name] = {}
+        if pinned_startup or name in refused:
+            entry["status"] = "shell_startup_unverified"
+            continue
+        runtime = ((runtime_receipt or {}).get("observed", {}).get(name, {})
+                   if name in spec.get("runtime", {}) else None)
+        try:
+            entry["status"] = _observe_image_tool(name, pin, lookup, runtime, entry)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            entry["status"] = "probe_failed"
+        if pin and entry["status"] != "observed":
+            refused.append(name)
+    return {"protocol": 1, "path": path[:_MAX_TOOL_PATH], "path_truncated": len(path) > _MAX_TOOL_PATH,
+            "boot_id": _lease_boot(), "shell_startup": bool(startup_env), "shell_startup_env": startup_env,
+            "shell_functions": shadowed,
+            "required": declared, "observed": observed, "ok": not refused, "refused": sorted(refused)}
+
+
+class _ToolchainDeadline(BaseException):
+    pass
+
+
+def _toolchain_timeout(signum, frame):
+    # Bypass regular probe exception handlers; subprocess.run still kills and
+    # waits for the exact probe child when interrupted.
+    raise _ToolchainDeadline()
+
+
+def toolchain_exec(spec_file, toolchain_file, runtime_file, argv):
+    started = time.monotonic()
+    spec = json.loads(pathlib.Path(spec_file).read_text())
+    declarations = normalize_image_tools(spec.get("image_tools", {}))
+    runtime = None
+    signal.signal(signal.SIGALRM, _toolchain_timeout)
+    signal.setitimer(signal.ITIMER_REAL, (30 if "runtime" in spec else 0) + 3 + 2.5 * len(declarations))
+    try:
+        if "runtime" in spec:
+            runtime = verify_runtime_pins(spec["runtime"])
+            write_json(pathlib.Path(runtime_file), runtime)
+        toolchain = observe_toolchain(spec, runtime)
+    except _ToolchainDeadline:
+        refused = sorted(name for name, pin in declarations.items() if pin)
+        path = os.environ.get("PATH", os.defpath)
+        toolchain = {"protocol": 1, "path": path[:_MAX_TOOL_PATH], "path_truncated": len(path) > _MAX_TOOL_PATH,
+                     "boot_id": _lease_boot(), "required": declarations, "observed": {},
+                     "ok": not refused, "refused": refused, "error": "toolchain preflight timed out"}
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    toolchain["preflight_seconds"] = round(time.monotonic() - started, 4)
+    write_json(pathlib.Path(toolchain_file), toolchain)
+    if "runtime" in spec and (runtime is None or not runtime["ok"]):
+        print("runtime verification refused payload: " + (runtime or {}).get("error", "verification timed out"), file=sys.stderr)
+        raise SystemExit(78)
+    if not toolchain["ok"]:
+        print("image tool verification refused payload: " + ", ".join(toolchain["refused"]), file=sys.stderr)
+        raise SystemExit(78)
+    # Start a fresh watchdog only now. It retains the existing timeout group,
+    # so the payload and its children still receive the normal timeout signal.
+    timer = ["/usr/bin/timeout", "-s", "KILL", str(int(spec["limit"])), *argv]
+    os.execv(timer[0], timer)
+
+
 # ------------------------------------------------------------------------------------------------------------------ resource limits
 class ResourceLimitGate:
     # gdp: law acceptance requires a positive requested cap: not result or requested > 0
@@ -2315,20 +2472,17 @@ def wrap(j: pathlib.Path, spec: dict, ctx: dict, work: pathlib.Path, tree: pathl
            *[f"{k}={v}" for k, v in {**defaults, **ctx.get("env", {}), **spec.get("env", {}),
                                       "SUPERCOMPUTER_OUTPUT_DIR": str(outputs.resolve())}.items()],
            *([f"HOME={home}"] if spec.get("strict_once") is True else [])]
-    if "runtime" in spec:
-        normalize_runtime_pins(spec["runtime"])
-        argv = [sys.executable, "-I", str(ROOT / "agent.py"), "runtime-exec",
-                str(j / "spec.json"), str(j / "runtime.json"), *argv]
+    argv = [sys.executable, "-I", str(ROOT / "agent.py"), "toolchain-exec",
+            str(j / "spec.json"), str(j / "toolchain.json"), str(j / "runtime.json"), *argv]
     cpus = ",".join(map(str, json.loads((j / "taskset" if (j / "taskset").exists() else j / "cpus").read_text())))
     prefix = ["sudo", "-n", "unshare", "-m", "--propagation", "private", "--", "sh", str(j / "ns.sh")]
     drop = ["setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}", "--init-groups", "--"]
     if normalize_memory_limit(spec) is not None:
         # Apply cgroup/RLIMIT while privileged, after the actual taskset. Only
         # the requested job enters the new cgroup; the agent remains outside.
-        return [*prefix, "taskset", "-c", cpus, "timeout", "-s", "KILL", str(int(spec["limit"])),
-                sys.executable, "-I", str(ROOT / "agent.py"), "resource-exec",
+        return [*prefix, "/usr/bin/taskset", "-c", cpus, sys.executable, "-I", str(ROOT / "agent.py"), "resource-exec",
                 str(j / "spec.json"), str(j / "resources.json"), *drop, *env, *argv]
-    return [*prefix, *drop, *env, "taskset", "-c", cpus, "timeout", "-s", "KILL", str(int(spec["limit"])), *argv]
+    return [*prefix, *drop, *env, "/usr/bin/taskset", "-c", cpus, *argv]
 
 
 def caches_in(ctx: dict, top: pathlib.Path) -> dict:
@@ -2359,6 +2513,21 @@ def caches_out(ctx: dict, top: pathlib.Path, had: dict, tag: str) -> list[str]:
     return saved
 
 
+def _toolchain_receipt(j):
+    try:
+        receipt = json.loads((j / "toolchain.json").read_text())
+        if isinstance(receipt, dict):
+            return receipt
+    except (OSError, ValueError):
+        pass
+    return {"protocol": 1, "error": "toolchain measurement did not complete"}
+
+
+def _payload_elapsed(j, started):
+    elapsed = time.monotonic() - started
+    return round(max(0.0, elapsed - _toolchain_receipt(j).get("preflight_seconds", 0)), 2)
+
+
 def run(batch: str, name: str, launch_identity=None):
     d = batch_dir(batch)
     j = d / "jobs" / name
@@ -2385,11 +2554,11 @@ def run(batch: str, name: str, launch_identity=None):
             subprocess.run(["cp", "-a", f"{tree}/.", str(top) + "/"], check=True)
             (top / ".sc-ready").unlink(missing_ok=True)
             had = caches_in(ctx, top)
-            argv = wrap(j, spec, ctx, work, tree, f"/work/{repo}/{spec.get('cwd', '.')}", ["bash", "-c", spec["cmd"]])
-            t0, oom0 = time.time(), oom_kills()
+            argv = wrap(j, spec, ctx, work, tree, f"/work/{repo}/{spec.get('cwd', '.')}", ["/bin/bash", "-c", spec["cmd"]])
+            t0, oom0 = time.monotonic(), oom_kills()
             with open(j / "out", "wb") as out, open(j / "err", "wb") as err:
                 p = subprocess.run(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
-            secs = round(time.time() - t0, 2)
+            secs = _payload_elapsed(j, t0)
             code = Outcome().code(True, p.returncode, int(secs), int(spec["limit"]))  # (a kill at its limit: 124, as Modal's runner reports its own)
             if code == 124 and p.returncode != 124:
                 (j / "err").write_text(f"timed out after {spec['limit']} s")
@@ -2404,11 +2573,11 @@ def run(batch: str, name: str, launch_identity=None):
                 row["saved"] = saved
         else:  # py: a function of a Modal runner, its arguments and result as JSON
             (j / "args.json").write_text(json.dumps(spec["args"]))
-            argv = wrap(j, spec, ctx, work, tree, "/work" if "runtime" in spec else "/", ["python3", "-I", f"{ROOT}/agent.py", "call", f"/src/{repo}/{spec['module']}", spec["fn"], str(j / "args.json"), str(j / "result.json")])
-            t0, oom0 = time.time(), oom_kills()
+            argv = wrap(j, spec, ctx, work, tree, "/work", ["python3", "-I", f"{ROOT}/agent.py", "call", f"/src/{repo}/{spec['module']}", spec["fn"], str(j / "args.json"), str(j / "result.json")])
+            t0, oom0 = time.monotonic(), oom_kills()
             with open(j / "out", "wb") as out, open(j / "err", "wb") as err:
                 p = subprocess.run(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
-            row.update(code=p.returncode, seconds=round(time.time() - t0, 2))
+            row.update(code=p.returncode, seconds=_payload_elapsed(j, t0))
             if out_of_memory(p.returncode, int(row["seconds"]), int(spec.get("limit", 10 ** 6)), oom0, oom_kills()):
                 row["oom"] = True
                 with open(j / "err", "a") as err:
@@ -2441,6 +2610,7 @@ def run(batch: str, name: str, launch_identity=None):
                 row['resource_error'] = 'resource_verification_failed'
                 if row.get('code') == 0:
                     row['code'] = 78
+        row["toolchain"] = _toolchain_receipt(j)
         if "runtime" in spec:
             try:
                 receipt = json.loads((j / "runtime.json").read_text())
@@ -3480,6 +3650,8 @@ if __name__ == "__main__":
         call(*rest)
     elif cmd == "runtime-exec":
         runtime_exec(rest[0], rest[1], rest[2:])
+    elif cmd == "toolchain-exec":
+        toolchain_exec(rest[0], rest[1], rest[2], rest[3:])
     elif cmd == "resource-exec":
         resource_exec(rest[0], rest[1], rest[2:])
     elif cmd == "resource-finalize":
