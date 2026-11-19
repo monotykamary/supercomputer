@@ -40,3 +40,10 @@ def worker_repair_allowed(strict: bool, live_or_unknown: bool, same_agent: bool)
 # gdp: law worker loss requires matching absence evidence: not result or absence_proven
 def worker_loss_allowed(start_settled: bool, quarantined: bool, failure_age: int, absence_proven: bool) -> bool:
     return start_settled and (quarantined or failure_age >= 120) and absence_proven
+
+
+# gdp: law terminal provider evidence retires the worker: not terminal or result
+# gdp: law a live boot within its deadline is kept: terminal or expired or not result
+# gdp: law time alone never drops an initialized or occupied worker: terminal or not held_work or not result
+def worker_retirement_allowed(terminal: bool, expired: bool, held_work: bool) -> bool:
+    return terminal or (expired and not held_work)

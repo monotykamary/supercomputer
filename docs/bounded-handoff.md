@@ -35,6 +35,15 @@ Such a dependency remains required: the scheduler does not omit it, invent an
 ACK, transfer an unfinished acquisition, or reinterpret it as an unoffered
 registry extra merely to meet a deadline.
 
+An explicit terminal provider state for an exact worker is different from an
+unready worker whose health is unknown. The controller records the former in
+`worker_retirements` (status and `LIVE/scheduler/worker-retirements/<vm>.json`),
+routes its items through worker loss, and excludes that VM ID from future reuse.
+It does not stop or delete the sandbox. A new empty acquisition can also be
+retired when its readiness budget expires; an initialized worker with uncertain
+health cannot be retired merely because it has been unready for a long time.
+Neither retirement reason is a strict namespace-cleanup receipt.
+
 Status exposes `handoff_pending` with the target, generation, phase (`pool` or
 `starts`), age and remaining drain time. Expiry diagnostics include acquisitions,
 creates, unready VMs, upgrades, adoption claims, reattachment and strict starts.

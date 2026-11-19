@@ -745,6 +745,7 @@ class Scheduler:
         self.cpu_constraints = self._constraints_load()
         self.starts_log: list[dict] = []  # {t, vm, ok (None while coming up)}
         self.resume_quarantine: dict[str, dict] = {}  # failed stopped-VM resumes; never auto-reacquired or adopted
+        self.worker_retirements = self._load_worker_retirements()
         self.br = {"open_until": 0.0, "backoff": BREAK_BACKOFF, "half": False, "t_trip": 0.0, "reason": "", "trips": 0}
         self.shed = False
         self.load = {}
@@ -1564,7 +1565,13 @@ class Scheduler:
         pruned = {}
         for vm in list(self.vms.values()):
             state = (observed.get(vm.id) or {}).get("state")
-            reason = ("dead" if vm.dead else state if state in ("stopped", "deleted", "error")
+            # A new boot belongs to _up: stopped can still mean it is resuming.
+            initialized = vm.ready or vm.t_ready is not None or vm.running or vm.finishing
+            if initialized and (not vm.ready or state in ('error', 'deleted')):
+                if self._retire_worker(vm, state, 'handoff.inventory'):
+                    pruned[vm.id] = state
+                    continue
+            reason = ("dead" if vm.dead else state if vm.ready and state == "stopped"
                       else "no agent" if vm.ready and vm.client is None else "")
             if rules.handoff_required(self._handoff_vm_occupied(vm), bool(reason)):
                 continue
@@ -1800,6 +1807,9 @@ class Scheduler:
         return life
 
     def _reattach_vm(self, vid: str, its: list) -> int:
+        if vid in getattr(self, 'worker_retirements', {}):
+            self.reattach_dead.add(vid)
+            return 0
         n = 0
         held = self.vms.get(vid)
         if held is not None and held.ready and not held.dead:  # (in hand already: its items joined to it)
@@ -2071,6 +2081,9 @@ class Scheduler:
         diagnostic = getattr(it.vm, 'lease_relinquishment', None)
         if isinstance(diagnostic, dict):
             evidence['lease_relinquishment'] = diagnostic
+        retirement = getattr(it.vm, 'worker_retirement', None)
+        if retirement is not None:
+            evidence['worker_retirement'] = retirement
         self._deliver_owned(it.batch, {"name": it.name, "code": -1, "seconds": -1,
                           "error": why, "strict_once": it.batch.strict_once,
                           "launch_identity": it.launch_identity, **evidence})
@@ -2960,6 +2973,7 @@ class Scheduler:
                                  "open": now < rules.breaker_deadline(self._breaker_enabled(), self.br["open_until"]),
                                  "open_for_s": max(0, round(rules.breaker_deadline(self._breaker_enabled(), self.br["open_until"]) - now))},
                     "resume_quarantine": dict(getattr(self, "resume_quarantine", {})),
+                    "worker_retirements": dict(getattr(self, "worker_retirements", {})),
                     "shed": self.shed, "load": self.load, "bring_up_s": round(self.bring_up, 1), "alerts": self.alerts[-5:],
                     "policy": self.pol, "hot_handoff": 1, "code": self.code, "code_installed": getattr(self, "_status_installed_code", self.code), "agent_code": self.agent_version, "stale": self.stale(),
                     "agents": {v.id: v.agent for v in live},
@@ -3571,13 +3585,13 @@ class Scheduler:
         """VMs to retire (LIVE/scheduler/retire, one id a line): nothing new placed there, let go once empty, never
         adopted nor leased again (an operator's: a VM whose tokens leaked, deleted once it's let go)."""
         if time.time() - getattr(self, "_retire_t", 0) < 2:  # (the file looked at every 2 s, not at every VM of every pass:
-            return self._retire  # 94% of the scheduler's time at 200 VMs, a stat per VM per pass)
+            return self._retire
         self._retire_t = time.time()
         p = DIR / "retire"
         mt = p.stat().st_mtime_ns if p.exists() else 0
         if getattr(self, "_retire_mt", None) != mt:
             self._retire_mt = mt
-            self._retire = set(p.read_text().split()) if p.exists() else set()
+            self._retire = (set(p.read_text().split()) if p.exists() else set()) | getattr(self, 'worker_retirements', {}).keys()
         return self._retire
 
     FRONT_FAILURES = ("502", "upstream unavailable", "didn't answer", "timed out", "timeout")
@@ -3747,6 +3761,8 @@ class Scheduler:
         # it beside placements so ordinary retry history remains auditable too.
         with self.lock:
             recorded = 0
+            if event == 'start_requested' and getattr(vm, 'worker_retirement', None):
+                return False
             for start in starts:
                 bid, name = start.get("batch"), start.get("spec", {}).get("name")
                 b = self.batches.get(bid)
@@ -3791,8 +3807,11 @@ class Scheduler:
         """
         while True:
             with self.lock:
+                if vm.dead or getattr(vm, 'worker_retirement', None):
+                    return False
                 if it.batch.admission_closed or it.owned.closed:
-                    it.state = 'cancel_pending'
+                    if it.state != 'done':
+                        it.state = 'cancel_pending'
                     return False
                 binding = self._prelaunch_binding(it)
                 if binding['vm'] != vm.id or binding['boot_id'] != (vm.lease or {}).get('boot'):
@@ -3846,8 +3865,11 @@ class Scheduler:
         b, rn = it.batch, it.run_name
         try:
             with self.lock:
+                if vm.dead:
+                    return
                 if b.admission_closed or it.owned.closed:
-                    it.state = "cancel_pending"
+                    if it.state != "done":
+                        it.state = "cancel_pending"
                     return
             if b.strict_once:
                 if not self._strict_prepare(it, vm):
@@ -3866,7 +3888,8 @@ class Scheduler:
             with self.lock:  # (its batch closed, the item preempted or moved while the batch was prepared here: never started.
                 if it.state != "starting" or it.vm is not vm or it.run_name != rn or b.closed or b.admission_closed or it.owned.closed:  # Their kill found nothing to kill: a run
                     if b.admission_closed or it.owned.closed:
-                        it.state = "cancel_pending"
+                        if it.state != "done":
+                            it.state = "cancel_pending"
                         return  # Keep its placement held until a bound reap receipt.
                     vm.running.pop((b.id, rn), None)  # stale preparation, never launch
                     if it.state == "preempting" and it.vm is vm and not b.closed:
@@ -3948,18 +3971,16 @@ class Scheduler:
                     it.state = "cancel_pending"
                     return
             log(f"{vm.id}: {b.id}: prepare failed ({str(e)[:200]})")
-            gone = "is stopped" in str(e) or not self._boat_up(vm.id)
+            state = self._provider_terminal_state(vm.id)
+            if state is not None:
+                self._retire_worker(vm, state, 'prepare.provider')
+                return
             unanswered = "didn't answer" in str(e) or "502" in str(e)
-            # (rules.prepare_failed: boat stopped it, the VM lost; an agent not answering on a VM boat reports up is our
-            # repair to make, no strike against the item, nor in an outage; a preparation that fails on an answering
-            # agent is one)
-            what = rules.prepare_failed(gone, unanswered, self._outage(), "lacked" in str(e) and "made again" in str(e))
+            # Without a terminal provider state this is a preparation failure, not worker loss.
+            what = rules.prepare_failed(False, unanswered, self._outage(), "lacked" in str(e) and "made again" in str(e))
             if not str(e).startswith("its preparation failed") and "made again" not in str(e):  # (3 in a row: no more placements there, rules.may_slot; a preparation counted
                 vm.prep_fails = getattr(vm, "prep_fails", 0) + 1  # once, not once per item waiting on it: 4 waiters quarantined a VM for one 3-s outage, B9)
-            if what == "lost":  # (boat stopped it: nothing more is placed there)
-                self._note_lease_relinquish(vm, source='prepare.provider_lost', error=e)
-                self._lost_vm(vm)
-            elif unanswered:
+            if unanswered:
                 threading.Thread(target=self._repair, args=(vm,), daemon=True).start()
             with self.lock:
                 if b.admission_closed or it.owned.closed:
@@ -4910,7 +4931,7 @@ class Scheduler:
         vm.lease, vm.birth_nonce = lease or {}, nonce
         vm.cpu_constraint, vm.cpu_known_resume = model, cpu_known_resume
         with self.lock:
-            if i in self.vms:  # (a VM is brought up once at a time: a second bring-up would replace its agent's token)
+            if i in self.vms or i in getattr(self, 'worker_retirements', {}):
                 return
             self.vms[i] = vm
         threading.Thread(target=self._up, args=(vm, k, b), daemon=True).start()
@@ -4957,7 +4978,7 @@ class Scheduler:
                     self._metrics_save()
 
     def _up(self, vm: VMState, k: int, b: Batch):
-        started = False
+        started = readiness_timeout = False
         try:
             if vm.how == "resumed":
                 got, paid = self.gate.take_split(1, self.stop)
@@ -4979,7 +5000,9 @@ class Scheduler:
                     boat.note_starts(-1)
                     raise RuntimeError("boat refused the resume")
             started = started or vm.how == "created"
-            if not boat.wait_running([vm.id], int(BREAK_READY)):
+            deadline = time.monotonic() + BREAK_READY
+            if not boat.wait_running([vm.id], int(BREAK_READY), abort_terminal=True):
+                readiness_timeout = True
                 raise RuntimeError("never came up")
             old = boat.read_agent(vm.id) or {}
             cached = vm.lease or old.get("lease") or self.held_before.get(vm.id, {}).get("lease")
@@ -5017,7 +5040,8 @@ class Scheduler:
                     pong = cl.ping()
                     ok = pong.get("version") == self.agent_version
             if not ok:
-                if not boat.wait_running([vm.id], int(BREAK_READY)):
+                if not boat.wait_running([vm.id], max(0, math.ceil(deadline - time.monotonic())), abort_terminal=True):
+                    readiness_timeout = True
                     raise RuntimeError("never came up")
                 tok = (boat.read_agent(vm.id) or {}).get("token") or old.get("token") or boat.owner_key()
                 r = boat.bootstrap_agent(vm.id, self.agent_b64, tok, 90, lease=vm.lease, nonce=getattr(vm, "birth_nonce", ""))
@@ -5073,10 +5097,13 @@ class Scheduler:
             if vm.dead:
                 return
             log(f"{vm.id}: {str(e)[:200]}")
-            vm.start_failure = str(e)[:200]
+            state = e.state if isinstance(e, boat.WorkerBootTerminated) else self._provider_terminal_state(vm.id, booting=True, detail=True)
+            vm.start_failure = f'provider state: {state}' if state else str(e)[:200]
             if started:
                 self._start_done(vm.id, False)
                 started = False
+            if self._retire_worker(vm, state, 'bring-up', expired=readiness_timeout):
+                return
             vm.dead = True
             self._let_go(vm, stop=True)
         finally:
@@ -5185,6 +5212,63 @@ class Scheduler:
         with contextlib.suppress(Exception):
             return boat.states(10).get(vm_id, {}).get("state") in boat.RUNNING
         return True  # (boat's list not to be had: no verdict, so not lost)
+
+    @staticmethod
+    def _provider_terminal_state(vm_id: str, *, booting=False, detail=False) -> str | None:
+        """Only a state for this ID is evidence. Missing rows and transitions are not."""
+        terminal = boat.WORKER_TERMINAL - {'stopped'} if booting else boat.WORKER_TERMINAL
+        with contextlib.suppress(Exception):
+            state = boat.states(10).get(vm_id, {}).get('state')
+            if state in terminal:
+                return state
+        if detail:
+            # The list and the exact VM's read-only endpoint can lag each other.
+            with contextlib.suppress(Exception):
+                info = boat.bj('info', vm_id, timeout=10)
+                info = info.get('sandbox') or info
+                if info.get('id') == vm_id and info.get('state') in terminal:
+                    return info['state']
+        return None
+
+    @staticmethod
+    def _load_worker_retirements() -> dict:
+        return {p.stem: json.loads(p.read_text()) for p in (DIR / 'worker-retirements').glob('*.json')}
+
+    def _retire_worker(self, vm: VMState, state: str | None, source: str, *, expired=False) -> bool:
+        """Fence the scheduler hold, not the provider resource. Never assert cleanup here."""
+        terminal = state in boat.WORKER_TERMINAL
+        if not terminal and not expired:
+            return False
+        with self.lock:
+            if (vm.dead or self.vms.get(vm.id) is not vm or self.stop.is_set()
+                    or getattr(self, 'handing_off', False) or getattr(self, 'recovery_blocked', False)
+                    or vm.upgrading or vm.id in getattr(self, '_namespace_recoveries', {})):
+                return False
+            if getattr(vm, 'worker_retirement', None):
+                self._lost_vm(vm)  # Retry a loss interrupted by a journal error.
+                return True
+            if vm.finishing:
+                return False  # Already-fetched legacy results must commit before dropping the hold.
+            if not rules.worker_retirement_allowed(terminal, expired, vm.ready or vm.t_ready is not None
+                                                   or self._handoff_vm_occupied(vm)):
+                return False
+            # This survives registry reconciliation, restart and hot handoff.
+            vm.ready = False
+            retirement = {'vm': vm.id, 'provider_state': state,
+                          'reason': 'provider_terminal' if terminal else 'readiness_timeout',
+                          'source': source, 't': time.time(), 'image': vm.image, 'type': vm.type,
+                          'used_slots': vm.used()}
+            if expired:
+                retirement['readiness_timeout_s'] = BREAK_READY
+            directory = DIR / 'worker-retirements'
+            directory.mkdir(parents=True, exist_ok=True)
+            write_private(directory / f'{vm.id}.json', retirement)
+            self.__dict__.setdefault('worker_retirements', {})[vm.id] = vm.worker_retirement = retirement
+            if hasattr(self, '_retire'):
+                self._retire.add(vm.id)
+            self._lost_vm(vm)
+            log('WORKER_RETIREMENT', json.dumps(retirement, sort_keys=True))
+            return True
 
     def _reclaim_ghosts(self, vm):
         """Observe/journal confirmed legacy ghosts; deliver terminal LOST, never retry here."""
@@ -5414,21 +5498,26 @@ class Scheduler:
             return None
         if getattr(self, "handing_off", False) or vm.id in getattr(self, "_namespace_recoveries", {}):
             return 0.5
+        if retirement := getattr(vm, 'worker_retirement', None):
+            return None if self._retire_worker(vm, retirement['provider_state'], retirement['source'],
+                                               expired=retirement['reason'] == 'readiness_timeout') else 0.5
         # Heartbeats refresh authority, not operational readiness. Recovery
         # must still run when a heartbeat made the periodic lease timer fresh.
         if rules.worker_renewal_needed(getattr(vm, "renewal_pending", False), time.monotonic() - vm.t_renew >= 60):
             try:
                 if not self._renew_lease(vm):
                     return None
-            except Exception as error:
-                # No placement while authority cannot be verified. A stopped VM
-                # cannot renew at all: do not pin its work/capacity forever.
+            except Exception:
+                # No placement while authority cannot be verified. A terminal
+                # provider state, unlike a transport error, releases capacity.
                 vm.ready = False
                 vm.renewal_pending = True
-                if not self._boat_up(vm.id):
-                    self._note_lease_relinquish(vm, source='renew.transport_provider_down',
-                                              error=error, operation='lease/renew')
-                    self._lost_vm(vm)
+                now = time.monotonic()
+                detail = now >= getattr(vm, '_next_provider_detail', 0.0)
+                if detail:
+                    vm._next_provider_detail = now + 60
+                state = self._provider_terminal_state(vm.id, detail=detail)
+                if self._retire_worker(vm, state, 'renew.provider'):
                     return None
                 self._check_unreachable_item(vm)
                 return 5.0
@@ -5499,11 +5588,10 @@ class Scheduler:
                 vm.quarantine_since = time.time()
                 log(f"{vm.id}: quarantined: {vm.quarantine}")
             outage = self._outage()
-            if "is stopped" in str(e) and rules.vm_lost(fails, outage, False, True):  # (boat stopped it: let go at once, its items to other VMs)
-                log(f"{vm.id}: boat reports it stopped")
-                self._note_lease_relinquish(vm, source='tick.provider_stopped', error=e, operation='rpc/vtick')
-                self._lost_vm(vm)
-                return None
+            if fails == 1 or 'is stopped' in str(e) or fails % 10 == 0:
+                state = self._provider_terminal_state(vm.id)
+                if self._retire_worker(vm, state, 'tick.provider'):
+                    return None
             if fails >= 2 and fails % 4 == 2:  # (its agent repaired in place, its items running on)
                 if self._repair(vm):
                     vm._fails = 0
@@ -5517,16 +5605,12 @@ class Scheduler:
                 self.trip(f"boat's front: the agents of {sum(1 for v in self._outage_vms() if v.failing)} of {len(self._outage_vms())} eligible VMs don't answer ({str(e)[:80]})")
             if fails <= 3 or fails % 10 == 0:
                 log(f"{vm.id}: tick failed ({fails}{', an outage' if outage else ''}): {str(e)[:160]}")
-            # ("lost": rules.vm_lost, boat reports it stopped or gone; boat asked only past the failures' threshold)
-            if rules.vm_lost(fails, outage, fails < (90 if outage else 12) or self._boat_up(vm.id), False):
-                self._note_lease_relinquish(vm, source='tick.provider_lost', error=e, operation='rpc/vtick')
-                self._lost_vm(vm)
-                return None
+
             # Preserve every existing retry/ack before probing or writing a loss row.
             self._check_unreachable_item(vm)
             return float(min(20, 2 * fails))
-        if self.stop.is_set():
-            return None  # The successor owns observations after the frozen snapshot.
+        if self.stop.is_set() or vm.dead or getattr(vm, 'worker_retirement', None):
+            return None  # Do not consume late observations after loss or handoff.
         if r.get("err"):  # (a batch's directory gone from the VM: prepared again)
             self._unprepare(vm, r.get("batch"))
             with self.lock:
@@ -5629,6 +5713,8 @@ class Scheduler:
             vm.client.rpc("killitem", bid, name, timeout=20)
 
     def _accept_finished(self, vm, row):
+        if getattr(vm, 'worker_retirement', None):
+            return False
         if getattr(self, "recovery_blocked", False) or self._unclassified(row["batch"]):
             return False  # leave results on the agent until their admission is decoded
         ack = {"batch": row["batch"], "name": row["name"]}
@@ -5914,10 +6000,11 @@ class Scheduler:
                                                          "error": f"boat failed it {it.fails} times (last: {why})"},), daemon=True).start()
 
     def _lost_vm(self, vm: VMState):
-        if vm.dead:
-            return
-        log(f"{vm.id}: lost")
         with self.lock:
+            if vm.dead:
+                return
+            retirement = getattr(vm, 'worker_retirement', None)
+            log(f"{vm.id}: lost")
             # A best-effort diagnostic never proves reap or stalls unrelated loss handling.
             held = {id(it): it for it in list(vm.running.values()) + list(vm.finishing.values())}
             for it in held.values():
@@ -5935,10 +6022,17 @@ class Scheduler:
                     else:
                         it.terminal_loss = evidence
                     it.owned.cancel()
-            vm.dead = True
+            if not retirement:
+                vm.dead = True
             # (rules.slept_through, ItemFate.vm_lost: a VM boat stopped while this machine slept is no strike)
             slept = rules.slept_through(time.time(), getattr(self, "t_wake", 0), 900)
             for key, it in list(vm.running.items()):
+                if retirement and it.batch.strict_once and not it.batch.admission_closed and it.state != 'done':
+                    # Keep the hold until the result commits. A journal failure
+                    # leaves dispatch fenced and the next poll can retry LOST.
+                    self._owned_failed(it, f"boat VM {vm.id} lost")
+                    vm.running.pop(key)
+                    continue
                 if it.batch.admission_closed or it.owned.closed:
                     if it.state != "done":
                         it.state = "cancel_pending"
@@ -5949,7 +6043,12 @@ class Scheduler:
                     it.state, it.vm, it.head = "queued", None, True
                 else:
                     self._boat_failed(it, vm.id, f"boat VM {vm.id} lost", strike)
-        self._let_go(vm, stop=True)
+            if retirement and self.vms.get(vm.id) is vm:
+                vm.dead = True
+                vm.starts = []
+                self.vms.pop(vm.id)
+        if not retirement:
+            self._let_go(vm, stop=True)
         self.wake.set()
 
     def _release_idle(self):

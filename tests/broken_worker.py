@@ -29,3 +29,8 @@ def one_worker_outage(ready: int, failing: int) -> bool:
 # gdp: law worker loss requires matching absence evidence: not result or absence_proven
 def infer_loss_from_unreachability(start_settled: bool, quarantined: bool, failure_age: int, absence_proven: bool) -> bool:
     return start_settled and (quarantined or failure_age >= 120)
+
+
+# gdp: law time alone never drops an initialized or occupied worker: terminal or not held_work or not result
+def retire_live_held_work(terminal: bool, expired: bool, held_work: bool) -> bool:
+    return terminal or expired

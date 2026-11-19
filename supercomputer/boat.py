@@ -371,6 +371,13 @@ def named_snapshots(max_age: float = 0) -> dict:
 
 
 RUNNING = {"ready", "idle", "running"}
+WORKER_TERMINAL = frozenset({"error", "deleted", "stopped"})
+
+
+class WorkerBootTerminated(RuntimeError):
+    def __init__(self, vm: str, state: str):
+        super().__init__(f'{vm}: provider reports {state}')
+        self.state = state
 
 
 _states = {"t": 0.0, "d": {}}
@@ -386,7 +393,7 @@ def states(max_age: float = 3.0) -> dict:
         return _states["d"]
 
 
-def wait_running(ids: list[str], timeout: int = 600) -> dict:
+def wait_running(ids: list[str], timeout: int = 600, *, abort_terminal: bool = False) -> dict:
     """Wait for hydrated, running VMs that answer exec, within the caller's existing budget."""
     t0, ok = time.time(), {}
     pending = list(ids)
@@ -398,6 +405,9 @@ def wait_running(ids: list[str], timeout: int = 600) -> dict:
             continue
         for i in list(pending):
             status = states_.get(i, {})
+            # A stopped VM may still be resuming; only error/deleted end a boot early.
+            if abort_terminal and status.get("state") in ("error", "deleted"):
+                raise WorkerBootTerminated(i, status['state'])
             if R.bootstrap_exec_allowed(status.get("state") in RUNNING, status.get("hydrated") is True):
                 r = exec_(i, ["true"], 30)
                 if r.get("exitCode") == 0:
@@ -685,9 +695,13 @@ def reconcile(d: dict, live: dict):
         gone = R.absent_gone(s.get("state") in ("deleted", "deleting"), not s, complete, d["vms"][i].get("absent", 0))
         if not s and not gone:
             continue
+        # Preserve provider-error VMs for inspection; no automatic stop/delete or resume.
+        if s.get("state") == "error":
+            d["vms"][i]["state"] = "error"
+            continue
         # (rules.boat.Entry.reconcile)
         what = entry(d["vms"][i]).reconcile(gone, bool(s.get("dataExpiredAt")),
-                                            s.get("state") in ("error", "stopped") and not s.get("snapshotAvailable"),
+                                            s.get("state") == "stopped" and not s.get("snapshotAvailable"),
                                             (s.get("stop") or {}).get("status") == "failing" and s.get("hydrated") is False)
         if what == "drop":
             d["vms"].pop(i)

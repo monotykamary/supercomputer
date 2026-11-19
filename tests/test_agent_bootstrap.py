@@ -294,7 +294,7 @@ class ResumeLifetime(unittest.TestCase):
                 clock['expires'] = clock['now'] + int(args[args.index('--ttl') + 1])
                 return '{}'
             self.fail(f'unexpected provider operation: {args[0]}')
-        def running(*args):
+        def running(*args, **kwargs):
             clock['now'] += 20
             return {vm.id: 20} if clock['now'] < clock['expires'] else {}
         def bootstrap(*args, **kwargs):

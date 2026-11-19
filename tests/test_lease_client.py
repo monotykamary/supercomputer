@@ -372,22 +372,22 @@ class LeaseClientTests(unittest.TestCase):
         for provider_up in (False, True):
             with self.subTest(provider_up=provider_up):
                 s = S.Scheduler.__new__(S.Scheduler)
-                s.lock = threading.RLock()
+                s.lock, s.stop = threading.RLock(), threading.Event()
                 vm = S.VMState('vm', 'image', 'large', 'warm')
                 vm.lease, vm.ready, vm.t_renew = dict(self.lease), True, 0.0
+                s.vms = {vm.id: vm}
                 with patch.object(S.time, 'monotonic', return_value=1000.0), \
                      patch.object(s, '_renew_lease', side_effect=RuntimeError('vm is stopped')), \
-                     patch.object(s, '_boat_up', return_value=provider_up) as check, \
-                     patch.object(s, '_lost_vm') as lost:
+                     patch.object(s, '_provider_terminal_state', return_value=None if provider_up else 'stopped') as check, \
+                     patch.object(s, '_retire_worker', return_value=not provider_up) as retire:
                     delay = s._tick(vm)
-                check.assert_called_once_with('vm')
+                check.assert_called_once_with('vm', detail=True)
+                retire.assert_called_once_with(vm, None if provider_up else 'stopped', 'renew.provider')
                 self.assertFalse(vm.ready)
                 if provider_up:
                     self.assertEqual(delay, 5.0)
-                    lost.assert_not_called()
                 else:
                     self.assertIsNone(delay)
-                    lost.assert_called_once_with(vm)
 
     def _idle_poll_worker(self, ready=False):
         s = S.Scheduler.__new__(S.Scheduler)
@@ -421,7 +421,7 @@ class LeaseClientTests(unittest.TestCase):
         clock = [1000.0]
         with patch.object(S.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(B, 'lease_vm', side_effect=[RuntimeError('temporary relay failure'), {'ok': True}, {'ok': True}]) as renew, \
-             patch.object(s, '_boat_up', return_value=True), \
+             patch.object(s, '_provider_terminal_state', return_value=None), \
              patch.object(B, 'boat', return_value='{}'):
             self.assertEqual(s._tick(vm), 5.0)
             self.assertFalse(vm.ready)
@@ -453,7 +453,7 @@ class LeaseClientTests(unittest.TestCase):
         s, vm = self._idle_poll_worker()
         with patch.object(S.time, 'monotonic', return_value=1001.0), \
              patch.object(B, 'lease_vm', side_effect=RuntimeError('temporary relay failure')), \
-             patch.object(s, '_boat_up', return_value=True), \
+             patch.object(s, '_provider_terminal_state', return_value=None), \
              patch.object(s, '_lost_vm') as lost:
             self.assertEqual(s._tick(vm), 5.0)
         self.assertFalse(vm.ready)
