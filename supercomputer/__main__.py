@@ -418,8 +418,8 @@ def main(argv=None):
         else:
             have = boat.named_snapshots()
             for name, snap, _ in boat.layers():
-                ok = have.get(snap, {}).get("status") == "ready" or have.get(boat._ALIAS.get(snap), {}).get("status") == "ready"
-                print(f"{name:8} {snap:30} {'ready' if ok else 'missing'}")
+                ready = boat.ready_layer_snapshot(snap, have)
+                print(f"{name:8} {ready or snap:30} {'ready' if ready else 'missing'}")
     elif a.cmd == "usage":
         import datetime
         tt = datetime.datetime.fromisoformat(a.since.replace("Z", "+00:00")).timestamp()

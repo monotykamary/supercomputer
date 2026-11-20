@@ -419,7 +419,21 @@ def wait_running(ids: list[str], timeout: int = 600, *, abort_terminal: bool = F
 
 
 # ---------------------------------------------------------------------------------------------------------- the image
-_ALIAS: dict = {}
+_ALIAS: dict[str, str] = {}
+_ALIASES: dict[str, tuple[str, ...]] = {}
+
+
+def layer_aliases(snap: str) -> tuple[str, ...]:
+    """Former top-layer snapshot names a non-top layer had before another layer went on it."""
+    return _ALIASES.get(snap) or ((_ALIAS[snap],) if snap in _ALIAS else ())
+
+
+def ready_layer_snapshot(snap: str, have: dict) -> str | None:
+    """The ready snapshot name for a layer: its canonical name, else a ready former top-layer alias."""
+    for candidate in (snap, *layer_aliases(snap)):
+        if have.get(candidate, {}).get("status") == "ready":
+            return candidate
+    return None
 
 
 def layers(p: config.Project | None = None) -> list[tuple[str, str, str]]:
@@ -429,8 +443,13 @@ def layers(p: config.Project | None = None) -> list[tuple[str, str, str]]:
     out, h = [], hashlib.sha256(p.image_salt.encode() + b"\n")
     for name, script in p.layer_scripts():
         h.update(name.encode() + b"\0" + script.encode() + b"\0")
-        out.append((name, f"{p.prefix}-{name}-{h.hexdigest()[:10]}", script))
-        _ALIAS[out[-1][1]] = f"{p.prefix}-{h.hexdigest()[:12]}"  # (the name it had when it was the top layer: the same snapshot)
+        digest = h.hexdigest()
+        snap = f"{p.prefix}-{name}-{digest[:10]}"
+        out.append((name, snap, script))
+        # (the names it had when it was the top layer: the same snapshot, under final_prefix or legacy prefix)
+        aliases = tuple(dict.fromkeys((f"{p.final_prefix}-{digest[:12]}", f"{p.prefix}-{digest[:12]}")))
+        _ALIASES[snap] = aliases
+        _ALIAS[snap] = aliases[0]
     # (the image's own name has a prefix of its own: a client of older code pruned every <prefix>- name it didn't use)
     out[-1] = (out[-1][0], f"{p.final_prefix}-{h.hexdigest()[:12]}", out[-1][2])
     return out
@@ -552,14 +571,15 @@ def ensure_image(build: bool = True) -> str:
     chain = layers()
     parent = None
     for name, snap, script in chain:
-        if have.get(_ALIAS.get(snap), {}).get("status") == "ready" and snap not in have:
-            snap = _ALIAS[snap]  # (a layer that was the image's top before another went on it)
-        if snap not in have or have[snap].get("status") != "ready":
+        ready = ready_layer_snapshot(snap, have)
+        if ready is not None:
+            snap = ready  # (already built, either under its layer name or as a former top-layer image)
+        else:
             if not build:
                 raise Unavailable(f"boat image {chain[-1][1]} isn't built (layer {snap} missing): supercomputer image --build")
             build_layer(name, snap, script, parent)
         parent = snap
-    prune_snapshots({s for _, s, _ in chain} | {_ALIAS[s] for _, s, _ in chain if s in _ALIAS}, chain[-1][1])
+    prune_snapshots({s for _, s, _ in chain} | {a for _, s, _ in chain for a in layer_aliases(s)}, chain[-1][1])
     return chain[-1][1]
 
 

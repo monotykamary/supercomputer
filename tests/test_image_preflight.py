@@ -115,5 +115,103 @@ class ScheduledImageTests(unittest.TestCase):
         self.assertIn(order, (["a+", "a-", "b+", "b-"], ["b+", "b-", "a+", "a-"]))
 
 
+class LayerAliasTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.addCleanup(os.environ.pop, "SUPERCOMPUTER_IMAGE", None)
+        os.environ.pop("SUPERCOMPUTER_IMAGE", None)
+
+    def _project(self, layers, *, prefix="gdpw", final_prefix="sc"):
+        return config.Project(self.root, {
+            "name": "gdp-wired",
+            "boat": {"prefix": prefix, "final_prefix": final_prefix, "image_salt": "salt-v1",
+                     "layers": [{"name": n, "script": s} for n, s in layers]},
+        })
+
+    def test_appended_layer_reuses_ready_final_prefix_parent(self):
+        base_layers = [("tools", "echo tools"), ("langs", "echo langs")]
+        prior = self._project(base_layers)
+        prior_chain = boat.layers(prior)
+        prior_top = prior_chain[-1][1]
+        self.assertTrue(prior_top.startswith("sc-"))
+
+        extended = self._project([*base_layers, ("node", "echo node")])
+        chain = boat.layers(extended)
+        have = {
+            prior_chain[0][1]: {"status": "ready"},
+            prior_top: {"status": "ready"},
+        }
+        self.assertEqual(boat.ready_layer_snapshot(chain[1][1], have), prior_top)
+        self.assertIsNone(boat.ready_layer_snapshot(chain[2][1], have))
+
+        with mock.patch.object(boat, "project", return_value=extended), \
+                mock.patch.object(boat, "named_snapshots", return_value=have), \
+                mock.patch.object(boat, "build_layer") as build_layer, \
+                mock.patch.object(boat, "prune_snapshots") as prune:
+            built = boat.ensure_image(True)
+
+        self.assertEqual(built, chain[-1][1])
+        build_layer.assert_called_once_with("node", chain[-1][1], "echo node", prior_top)
+        self.assertIn(prior_top, prune.call_args.args[0])
+
+    def test_legacy_prefix_alias_remains_supported_when_final_prefix_absent(self):
+        base_layers = [("tools", "echo tools"), ("langs", "echo langs")]
+        extended = self._project([*base_layers, ("node", "echo node")])
+        chain = boat.layers(extended)
+        legacy_alias = next(a for a in boat.layer_aliases(chain[1][1]) if a.startswith("gdpw-"))
+        have = {
+            chain[0][1]: {"status": "ready"},
+            legacy_alias: {"status": "ready"},
+        }
+        with mock.patch.object(boat, "project", return_value=extended), \
+                mock.patch.object(boat, "named_snapshots", return_value=have), \
+                mock.patch.object(boat, "build_layer") as build_layer, \
+                mock.patch.object(boat, "prune_snapshots"):
+            boat.ensure_image(True)
+
+        build_layer.assert_called_once_with("node", chain[-1][1], "echo node", legacy_alias)
+
+    def test_no_build_reports_only_missing_top_layer_when_parent_alias_is_ready(self):
+        base_layers = [("tools", "echo tools"), ("langs", "echo langs")]
+        prior_chain = boat.layers(self._project(base_layers))
+        extended = self._project([*base_layers, ("node", "echo node")])
+        chain = boat.layers(extended)
+        have = {
+            prior_chain[0][1]: {"status": "ready"},
+            prior_chain[1][1]: {"status": "ready"},
+            chain[1][1]: {"status": "failed"},
+        }
+        with mock.patch.object(boat, "project", return_value=extended), \
+                mock.patch.object(boat, "named_snapshots", return_value=have):
+            with self.assertRaisesRegex(boat.Unavailable, chain[-1][1]):
+                boat.ensure_image(False)
+
+    def test_image_cli_reports_ready_for_aliased_final_prefix_parent(self):
+        import io
+        from supercomputer import __main__ as cli
+        base_layers = [("tools", "echo tools"), ("langs", "echo langs")]
+        prior_chain = boat.layers(self._project(base_layers))
+        extended = self._project([*base_layers, ("node", "echo node")])
+        chain = boat.layers(extended)
+        have = {
+            prior_chain[0][1]: {"status": "ready"},
+            prior_chain[1][1]: {"status": "ready"},
+        }
+        buf = io.StringIO()
+        with mock.patch.object(config, "use", return_value=extended), \
+                mock.patch.object(boat, "project", return_value=extended), \
+                mock.patch.object(boat, "named_snapshots", return_value=have), \
+                mock.patch.object(sys, "stdout", buf):
+            cli.main(["image"])
+        lines = [line.split() for line in buf.getvalue().strip().splitlines()]
+        self.assertEqual(lines, [
+            ["tools", prior_chain[0][1], "ready"],
+            ["langs", prior_chain[1][1], "ready"],
+            ["node", chain[2][1], "missing"],
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()
