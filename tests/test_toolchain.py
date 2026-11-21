@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+import pathlib as _pathlib, sys as _sys; _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[1]))  # (the checkout's package, run as tests/x.py)
 from supercomputer import agent, boat, clientresults, config, fanout, resultfiles, resultjson, toolchain
 from supercomputer.rules.agent_capabilities import agent_capabilities_match, required_agent_capabilities
 

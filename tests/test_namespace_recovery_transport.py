@@ -1,5 +1,6 @@
 import json,time,unittest
 from unittest.mock import patch
+import pathlib as _pathlib, sys as _sys; _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[1]))  # (the checkout's package, run as tests/x.py)
 from supercomputer.namespace_recovery_transport import NativeTransport,CAPSULE,BOOT
 
 class NativeTransportTests(unittest.TestCase):

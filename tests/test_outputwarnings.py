@@ -2,6 +2,7 @@
 import io
 import unittest
 
+import pathlib as _pathlib, sys as _sys; _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[1]))  # (the checkout's package, run as tests/x.py)
 from supercomputer.outputwarnings import warn_broad_outputs
 
 

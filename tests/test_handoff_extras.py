@@ -17,7 +17,7 @@ from supercomputer import boat, scheduler
 
 
 class TakePoolExtras(unittest.TestCase):
-    def take(self, handoff, extra_state="idle"):
+    def take(self, handoff, extra_state="idle", offered_extra=None):
         with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
             root = pathlib.Path(tmp)
             (root / "queue").mkdir()
@@ -33,7 +33,7 @@ class TakePoolExtras(unittest.TestCase):
                 (root / "handoff.json").write_text(json.dumps({
                     "from_pid": 11, "t": time.time(), "admission_guard": True, "batches": [],
                     "vms": [{"id": "offered", "image": "image", "type": "large", "slots": 4,
-                             "lease": leases["offered"], "items": []}]}))
+                             "lease": leases["offered"], "items": [], **(offered_extra or {})}]}))
             s = object.__new__(scheduler.Scheduler)
             s.vms, s.batches, s.recovery_errors, s.held_before = {}, {}, {}, {}
             s.code, s.agent_b64 = "new", ""
@@ -73,6 +73,19 @@ class TakePoolExtras(unittest.TestCase):
         s._renew_lease.assert_not_called()
         self.assertEqual(s._handoff_ack["taken"], ["offered"])
         self.assertEqual(s._handoff_ack["missing"], [])
+
+    def test_a_deadline_or_broken_worker_retirement_survives_the_handoff(self):
+        """A new scheduler keeps the old one's retirement: still quarantined, still to be reaped, not cleared by its
+        first successful tick (11-21: the deadline quarantine was carried as plain text and cleared)."""
+        mark = {"quarantine": "retired: worker broken 901 s", "quarantine_since": 5.0,
+                "deadline_missed": "worker broken 901 s: boat's front failed its last 10 requests", "reap_when_empty": True}
+        s, *_ = self.take(True, offered_extra=mark)
+        v = s.vms["offered"]
+        self.assertEqual((v.quarantine, v.deadline_missed, v.reap_when_empty),
+                         (mark["quarantine"], mark["deadline_missed"], True))
+        self.assertEqual(scheduler.Scheduler._retire_mark(v), {"deadline_missed": mark["deadline_missed"], "reap_when_empty": True})
+        plain, *_ = self.take(True, offered_extra={"quarantine": "worker-local agent connection refused"})
+        self.assertIsNone(getattr(plain.vms["offered"], "deadline_missed", None))
 
     def test_stopped_extra_is_in_baseline_before_it_can_become_idle(self):
         s, records, original, clients = self.take(True, "stopped")

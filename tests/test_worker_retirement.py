@@ -1,7 +1,10 @@
 """Provider-driven retirement: only read-only provider calls in these fixtures."""
+import pathlib
+import sys
 import unittest
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # (the checkout's package, run as tests/x.py)
 from supercomputer import boat, scheduler as S
 import test_owned_scheduler as fixture
 

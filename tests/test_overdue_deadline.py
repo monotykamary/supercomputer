@@ -154,5 +154,73 @@ class Deadline(unittest.TestCase):
         self.assertEqual(it.fails, S.BOAT_TRIES)
 
 
+class BrokenWorker(Deadline):
+    """11-20/21: bx_p6avs5jw's front 502 on every request for 5 h+ (prep's /put failing there); bx_8f4yedv5 quarantined,
+    its agent refusing connections, for 2.5 days. A worker broken BROKEN_WORKER_S with no strict item is retired: no
+    new placement, stopped once empty, and the mark survives a handoff or restart."""
+
+    def broken_front(self, v, since):
+        v.client = S.boat.AgentClient(v.id, "https://invalid.example/agent", "token", lease=v.lease)
+        v.client.front_failures, v.client.front_failing_since = S.FRONT_BROKEN_N, since
+
+    def test_the_client_counts_front_failures_and_any_answer_resets_them(self):
+        c = S.boat.AgentClient("vm", "https://invalid.example/agent", "token", lease={})
+        with patch.object(c, "_req_front", return_value=(502, b"upstream unavailable\n", "text/plain")):
+            for _ in range(3):
+                c._req("POST", "/put", b"x")
+        self.assertEqual(c.front_failures, 3)
+        self.assertGreater(c.front_failing_since, 0)
+        with patch.object(c, "_req_front", side_effect=S.boat.AgentError("vm: the warm agent didn't answer")):
+            with self.assertRaises(S.boat.AgentError):
+                c._req("POST", "/rpc", b"{}")
+        self.assertEqual(c.front_failures, 4)
+        with patch.object(c, "_req_front", return_value=(200, b"{}", "application/json")):
+            c._req("POST", "/rpc", b"{}")
+        self.assertEqual((c.front_failures, c.front_failing_since), (0, 0.0))
+
+    def test_an_empty_front_broken_vm_is_retired_and_reaped(self):
+        b, v = self.placed()
+        v.running.clear()
+        now = time.time()
+        self.broken_front(v, now - S.BROKEN_WORKER_S + 60)
+        reaped, _ = self.sweep(now)
+        self.assertEqual(reaped, [])  # (not broken long enough)
+        self.broken_front(v, now - S.BROKEN_WORKER_S - 1)
+        reaped, thread = self.sweep(now)
+        self.assertEqual(reaped, [v])
+        self.assertTrue(v.quarantine.startswith("retired: "))
+        self.assertIn(self.s._lost_vm, [c.kwargs.get("target") for c in thread.call_args_list])
+        self.assertFalse(S.vm_fits(S.fit_shape(batch(self.s, "next").items["i0"]), v, set()))
+
+    def test_a_quarantined_vm_failing_every_tick_is_reaped_once_empty(self):
+        b, v = self.placed(limit=100000)
+        now = time.time()
+        v.quarantine, v.quarantine_since, v.failing = "worker-local agent connection refused", now - S.BROKEN_WORKER_S - 1, 40
+        reaped, _ = self.sweep(now)
+        self.assertEqual(reaped, [])  # (its legacy item first: it ends or meets its deadline)
+        self.assertTrue(v.deadline_missed)
+        v.running.clear()
+        reaped, _ = self.sweep(now + 31)
+        self.assertEqual(reaped, [v])
+
+    def test_a_strict_hold_keeps_a_broken_vm(self):
+        b, v = self.placed(limit=100, strict=True)
+        now = time.time()
+        self.broken_front(v, now - S.BROKEN_WORKER_S - 1)
+        reaped, _ = self.sweep(now)
+        self.assertEqual(reaped, [])
+        self.assertIn((b.id, b.items["i0"].run_name), v.running)
+
+    def test_the_retirement_mark_is_what_state_and_handoff_carry(self):
+        b, v = self.placed()
+        v.deadline_missed, v.reap_when_empty = "worker broken 901 s: boat's front failed its last 10 requests", True
+        self.assertEqual(self.s._retire_mark(v), {"deadline_missed": v.deadline_missed, "reap_when_empty": True})
+        self.assertEqual(self.s._retire_mark(vm(self.s, "clean")), {})
+        self.s.code = "test"
+        self.s._durable_snapshot = self.s._distinct_snapshot = self.s._image_pins_manifest = lambda: {}
+        snap = {x["id"]: x for x in self.s._handoff_snapshot()["vms"]}
+        self.assertEqual(snap[v.id]["deadline_missed"], v.deadline_missed)
+        self.assertTrue(snap[v.id]["reap_when_empty"])
+
 if __name__ == "__main__":
     unittest.main()

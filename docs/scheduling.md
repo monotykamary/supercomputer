@@ -186,6 +186,11 @@ and the breaker survive too.
   alert records it, and its VM takes nothing new and is stopped once it holds no strict item. A finished row the
   controller cannot import never blocks the VM's other rows; `resultpart` replays over boat exec when the front
   fails. Strict items keep their custody contract (`docs/strict-once.md`) and never time out here.
+- A broken worker is retired: boat's front failing every request (`FRONT_BROKEN_N`, 10, in a row) or its agent
+  quarantined with every tick failing, for `BROKEN_WORKER_S` (900 s, `SUPERCOMPUTER_BROKEN_WORKER_S`) without a
+  break, and no strict item held: no new placement at once, stopped once its legacy items are gone (the deadline
+  bounds them), demand starting a replacement. A deadline or broken-worker retirement is kept in the scheduler's
+  state and its handoff snapshot, so a successor neither clears it nor places there.
 - Agents follow the code: each reports its code hash; a stale one is upgraded in place between items.
 - State on disk written whole then renamed (batches, registry, policy, accounts); appended rows and placements
   tolerate a torn last line. A `kill -9` loses nothing: the next scheduler takes everything back.

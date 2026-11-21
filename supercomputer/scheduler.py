@@ -184,6 +184,12 @@ BOAT_TRIES = _env("BOAT_TRIES", 3)  # boat failures before an item is terminal L
 # front answering 502, its gate held at 68/69 for hours).
 OVERDUE_GRACE_S = _env("OVERDUE_GRACE_S", 900.0)
 DEADLINE_EVERY_S = 30.0  # the deadline sweep's cadence (main loop, off the pollers)
+# A worker broken this long (boat's front failing every request, or its agent quarantined and failing every tick) with
+# no strict item held is retired: no new placement at once, stopped once its legacy items are gone (the deadline bounds
+# them), a new VM started by demand in its place (11-20: bx_p6avs5jw's front 502 on every request for 5 h+, /put and
+# prep failing there; bx_8f4yedv5's agent refusing connections for 2.5 days, an xlarge held quarantined).
+BROKEN_WORKER_S = _env("BROKEN_WORKER_S", 900.0)
+FRONT_BROKEN_N = 10  # consecutive front failures before its time counts (one failure is no evidence)
 DRAIN_STEP = _env("DRAIN_STEP", 0.25)  # past their hold, the VMs above the floor shed by at most this share (rounded up) a window
 DRAIN_EVERY = _env("DRAIN_EVERY", 300.0)  # the staged drain's window: until this long after its last shed
 FLOOR_ALWAYS = _env("FLOOR_ALWAYS", 0) not in (0, "0", "")  # the floor held with no treadmill alive too
@@ -834,7 +840,7 @@ class Scheduler:
             tmp.rename(p)
             st = {"breaker": self.br, "bring_up": self.bring_up, "wave": self.wave, "starts_log": self.starts_log[-200:],
                   "resume_quarantine": getattr(self, "resume_quarantine", {}),
-                  "held": {v.id: {"t_real": v.t_real, "draining": v.draining, "lease": v.lease, "ttl": v.ttl, "quarantine": v.quarantine, "quarantine_since": v.quarantine_since} for v in list(self.vms.values()) if not v.dead},
+                  "held": {v.id: {"t_real": v.t_real, "draining": v.draining, "lease": v.lease, "ttl": v.ttl, "quarantine": v.quarantine, "quarantine_since": v.quarantine_since, **self._retire_mark(v)} for v in list(self.vms.values()) if not v.dead},
                   "est": self.est_hist, "class_obs": {str(k): v[-200:] for k, v in self.class_obs.items()},
                   "hints": {k: h for k, h in self.hints.items() if h.get("until", 0) > time.time()},
                   "drains": {img: {"open": d.open, "t_last": d.t_last, "share": d.share, "quota": d.quota, "released": d.released}
@@ -1286,6 +1292,10 @@ class Scheduler:
             vm.model = i.get("model", "")
             vm.quarantine = i.get("quarantine", hb.get("quarantine", ""))
             vm.quarantine_since = i.get("quarantine_since", hb.get("quarantine_since", 0.0))
+            mark = i.get("deadline_missed", hb.get("deadline_missed"))  # (a retirement outlives a handoff or restart)
+            if isinstance(mark, str) and mark:
+                vm.deadline_missed = mark
+                vm.reap_when_empty = bool(i.get("reap_when_empty", hb.get("reap_when_empty", False)))
             vm.ready, vm.t_ready, vm.idle_since = True, now, now
             if snap:  # (a handoff: its items exactly as the old one held them there, no record older than that)
                 for x in i.get("items", []):
@@ -1719,7 +1729,7 @@ class Scheduler:
             vms.append({"id": v.id, "image": v.image, "type": v.type, "slots": v.slots, "prepared": sorted(v.prepared), "trees": sorted(v.trees),
                         "model": v.model, "caches": sorted([list(c) for c in v.caches]), "lease": v.lease, "ttl": v.ttl, "t_real": v.t_real, "draining": v.draining, "gen": v.gen, "agent": v.agent,
                         "agent_capabilities": dict(v.agent_capabilities),
-                        "quarantine": v.quarantine, "quarantine_since": v.quarantine_since,
+                        "quarantine": v.quarantine, "quarantine_since": v.quarantine_since, **self._retire_mark(v),
                         "items": [{"batch": it.batch.id, "name": it.name, "run_name": it.run_name,
                                    "state": "running" if it.state == "finishing" else it.state,
                                    "placement": it.last_placement, "launch_identity": it.launch_identity, "placed": it.placed}
@@ -5540,6 +5550,28 @@ class Scheduler:
         late = now - it.t_start - limit - OVERDUE_GRACE_S
         return late if late > 0 else None
 
+    @staticmethod
+    def _retire_mark(v) -> dict:
+        """A deadline or broken-worker retirement as the scheduler's state and a handoff carry it."""
+        mark = getattr(v, "deadline_missed", None)
+        return {"deadline_missed": mark, "reap_when_empty": bool(getattr(v, "reap_when_empty", False))} if mark else {}
+
+    @staticmethod
+    def _broken_for(vm, now: float) -> tuple[float, str] | None:
+        """Seconds this worker has been broken without a break, and how; None when it isn't. A quarantine counts while
+        its ticks keep failing (a successful tick clears it); the front while every request through it has failed."""
+        if getattr(vm, "quarantine", "") and getattr(vm, "failing", 0) and not getattr(vm, "deadline_missed", None):
+            since = float(getattr(vm, "quarantine_since", 0.0) or 0.0)
+            if since:
+                return now - since, f"quarantined ({vm.quarantine[:80]}), every tick failing"
+        c = getattr(vm, "client", None)
+        n = getattr(c, "front_failures", 0) if c is not None else 0
+        if isinstance(n, int) and n >= FRONT_BROKEN_N:
+            since = float(getattr(c, "front_failing_since", 0.0) or 0.0)
+            if since:
+                return now - since, f"boat's front failed its last {n} requests"
+        return None
+
     def _deadline_tick(self, now: float):
         """The controller's deadline, whatever the worker's agent: a legacy item with no result past its limit and
         OVERDUE_GRACE_S has its hold released and is failed on boat (one strike: queued again on another VM within
@@ -5572,14 +5604,22 @@ class Scheduler:
                     self.alert(f"{vm.id}: {it.batch.id}/{it.name}: {why}; its hold released, the VM reaped")
                     vm.deadline_missed = why
                     vm.quarantine, vm.quarantine_since = f"deadline: {why}"[:300], now
+                broken = None if getattr(vm, "deadline_missed", None) else self._broken_for(vm, now)
+                if broken and broken[0] >= BROKEN_WORKER_S:
+                    why = f"worker broken {broken[0]:.0f} s: {broken[1]}"
+                    vm.deadline_missed, vm.reap_when_empty = why, True
+                    vm.quarantine, vm.quarantine_since = f"retired: {why}"[:300], now
+                    self.alert(f"{vm.id}: {why}; no new placement, stopped once empty and replaced by demand")
                 if not getattr(vm, "deadline_missed", None):
                     continue
                 pending = getattr(vm, "finishing", {})
                 if pending or any(x.batch.strict_once for x in vm.running.values()):
                     continue  # (no new placement; reaped once its strict holds and commits are over)
+                if getattr(vm, "reap_when_empty", False) and (vm.running or getattr(vm, "foreign", 0)):
+                    continue  # (its legacy items end, or meet their deadline, first)
                 reap.append(vm)
         for vm in reap:
-            log(f"{vm.id}: reaped after a missed deadline ({vm.deadline_missed[:160]})")
+            log(f"{vm.id}: reaped ({vm.deadline_missed[:160]})")
             threading.Thread(target=self._lost_vm, args=(vm,), name="deadline-reap", daemon=True).start()
         if reap:
             self.wake.set()

@@ -1587,6 +1587,9 @@ class AgentClient:
         self.cookie = cookie
         self.idle: list[tuple[http.client.HTTPSConnection, float]] = []
         self.lock = threading.Lock()
+        # (boat's front for this VM: consecutive requests it failed (a transport error, a 502/503/504) and since when;
+        # reset by any answer through it. The scheduler retires a VM whose front stays broken: Scheduler._broken_for)
+        self.front_failures, self.front_failing_since = 0, 0.0
 
     IDLE_TIMEOUT = 30.0  # monotonic seconds; untouched pools swept within a further 5 seconds
 
@@ -1645,7 +1648,28 @@ class AgentClient:
         with contextlib.suppress(OSError):
             c.close()
 
-    def _req(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json", decode=None, transport_event=None, one_shot=False) -> tuple[int, object, str]:
+    FRONT_DOWN = (502, 503, 504)
+
+    def _front_seen(self, ok: bool):
+        with getattr(self, "lock", None) or contextlib.nullcontext():
+            if ok:
+                self.front_failures, self.front_failing_since = 0, 0.0
+            else:
+                if not getattr(self, "front_failures", 0):
+                    self.front_failing_since = time.time()
+                self.front_failures = getattr(self, "front_failures", 0) + 1
+
+    def _req(self, *args, **kwargs) -> tuple[int, object, str]:
+        """One request through boat's front, its outcome counted for the front's health (front_failures)."""
+        try:
+            out = self._req_front(*args, **kwargs)
+        except AgentError:
+            self._front_seen(False)
+            raise
+        self._front_seen(out[0] not in self.FRONT_DOWN)
+        return out
+
+    def _req_front(self, method: str, path: str, body: bytes | None = None, timeout: float = 60, ctype: str = "application/json", decode=None, transport_event=None, one_shot=False) -> tuple[int, object, str]:
         from .rules.owned_lifecycle import strict_transport_attempts
         strict = one_shot
         if method == "POST" and path in ("/submit", "/snapshot", "/close-receipt") and body:
