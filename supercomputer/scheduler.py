@@ -177,6 +177,13 @@ if not math.isfinite(BREAK_EVEN_OVERRIDE_S) or BREAK_EVEN_OVERRIDE_S < 0:
     raise ValueError("SUPERCOMPUTER_HORIZON must be a finite positive replay override, or 0 to disable")
 SUB_VMS = _env("SUB_VMS", 8)  # a submission client's VMs' worth of slots at once
 BOAT_TRIES = _env("BOAT_TRIES", 3)  # boat failures before an item is terminal LOST; never another provider
+# The controller's own deadline for a legacy item: no result accepted this long past its limit (counted from its
+# placement, its preparation included) and its hold is released, the item failed on boat (queued again within
+# BOAT_TRIES) and its VM reaped. The agent's `timeout -s KILL` is the limit; this is the backstop for a VM whose
+# result never reaches the controller (11-20 23:46: full-054 done in 118 s on bx_p6avs5jw, its payloads behind a
+# front answering 502, its gate held at 68/69 for hours).
+OVERDUE_GRACE_S = _env("OVERDUE_GRACE_S", 900.0)
+DEADLINE_EVERY_S = 30.0  # the deadline sweep's cadence (main loop, off the pollers)
 DRAIN_STEP = _env("DRAIN_STEP", 0.25)  # past their hold, the VMs above the floor shed by at most this share (rounded up) a window
 DRAIN_EVERY = _env("DRAIN_EVERY", 300.0)  # the staged drain's window: until this long after its last shed
 FLOOR_ALWAYS = _env("FLOOR_ALWAYS", 0) not in (0, "0", "")  # the floor held with no treadmill alive too
@@ -3048,6 +3055,10 @@ class Scheduler:
             else:  # (passes at most 4 a second: the wakes of items finishing together are one pass; 09:19, 15 light passes a second)
                 self.stop.wait(max(0.0, 0.25 - dt))
             self._abandon_tick()
+            try:
+                self._deadline_tick(time.time())
+            except Exception as e:
+                log(f"deadline: {e!r}"[:400])
             with contextlib.suppress(Exception):
                 self._watchdog_tick(time.time())
             with self.lock:
@@ -5495,6 +5506,85 @@ class Scheduler:
             self.wake.set()
         log(f'{vm.id}: worker-lost {binding["batch"]}/{binding["run_name"]}; cleanup custody retained')
 
+    def _note_result_failure(self, vm: VMState, row: dict, error: Exception):
+        """A finished row the controller could not take (its payloads unreadable, a transfer refused): logged once a
+        minute a row, kept on the item for status; the row stays unacknowledged and is asked again."""
+        key = (row.get("batch"), row.get("name"))
+        with self.lock:
+            it = vm.running.get(key)
+            if it is not None and not it.batch.strict_once:  # (a strict item's result_error is its custody's word)
+                it.result_error = str(error)[:300]
+        seen = vm.__dict__.setdefault("_result_failure_log", {})
+        now = time.time()
+        if now - seen.get(key, 0.0) >= 60:
+            seen[key] = now
+            log(f"{vm.id}: {key[0]}: {key[1]}: its finished row not taken: {error!r}"[:400])
+
+    @staticmethod
+    def _overdue(it, now: float) -> float | None:
+        """Seconds past the controller's deadline (its limit and OVERDUE_GRACE_S after placement) of a legacy item
+        still held with no result; None when it isn't due: strict items keep their custody contract, never this."""
+        if it.batch.strict_once or not it.t_start or not it.start_done.is_set():
+            return None
+        if it.batch.closed:
+            if it.state != "done":
+                return None
+        elif it.state != "running" or it.batch.admission_closed or it.owned.closed:
+            return None  # (a cancel in flight keeps its own receipt-bound path)
+        try:
+            limit = float(it.spec.get("limit"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(limit) or limit <= 0:
+            return None
+        late = now - it.t_start - limit - OVERDUE_GRACE_S
+        return late if late > 0 else None
+
+    def _deadline_tick(self, now: float):
+        """The controller's deadline, whatever the worker's agent: a legacy item with no result past its limit and
+        OVERDUE_GRACE_S has its hold released and is failed on boat (one strike: queued again on another VM within
+        BOAT_TRIES, else terminal); its VM takes nothing new and is reaped (stopped) once it holds no strict item and
+        no result being committed. A row that comes later from that run is acknowledged unread."""
+        if (now - getattr(self, "_t_deadline", 0.0) < DEADLINE_EVERY_S or getattr(self, "handing_off", False)
+                or getattr(self, "recovery_blocked", False) or self.stop.is_set()):
+            return []
+        self._t_deadline = now
+        reap = []
+        with self.lock:
+            for vm in list(self.vms.values()):
+                if (vm.dead or getattr(vm, "worker_retirement", None) or vm.upgrading
+                        or vm.id in getattr(self, "_namespace_recoveries", {})):
+                    continue
+                for key, it in list(vm.running.items()):
+                    late = self._overdue(it, now)
+                    if late is None:
+                        continue
+                    limit = float(it.spec["limit"])
+                    why = (f"no result {now - it.t_start:.0f} s after its placement on {vm.id} (limit {limit:.0f} s"
+                           f" + {OVERDUE_GRACE_S:.0f} s): the controller's deadline"
+                           + (f"; last: {it.result_error[:120]}" if getattr(it, "result_error", None) else ""))
+                    vm.running.pop(key)
+                    vm.busy_s += now - it.t_start
+                    vm.idle_since = now
+                    threading.Thread(target=self._kill_run, args=(vm, key[0], key[1]), daemon=True).start()
+                    if it.state == "running":
+                        self._boat_failed(it, vm.id, why)
+                    self.alert(f"{vm.id}: {it.batch.id}/{it.name}: {why}; its hold released, the VM reaped")
+                    vm.deadline_missed = why
+                    vm.quarantine, vm.quarantine_since = f"deadline: {why}"[:300], now
+                if not getattr(vm, "deadline_missed", None):
+                    continue
+                pending = getattr(vm, "finishing", {})
+                if pending or any(x.batch.strict_once for x in vm.running.values()):
+                    continue  # (no new placement; reaped once its strict holds and commits are over)
+                reap.append(vm)
+        for vm in reap:
+            log(f"{vm.id}: reaped after a missed deadline ({vm.deadline_missed[:160]})")
+            threading.Thread(target=self._lost_vm, args=(vm,), name="deadline-reap", daemon=True).start()
+        if reap:
+            self.wake.set()
+        return reap
+
     def _tick(self, vm: VMState) -> float | None:
         """One tick of the VM (a call that waits for nothing): the seconds until its next, None when it's done."""
         if vm.dead:
@@ -5576,7 +5666,7 @@ class Scheduler:
             r["done"] = owned_done + r.get("done", [])
             vm._fails, vm.failing = 0, 0
             vm._item_failure_since = None
-            if vm.quarantine:
+            if vm.quarantine and not getattr(vm, "deadline_missed", None):
                 log(f"{vm.id}: worker quarantine cleared by a successful tick")
                 vm.quarantine, vm.quarantine_since = "", 0.0
         except Exception as e:
@@ -5627,8 +5717,15 @@ class Scheduler:
         self._model_report(vm, r.get("model", ""))
         self._disk(vm, r.get("disk") or {})
         self._foreign(vm, r)
+        failed_rows = 0
         for row in r.get("done", []):
-            self._accept_finished(vm, row)
+            try:
+                self._accept_finished(vm, row)
+            except Exception as e:  # (one row that can't be taken never blocks the VM's other rows or its acks)
+                failed_rows += 1
+                self._note_result_failure(vm, row, e)
+        if failed_rows:
+            return 5.0  # (its rows asked again, its acks out; the deadline sweep bounds a row never taken)
         if r.get("done") or vm.acks:
             return 0.5  # (its acks out soon)
         # A drained queue can still have an urgent final result in flight.
@@ -5819,6 +5916,18 @@ class Scheduler:
             return self._finished_ghost(vm, row)
         if getattr(self, "handing_off", False):
             return False
+        key = (row["batch"], row["name"])
+        with self.lock:
+            held = vm.running.get(key)
+            if held is None:  # (no item owns it: nothing to import, nothing to deliver; ACKed unless being committed)
+                return key not in getattr(vm, "finishing", {})
+            if held.batch.closed:  # (its client closed the batch: no import a closed batch never reads)
+                vm.running.pop(key)
+                if held.t_start:
+                    vm.busy_s += time.time() - held.t_start
+                vm.idle_since = time.time()
+                self.wake.set()
+                return True
         row = self._fetch_result_files(vm, row)
         # Terminal runs release capacity immediately, but remain in the
         # handoff inventory until their row is committed and safe to ACK.

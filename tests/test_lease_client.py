@@ -333,6 +333,23 @@ class LeaseClientTests(unittest.TestCase):
             self.assertEqual(client.rpc('cancelitem', 'b', 'n', 1, 'launch-1', timeout=3), receipt)
             transport.assert_called_once()
 
+    def test_resultpart_front_502_replays_over_exec(self):
+        """11-20 23:48: bx_p6avs5jw's front answered every request 502 "upstream unavailable"; vtick went on over exec,
+        but resultpart had no fallback, so full-054's finished payloads were never imported and its gate held. A
+        bounded, owner-bound read is safe to repeat: sent again from inside the VM."""
+        client = self.client()
+        part = {"data": "", "offset": 0, "bytes": 0, "sha256": "a" * 64, "eof": True}
+        def remote(vm, argv, timeout):
+            body = json.loads(base64.b64decode(argv[-2]))
+            self.assertEqual(body['cmd'], 'resultpart')
+            self.assertEqual(body['args'][:5], ['b', 'n', 'a' * 64, 0, 262144])
+            self.assertEqual(body['args'][-1], {'_lease': self.lease})
+            return {'exitCode': 0, 'stdout': json.dumps(part)}
+        with patch.object(client, '_req', return_value=(502, b'upstream unavailable\n', 'text/plain')), \
+             patch.object(B, 'exec_', side_effect=remote) as transport:
+            self.assertEqual(client.rpc('resultpart', 'b', 'n', 'a' * 64, 0, 262144, timeout=120), part)
+            transport.assert_called_once()
+
     def test_unknown_command_cannot_fallback_to_exec(self):
         client = self.client()
         with patch.object(client, '_req', side_effect=B.AgentError('front down')), patch.object(client, '_rpc_exec') as remote:

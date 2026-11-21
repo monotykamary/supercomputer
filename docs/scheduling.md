@@ -180,6 +180,12 @@ and the breaker survive too.
 - The pool rule: with work queued no VM is released; a VM whose agent doesn't answer is repaired in place (the agent
   restarted by boat exec with its token, its items running on, in sessions of their own); "lost" only when boat
   reports the VM stopped or gone. An item is never retried on a VM that failed it, and one VM is one strike.
+- The controller's deadline, whatever the worker or its agent version: a legacy (non-strict) item with no result
+  accepted `limit` + `OVERDUE_GRACE_S` (900 s, `SUPERCOMPUTER_OVERDUE_GRACE_S`) after its placement has its hold
+  released and is failed on boat (one strike, queued again on another VM within the three tries, else terminal), an
+  alert records it, and its VM takes nothing new and is stopped once it holds no strict item. A finished row the
+  controller cannot import never blocks the VM's other rows; `resultpart` replays over boat exec when the front
+  fails. Strict items keep their custody contract (`docs/strict-once.md`) and never time out here.
 - Agents follow the code: each reports its code hash; a stale one is upgraded in place between items.
 - State on disk written whole then renamed (batches, registry, policy, accounts); appended rows and placements
   tolerate a torn last line. A `kill -9` loses nothing: the next scheduler takes everything back.

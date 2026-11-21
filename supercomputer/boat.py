@@ -1705,7 +1705,11 @@ class AgentClient:
 
     # (cancelitem too: identity-bound and idempotent, its receipt the agent's own, the only thing that completes a strict
     # cleanup; 11-16, five old-agent xlarge held for days, every cancel timed out by boat's front while ticks went on)
-    EXEC_OK = {"ping", "vtick", "killitem", "itemlogs", "begin", "prep", "tree", "have", "pull", "pullcache", "upgrade", "cancelitem"}
+    # (resultpart: a bounded, owner-bound read of a finished run's payload until its ACK, safe to repeat; 11-20 23:48,
+    # bx_p6avs5jw's front answered every request 502 "upstream unavailable" while vtick went on over exec, and
+    # full-054's 3 payloads (10 KB) could never be imported: its gate held at 68/69 for hours)
+    EXEC_OK = {"ping", "vtick", "killitem", "itemlogs", "begin", "prep", "tree", "have", "pull", "pullcache", "upgrade", "cancelitem",
+               "resultpart"}
 
     def rpc(self, cmd: str, *args, timeout: float = 60, replay_safe: bool = False):
         args = [*args, {"_lease": {**self.lease, "owner": self.owner, "vm_id": self.vm}}] if cmd != "lease" else list(args)
