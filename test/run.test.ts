@@ -116,3 +116,24 @@ test.skipIf(!linux)('a box gone with outputs on it: the attempt is tried again, 
   expect(readFileSync(join(r.out, 'gone.files', 'o'), 'utf8')).toBe('ok\n')
 }, 60_000)
 
+test.skipIf(!linux)("GPU jobs: a box of the type's own size and template, deleted (not paused) when the batch ends", async () => {
+  const r = repo({'x': ''})
+  const f = jobs(r, [
+    {name: 'l4', cmd: 'nproc >/dev/null; echo ok', gpu: 'l4', cpu: 10, memory: 30000},
+    {name: 'h100', cmd: 'echo ok', gpu: 'h100'},
+  ])
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s']))
+  expect(code, err).toBe(0)
+  const created = readFileSync(join(r.fake, 'calls.log'), 'utf8').split('\n').filter((l) => l.startsWith('created')).map((l) => l.split(' ').slice(2).join(' ')).sort()
+  expect(created).toEqual(['template=gpu gpu=l4 11x36864', 'template=gpu-metal gpu=h100 44x229376'])
+  expect(err).toContain('deleted (a GPU box is not kept)')
+  expect(boxes(r.fake)).toEqual([])
+}, 60_000)
+
+test.skipIf(!linux)('a GPU job its box cannot hold is refused with the reason', async () => {
+  const r = repo({'x': ''})
+  const f = jobs(r, [{name: 'big', cmd: 'true', gpu: 't4', cpu: 8}])
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s']))
+  expect(code).not.toBe(0)
+  expect(err).toContain('a t4 box has 7 vCPUs')
+}, 60_000)

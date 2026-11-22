@@ -86,6 +86,25 @@ export async function exec(box: string, script: string, o: {stdin?: Blob | strin
   return {stdout: d.stdout ?? '', stderr: d.stderr ?? '', exitCode: d.exitCode}
 }
 
+// A GPU box as instabox makes it: the template that has the type (h100 is gpu-metal's, the others gpu's) and its size,
+// the type's vCPUs and memory per GPU times the count (`instabox templates --json`).
+export type GpuBox = {template: string; vcpus: number; memMiB: number}
+type Template = {id: string; gpuTypes?: {type: string; sizes: {vcpus: number; memMiB: number}[]; counts: number[]}[]}
+export async function gpuBox(gpu: string): Promise<GpuBox> {
+  const [type, n] = gpu.split(':')
+  const count = Number(n ?? 1)
+  const {templates} = JSON.parse(await ok(['templates', '--json'])) as {templates: Template[]}
+  // (the plain template before its -inference twin, which has the same types)
+  for (const t of [...templates].sort((a, b) => a.id.length - b.id.length)) {
+    const g = t.gpuTypes?.find((x) => x.type === type)
+    if (!g || !g.sizes[0]) continue
+    if (!g.counts.includes(count)) throw new Error(`${gpu}: instabox makes ${type} boxes of ${g.counts.join(', ')} GPUs`)
+    return {template: t.id, vcpus: g.sizes[0].vcpus * count, memMiB: g.sizes[0].memMiB * count}
+  }
+  const types = templates.flatMap((t) => t.gpuTypes?.map((x) => x.type) ?? [])
+  throw new Error(`${gpu}: instabox has no ${type} GPUs (${[...new Set(types)].join(', ')})`)
+}
+
 export const push = (box: string, local: string, remote: string) => ok(['push', box, local, remote])
 export const pull = (box: string, remote: string, local: string) => ok(['pull', box, remote, local])
 export const suspend = (box: string) => ok(['suspend', box])

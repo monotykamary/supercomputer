@@ -18,6 +18,12 @@ const fail = (msg: string, code = 1): never => {
 }
 const log = (line: string) => writeFileSync(join(root, 'calls.log'), line + '\n', {flag: 'a'})
 
+// instabox's GPU templates, as `instabox templates --json` lists them (the parts the runner reads)
+const GPU_TYPES = [
+  {id: 'gpu', gpuTypes: [{type: 'l4', sizes: [{vcpus: 11, memMiB: 36864}], counts: [1, 2, 4]}, {type: 't4', sizes: [{vcpus: 7, memMiB: 24576}], counts: [1, 2, 4]}]},
+  {id: 'gpu-metal', gpuTypes: [{type: 'h100', sizes: [{vcpus: 44, memMiB: 229376}], counts: [1]}]},
+]
+
 const [cmd, ...args] = process.argv.slice(2)
 log([cmd, ...args.slice(0, 2)].join(' '))
 const flag = (name: string) => {
@@ -32,9 +38,18 @@ if (cmd === 'create') {
   if (find(name)) fail(`operation_conflict: a machine named "${name}" already exists`)
   const id = `m_${Math.random().toString(36).slice(2, 12)}`
   mkdirSync(join(at(id), 'home'), {recursive: true})
-  const b: Box = {id, name, state: 'running', vcpus: Number(flag('--vcpus') ?? 4), memMiB: Number(flag('--mem-mib') ?? 8192), metadata: Object.fromEntries(metas()), updatedAt: new Date().toISOString(), autoSuspendedAt: null}
+  // (a GPU box: the size of its type's, as instabox's templates say, times the count)
+  const gpu = flag('--gpu'), [type, n] = (gpu ?? '').split(':')
+  const g = gpu ? GPU_TYPES.flatMap((t) => t.gpuTypes).find((x) => x.type === type) : undefined
+  if (gpu && (!g || flag('--template') !== GPU_TYPES.find((t) => t.gpuTypes.includes(g))!.id)) fail(`bad_request: no ${type} GPUs on template ${flag('--template')}`)
+  const count = Number(n ?? 1)
+  const vcpus = g ? g.sizes[0]!.vcpus * count : Number(flag('--vcpus') ?? 4), memMiB = g ? g.sizes[0]!.memMiB * count : Number(flag('--mem-mib') ?? 8192)
+  const b: Box = {id, name, state: 'running', vcpus, memMiB, metadata: Object.fromEntries(metas()), updatedAt: new Date().toISOString(), autoSuspendedAt: null}
   write(b)
+  log(`created ${name} template=${flag('--template') ?? '-'} gpu=${gpu ?? '-'} ${vcpus}x${memMiB}`)
   console.log(JSON.stringify(b))
+} else if (cmd === 'templates') {
+  console.log(JSON.stringify({templates: [{id: 'universal'}, ...GPU_TYPES]}))
 } else if (cmd === 'ls') {
   const want = metas()
   console.log(JSON.stringify(all().filter((b) => want.every(([k, v]) => b.metadata[k] === v))))
