@@ -52,6 +52,7 @@ assumed), in about 3 seconds:
 | the batch passes only with nothing left to run or fetch, and no job failed or lost | exit 0 |
 | an answer is never taken back; a lost job stays lost; a verdict is final | step laws |
 | a job is tried again only with an attempt left | step law |
+| with peers (no controller), work is never left with no box open: the last box is replaced, never just closed | `launch` |
 
 `BUGS` in `src/batch.ts` are the bugs these laws rule out, each a variant of the same rule (a box opened past the cap,
 jobs packed by vCPUs alone, an answer retried, strict-once work tried twice, a box closed with outputs on it, a group
@@ -65,6 +66,27 @@ bun run laws    # the laws proven, every bug refuted, the builders cross-checked
 bun test        # that, the engine, jobs files and config, and the runner end to end on a stand-in instabox (Linux)
 bun run check   # types
 ```
+
+## With no controller at all (experimental)
+
+```sh
+supercomputer launch --jobs jobs.json --ledger OWNER/REPO       # prints OWNER/REPO#BATCH; this machine may go
+supercomputer batch fetch --ledger OWNER/REPO#BATCH --out runs/x
+```
+
+The batch's log lives on a branch `sc/<batch>` of a GitHub repo (`src/ledger.ts`). Every box runs `supercomputer peer`
+(`src/peer.ts`): it replays the log through the batch rule and appends what the rule accepts with GitHub's
+`createCommitOnBranch` and its `expectedHeadOid`, so of two appends at one point exactly one lands (GitHub's REST ref
+update takes non-fast-forwards, so it is not used). Whatever the boxes do at once, the log is one run of the rule, and
+its laws hold of it. Boxes report their own exits, store each job's log and outputs in the ledger with its answer,
+start the queued jobs that fit on them, find other boxes gone (their attempts retried), open boxes for work none can
+take, and go when nothing is left for them. What an idle box does (finish, stay to watch the others, hand its slot on,
+close) is a proven gdp-wired decision (`src/idle.ts`), and the rule's `peers` mode keeps the last box while work is
+left. Boxes get the GitHub token and an instabox key as instabox proxy Secrets (`SC_LEDGER_TOKEN`, `SC_INSTABOX_KEY`):
+placeholders in the box, the real values sent only to api.github.com and api.instabox.sh.
+
+What is not proven: that a box is alive. A box is found gone only when instabox says so, five minutes after it was
+claimed at the earliest; a box that is up but whose peer is stuck holds its jobs until `delete-after` (6 h).
 
 ## Install
 

@@ -16,35 +16,38 @@ import {bool, forall, nat, oneOf, record, rule, when, yes} from 'gdp-wired'
 // Groups per batch: a (box, group) pair is the key box * GROUPS + group.
 export const GROUPS = 4096
 
-export const Op = oneOf('add', 'open', 'start', 'exit', 'fetch', 'retry', 'drop', 'close', 'finish')
+export const Op = oneOf('add', 'open', 'start', 'exit', 'fetch', 'retry', 'drop', 'close', 'finish', 'replace')
 export const Status = oneOf('none', 'queued', 'running', 'ended', 'done', 'lost')
 export const Job = record({st: Status, attempts: nat, cpu: nat, mem: nat, box: nat, exit: nat, group: nat, need: nat})
 export const Box = record({open: bool, vcpus: nat, mem: nat, cpu: nat, memUsed: nat, running: nat, unfetched: nat, starts: nat, kind: nat})
 
 // The bugs the laws rule out, each a variant of the same rule (test/broken.test.ts refutes every one by a run).
 export const BUGS = ['opens past the cap', 'packs by vCPUs alone', 'retries an answer', 'tries strict-once work twice',
-  'closes a box with outputs on it', 'puts a group twice on a box', 'passes with a failure'] as const
+  'closes a box with outputs on it', 'puts a group twice on a box', 'passes with a failure', 'strands work with no box'] as const
 export type Bug = (typeof BUGS)[number]
 
 export const makeBatch = (bug?: Bug) => rule(bug ? `batch (${bug})` : 'batch')
-  .params({cap: nat, maxAttempts: nat, strictOnce: bool, timing: bool})
+  // (peers: a batch with no controller, run by its boxes (src/peer.ts): its last box never closes while work is left)
+  .params({cap: nat, maxAttempts: nat, strictOnce: bool, timing: bool, peers: bool})
   .inputs({op: Op, job: nat, box: nat, cpu: nat, mem: nat, code: nat, group: nat, kind: nat})
-  .state({live: 0, verdict: oneOf('open', 'passed', 'failed').from('open'), ok: bool.from(false)})
+  .state({live: 0, verdict: oneOf('open', 'passed', 'failed').from('open'), ok: bool.from(false), begun: bool.from(false)})
   .maps({
     Jobs: Job.from({st: 'none', attempts: 0, cpu: 0, mem: 0, box: 0, exit: 0, group: 0, need: 0}),
     Boxes: Box.from({open: false, vcpus: 0, mem: 0, cpu: 0, memUsed: 0, running: 0, unfetched: 0, starts: 0, kind: 0}),
     Groups: 0,
   })
   .assume(({group}) => group.lt(GROUPS))
-  .flags(({op, job, box, group, Jobs, Boxes, Groups, live, verdict, cap, maxAttempts, strictOnce, timing}) => {
+  .flags(({op, job, box, group, Jobs, Boxes, Groups, live, verdict, cap, maxAttempts, strictOnce, timing, peers, begun}) => {
     const j = Jobs.at(job)
     const b = Boxes.at(box)
     const on = Boxes.at(j.box) // the box the job is on
     const holds = bug === 'retries an answer' ? j.st.is('running').or(j.st.is('ended'), j.st.is('done')) : j.st.is('running').or(j.st.is('ended'))
     const attemptLeft = bug === 'tries strict-once work twice' ? j.attempts.lt(maxAttempts) : j.attempts.lt(maxAttempts).and(strictOnce.not().or(j.attempts.eq(0)))
     const open = verdict.is('open')
+    const workLeft = Jobs.sum((c) => when(c.st.is('queued').or(c.st.is('running'), c.st.is('ended')), 1, 0)).gt(0)
     return {
-      adds: op.is('add').and(open, j.st.is('none'), group.lt(GROUPS)),
+      // (with peers, every job is added before the first box opens: work is never added with no box to take it)
+      adds: op.is('add').and(open, j.st.is('none'), group.lt(GROUPS), peers.not().or(begun.not())),
       opens: op.is('open').and(open, b.open.not(), bug === 'opens past the cap' ? yes : live.lt(cap)),
       starts: op.is('start').and(
         j.st.is('queued'),
@@ -64,15 +67,20 @@ export const makeBatch = (bug?: Bug) => rule(bug ? `batch (${bug})` : 'batch')
       drops: op.is('drop').and(holds, on.open, j.attempts.lt(maxAttempts).and(strictOnce.not()).not(),
         j.st.is('ended').or(on.running.atLeast(1).and(on.cpu.atLeast(j.cpu), on.memUsed.atLeast(j.mem))),
         j.st.is('running').or(on.unfetched.atLeast(1))),
-      closes: op.is('close').and(b.open, b.running.eq(0), bug === 'closes a box with outputs on it' ? yes : b.unfetched.eq(0)),
+      closes: op.is('close').and(b.open, b.running.eq(0), bug === 'closes a box with outputs on it' ? yes : b.unfetched.eq(0),
+        // (with peers, the last open box stays while work is left: it is replaced by a box that can take the work)
+        bug === 'strands work with no box' ? yes : peers.not().or(live.atLeast(2), workLeft.not())),
+      // A box with nothing on it given over, in its slot, to a new box of another size or kind (the last box, handing
+      // the work left to one that can take it).
+      replaces: op.is('replace').and(open, b.open, b.running.eq(0), b.unfetched.eq(0)),
     }
   })
-  .step(({op, job, box, cpu, mem, code, group, kind, Jobs, Boxes, Groups, live, verdict, adds, opens, starts, exits, fetches, retries, drops, closes}) => {
+  .step(({op, job, box, cpu, mem, code, group, kind, Jobs, Boxes, Groups, live, verdict, begun, adds, opens, starts, exits, fetches, retries, drops, closes, replaces}) => {
     const j = Jobs.at(job)
     const leaves = retries.or(drops) // an attempt ends without an answer
     const wasRunning = j.st.is('running')
     // The one box this step touches: the request's (open, start, close) or the job's (exit, fetch, retry, drop).
-    const target = when(op.is('open').or(op.is('start'), op.is('close')), box, j.box)
+    const target = when(op.is('open').or(op.is('start'), op.is('close'), op.is('replace')), box, j.box)
     const b = Boxes.at(target)
     const freed = exits.or(leaves.and(wasRunning)) // the job's vCPUs and memory come back
     const answered = fetches.or(leaves.and(wasRunning.not())) // its outputs leave the box
@@ -82,7 +90,8 @@ export const makeBatch = (bug?: Bug) => rule(bug ? `batch (${bug})` : 'batch')
       Jobs.sum((c) => when(c.st.is('queued').or(c.st.is('running'), c.st.is('ended')), 1, 0)).eq(0))
     const failed = Jobs.sum((c) => when(c.st.is('done').and(c.exit.gt(0)).or(c.st.is('lost')), 1, 0))
     return {
-      ok: adds.or(opens, starts, exits, fetches, retries, drops, closes, finishing),
+      ok: adds.or(opens, starts, exits, fetches, retries, drops, closes, finishing, replaces),
+      begun: begun.or(opens),
       live: when(opens, live.plus(1), when(closes, live.minus(1), live)),
       verdict: when(finishing.and(bug === 'passes with a failure' ? yes : failed.eq(0)), 'passed', when(finishing, 'failed', verdict)),
       Jobs: Jobs.set(job, {
@@ -97,14 +106,14 @@ export const makeBatch = (bug?: Bug) => rule(bug ? `batch (${bug})` : 'batch')
       }),
       Boxes: Boxes.set(target, {
         open: opens.or(closes.not().and(b.open)),
-        vcpus: when(opens, cpu, b.vcpus),
-        mem: when(opens, mem, b.mem),
-        cpu: when(opens, 0, when(starts, b.cpu.plus(j.cpu), when(freed, b.cpu.minus(j.cpu), b.cpu))),
-        memUsed: when(opens, 0, when(starts, b.memUsed.plus(j.mem), when(freed, b.memUsed.minus(j.mem), b.memUsed))),
-        running: when(opens, 0, when(starts, b.running.plus(1), when(freed, b.running.minus(1), b.running))),
-        unfetched: when(opens, 0, when(exits, b.unfetched.plus(1), when(answered, b.unfetched.minus(1), b.unfetched))),
-        starts: when(opens, 0, when(starts, b.starts.plus(1), b.starts)),
-        kind: when(opens, kind, b.kind),
+        vcpus: when(opens.or(replaces), cpu, b.vcpus),
+        mem: when(opens.or(replaces), mem, b.mem),
+        cpu: when(opens.or(replaces), 0, when(starts, b.cpu.plus(j.cpu), when(freed, b.cpu.minus(j.cpu), b.cpu))),
+        memUsed: when(opens.or(replaces), 0, when(starts, b.memUsed.plus(j.mem), when(freed, b.memUsed.minus(j.mem), b.memUsed))),
+        running: when(opens.or(replaces), 0, when(starts, b.running.plus(1), when(freed, b.running.minus(1), b.running))),
+        unfetched: when(opens.or(replaces), 0, when(exits, b.unfetched.plus(1), when(answered, b.unfetched.minus(1), b.unfetched))),
+        starts: when(opens.or(replaces), 0, when(starts, b.starts.plus(1), b.starts)),
+        kind: when(opens.or(replaces), kind, b.kind),
       }),
       Groups: Groups.set(gkey, when(j.group.eq(0), g, when(starts, g.plus(1), when(fetches.or(leaves), g.minus(1), g)))),
     }
@@ -125,6 +134,8 @@ export const lawsOf = (batch: Batch) => [
   batch.law('a closed box holds nothing', ({Boxes}) => forall((k) => Boxes.at(k).open.or(Boxes.at(k).running.eq(0).and(Boxes.at(k).unfetched.eq(0))))),
   batch.law('the batch passes only with nothing left to run or fetch', ({verdict, Jobs}) =>
     verdict.is('passed').implies(Jobs.sum((c) => when(c.st.is('queued').or(c.st.is('running'), c.st.is('ended')), 1, 0)).eq(0))),
+  batch.law('with peers, work is never left with no box open', ({peers, begun, live, Jobs}) =>
+    peers.and(begun).implies(live.atLeast(1).or(Jobs.sum((c) => when(c.st.is('queued').or(c.st.is('running'), c.st.is('ended')), 1, 0)).eq(0)))),
   batch.law('the batch passes only with no job failed or lost', ({verdict, Jobs}) =>
     verdict.is('passed').implies(Jobs.sum((c) => when(c.st.is('done').and(c.exit.gt(0)).or(c.st.is('lost')), 1, 0)).eq(0))),
 ]

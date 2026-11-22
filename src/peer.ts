@@ -20,6 +20,7 @@ import {Engine, type Limits, type Req} from './engine.ts'
 import * as ib from './instabox.ts'
 import {type Cache, type Config, fits, type Job} from './jobs.ts'
 import {type BoxRec, type Files, type Ledger, openLedger, type State} from './ledger.ts'
+import {decideIdle} from './idle.ts'
 import {biggest, jobScript, kindOf, newBatch, SYSTEM_MIB} from './run.ts'
 import type {Tree} from './tree.ts'
 
@@ -193,7 +194,8 @@ async function isGone(name: string): Promise<boolean> {
 // The laptop's part: the batch written to a new ledger, its first boxes opened and made. Then it may go.
 export async function launch(jobs: Job[], cfg: Config, tree: Tree, limits: Limits, repo: string, log: (s: string) => void): Promise<string> {
   for (const j of jobs) if (j.gpu) throw new Error(`${j.name}: GPU jobs don't run controller-less yet`)
-  const b = newBatch(jobs, cfg, tree, limits)
+  // (peers: the rule keeps the last box while work is left, and hands its slot on with replace)
+  const b = newBatch(jobs, cfg, tree, {...limits, peers: true})
   const shared: Shared = {id: b.id, owner: b.owner, tree: b.tree, caches: b.caches, cfg: b.cfg, limits: b.limits, jobs: b.jobs, groups: b.groups, kinds: b.kinds}
   const out = join(mkdtempSync(join(tmpdir(), 'sc-js-')), 'sc.js')
   const built = Bun.spawnSync(['bun', 'build', join(import.meta.dir, 'cli.ts'), '--target', 'bun', '--outfile', out], {stdout: 'pipe', stderr: 'pipe'})
@@ -352,59 +354,58 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
       continue
     }
 
-    // Nothing left for this box: the batch finished when nothing is left at all; else the box closes, unless it is
-    // the last idle one while others still run (someone must be there to find a box gone).
+    // Nothing left for this box: the proven idle decision says whether the batch finishes, the box stays to watch
+    // the others, hands its slot on (the last box), or closes and goes.
     const queued = e.jobs().filter(([, j]) => j.st === 'queued').map(([i]) => i)
     if (mine.running === 0 && mine.unfetched === 0 && !queued.some((i) => e.would({op: 'start', job: i, box: me.slot}))) {
       const left = e.count('queued') + e.count('running') + e.count('ended')
-      if (left === 0) {
+      // What to do is the proven idle decision's (src/idle.ts); its inputs are read off the rule's state.
+      const idleBoxes = e.boxes().filter(([, b]) => b.running === 0 && b.unfetched === 0).map(([b]) => b)
+      const sim = new Engine(shared.limits, state.log)
+      const act = decideIdle({
+        left,
+        others: e.boxes().length - 1,
+        busy: e.boxes().filter(([b, x]) => b !== me.slot && (x.running > 0 || x.unfetched > 0)).length,
+        young: e.boxes().some(([b]) => b !== me.slot && Date.now() - (state.boxes[b]?.at ?? 0) < GRACE_MS),
+        blocked: e.boxes().length >= shared.limits.maxBoxes && queued.some((i) => !e.boxes().some(([b]) => sim.would({op: 'start', job: i, box: b}))),
+        lowest: Math.min(...idleBoxes) === me.slot,
+      })
+      if (act === 'finish') {
         const took = await propose(ledger, head, shared, state, [{op: 'finish'}])
         if (took?.length) o.log(`the batch finished: ${new Engine(shared.limits, [...state.log, ...took]).verdict}`)
         continue
       }
-      // (while any other box is open, running, booting or idle, the lowest idle one stays: someone must be there to
-      // find a box gone, or one that never came up; the other idle ones go, freeing their slots)
-      const idle = e.boxes().filter(([, b]) => b.running === 0 && b.unfetched === 0).map(([b]) => b)
-      const others = e.boxes().length > 1
-      // (a watcher is needed only while fewer than two other boxes are busy, which watch each other, or one is new and
-      // may never come up; and never in a slot that queued work needs, at the cap, for a box of another kind)
-      const busy = e.boxes().filter(([b, x]) => b !== me.slot && (x.running > 0 || x.unfetched > 0)).length
-      const young = e.boxes().some(([b]) => b !== me.slot && Date.now() - (state.boxes[b]?.at ?? 0) < GRACE_MS)
-      const sim = new Engine(shared.limits, state.log)
-      const blocked = e.boxes().length >= shared.limits.maxBoxes && queued.some((i) => !e.boxes().some(([b]) => sim.would({op: 'start', job: i, box: b})))
-      if (others && !blocked && (busy < 2 || young) && Math.min(...idle) === me.slot) {
-        await sleep(o.poll)
-        continue
-      }
-      if (others) {
+      if (act === 'close') {
         if ((await propose(ledger, head, shared, state, [{op: 'close', box: me.slot}])) === undefined) continue
         return leave('nothing left for this box')
       }
-      // (the last box, and queued work it can't take: its slot given to a box that can, in one append, before it
-      // goes; if none could be made, it takes its slot back and stays)
-      if (making.size) {
-        await sleep(o.poll)
+      if (act === 'hand') {
+        if (making.size) {
+          await sleep(o.poll)
+          continue
+        }
+        // (the last box: its slot replaced by a box for the first queued job it can't take, the rule's replace; if
+        // that box can't be made, the slot is replaced back by this one, which stays; not under --timing, where a box
+        // runs one job in its life)
+        const i = queued[0]!
+        const job = shared.jobs[i]!
+        const size = job.size ?? (shared.limits.timing ? fits(job) : biggest(fits(job), shared.cfg.size))
+        const rec: BoxRec = {name: `sc-${shared.owner}-${Math.random().toString(36).slice(2, 10)}`, at: Date.now(), size, image: job.image, by: me.name}
+        const own = state.boxes[me.slot]!
+        const took = await propose(ledger, head, shared, state, [{op: 'replace', box: me.slot, cpu: size.vcpus, mem: size.memMiB - SYSTEM_MIB, kind: shared.kinds.indexOf(kindOf(job)) + 1}], (st) => (st.boxes[me.slot] = rec))
+        if (!took?.length) continue
+        o.log(`slot ${me.slot} handed to ${rec.name} for ${job.name}`)
+        if (await makeBox(ledger, shared, me.slot, rec, head, o.log)) return leave(`its slot handed to ${rec.name}`)
+        if (shared.limits.timing) return leave('no box could be made for the work left, and under --timing this one cannot take it')
+        for (;;) {
+          const r = await ledger.read()
+          const back = await propose(ledger, r.head, shared, r.state, [{op: 'replace', box: me.slot, cpu: own.size.vcpus, mem: own.size.memMiB - SYSTEM_MIB, kind: mine.kind}], (st) => (st.boxes[me.slot] = {...own, at: Date.now()}))
+          if (back !== undefined) break
+        }
+        await sleep(30)
         continue
       }
-      const made = await grow(ledger, shared, me.name, o.log, [{op: 'close', box: me.slot}])
-      if (made) return leave('its slot given to a box for the work left')
-      // (none could be made: it takes its slot back and stays, to try again; not under --timing, where a box runs one
-      // job in its life and reopening would start another on it)
-      if (shared.limits.timing) {
-        o.log('no box could be made for the work left, and under --timing this one cannot take it: the batch waits for `batch fetch` or a new launch')
-        return leave('nothing it can do')
-      }
-      for (;;) {
-        const r = await ledger.read()
-        const e2 = new Engine(shared.limits, r.state.log)
-        if (e2.box(me.slot)?.open || e2.verdict !== 'open') break
-        const rec = r.state.boxes[me.slot]!
-        const reopen: Req = {op: 'open', box: me.slot, cpu: rec.size.vcpus, mem: rec.size.memMiB - SYSTEM_MIB, kind: mine.kind}
-        const took = await propose(ledger, r.head, shared, r.state, [reopen], (s) => (s.boxes[me.slot] = {...rec, at: Date.now()}))
-        if (took?.length) break
-        if (took !== undefined) await sleep(o.poll) // (refused: at the cap; another box took the slot meanwhile)
-      }
-      await sleep(30)
+      // (stay: the one watching the others)
     }
     await sleep(o.poll)
   }
