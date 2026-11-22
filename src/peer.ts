@@ -32,6 +32,15 @@ export type PeerOptions = {log: (line: string) => void; poll: number}
 const GRACE_MS = 5 * 60_000
 const SECRETS = ['SC_LEDGER_TOKEN', 'SC_INSTABOX_KEY']
 const sleep = (s: number) => new Promise((r) => setTimeout(r, s * 1000))
+const alive = (pid: number) => {
+  if (!Number.isInteger(pid) || pid <= 0) return true // (no pid to tell by: not taken for dead)
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
 
 // Ask the rule for these requests in order and append those it accepts, as one version: the requests taken (none
 // accepted: []), or undefined when another participant appended first.
@@ -42,35 +51,70 @@ export async function propose(ledger: Ledger, head: string, shared: Shared, stat
   const next: State = {...structuredClone(state), log: e.log} // (a copy: a lost append leaves the state read as it was)
   edit?.(next)
   const h = await ledger.append(head, next, files, took.map((r) => `${r.op}${r.job !== undefined ? ` ${shared.jobs[r.job]?.name}` : ''}${r.box !== undefined ? ` box ${r.box}` : ''}`).join(', '))
+  // (beaten: a moment's random wait, so participants that raced don't race again in step)
+  if (!h) await sleep(0.2 + Math.random() * 1.3)
   return h ? took : undefined
 }
 
 // The request that ends an attempt with no native answer: tried again when the rule gives it another, else lost.
 const lose = (e: Engine, i: number): Req => (e.would({op: 'retry', job: i}) ? {op: 'retry', job: i} : {op: 'drop', job: i})
 
-// A box for the first queued job no open box can take, opened in the ledger (with its name, claimed now); the slot
-// and record, or undefined when the rule opens none or another participant appended first.
-export async function claimBox(ledger: Ledger, head: string, shared: Shared, state: State): Promise<{slot: number; rec: BoxRec} | undefined> {
+// A box for the first queued job no open box can take, opened in the ledger (with its name, claimed now by `by`),
+// after `before` (a box closing itself to free the slot): the slot and record; 'none' when no job needs one or the
+// rule opens none; 'beaten' when another participant appended first.
+export type Claim = {slot: number; rec: BoxRec} | 'none' | 'beaten'
+export async function claimBox(ledger: Ledger, head: string, shared: Shared, state: State, by: string, before: Req[] = []): Promise<Claim> {
   const e = new Engine(shared.limits, state.log)
   // (the queued jobs packed, as if started, onto the room the open boxes have: a box only for one left over)
   const sim = new Engine(shared.limits, state.log)
+  for (const r of before) if (!e.step(r) || !sim.step(r)) return 'none'
   for (const [i, j] of e.jobs()) {
     if (j.st !== 'queued') continue
     if (sim.boxes().some(([b]) => sim.step({op: 'start', job: i, box: b}))) continue
     const job = shared.jobs[i]!
     const size = job.size ?? (shared.limits.timing ? fits(job) : biggest(fits(job), shared.cfg.size))
     const slot = Object.keys(state.boxes).length
-    const rec: BoxRec = {name: `sc-${shared.owner}-${Math.random().toString(36).slice(2, 10)}`, at: Date.now(), size, image: job.image}
+    const rec: BoxRec = {name: `sc-${shared.owner}-${Math.random().toString(36).slice(2, 10)}`, at: Date.now(), size, image: job.image, by}
     const open: Req = {op: 'open', box: slot, cpu: size.vcpus, mem: size.memMiB - SYSTEM_MIB, kind: shared.kinds.indexOf(kindOf(job)) + 1}
-    if (!e.would(open)) return undefined // (at the cap: the job waits for a slot)
-    const took = await propose(ledger, head, shared, state, [open], (s) => (s.boxes[slot] = rec))
-    return took?.length ? {slot, rec} : undefined
+    if (!e.would(open)) return 'none' // (at the cap: the job waits for a slot)
+    const took = await propose(ledger, head, shared, state, [...before, open], (s) => (s.boxes[slot] = rec))
+    return took === undefined ? 'beaten' : took.length === before.length + 1 ? {slot, rec} : 'none'
   }
-  return undefined
+  return 'none'
+}
+
+// Claim and make the boxes queued work needs, until none is needed: how many were made. A box that could not be made
+// has its slot closed again (nothing is on it), so the work it was for is claimed anew.
+async function grow(ledger: Ledger, shared: Shared, by: string, log: (s: string) => void, before: Req[] = []): Promise<number> {
+  let made = 0
+  // (three boxes in a row that could not be made: instabox is refusing them, and it stops trying)
+  for (let failed = 0; failed < 3; ) {
+    const {head, state} = await ledger.read()
+    const c = await claimBox(ledger, head, shared, state, by, before)
+    if (c === 'beaten') continue
+    if (c === 'none') return made
+    before = []
+    if (await makeBox(ledger, shared, c.slot, c.rec, head, log)) {
+      made++
+      failed = 0
+    } else {
+      failed++
+      await closeSlot(ledger, shared, c.slot)
+    }
+  }
+  return made
+}
+
+// A slot closed in the ledger (a box never made), whatever else moved meanwhile.
+async function closeSlot(ledger: Ledger, shared: Shared, slot: number): Promise<void> {
+  for (;;) {
+    const {head, state} = await ledger.read()
+    if ((await propose(ledger, head, shared, state, [{op: 'close', box: slot}])) !== undefined) return
+  }
 }
 
 // The box itself: made from the batch's image with the ledger's Secrets, its peer started by its setup script.
-async function makeBox(ledger: Ledger, shared: Shared, slot: number, rec: BoxRec, log: (s: string) => void): Promise<void> {
+async function makeBox(ledger: Ledger, shared: Shared, slot: number, rec: BoxRec, head: string, log: (s: string) => void): Promise<boolean> {
   const [repo, batch] = ledger.where.split('#') as [string, string]
   const img = rec.image ? shared.cfg.images[rec.image]! : shared.cfg.image
   const boot = `#!/usr/bin/env bash
@@ -81,7 +125,8 @@ command -v bun >/dev/null || { curl -fsSL https://bun.sh/install | bash >/dev/nu
 command -v instabox >/dev/null || sudo npm i -g instabox@latest >/dev/null 2>&1
 mkdir -p ~/sc/trees ~/sc/peer
 api() { curl -fsSL --retry 5 --retry-all-errors -H "Authorization: Bearer $SC_LEDGER_TOKEN" -H 'User-Agent: supercomputer' "$@"; }
-head=$(api "https://api.github.com/repos/${repo}/git/ref/heads/sc/${batch}" | python3 -c 'import json, sys; print(json.load(sys.stdin)["object"]["sha"])')
+# (a version known to hold them: GitHub's answer for the branch's head may lag behind it)
+head=${head}
 api -H 'Accept: application/vnd.github.raw' -o ~/sc/peer/sc.js "https://api.github.com/repos/${repo}/contents/sc.js?ref=$head"
 api -H 'Accept: application/vnd.github.raw' -o ~/sc/trees/${shared.tree}.tgz "https://api.github.com/repos/${repo}/contents/tree.tgz?ref=$head"
 cat > ~/sc/peer/run.sh <<'EOF'
@@ -95,23 +140,49 @@ echo "peer started"
   const file = join(dir, 'boot.sh')
   writeFileSync(file, boot)
   try {
-    log(`box ${rec.name}: creating (slot ${slot}, ${rec.size.vcpus} vCPU / ${rec.size.memMiB / 1024} GiB)`)
-    await ib.create({
-      name: rec.name, vcpus: rec.size.vcpus, memMiB: rec.size.memMiB, snapshot: img.snapshot, template: img.template,
-      meta: {sc: '1', sc_owner: shared.owner, sc_batch: shared.id},
-      // (no idle pause: its peer decides when it is done; a backstop against a peer that never does)
-      autoSuspend: '0', deleteAfter: '6h', secrets: SECRETS, setupFile: file,
-    })
-    log(`box ${rec.name}: up, its peer running`)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      log(`box ${rec.name}: creating (slot ${slot}, ${rec.size.vcpus} vCPU / ${rec.size.memMiB / 1024} GiB)${attempt > 1 ? `, attempt ${attempt}` : ''}`)
+      try {
+        await ib.create({
+          name: rec.name, vcpus: rec.size.vcpus, memMiB: rec.size.memMiB, snapshot: img.snapshot, template: img.template,
+          meta: {sc: '1', sc_owner: shared.owner, sc_batch: shared.id},
+          // (no idle pause: its peer decides when it is done; a backstop against a peer that never does)
+          autoSuspend: '0', deleteAfter: '6h', secrets: SECRETS, setupFile: file,
+        })
+        log(`box ${rec.name}: up, its peer running`)
+        return true
+      } catch (e) {
+        log(`box ${rec.name}: ${e instanceof Error ? e.message : e}`)
+        const b = await ib.get(rec.name).catch(() => undefined)
+        // (it exists and booted: made after all, by this try or another participant's)
+        if (b && b.metadata?.setupStatus !== 'failed' && b.metadata?.setupStatus !== 'running') return true
+        // (made, but its boot failed: deleted before the next try, so it bills nothing)
+        if (b) await ib.remove(rec.name).catch(() => undefined)
+      }
+    }
+    return false
   } finally {
     rmSync(dir, {recursive: true, force: true})
   }
+}
+
+// Whether instabox says, for certain, that there is no such box (an error of any other kind is no answer).
+async function notFound(name: string): Promise<boolean> {
+  return ib.get(name).then(
+    () => false,
+    (e) => e instanceof ib.InstaboxError && /not.?found|404|no (such )?sandbox/i.test(e.stderr),
+  )
 }
 
 // Whether instabox says the box is gone for good: deleted, never made, broken or stopped (its processes ended).
 async function isGone(name: string): Promise<boolean> {
   try {
     const b = await ib.get(name)
+    // (its boot failed: no peer will ever run there, so it goes, and its slot with it)
+    if (b.metadata?.setupStatus === 'failed') {
+      await ib.remove(name).catch(() => undefined)
+      return true
+    }
     if (b.state === 'suspended') await ib.resume(name).catch(() => undefined)
     return ['deleted', 'error', 'stopped'].includes(b.state)
   } catch (e) {
@@ -130,15 +201,9 @@ export async function launch(jobs: Job[], cfg: Config, tree: Tree, limits: Limit
   const ledger = openLedger(`${repo}#${b.id}`)
   await ledger.create({'batch.json': JSON.stringify(shared, null, 1), 'tree.tgz': new Uint8Array(readFileSync(tree.tarball)), 'sc.js': new Uint8Array(readFileSync(out))}, {log: b.log, boxes: {}, times: {}})
   log(`batch ${b.id}: ${jobs.length} jobs in the ledger ${ledger.where}`)
-  const making: Promise<void>[] = []
-  for (;;) {
-    const {head, state} = await ledger.read()
-    const c = await claimBox(ledger, head, shared, state)
-    if (!c) break
-    making.push(makeBox(ledger, shared, c.slot, c.rec, log))
-  }
-  const made = await Promise.allSettled(making)
-  for (const m of made) if (m.status === 'rejected') log(`a box was not made: ${m.reason instanceof Error ? m.reason.message : m.reason} (its slot is closed by a peer once it is found gone)`)
+  const made = await grow(ledger, shared, 'launch', log)
+  // (no box made: nobody is left to run the batch, so it is not launched)
+  if (!made) throw new Error(`no box could be made for batch ${b.id}; its ledger ${ledger.where} holds it, and nothing runs it`)
   return ledger.where
 }
 
@@ -147,16 +212,36 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
   const ledger = openLedger(spec)
   const shared = JSON.parse(new TextDecoder().decode(await ledger.file('batch.json'))) as Shared
   const run = join(homedir(), 'sc', 'run', shared.id)
-  const jobDir = (i: number) => join(run, shared.jobs[i]!.name)
-  const making = new Set<Promise<void>>()
+  // (a folder per attempt: a retried job on the same box never reads the attempt before's exit)
+  const jobDir = (i: number, attempt: number) => join(run, `${shared.jobs[i]!.name}.${attempt}`)
+  const making = new Set<Promise<unknown>>()
   const lastProbe = new Map<number, number>()
   o.log(`peer of box ${me.slot} (${me.name}) in batch ${shared.id}`)
 
+  // Going: first the boxes this one claimed that aren't up (a peer that died between claiming and making one), then
+  // this box deleted. Marked done for the supervisor only once deleting failed for good; else it starts again.
   const leave = async (why: string) => {
     o.log(`leaving: ${why}`)
     await Promise.allSettled([...making])
-    writeFileSync(join(homedir(), 'sc', 'peer', 'done'), why)
-    await ib.remove(me.name).catch((e) => o.log(`deleting this box: ${e instanceof Error ? e.message : e}`))
+    const {state} = await ledger.read()
+    const e = new Engine(shared.limits, state.log)
+    // (only while the batch is open, only a slot claimed lately with nothing on it, only one instabox says for certain
+    // has no box: never a box that is up, or one that went away on its own)
+    for (const [b, x] of e.verdict === 'open' ? e.boxes() : []) {
+      const rec = state.boxes[b]
+      if (rec?.by !== me.name || b === me.slot || x.running || x.unfetched || Date.now() - rec.at > GRACE_MS) continue
+      if ((await notFound(rec.name)) && !(await makeBox(ledger, shared, b, rec, (await ledger.read()).head, o.log))) await closeSlot(ledger, shared, b)
+    }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await ib.remove(me.name)
+        return
+      } catch (err) {
+        o.log(`deleting this box: ${err instanceof Error ? err.message : err}`)
+        await sleep(5 * attempt)
+      }
+    }
+    // (the supervisor starts this peer again, which comes back here and tries again)
   }
 
   for (;;) {
@@ -176,12 +261,15 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
     const exits: Req[] = []
     const ended: Record<string, number> = {}
     for (const i of onMe('running')) {
-      const d = jobDir(i)
-      if (existsSync(join(d, 'exit'))) {
-        const [code, at] = readFileSync(join(d, 'exit'), 'utf8').trim().split(' ').map(Number) as [number, number]
-        exits.push({op: 'exit', job: i, code: Number.isInteger(code) && code >= 0 ? code : 255})
-        ended[shared.jobs[i]!.name] = at
-      } else if (!existsSync(join(d, 'job.sh'))) exits.push(lose(e, i))
+      const d = jobDir(i, e.job(i)!.attempts)
+      const exitOf = () => (existsSync(join(d, 'exit')) ? readFileSync(join(d, 'exit'), 'utf8').trim().split(' ').map(Number) as [number, number] : undefined)
+      let x = exitOf()
+      // (no exit and its process gone, killed past its own timeout's reach: the attempt is lost)
+      if (!x && existsSync(join(d, 'pid')) && !alive(Number(readFileSync(join(d, 'pid'), 'utf8')))) x = exitOf() ?? [-1, 0]
+      if (x && x[0] >= 0) {
+        exits.push({op: 'exit', job: i, code: Number.isInteger(x[0]) ? x[0] : 255})
+        ended[shared.jobs[i]!.name] = x[1]
+      } else if (x || !existsSync(join(d, 'job.sh'))) exits.push(lose(e, i))
     }
     if (exits.length) {
       const took = await propose(ledger, head, shared, state, exits, (s) => {
@@ -195,7 +283,12 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
     const fetchable = onMe('ended')
     if (fetchable.length) {
       const i = fetchable[0]!
-      const d = jobDir(i)
+      const d = jobDir(i, e.job(i)!.attempts)
+      // (a job that removed its own output folder, or wrote no log, still has its answer)
+      if (existsSync(d)) {
+        mkdirSync(join(d, 'out'), {recursive: true})
+        if (!existsSync(join(d, 'log'))) writeFileSync(join(d, 'log'), '')
+      }
       const t = Bun.spawnSync(['tar', '-czf', '-', '-C', d, 'log', 'out'], {stdout: 'pipe', stderr: 'pipe'})
       const took = t.exitCode === 0
         ? await propose(ledger, head, shared, state, [{op: 'fetch', job: i}], undefined, {[`out/${shared.jobs[i]!.name}.tgz`]: new Uint8Array(t.stdout)})
@@ -215,11 +308,19 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
       const took = await propose(ledger, head, shared, state, starts, (s) => {
         for (const r of starts) s.times[shared.jobs[r.job!]!.name] = {started: now, where: me.name}
       })
+      const failed: Req[] = []
       for (const r of took ?? []) {
         const job = shared.jobs[r.job!]!
-        const {script, launch} = jobScript(shared, job)
+        const {script, launch} = jobScript(shared, job, e.job(r.job!)!.attempts + 1)
         const p = Bun.spawnSync(['bash', '-c', launch], {stdin: new Blob([script]), stderr: 'pipe'})
         o.log(`${job.name}: ${p.exitCode === 0 ? 'started' : `not started: ${p.stderr}`}`)
+        if (p.exitCode !== 0) failed.push({op: 'retry', job: r.job!})
+      }
+      // (a launch that failed: its attempt lost now, not found later)
+      for (let i = 0; failed.length && i < 5; i++) {
+        const r = await ledger.read()
+        const e2 = new Engine(shared.limits, r.state.log)
+        if ((await propose(ledger, r.head, shared, r.state, failed.map((f) => lose(e2, f.job!)))) !== undefined) break
       }
       continue
     }
@@ -241,10 +342,11 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
     }
     if (acted) continue
 
-    // Work no open box can take: a box opened for it.
-    const claimed = await claimBox(ledger, head, shared, state)
-    if (claimed) {
-      const m = makeBox(ledger, shared, claimed.slot, claimed.rec, o.log).catch((err) => o.log(`box ${claimed.rec.name}: ${err instanceof Error ? err.message : err}`))
+    // Work no open box can take: a box opened for it, made meanwhile (its slot closed again if it can't be).
+    const claimed = await claimBox(ledger, head, shared, state, me.name)
+    if (claimed === 'beaten') continue
+    if (claimed !== 'none') {
+      const m = makeBox(ledger, shared, claimed.slot, claimed.rec, head, o.log).then((ok) => (ok ? undefined : closeSlot(ledger, shared, claimed.slot)))
       making.add(m)
       void m.finally(() => making.delete(m))
       continue
@@ -260,20 +362,49 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
         if (took?.length) o.log(`the batch finished: ${new Engine(shared.limits, [...state.log, ...took]).verdict}`)
         continue
       }
+      // (while any other box is open, running, booting or idle, the lowest idle one stays: someone must be there to
+      // find a box gone, or one that never came up; the other idle ones go, freeing their slots)
       const idle = e.boxes().filter(([, b]) => b.running === 0 && b.unfetched === 0).map(([b]) => b)
-      const othersRun = e.boxes().some(([b, x]) => b !== me.slot && (x.running > 0 || x.unfetched > 0))
-      if (!(othersRun && Math.min(...idle) === me.slot)) {
-        const took = await propose(ledger, head, shared, state, [{op: 'close', box: me.slot}])
-        if (took === undefined) continue
-        // (closed: the slot it frees opened for queued work another kind of box must take, before this one goes)
-        for (;;) {
-          const r = await ledger.read()
-          const c2 = await claimBox(ledger, r.head, shared, r.state)
-          if (!c2) break
-          await makeBox(ledger, shared, c2.slot, c2.rec, o.log).catch((err) => o.log(`box ${c2.rec.name}: ${err instanceof Error ? err.message : err}`))
-        }
+      const others = e.boxes().length > 1
+      // (a watcher is needed only while fewer than two other boxes are busy, which watch each other, or one is new and
+      // may never come up; and never in a slot that queued work needs, at the cap, for a box of another kind)
+      const busy = e.boxes().filter(([b, x]) => b !== me.slot && (x.running > 0 || x.unfetched > 0)).length
+      const young = e.boxes().some(([b]) => b !== me.slot && Date.now() - (state.boxes[b]?.at ?? 0) < GRACE_MS)
+      const sim = new Engine(shared.limits, state.log)
+      const blocked = e.boxes().length >= shared.limits.maxBoxes && queued.some((i) => !e.boxes().some(([b]) => sim.would({op: 'start', job: i, box: b})))
+      if (others && !blocked && (busy < 2 || young) && Math.min(...idle) === me.slot) {
+        await sleep(o.poll)
+        continue
+      }
+      if (others) {
+        if ((await propose(ledger, head, shared, state, [{op: 'close', box: me.slot}])) === undefined) continue
         return leave('nothing left for this box')
       }
+      // (the last box, and queued work it can't take: its slot given to a box that can, in one append, before it
+      // goes; if none could be made, it takes its slot back and stays)
+      if (making.size) {
+        await sleep(o.poll)
+        continue
+      }
+      const made = await grow(ledger, shared, me.name, o.log, [{op: 'close', box: me.slot}])
+      if (made) return leave('its slot given to a box for the work left')
+      // (none could be made: it takes its slot back and stays, to try again; not under --timing, where a box runs one
+      // job in its life and reopening would start another on it)
+      if (shared.limits.timing) {
+        o.log('no box could be made for the work left, and under --timing this one cannot take it: the batch waits for `batch fetch` or a new launch')
+        return leave('nothing it can do')
+      }
+      for (;;) {
+        const r = await ledger.read()
+        const e2 = new Engine(shared.limits, r.state.log)
+        if (e2.box(me.slot)?.open || e2.verdict !== 'open') break
+        const rec = r.state.boxes[me.slot]!
+        const reopen: Req = {op: 'open', box: me.slot, cpu: rec.size.vcpus, mem: rec.size.memMiB - SYSTEM_MIB, kind: mine.kind}
+        const took = await propose(ledger, r.head, shared, r.state, [reopen], (s) => (s.boxes[me.slot] = {...rec, at: Date.now()}))
+        if (took?.length) break
+        if (took !== undefined) await sleep(o.poll) // (refused: at the cap; another box took the slot meanwhile)
+      }
+      await sleep(30)
     }
     await sleep(o.poll)
   }

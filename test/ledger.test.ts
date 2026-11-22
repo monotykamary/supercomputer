@@ -45,14 +45,31 @@ test('two boxes racing for one job: one starts it, the other is refused by the r
   expect(new Engine(limits, again.state.log).job(0)!.box).toBe(1 - loser)
 })
 
+test("the last box, closing itself for work it can't take: its slot given to the new box in one append", async () => {
+  const l = await fresh(1)
+  const s = shared(1)
+  let r = await l.read()
+  const lim1 = {...limits, maxBoxes: 1}
+  const s1 = {...s, limits: lim1}
+  // (a box of another kind (2) at the cap of 1: the queued job (kind 1) can't start on it)
+  expect(await propose(l, r.head, s1, r.state, [{op: 'open', box: 0, cpu: 2, mem: 3584, kind: 2}], (st) => (st.boxes[0] = {name: 'a', at: 0, size: {vcpus: 2, memMiB: 4096}}))).toHaveLength(1)
+  r = await l.read()
+  expect(await claimBox(l, r.head, s1, r.state, 'a')).toBe('none') // at the cap
+  const c = await claimBox(l, r.head, s1, r.state, 'a', [{op: 'close', box: 0}])
+  expect(c).toMatchObject({slot: 1, rec: {by: 'a'}})
+  const e = new Engine(lim1, (await l.read()).state.log)
+  expect(e.boxes().map(([b]) => b)).toEqual([1])
+})
+
 test('boxes for queued work: packed onto open room first, never past the cap', async () => {
   const l = await fresh(5) // 5 one-vCPU jobs, 2-vCPU boxes, at most 2 boxes
   const s = shared(5)
   const slots: number[] = []
   for (;;) {
     const r = await l.read()
-    const c = await claimBox(l, r.head, s, r.state)
-    if (!c) break
+    const c = await claimBox(l, r.head, s, r.state, 'test')
+    if (c === 'beaten') continue
+    if (c === 'none') break
     slots.push(c.slot)
   }
   expect(slots).toEqual([0, 1])

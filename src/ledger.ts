@@ -15,8 +15,8 @@ import {dirname, join} from 'node:path'
 import type {Req} from './engine.ts'
 import type {Size} from './jobs.ts'
 
-// A box of the batch, by its slot: its instabox name, when it was claimed (ms), and what it was made as.
-export type BoxRec = {name: string; at: number; size: Size; image?: string; gpu?: string}
+// A box of the batch, by its slot: its instabox name, when it was claimed (ms), what it was made as, and who claimed it.
+export type BoxRec = {name: string; at: number; size: Size; image?: string; gpu?: string; by?: string}
 export type Time = {started?: number; ended?: number; where?: string}
 export type State = {log: Req[]; boxes: Record<string, BoxRec>; times: Record<string, Time>}
 export type Files = Record<string, string | Uint8Array>
@@ -90,6 +90,15 @@ class GitHubLedger implements Ledger {
         await Bun.sleep(500 * 2 ** attempt)
         continue
       }
+      // (a rate limit, primary or secondary: waited out as GitHub says, up to 10 times, at most 5 minutes each)
+      const secondary = r.status === 403 && /secondary rate limit|abuse/i.test(await r.clone().text())
+      const limited = r.status === 429 || (r.status === 403 && (r.headers.get('retry-after') || r.headers.get('x-ratelimit-remaining') === '0' || secondary))
+      if (limited && attempt < 10) {
+        const reset = Number(r.headers.get('x-ratelimit-reset')) * 1000 - Date.now()
+        const wait = Number(r.headers.get('retry-after')) * 1000 || (reset > 0 ? reset : 60_000)
+        await Bun.sleep(Math.min(wait, 300_000) + Math.random() * 1000)
+        continue
+      }
       return r
     }
   }
@@ -103,8 +112,20 @@ class GitHubLedger implements Ledger {
     const additions = Object.entries(files).map(([path, f]) => ({path, contents: Buffer.from(bytes(f)).toString('base64')}))
     const query = `mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }`
     const input = {branch: {repositoryNameWithOwner: this.repo, branchName: this.branch}, expectedHeadOid: expected, message: {headline: message}, fileChanges: {additions}}
-    const r = await this.call('https://api.github.com/graphql', {method: 'POST', body: {query, variables: {input}}})
-    const d = (await r.json()) as {data?: {createCommitOnBranch?: {commit: {oid: string}} | null}; errors?: {type?: string; message: string}[]}
+    let d: {data?: {createCommitOnBranch?: {commit: {oid: string}} | null}; errors?: {type?: string; message: string}[]}
+    let r: Response
+    for (let attempt = 0; ; attempt++) {
+      r = await this.call('https://api.github.com/graphql', {method: 'POST', body: {query, variables: {input}}})
+      const body = await r.text()
+      try {
+        d = JSON.parse(body) as typeof d
+      } catch {
+        throw new Error(`the ledger ${this.where}: GraphQL ${r.status}: ${body.slice(0, 200)}`)
+      }
+      // (GraphQL's rate limit comes as an error, not a status: waited out like the REST one)
+      if (!d.errors?.some((e) => e.type === 'RATE_LIMITED') || attempt >= 10) break
+      await Bun.sleep(60_000 + Math.random() * 5000)
+    }
     if (d.errors?.some((e) => e.type === 'STALE_DATA')) return undefined
     const oid = d.data?.createCommitOnBranch?.commit.oid
     if (!oid) throw new Error(`the ledger ${this.where}: ${r.status} ${d.errors?.map((e) => e.message).join('; ') ?? 'no commit'}`)
@@ -124,6 +145,7 @@ class GitHubLedger implements Ledger {
     const sha = await this.commitOn(root, {...files, 'state.json': JSON.stringify(state)}, `batch ${this.batch}`)
     if (!sha) throw new Error(`the ledger ${this.where}: another made it first`)
     this.cached = {head: sha, state}
+    this.beaten = true // (GitHub's REST answer for the branch may lag behind this commit)
   }
 
   async read(): Promise<{head: string; state: State}> {
@@ -133,12 +155,18 @@ class GitHubLedger implements Ledger {
       // answer may still be the old one for a while)
       const [owner, name] = this.repo.split('/')
       const query = `query($o: String!, $n: String!, $q: String!) { repository(owner: $o, name: $n) { ref(qualifiedName: $q) { target { oid } } } }`
-      const r = await this.call('https://api.github.com/graphql', {method: 'POST', body: {query, variables: {o: owner, n: name, q: `refs/heads/${this.branch}`}}})
-      const d = (await r.json()) as {data?: {repository?: {ref?: {target: {oid: string}} | null}}}
-      const oid = d.data?.repository?.ref?.target.oid
+      let oid: string | undefined
+      for (let attempt = 0; ; attempt++) {
+        const r = await this.call('https://api.github.com/graphql', {method: 'POST', body: {query, variables: {o: owner, n: name, q: `refs/heads/${this.branch}`}}})
+        const d = (await r.json().catch(() => ({}))) as {data?: {repository?: {ref?: {target: {oid: string}} | null}}; errors?: {type?: string}[]}
+        oid = d.data?.repository?.ref?.target.oid
+        if (oid || !d.errors?.some((e) => e.type === 'RATE_LIMITED') || attempt >= 10) break
+        await Bun.sleep(60_000 + Math.random() * 5000)
+      }
       if (!oid) throw new Error(`the ledger ${this.where}: no branch ${this.branch}`)
       head = oid
       this.beaten = false
+      this.etag = undefined // (the REST answer's tag is from before: the next REST read is unconditional)
     } else {
       // (unchanged since the last read: GitHub answers 304, which costs no rate limit)
       const r = await this.api('GET', `/git/ref/heads/${this.branch}`, undefined, this.etag && this.cached ? {'If-None-Match': this.etag} : {})
@@ -147,8 +175,22 @@ class GitHubLedger implements Ledger {
       head = ((await r.json()) as {object: {sha: string}}).object.sha
       this.etag = r.headers.get('etag') ?? undefined
     }
-    if (this.cached?.head !== head) this.cached = {head, state: JSON.parse(text(await this.file('state.json', head))) as State}
-    return {head, state: structuredClone(this.cached.state)}
+    if (this.cached?.head !== head) {
+      // (a lagging answer can name a commit from before the batch, with no state.json: the state held is kept)
+      const raw = await this.file('state.json', head).catch((e: unknown) => {
+        if (!this.cached) throw e
+        return undefined
+      })
+      if (!raw) {
+        this.beaten = true
+        return {head: this.cached!.head, state: structuredClone(this.cached!.state)}
+      }
+      const state = JSON.parse(text(raw)) as State
+      // (a head older than the one held, from a lagging answer: kept as held, and the next read asks GraphQL)
+      if (this.cached && state.log.length < this.cached.state.log.length) this.beaten = true
+      else this.cached = {head, state}
+    }
+    return {head: this.cached.head, state: structuredClone(this.cached.state)}
   }
 
   async file(path: string, head?: string): Promise<Uint8Array> {
@@ -161,7 +203,9 @@ class GitHubLedger implements Ledger {
   async append(head: string, state: State, files: Files = {}, message = 'step'): Promise<string | undefined> {
     const sha = await this.commitOn(head, {...files, 'state.json': JSON.stringify(state)}, message)
     if (sha) this.cached = {head: sha, state: structuredClone(state)}
-    else this.beaten = true // (the next read asks where the branch is now)
+    // (either way the next read asks GraphQL where the branch is: after this commit, GitHub's REST answer may still be
+    // the one before it; beaten, it is someone else's)
+    this.beaten = true
     return sha
   }
 }
