@@ -80,7 +80,7 @@ export function readJobs(file: string): Job[] {
 // image may have its own `setup` and `data` (a box path for each local file or folder, relative to the repo):
 // `supercomputer image build NAME` puts the data at its paths on a box of the repo's image, runs the setup after it,
 // and saves the snapshot.
-export type Image = {snapshot?: string; template: string; path: string[]; env: Record<string, string>; setup?: string; data: Record<string, string>}
+export type Image = {snapshot?: string; template: string; path: string[]; env: Record<string, string>; setup?: string; data: Record<string, string>; ownTemplate?: boolean}
 
 // Build outputs kept on each box between jobs and batches (a Lean library's .olean files): a job finds `outputs` in
 // `dir` already there when the cache's key (its salt and every input) matches, and what it built is kept for the next.
@@ -120,12 +120,15 @@ export function readConfig(root: string): Config {
   for (const [k, v] of Object.entries((ib.images ?? {}) as Record<string, any>)) {
     if (!/^[a-z0-9][a-z0-9-]*$/.test(k)) throw new Error(`${f}: [instabox.images.${k}]: a name of lowercase letters, digits and dashes`)
     const data: Record<string, string> = {}
-    for (const [to, from] of Object.entries((v.data ?? {}) as Record<string, unknown>)) {
-      if (!to.startsWith('/') || to.split('/').includes('..') || typeof from !== 'string') throw new Error(`${f}: [instabox.images.${k}] data: "/absolute/box/path" = "path/in/the/repo"`)
+    for (const [path, from] of Object.entries((v.data ?? {}) as Record<string, unknown>)) {
+      // (a trailing slash dropped: "/bench/" is /bench; never / itself, which the copy would replace)
+      const to = path.replace(/\/+$/, '')
+      if (!path.startsWith('/') || !to || to.split('/').some((p) => p === '..' || p === '.') || typeof from !== 'string')
+        throw new Error(`${f}: [instabox.images.${k}] data: "/absolute/box/path" = "path/in/the/repo" (not "/" itself)`)
       data[to] = from
     }
     if (Object.keys(data).length && !v.setup) throw new Error(`${f}: [instabox.images.${k}] has data but no setup: its snapshot is built by \`supercomputer image build ${k}\``)
-    images[k] = {snapshot: v.snapshot ?? (v.setup ? undefined : image.snapshot), template: v.template ?? image.template, path: [...(v.path ?? []), ...image.path], env: {...image.env, ...(v.env ?? {})}, setup: v.setup, data}
+    images[k] = {snapshot: v.snapshot ?? (v.setup ? undefined : image.snapshot), template: v.template ?? image.template, ownTemplate: v.template !== undefined, path: [...(v.path ?? []), ...image.path], env: {...image.env, ...(v.env ?? {})}, setup: v.setup, data}
   }
   const caches = ((t.cache ?? []) as Record<string, any>[]).map((c): Cache => {
     const mods: string[] = c.modules ?? ['']
