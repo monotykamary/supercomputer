@@ -15,10 +15,11 @@ import {parseArgs} from 'node:util'
 import * as ib from './instabox.ts'
 import {readConfig, readJobs, sizeOf} from './jobs.ts'
 import {newBatch, owner, readBatch, reap, run} from './run.ts'
+import {fetchLedger, launch, peer} from './peer.ts'
 import {pack, root} from './tree.ts'
 
 const log = (s: string) => console.error(`${new Date().toISOString().slice(11, 19)} ${s}`)
-const USAGE = 'usage: supercomputer run --jobs FILE --out DIR | batch fetch DIR | status | reap [--keep 30m] | image build [NAME] | --skill'
+const USAGE = 'usage: supercomputer run --jobs FILE --out DIR | launch --jobs FILE --ledger OWNER/REPO | batch fetch DIR | batch fetch --ledger OWNER/REPO#BATCH --out DIR | status | reap [--keep 30m] | image build [NAME] | --skill'
 
 function seconds(s: string): number {
   const m = /^(\d+)(s|m|h)?$/.exec(s)
@@ -96,6 +97,40 @@ async function main(argv: string[]): Promise<number> {
       log(`batch ${batch.id}: ${jobs.length} jobs, tree ${tree.hash} (${tree.files} files, ${(tree.bytes / 1e6).toFixed(1)} MB); results in ${out}`)
     }
     return run(batch, tree.hash === batch.tree ? tree : undefined, {out, poll: seconds(v.poll!), keep: seconds(v.keep!), log})
+  }
+  // Controller-less (src/peer.ts): the batch in a ledger, its boxes running it with no client.
+  if (cmd === 'launch') {
+    const {values: v} = parseArgs({
+      args: rest,
+      options: {
+        jobs: {type: 'string'}, ledger: {type: 'string'},
+        'max-boxes': {type: 'string', default: '50'}, 'max-attempts': {type: 'string', default: '3'},
+        size: {type: 'string'}, timing: {type: 'boolean', default: false}, 'strict-once': {type: 'boolean', default: false},
+      },
+    })
+    if (!v.jobs || !v.ledger) throw new Error('launch needs --jobs FILE and --ledger OWNER/REPO')
+    const repo = await root(process.cwd())
+    const cfg = readConfig(repo)
+    if (v.size) cfg.size = sizeOf(v.size)
+    const tree = await pack(repo, cfg.ignore)
+    const where = await launch(readJobs(resolve(v.jobs)), cfg, tree, {
+      maxBoxes: count(v['max-boxes']!, '--max-boxes'), maxAttempts: count(v['max-attempts']!, '--max-attempts'),
+      strictOnce: v['strict-once']!, timing: v.timing!,
+    }, v.ledger, log)
+    console.log(where)
+    log(`launched: the boxes run the batch now, this machine may go; results: supercomputer batch fetch --ledger ${where} --out DIR`)
+    return 0
+  }
+  if (cmd === 'peer') {
+    const {values: v} = parseArgs({args: rest, options: {ledger: {type: 'string'}, slot: {type: 'string'}, name: {type: 'string'}, poll: {type: 'string', default: '3s'}}})
+    if (!v.ledger || v.slot === undefined || !v.name) throw new Error('peer needs --ledger, --slot and --name')
+    await peer(v.ledger, {slot: Number(v.slot), name: v.name}, {log, poll: seconds(v.poll!)})
+    return 0
+  }
+  if (cmd === 'batch' && rest[0] === 'fetch' && rest.includes('--ledger')) {
+    const {values: v} = parseArgs({args: rest.slice(1), options: {ledger: {type: 'string'}, out: {type: 'string'}}})
+    if (!v.ledger || !v.out) throw new Error('batch fetch --ledger OWNER/REPO#BATCH needs --out DIR')
+    return fetchLedger(v.ledger, resolve(v.out), log)
   }
   if (cmd === 'batch' && rest[0] === 'fetch') {
     const {values: v, positionals: p} = parseArgs({args: rest.slice(1), allowPositionals: true, options: loop})

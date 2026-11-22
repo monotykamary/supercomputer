@@ -57,12 +57,12 @@ type Live = BoxRec & {misses: number; ready: Promise<void>}
 
 const q = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
 const sleep = (s: number) => new Promise((r) => setTimeout(r, s * 1000))
-const SYSTEM_MIB = 512 // a box's memory left to its system
+export const SYSTEM_MIB = 512 // a box's memory left to its system
 
 export const owner = () => new Bun.CryptoHasher('sha256').update(`${userInfo().username}@${hostname()}`).digest('hex').slice(0, 8)
 
 // What a box must be for the job: its image, its GPU and, when it names one, its size.
-const kindOf = (j: Job) => [j.image ?? '', j.gpu ?? '', j.size ? `${j.size.vcpus}x${j.size.memMiB}` : ''].join('|')
+export const kindOf = (j: Job) => [j.image ?? '', j.gpu ?? '', j.size ? `${j.size.vcpus}x${j.size.memMiB}` : ''].join('|')
 
 // At most n instabox calls at once.
 function limiter(n: number) {
@@ -101,7 +101,7 @@ export function newBatch(jobs: Job[], cfg: Config, tree: Tree, limits: Limits): 
 }
 
 // A cache's key: its salt and every input file's path and content (a missing one as such).
-function cacheKey(root: string, c: Cache): string {
+export function cacheKey(root: string, c: Cache): string {
   const h = new Bun.CryptoHasher('sha256').update(c.salt + '\0')
   for (const f of [...c.inputs].sort()) {
     const file = join(root, c.dir, f)
@@ -233,37 +233,8 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     save()
     try {
       await b.ready
-      const J = dir(job.name)
-      const img = imageOf(job.image)
-      const path = img.path.map((p) => p.replace(/^~/, '$HOME')).join(':')
-      const env = Object.entries({...img.env, ...job.env}).map(([k, v]) => `export ${k}=${q(String(v))}`).join('\n')
-      // Each cache: its outputs copied into the tree when the box has them for this key; kept after the job when it
-      // built all of them and the box has none yet.
-      const caches = batch.caches.map((c) => {
-        const C = `"$HOME/sc/cache/${c.name}/${c.key}"`, D = `"$J/tree"/${q(c.dir)}`
-        const outs = c.outputs.map(q).join(' ')
-        return {
-          seed: `[ -d ${C} ] && cp -a ${C}/. ${D}/ 2>/dev/null`,
-          keep: `( cd ${D} 2>/dev/null && [ ! -d ${C} ] && ls ${outs} >/dev/null 2>&1 && T=${C}.$$ && mkdir -p "$T" && cp --parents ${outs} "$T"/ && mv -T "$T" ${C} 2>/dev/null || rm -rf "$T" ) || true`,
-        }
-      })
-      const script = [
-        'set -u',
-        `J=${J.replace(/^~/, '$HOME')}`,
-        `tar -xzf "$HOME/sc/trees/${batch.tree}.tgz" -C "$J/tree" || { echo "the tree did not unpack" > "$J/log"; echo 125 > "$J/exit"; exit; }`,
-        `cd "$J/tree"/${q(job.cwd)} || { echo "no ${job.cwd} in the tree" > "$J/log"; echo 126 > "$J/exit"; exit; }`,
-        path ? `export PATH="${path}:$PATH"` : '',
-        env,
-        `export SUPERCOMPUTER_OUTPUT_DIR="$J/out" SUPERCOMPUTER_JOB=${q(job.name)} SUPERCOMPUTER_BATCH=${q(batch.id)}`,
-        ...caches.map((c) => c.seed),
-        'date +%s > "$J/started"',
-        `timeout -k 30 ${job.timeout} bash -c ${q(batch.cfg.pre + job.cmd)} > "$J/log" 2>&1 < /dev/null`,
-        'code=$?',
-        ...caches.map((c) => c.keep),
-        'echo "$code $(date +%s)" > "$J/exit.tmp" && mv "$J/exit.tmp" "$J/exit"',
-      ].filter(Boolean).join('\n')
-      const launch = `J=${J.replace(/^~/, '$HOME')}; rm -rf "$J" && mkdir -p "$J/tree" "$J/out" && cat > "$J/job.sh" && (setsid nohup bash "$J/job.sh" > "$J/runner.log" 2>&1 < /dev/null &)`
-      const r = await api(() => ib.exec(b.id, launch, {stdin: script + '\n'}))
+      const {script, launch} = jobScript(batch, job)
+      const r = await api(() => ib.exec(b.id, launch, {stdin: script}))
       if (r.exitCode !== 0) throw new Error(`launch exited ${r.exitCode}: ${r.stderr.trim()}`)
       o.log(`${job.name}: started on ${b.name}`)
     } catch (e) {
@@ -412,7 +383,43 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
   return rule.verdict === 'passed' ? 0 : 3
 }
 
-function biggest(a: Size, b?: Size): Size {
+// A job's script on its box, and the command that starts it detached (setsid) with the script on its stdin: it unpacks
+// the tree, seeds the caches, runs the command under its timeout, keeps what it built, and writes its exit code last.
+export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, job: Job): {script: string; launch: string} {
+  const J = `~/sc/run/${batch.id}/${job.name}`
+  const img = job.image ? batch.cfg.images[job.image]! : batch.cfg.image
+  const path = img.path.map((p) => p.replace(/^~/, '$HOME')).join(':')
+  const env = Object.entries({...img.env, ...job.env}).map(([k, v]) => `export ${k}=${q(String(v))}`).join('\n')
+  // Each cache: its outputs copied into the tree when the box has them for this key; kept after the job when it
+  // built all of them and the box has none yet.
+  const caches = batch.caches.map((c) => {
+    const C = `"$HOME/sc/cache/${c.name}/${c.key}"`, D = `"$J/tree"/${q(c.dir)}`
+    const outs = c.outputs.map(q).join(' ')
+    return {
+      seed: `[ -d ${C} ] && cp -a ${C}/. ${D}/ 2>/dev/null`,
+      keep: `( cd ${D} 2>/dev/null && [ ! -d ${C} ] && ls ${outs} >/dev/null 2>&1 && T=${C}.$$ && mkdir -p "$T" && cp --parents ${outs} "$T"/ && mv -T "$T" ${C} 2>/dev/null || rm -rf "$T" ) || true`,
+    }
+  })
+  const script = [
+    'set -u',
+    `J=${J.replace(/^~/, '$HOME')}`,
+    `tar -xzf "$HOME/sc/trees/${batch.tree}.tgz" -C "$J/tree" || { echo "the tree did not unpack" > "$J/log"; echo 125 > "$J/exit"; exit; }`,
+    `cd "$J/tree"/${q(job.cwd)} || { echo "no ${job.cwd} in the tree" > "$J/log"; echo 126 > "$J/exit"; exit; }`,
+    path ? `export PATH="${path}:$PATH"` : '',
+    env,
+    `export SUPERCOMPUTER_OUTPUT_DIR="$J/out" SUPERCOMPUTER_JOB=${q(job.name)} SUPERCOMPUTER_BATCH=${q(batch.id)}`,
+    ...caches.map((c) => c.seed),
+    'date +%s > "$J/started"',
+    `timeout -k 30 ${job.timeout} bash -c ${q(batch.cfg.pre + job.cmd)} > "$J/log" 2>&1 < /dev/null`,
+    'code=$?',
+    ...caches.map((c) => c.keep),
+    'echo "$code $(date +%s)" > "$J/exit.tmp" && mv "$J/exit.tmp" "$J/exit"',
+  ].filter(Boolean).join('\n') + '\n'
+  const launch = `J=${J.replace(/^~/, '$HOME')}; rm -rf "$J" && mkdir -p "$J/tree" "$J/out" && cat > "$J/job.sh" && (setsid nohup bash "$J/job.sh" > "$J/runner.log" 2>&1 < /dev/null &)`
+  return {script, launch}
+}
+
+export function biggest(a: Size, b?: Size): Size {
   return b && b.vcpus > a.vcpus ? b : a
 }
 

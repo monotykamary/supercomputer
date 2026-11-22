@@ -47,6 +47,9 @@ export type CreateOptions = {
   gpu?: string
   meta: Record<string, string>
   autoSuspend?: string
+  secrets?: string[] // instabox Secrets the box gets (a placeholder each; the proxy swaps the value in for its hosts)
+  setupFile?: string // run in the box once it is up; create returns when it has
+  deleteAfter?: string
 }
 
 export async function create(o: CreateOptions): Promise<Box> {
@@ -56,6 +59,9 @@ export async function create(o: CreateOptions): Promise<Box> {
   if (o.gpu) args.push('--gpu', o.gpu, '--queue')
   else args.push('--vcpus', String(o.vcpus), '--mem-mib', String(o.memMiB))
   for (const [k, v] of Object.entries(o.meta)) args.push('--meta', `${k}=${v}`)
+  if (o.secrets?.length) args.push('--secrets', o.secrets.join(','))
+  if (o.setupFile) args.push('--setup-file', o.setupFile)
+  if (o.deleteAfter) args.push('--delete-after', o.deleteAfter)
   return JSON.parse(await ok(args)) as Box
 }
 
