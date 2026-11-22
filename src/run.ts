@@ -385,8 +385,8 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
 
 // A job's script on its box, and the command that starts it detached (setsid) with the script on its stdin: it unpacks
 // the tree, seeds the caches, runs the command under its timeout, keeps what it built, and writes its exit code last.
-export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, job: Job): {script: string; launch: string} {
-  const J = `~/sc/run/${batch.id}/${job.name}`
+export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, job: Job, attempt?: number): {script: string; launch: string} {
+  const J = `~/sc/run/${batch.id}/${job.name}${attempt ? `.${attempt}` : ''}`
   const img = job.image ? batch.cfg.images[job.image]! : batch.cfg.image
   const path = img.path.map((p) => p.replace(/^~/, '$HOME')).join(':')
   const env = Object.entries({...img.env, ...job.env}).map(([k, v]) => `export ${k}=${q(String(v))}`).join('\n')
@@ -415,7 +415,7 @@ export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, 
     ...caches.map((c) => c.keep),
     'echo "$code $(date +%s)" > "$J/exit.tmp" && mv "$J/exit.tmp" "$J/exit"',
   ].filter(Boolean).join('\n') + '\n'
-  const launch = `J=${J.replace(/^~/, '$HOME')}; rm -rf "$J" && mkdir -p "$J/tree" "$J/out" && cat > "$J/job.sh" && (setsid nohup bash "$J/job.sh" > "$J/runner.log" 2>&1 < /dev/null &)`
+  const launch = `J=${J.replace(/^~/, '$HOME')}; rm -rf "$J" && mkdir -p "$J/tree" "$J/out" && cat > "$J/job.sh" && (setsid nohup bash "$J/job.sh" > "$J/runner.log" 2>&1 < /dev/null & echo $! > "$J/pid")`
   return {script, launch}
 }
 
