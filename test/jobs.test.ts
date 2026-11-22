@@ -53,14 +53,31 @@ test('supercomputer.toml: [instabox] for the boxes, [run] pre, images and caches
     '[run]', 'pre = "export X=1; "',
     '[instabox]', 'size = "large"', 'snapshot = "sc-demo-abc"', 'path = ["/opt/node/bin"]', 'env = { A = "1" }', 'ignore = ["runs/**"]',
     '[instabox.images.runner]', 'path = ["/usr/lib/llvm-18/bin"]', 'env = { B = "2" }',
+    '[instabox.images.chc]', 'setup = "sc/chc.sh"', 'data = { "/bench" = "data/bench", "/data/m.jsonl" = "runs/m.jsonl" }',
     '[[cache]]', 'name = "olean"', 'dir = "lean"', 'modules = ["A", "B"]', 'inputs = "{m}.lean"', 'outputs = "{m}.olean"', 'salt = "v1"',
   ].join('\n'))
   expect(readConfig(dir)).toEqual({
     name: 'demo', pre: 'export X=1; ', size: {vcpus: 8, memMiB: 16384}, setup: undefined, ignore: ['runs/**'],
-    image: {snapshot: 'sc-demo-abc', template: 'universal', path: ['/opt/node/bin'], env: {A: '1'}},
-    images: {runner: {snapshot: 'sc-demo-abc', template: 'universal', path: ['/usr/lib/llvm-18/bin', '/opt/node/bin'], env: {A: '1', B: '2'}}},
+    image: {snapshot: 'sc-demo-abc', template: 'universal', path: ['/opt/node/bin'], env: {A: '1'}, setup: undefined, data: {}},
+    images: {
+      runner: {snapshot: 'sc-demo-abc', template: 'universal', path: ['/usr/lib/llvm-18/bin', '/opt/node/bin'], env: {A: '1', B: '2'}, setup: undefined, data: {}},
+      // (an image with its own setup is its own snapshot: none until `image build chc`, never the repo's)
+      chc: {snapshot: undefined, template: 'universal', path: ['/opt/node/bin'], env: {A: '1'}, setup: 'sc/chc.sh', data: {'/bench': 'data/bench', '/data/m.jsonl': 'runs/m.jsonl'}},
+    },
     caches: [{name: 'olean', dir: 'lean', inputs: ['A.lean', 'B.lean'], outputs: ['A.olean', 'B.olean'], salt: 'v1'}],
   })
+})
+
+test("an image's data: absolute box paths, and a setup to build it", () => {
+  const cfg = (body: string) => {
+    const dir = mkdtempSync(join(tmpdir(), 'sc-cfg-'))
+    writeFileSync(join(dir, 'supercomputer.toml'), body)
+    return () => readConfig(dir)
+  }
+  expect(cfg('[instabox.images.x]\nsetup = "s.sh"\ndata = { "bench" = "b" }')).toThrow(/absolute/)
+  expect(cfg('[instabox.images.x]\nsetup = "s.sh"\ndata = { "/a/../etc" = "b" }')).toThrow(/absolute/)
+  expect(cfg('[instabox.images.x]\ndata = { "/bench" = "b" }')).toThrow(/no setup/)
+  expect(cfg('[instabox.images.Big]\nsetup = "s.sh"')).toThrow(/lowercase/)
 })
 
 test("the old supercomputer's sections are refused, not ignored", () => {

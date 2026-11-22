@@ -76,8 +76,11 @@ export function readJobs(file: string): Job[] {
   })
 }
 
-// A box's image: an instabox snapshot (or a template), with what jobs on it add to PATH and the environment.
-export type Image = {snapshot?: string; template: string; path: string[]; env: Record<string, string>}
+// A box's image: an instabox snapshot (or a template), with what jobs on it add to PATH and the environment. A named
+// image may have its own `setup` and `data` (a box path for each local file or folder, relative to the repo):
+// `supercomputer image build NAME` puts the data at its paths on a box of the repo's image, runs the setup after it,
+// and saves the snapshot.
+export type Image = {snapshot?: string; template: string; path: string[]; env: Record<string, string>; setup?: string; data: Record<string, string>}
 
 // Build outputs kept on each box between jobs and batches (a Lean library's .olean files): a job finds `outputs` in
 // `dir` already there when the cache's key (its salt and every input) matches, and what it built is kept for the next.
@@ -104,6 +107,7 @@ export type Config = {
 //   size = "large"                         (the smallest box a batch makes; a job's own size wins when bigger)
 //   path = ["~/.bun/bin"], env = {A = "1"}, ignore = ["runs/**"]
 //   [instabox.images.runner]               (a job's "image": "runner": another snapshot, its own path and env)
+//   [instabox.images.chc] setup = "...", data = {"/bench" = "data/bench"}   (built on the repo's image by `image build chc`)
 //   [[cache]] name, dir, modules, inputs = "{m}.lean", outputs = "{m}.olean", salt
 export function readConfig(root: string): Config {
   const f = join(root, 'supercomputer.toml')
@@ -111,10 +115,18 @@ export function readConfig(root: string): Config {
   for (const k of ['boat', 'modal', 'treadmill', 'gpu', 'runpod'])
     if (t[k] !== undefined) throw new Error(`${f}: [${k}] is the old supercomputer's; this one runs on instabox only ([instabox])`)
   const ib = t.instabox ?? {}
-  const image: Image = {snapshot: ib.snapshot, template: ib.template ?? 'universal', path: ib.path ?? [], env: ib.env ?? {}}
+  const image: Image = {snapshot: ib.snapshot, template: ib.template ?? 'universal', path: ib.path ?? [], env: ib.env ?? {}, setup: ib.setup, data: {}}
   const images: Record<string, Image> = {}
-  for (const [k, v] of Object.entries((ib.images ?? {}) as Record<string, any>))
-    images[k] = {snapshot: v.snapshot ?? image.snapshot, template: v.template ?? image.template, path: [...(v.path ?? []), ...image.path], env: {...image.env, ...(v.env ?? {})}}
+  for (const [k, v] of Object.entries((ib.images ?? {}) as Record<string, any>)) {
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(k)) throw new Error(`${f}: [instabox.images.${k}]: a name of lowercase letters, digits and dashes`)
+    const data: Record<string, string> = {}
+    for (const [to, from] of Object.entries((v.data ?? {}) as Record<string, unknown>)) {
+      if (!to.startsWith('/') || to.split('/').includes('..') || typeof from !== 'string') throw new Error(`${f}: [instabox.images.${k}] data: "/absolute/box/path" = "path/in/the/repo"`)
+      data[to] = from
+    }
+    if (Object.keys(data).length && !v.setup) throw new Error(`${f}: [instabox.images.${k}] has data but no setup: its snapshot is built by \`supercomputer image build ${k}\``)
+    images[k] = {snapshot: v.snapshot ?? (v.setup ? undefined : image.snapshot), template: v.template ?? image.template, path: [...(v.path ?? []), ...image.path], env: {...image.env, ...(v.env ?? {})}, setup: v.setup, data}
+  }
   const caches = ((t.cache ?? []) as Record<string, any>[]).map((c): Cache => {
     const mods: string[] = c.modules ?? ['']
     const each = (p: string | string[] | undefined) => [p ?? []].flat().flatMap((x) => mods.map((m) => String(x).replaceAll('{m}', m)))

@@ -22,6 +22,7 @@ supercomputer run --jobs jobs.json --out runs/x [--max-boxes 50] [--size large] 
   Unnamed, jobs pack onto boxes of `[instabox] size` (or the smallest that fits) by vCPUs and memory.
 - `"gpu": "a100"` (`l4`, `t4`, `h100`, `"a100:2"`): a GPU box from instabox's GPU queue.
 - `"image": "runner"`: a box of `[instabox.images.runner]` (another snapshot, its own PATH and env).
+  An image with its own `setup` (and `data`) is built on the repo's image by `supercomputer image build NAME`.
 
 **Survives this machine going away.** Each job runs detached on its box and keeps its log, exit and outputs there.
 Close the laptop mid-batch and the boxes finish their jobs, then pause themselves. Note the `--out` directory, and
@@ -53,6 +54,9 @@ size = "large"
 path = ["~/.bun/bin"]
 env = { A = "1" }
 ignore = ["runs/**"]
+[instabox.images.bench]                # "image": "bench": the repo's image plus this setup and data
+setup = "supercomputer/bench.sh"       # (`supercomputer image build bench`; then its snapshot = "..." here)
+data = { "/bench" = "data/bench", "/data/models.jsonl" = "runs/models.jsonl" }   # box path = file or folder in the repo
 [[cache]]                              # build outputs kept on each box between jobs and batches
 name = "olean"
 dir = "lean"
