@@ -103,7 +103,8 @@ async function grow(ledger: Ledger, shared: Shared, by: string, log: (s: string)
         failed = 0
         break
       }
-      if (++failed >= 3 || (await closeSlot(ledger, shared, c.slot))) break
+      const closed = await closeSlot(ledger, shared, c.slot)
+      if (++failed >= 3 || closed) break
       rec = await replaceSlot(ledger, shared, c.slot, rec)
     }
   }
