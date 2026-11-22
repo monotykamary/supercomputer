@@ -4,12 +4,12 @@
 
 import {batch, GROUPS, type Op} from './batch.ts'
 
-export type Limits = {maxBoxes: number; maxAttempts: number; strictOnce: boolean; timing: boolean}
+export type Limits = {maxBoxes: number; maxAttempts: number; strictOnce: boolean; timing: boolean; peers?: boolean}
 type OpName = typeof Op extends {values: readonly (infer V)[]} ? V : string
 export type Req = {op: OpName; job?: number; box?: number; cpu?: number; mem?: number; code?: number; group?: number; kind?: number}
 export type JobView = {st: 'none' | 'queued' | 'running' | 'ended' | 'done' | 'lost'; attempts: number; cpu: number; mem: number; box: number; exit: number; group: number; need: number}
 export type BoxView = {open: boolean; vcpus: number; mem: number; cpu: number; memUsed: number; running: number; unfetched: number; starts: number; kind: number}
-type View = {live: number; verdict: 'open' | 'passed' | 'failed'; ok: boolean; Jobs: Record<string, JobView>; Boxes: Record<string, BoxView>}
+type View = {live: number; verdict: 'open' | 'passed' | 'failed'; ok: boolean; begun: boolean; Jobs: Record<string, JobView>; Boxes: Record<string, BoxView>}
 
 const machine = batch.compiled()
 const blank = {op: 'add', job: 0, box: 0, cpu: 0, mem: 0, code: 0, group: 0, kind: 0} as const
@@ -22,7 +22,7 @@ export class Engine {
   private view?: View
 
   constructor(readonly limits: Limits, log: Req[] = []) {
-    this.values = {cap: limits.maxBoxes, maxAttempts: limits.maxAttempts, strictOnce: limits.strictOnce, timing: limits.timing}
+    this.values = {cap: limits.maxBoxes, maxAttempts: limits.maxAttempts, strictOnce: limits.strictOnce, timing: limits.timing, peers: limits.peers ?? false}
     this.params = batch.encodeParams(this.values as never)
     this.st = machine.init(this.params)
     for (const [i, r] of log.entries()) if (!this.step(r)) throw new Error(`batch.json's log: request ${i} (${r.op}) is one the batch rule refuses`)

@@ -2,6 +2,7 @@
 // kernel, nothing assumed; each bug they rule out refuted by a run from the start; the builders cross-checked.
 import {expect, test} from 'bun:test'
 import {proveDecision, proveSteps} from 'gdp-wired'
+import {decideIdle, idleLaws} from '../src/idle.ts'
 import {letGoLaw} from '../src/pool.ts'
 import {batch, type Bug, BUGS, laws, lawsOf, makeBatch, stepLaws, stepLawsOf} from '../src/batch.ts'
 
@@ -12,7 +13,7 @@ test('every law of the batch is proven from every state the laws allow', () => {
 
 // Runs the search does not reach in its time (ten steps and more), written out: each replayed on the variant's own
 // compiled machine from the start, then the law's breach read off the state it reaches.
-const P = {cap: 2, maxAttempts: 3, strictOnce: false, timing: false}
+const P = {cap: 2, maxAttempts: 3, strictOnce: false, timing: false, peers: false}
 const replay = (bug: Bug, reqs: Record<string, unknown>[]) => {
   const r = makeBatch(bug), m = r.compiled(), params = r.encodeParams(P)
   let st = m.init(params)
@@ -29,6 +30,17 @@ const written: Partial<Record<Bug, () => boolean>> = {
   },
   // two members of group 1 started on box 0
   'puts a group twice on a box': () => (replay('puts a group twice on a box', twoOnABox(1)).st.maps.Groups?.get(1) ?? 0) > 1,
+  // a job ends on box 0, its outputs still there, and the box closes
+  'closes a box with outputs on it': () => {
+    const {d} = replay('closes a box with outputs on it', [{op: 'add', job: 0, cpu: 1, mem: 1}, {op: 'open', box: 0, cpu: 4, mem: 100}, {op: 'start', job: 0, box: 0}, {op: 'exit', job: 0}, {op: 'close', box: 0}])
+    const b = (d as unknown as {Boxes: Record<number, {open: boolean; unfetched: number}>}).Boxes[0]
+    return b?.open === false && b.unfetched === 1
+  },
+  // a job answers 3, and the batch finishes passed
+  'passes with a failure': () => {
+    const {d} = replay('passes with a failure', [{op: 'add', job: 0, cpu: 1, mem: 1}, {op: 'open', box: 0, cpu: 4, mem: 100}, {op: 'start', job: 0, box: 0}, {op: 'exit', job: 0, code: 3}, {op: 'fetch', job: 0}, {op: 'finish'}])
+    return (d as unknown as {verdict: string}).verdict === 'passed' && (d.Jobs[0] as unknown as {exit: number}).exit === 3
+  },
 }
 
 for (const bug of BUGS)
@@ -50,3 +62,35 @@ test("the warm pool's decision: a paused box is deleted only past its keep", () 
   expect({proven: v.proven, checked: v.checked}).toEqual({proven: true, checked: true})
 })
 
+
+for (const law of idleLaws)
+  test(`the idle box's decision: ${law.name ?? 'a law'}`, () => {
+    const v = proveDecision(law)
+    expect({proven: v.proven, checked: v.checked}).toEqual({proven: true, checked: true})
+  })
+
+test("the idle decision's compiled runner answers as its laws say", () => {
+  const base = {left: 3, others: 2, busy: 1, young: false, blocked: false, lowest: true}
+  expect(decideIdle({...base, left: 0})).toBe('finish')
+  expect(decideIdle({...base, others: 0})).toBe('hand')
+  expect(decideIdle(base)).toBe('stay')
+  expect(decideIdle({...base, blocked: true})).toBe('close')
+  expect(decideIdle({...base, busy: 2})).toBe('close')
+  expect(decideIdle({...base, busy: 2, young: true})).toBe('stay')
+  expect(decideIdle({...base, lowest: false})).toBe('close')
+})
+
+test('with peers, the last box with work left is refused its close, and replaced instead', async () => {
+  const {Engine} = await import('../src/engine.ts')
+  const e = new Engine({maxBoxes: 1, maxAttempts: 3, strictOnce: false, timing: false, peers: true})
+  expect(e.step({op: 'add', job: 0, cpu: 1, mem: 1, kind: 1})).toBe(true)
+  expect(e.step({op: 'open', box: 0, cpu: 2, mem: 100, kind: 2})).toBe(true)
+  expect(e.step({op: 'add', job: 1, cpu: 1, mem: 1, kind: 1})).toBe(false) // (no work added once a box is open)
+  expect(e.step({op: 'close', box: 0})).toBe(false)
+  expect(e.step({op: 'replace', box: 0, cpu: 2, mem: 100, kind: 1})).toBe(true)
+  expect(e.step({op: 'start', job: 0, box: 0})).toBe(true)
+  const lone = new Engine({maxBoxes: 1, maxAttempts: 3, strictOnce: false, timing: false})
+  lone.step({op: 'add', job: 0, cpu: 1, mem: 1, kind: 1})
+  lone.step({op: 'open', box: 0, cpu: 2, mem: 100, kind: 2})
+  expect(lone.step({op: 'close', box: 0})).toBe(true) // (a client-run batch: the client is there to open another)
+})
