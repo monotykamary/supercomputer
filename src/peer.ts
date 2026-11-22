@@ -85,32 +85,51 @@ export async function claimBox(ledger: Ledger, head: string, shared: Shared, sta
 }
 
 // Claim and make the boxes queued work needs, until none is needed: how many were made. A box that could not be made
-// has its slot closed again (nothing is on it), so the work it was for is claimed anew.
+// has its slot closed again (nothing is on it), so the work it was for is claimed anew; the last open box, which the
+// rule keeps while work is left, has its slot replaced by a fresh box instead.
 async function grow(ledger: Ledger, shared: Shared, by: string, log: (s: string) => void, before: Req[] = []): Promise<number> {
   let made = 0
   // (three boxes in a row that could not be made: instabox is refusing them, and it stops trying)
-  for (let failed = 0; failed < 3; ) {
+  let failed = 0
+  while (failed < 3) {
     const {head, state} = await ledger.read()
     const c = await claimBox(ledger, head, shared, state, by, before)
     if (c === 'beaten') continue
     if (c === 'none') return made
     before = []
-    if (await makeBox(ledger, shared, c.slot, c.rec, head, log)) {
-      made++
-      failed = 0
-    } else {
-      failed++
-      await closeSlot(ledger, shared, c.slot)
+    for (let rec = c.rec; ; ) {
+      if (await makeBox(ledger, shared, c.slot, rec, (await ledger.read()).head, log)) {
+        made++
+        failed = 0
+        break
+      }
+      if (++failed >= 3 || (await closeSlot(ledger, shared, c.slot))) break
+      rec = await replaceSlot(ledger, shared, c.slot, rec)
     }
   }
   return made
 }
 
-// A slot closed in the ledger (a box never made), whatever else moved meanwhile.
-async function closeSlot(ledger: Ledger, shared: Shared, slot: number): Promise<void> {
+// A slot closed in the ledger (a box never made), whatever else moved meanwhile: false when the rule refuses it (the
+// last open box, while work is left).
+async function closeSlot(ledger: Ledger, shared: Shared, slot: number): Promise<boolean> {
   for (;;) {
     const {head, state} = await ledger.read()
-    if ((await propose(ledger, head, shared, state, [{op: 'close', box: slot}])) !== undefined) return
+    const took = await propose(ledger, head, shared, state, [{op: 'close', box: slot}])
+    if (took !== undefined) return took.length > 0
+  }
+}
+
+// A slot's box that could not be made, replaced in the ledger by a fresh one of the same size and kind (a new name):
+// the record to make.
+async function replaceSlot(ledger: Ledger, shared: Shared, slot: number, old: BoxRec): Promise<BoxRec> {
+  const rec: BoxRec = {...old, name: `sc-${shared.owner}-${Math.random().toString(36).slice(2, 10)}`, at: Date.now()}
+  for (;;) {
+    const {head, state} = await ledger.read()
+    const e = new Engine(shared.limits, state.log)
+    const kind = e.box(slot)?.kind ?? 0
+    const took = await propose(ledger, head, shared, state, [{op: 'replace', box: slot, cpu: rec.size.vcpus, mem: rec.size.memMiB - SYSTEM_MIB, kind}], (s) => (s.boxes[slot] = rec))
+    if (took !== undefined) return took.length ? rec : old
   }
 }
 
@@ -231,8 +250,9 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
     // has no box: never a box that is up, or one that went away on its own)
     for (const [b, x] of e.verdict === 'open' ? e.boxes() : []) {
       const rec = state.boxes[b]
-      if (rec?.by !== me.name || b === me.slot || x.running || x.unfetched || Date.now() - rec.at > GRACE_MS) continue
-      if ((await notFound(rec.name)) && !(await makeBox(ledger, shared, b, rec, (await ledger.read()).head, o.log))) await closeSlot(ledger, shared, b)
+      if (rec?.by !== me.name || rec.name === me.name || x.running || x.unfetched || Date.now() - rec.at > GRACE_MS) continue
+      if ((await notFound(rec.name)) && !(await makeBox(ledger, shared, b, rec, (await ledger.read()).head, o.log)) && !(await closeSlot(ledger, shared, b)))
+        o.log(`slot ${b}: its box could not be made, and it is the last one: the batch waits for \`batch fetch\` or a new launch`)
     }
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -348,6 +368,7 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
     const claimed = await claimBox(ledger, head, shared, state, me.name)
     if (claimed === 'beaten') continue
     if (claimed !== 'none') {
+      // (its slot is never the last open one: this box is open too, so closing it is never refused)
       const m = makeBox(ledger, shared, claimed.slot, claimed.rec, head, o.log).then((ok) => (ok ? undefined : closeSlot(ledger, shared, claimed.slot)))
       making.add(m)
       void m.finally(() => making.delete(m))
@@ -399,6 +420,8 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
         if (shared.limits.timing) return leave('no box could be made for the work left, and under --timing this one cannot take it')
         for (;;) {
           const r = await ledger.read()
+          // (only its own hand-off taken back: never a slot someone else replaced meanwhile)
+          if (r.state.boxes[me.slot]?.name !== rec.name) break
           const back = await propose(ledger, r.head, shared, r.state, [{op: 'replace', box: me.slot, cpu: own.size.vcpus, mem: own.size.memMiB - SYSTEM_MIB, kind: mine.kind}], (st) => (st.boxes[me.slot] = {...own, at: Date.now()}))
           if (back !== undefined) break
         }
