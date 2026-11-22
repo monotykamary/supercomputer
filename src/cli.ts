@@ -73,10 +73,6 @@ async function main(argv: string[]): Promise<number> {
     const out = resolve(v.out)
     const repo = await root(process.cwd())
     const jobs = readJobs(resolve(v.jobs))
-    for (const j of jobs) {
-      const img = j.image ? readConfig(repo).images[j.image] : undefined
-      if (img?.setup && !img.snapshot) throw new Error(`${j.name}: image ${j.image} has no snapshot yet: \`supercomputer image build ${j.image}\`, then set its snapshot in supercomputer.toml`)
-    }
     const tree = await pack(repo, readConfig(repo).ignore)
     let batch = readBatch(out)
     if (batch) {
@@ -133,9 +129,9 @@ async function main(argv: string[]): Promise<number> {
     const img = which ? cfg.images[which] : cfg.image
     if (!img) throw new Error(`no [instabox.images.${which}] in supercomputer.toml`)
     if (!img.setup) throw new Error(`supercomputer.toml has no ${which ? `[instabox.images.${which}]` : '[instabox]'} setup = "path/to/setup.sh"`)
-    // (a named image is built on the repo's image: its snapshot, else its template)
-    const base = which ? cfg.image.snapshot ?? `template:${cfg.image.template}` : `template:${img.template}`
-    if (which && !cfg.image.snapshot) log(`image ${which}: the repo has no [instabox] snapshot yet, so it builds on the ${cfg.image.template} template alone`)
+    // (a named image is built on the repo's image, its snapshot, unless it names a template of its own)
+    const base = which && !img.ownTemplate ? cfg.image.snapshot ?? `template:${cfg.image.template}` : `template:${img.template}`
+    if (which && !img.ownTemplate && !cfg.image.snapshot) log(`image ${which}: the repo has no [instabox] snapshot yet, so it builds on the ${cfg.image.template} template alone`)
     const setup = join(repo, img.setup)
     if (!existsSync(setup)) throw new Error(`no ${img.setup}`)
     const h = new Bun.CryptoHasher('sha256').update(base.replace(/^template:/, '') + '\0').update(readFileSync(setup))

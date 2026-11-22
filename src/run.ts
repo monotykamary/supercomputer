@@ -81,7 +81,12 @@ function limiter(n: number) {
 }
 
 export function newBatch(jobs: Job[], cfg: Config, tree: Tree, limits: Limits): Batch {
-  for (const j of jobs) if (j.image && !cfg.images[j.image]) throw new Error(`${j.name}: no image ${j.image} in supercomputer.toml's [instabox.images]`)
+  for (const j of jobs) {
+    const img = j.image ? cfg.images[j.image] : undefined
+    if (j.image && !img) throw new Error(`${j.name}: no image ${j.image} in supercomputer.toml's [instabox.images]`)
+    // (an image of its own setup has no snapshot until it is built: its boxes would be the bare template)
+    if (img?.setup && !img.snapshot) throw new Error(`${j.name}: image ${j.image} has no snapshot yet: \`supercomputer image build ${j.image}\`, then set its snapshot in supercomputer.toml`)
+  }
   const id = `${new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)}-${Math.random().toString(36).slice(2, 8)}`
   if (limits.strictOnce) limits = {...limits, maxAttempts: 1}
   const groups = [...new Set(jobs.flatMap((j) => (j.group ? [j.group] : [])))]
