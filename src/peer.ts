@@ -156,7 +156,7 @@ echo "peer started"
         log(`box ${rec.name}: ${e instanceof Error ? e.message : e}`)
         const b = await ib.get(rec.name).catch(() => undefined)
         // (it exists and booted: made after all, by this try or another participant's)
-        if (b && b.metadata?.setupStatus !== 'failed' && b.metadata?.setupStatus !== 'running') return true
+        if (b && b.state === 'running' && b.metadata?.setupStatus === 'succeeded') return true
         // (made, but its boot failed: deleted before the next try, so it bills nothing)
         if (b) await ib.remove(rec.name).catch(() => undefined)
       }

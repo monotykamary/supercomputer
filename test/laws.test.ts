@@ -75,6 +75,7 @@ test("the idle decision's compiled runner answers as its laws say", () => {
   expect(decideIdle({...base, others: 0})).toBe('hand')
   expect(decideIdle(base)).toBe('stay')
   expect(decideIdle({...base, blocked: true})).toBe('close')
+  expect(decideIdle({...base, busy: 0, blocked: true})).toBe('stay') // (the others may never have come up)
   expect(decideIdle({...base, busy: 2})).toBe('close')
   expect(decideIdle({...base, busy: 2, young: true})).toBe('stay')
   expect(decideIdle({...base, lowest: false})).toBe('close')
