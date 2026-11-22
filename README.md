@@ -95,3 +95,8 @@ claimed at the earliest; a box that is up but whose peer is stuck holds its jobs
 ```
 
 It needs `bun` and a signed-in `instabox` (`instabox login`, or `INSTABOX_API_KEY`).
+
+**From the Python supercomputer (0.1).** 1.0 replaces it: boat, Modal, the treadmill and RunPod are gone, and so are
+`--backend`, `--class` and the `[boat]`, `[modal]`, `[treadmill]`, `[gpu]` and `[runpod]` sections (refused, not
+ignored). `uv tool uninstall supercomputer`, then install as above. `uv tool install git+https://github.com/monotykamary/supercomputer`
+now installs only a pointer here; the Python version stays at `git+https://github.com/monotykamary/supercomputer@v0.1.0-python`.

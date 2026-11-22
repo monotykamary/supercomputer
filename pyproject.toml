@@ -1,0 +1,17 @@
+# supercomputer 1.0 is TypeScript on instabox. This stub only keeps `uv tool install git+https://github.com/monotykamary/supercomputer`
+# from failing with a build error: the command it installs says where supercomputer went, and exits 1.
+[project]
+name = "supercomputer"
+version = "1.0.0"
+description = "supercomputer 1.0 is TypeScript on instabox; this package only says how to install it"
+requires-python = ">=3.9"
+
+[project.scripts]
+supercomputer = "supercomputer_moved:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["supercomputer_moved"]
