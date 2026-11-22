@@ -1,0 +1,24 @@
+name: Test
+
+# Types and the tests: the batch rule's laws proven from every state they allow and every bug refuted, the engine, and
+# the runner end to end on a stand-in instabox (Linux). On instabox boxes (the instabox GitHub App's labels), for
+# this repository's own pushes and pull requests only.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Types and tests
+    if: github.repository == 'monotykamary/supercomputer' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: instabox-medium
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test

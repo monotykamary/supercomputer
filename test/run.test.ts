@@ -1,0 +1,118 @@
+// The runner end to end on the stand-in instabox (test/fake-instabox.ts): a batch's answers and outputs, a box lost
+// mid-job, a batch picked up after its client died, the warm pool, and the Lean-style cache. Linux only (setsid).
+import {expect, test} from 'bun:test'
+import {existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
+import {Engine} from '../src/engine.ts'
+
+const here = join(import.meta.dir, '..')
+const linux = process.platform === 'linux'
+
+function repo(files: Record<string, string>, toml = '') {
+  const dir = mkdtempSync(join(tmpdir(), 'sc-repo-'))
+  for (const [f, body] of Object.entries(files)) {
+    mkdirSync(join(dir, f, '..'), {recursive: true})
+    writeFileSync(join(dir, f), body)
+  }
+  writeFileSync(join(dir, 'supercomputer.toml'), `name = "t"\n[instabox]\ntemplate = "universal"\n${toml}`)
+  Bun.spawnSync(['git', 'init', '-q'], {cwd: dir})
+  Bun.spawnSync(['git', 'add', '-A'], {cwd: dir})
+  const fake = mkdtempSync(join(tmpdir(), 'sc-fake-'))
+  return {dir, fake, out: join(dir, 'runs', 'x')}
+}
+
+function sc(r: {dir: string; fake: string}, args: string[]) {
+  return Bun.spawn(['bun', join(here, 'src/cli.ts'), ...args], {
+    cwd: r.dir,
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake},
+  })
+}
+
+async function done(p: ReturnType<typeof sc>) {
+  const [err, code] = await Promise.all([new Response(p.stderr).text(), p.exited])
+  return {err, code}
+}
+
+const jobs = (r: {dir: string}, list: unknown[]) => {
+  writeFileSync(join(r.dir, 'jobs.json'), JSON.stringify(list))
+  return 'jobs.json'
+}
+const summary = (out: string) => readFileSync(join(out, 'summary.tsv'), 'utf8').trim().split('\n').slice(1).map((l) => l.split('\t').slice(0, 2))
+const boxes = (fake: string) => readdirSync(fake).filter((f) => f.startsWith('m_')).map((id) => JSON.parse(readFileSync(join(fake, id, 'box.json'), 'utf8')))
+
+test.skipIf(!linux)('a batch: answers, outputs fetched and checked, failures not retried, boxes paused', async () => {
+  const r = repo({'src/a.txt': 'hello'})
+  const f = jobs(r, [
+    {name: 'ok', cmd: 'cat src/a.txt > "$SUPERCOMPUTER_OUTPUT_DIR/copy.txt"', cpu: 1},
+    {name: 'fails', cmd: 'echo no; exit 3', cpu: 1},
+    {name: 'big', cmd: 'nproc >/dev/null; echo fine', cpu: 3, memory: 2000},
+  ])
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s']))
+  expect(code, err).toBe(3)
+  expect(summary(r.out).sort()).toEqual([['big', '0'], ['fails', '3'], ['ok', '0']])
+  expect(readFileSync(join(r.out, 'ok.files', 'copy.txt'), 'utf8')).toBe('hello')
+  expect(readFileSync(join(r.out, 'fails.log'), 'utf8')).toBe('no\n')
+  expect(err).not.toContain('queued again')
+  expect(boxes(r.fake).every((b) => b.state === 'suspended')).toBe(true)
+  const batch = JSON.parse(readFileSync(join(r.out, 'batch.json'), 'utf8'))
+  const e = new Engine(batch.limits, batch.log) // batch.json's log, replayed through the rule
+  expect([e.count('done'), e.boxes().length, e.verdict]).toEqual([3, 0, 'failed'])
+}, 60_000)
+
+test.skipIf(!linux)('a box lost mid-job: the attempt is tried again on a new box', async () => {
+  const r = repo({'x': ''})
+  const f = jobs(r, [{name: 'once', cmd: `if [ ! -f "$FAKE_INSTABOX_DIR/killed" ]; then touch "$FAKE_INSTABOX_DIR/killed"; rm "$HOME/../box.json"; sleep 3; fi; echo second > "$SUPERCOMPUTER_OUTPUT_DIR/o"`}])
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s']))
+  expect(code, err).toBe(0)
+  expect(err).toContain('queued again')
+  expect(readFileSync(join(r.out, 'once.files', 'o'), 'utf8')).toBe('second\n')
+}, 60_000)
+
+test.skipIf(!linux)('strict-once: a lost attempt is not tried again', async () => {
+  const r = repo({'x': ''})
+  const f = jobs(r, [{name: 'once', cmd: `rm "$HOME/../box.json"; sleep 3`}])
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s', '--strict-once']))
+  expect(code, err).toBe(3)
+  expect(summary(r.out)).toEqual([['once', 'lost']])
+}, 60_000)
+
+test.skipIf(!linux)("a batch picked up after its client died: the finished job fetched, not run again", async () => {
+  const r = repo({'x': ''})
+  const f = jobs(r, [{name: 'slow', cmd: `echo run >> "$FAKE_INSTABOX_DIR/runs"; sleep 4; echo out > "$SUPERCOMPUTER_OUTPUT_DIR/o"`}])
+  const first = sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s'])
+  for (let i = 0; i < 100 && !existsSync(join(r.fake, 'runs')); i++) await Bun.sleep(100)
+  first.kill(9)
+  await first.exited
+  await Bun.sleep(5000) // the job finishes on its box meanwhile
+  const {err, code} = await done(sc(r, ['batch', 'fetch', r.out, '--poll', '1s']))
+  expect(code, err).toBe(0)
+  expect(readFileSync(join(r.fake, 'runs'), 'utf8')).toBe('run\n')
+  expect(readFileSync(join(r.out, 'slow.files', 'o'), 'utf8')).toBe('out\n')
+}, 60_000)
+
+test.skipIf(!linux)('the warm pool: the next batch resumes a paused box; the cache seeds what an earlier job built', async () => {
+  const r = repo({'lean/A.lean': 'def a := 1'}, '[[cache]]\nname = "olean"\ndir = "lean"\nmodules = ["A"]\ninputs = "{m}.lean"\noutputs = "{m}.olean"\nsalt = "v1"\n')
+  const build = 'cd lean && if [ -f A.olean ]; then echo seeded > "$SUPERCOMPUTER_OUTPUT_DIR/how"; else echo built > A.olean; echo built > "$SUPERCOMPUTER_OUTPUT_DIR/how"; fi'
+  const f = jobs(r, [{name: 'lean', cmd: build}])
+  expect((await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s']))).code).toBe(0)
+  expect(readFileSync(join(r.out, 'lean.files', 'how'), 'utf8')).toBe('built\n')
+  const again = await done(sc(r, ['run', '--jobs', f, '--out', join(r.dir, 'runs', 'y'), '--poll', '1s']))
+  expect(again.code, again.err).toBe(0)
+  expect(again.err).toContain('resumed from the warm pool')
+  expect(readFileSync(join(r.dir, 'runs', 'y', 'lean.files', 'how'), 'utf8')).toBe('seeded\n')
+  expect(boxes(r.fake).length).toBe(1)
+}, 60_000)
+
+test.skipIf(!linux)('a box gone with outputs on it: the attempt is tried again, not fetched forever', async () => {
+  const r = repo({'x': ''})
+  // (the first attempt writes its exit, then its box goes before the outputs are fetched)
+  const f = jobs(r, [{name: 'gone', cmd: `if [ ! -f "$FAKE_INSTABOX_DIR/once" ]; then touch "$FAKE_INSTABOX_DIR/once"; (sleep 0.5; rm "$HOME/../box.json") & fi; echo ok > "$SUPERCOMPUTER_OUTPUT_DIR/o"`}])
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '2s']))
+  expect(code, err).toBe(0)
+  expect(err).toContain('queued again')
+  expect(readFileSync(join(r.out, 'gone.files', 'o'), 'utf8')).toBe('ok\n')
+}, 60_000)
+
