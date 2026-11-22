@@ -4,11 +4,13 @@
 //   supercomputer batch fetch runs/x   pick a batch up from runs/x/batch.json: fetch what finished, run the rest
 //   supercomputer status               the warm pool and the boxes running for this client
 //   supercomputer reap [--keep 30m]    delete paused boxes of the warm pool past their keep
-//   supercomputer image build          the repo's snapshot, from supercomputer.toml's [instabox] setup
+//   supercomputer image build [NAME]   the repo's snapshot, from supercomputer.toml's [instabox] setup (NAME: one of
+//                                      [instabox.images], its data and setup on the repo's image)
 //   supercomputer --skill              how to use it, for an agent
 
-import {existsSync, readFileSync} from 'node:fs'
-import {join, resolve} from 'node:path'
+import {existsSync, readFileSync, readdirSync, rmSync, statSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {basename, dirname, join, resolve} from 'node:path'
 import {parseArgs} from 'node:util'
 import * as ib from './instabox.ts'
 import {readConfig, readJobs, sizeOf} from './jobs.ts'
@@ -16,7 +18,7 @@ import {newBatch, owner, readBatch, reap, run} from './run.ts'
 import {pack, root} from './tree.ts'
 
 const log = (s: string) => console.error(`${new Date().toISOString().slice(11, 19)} ${s}`)
-const USAGE = 'usage: supercomputer run --jobs FILE --out DIR | batch fetch DIR | status | reap [--keep 30m] | image build | --skill'
+const USAGE = 'usage: supercomputer run --jobs FILE --out DIR | batch fetch DIR | status | reap [--keep 30m] | image build [NAME] | --skill'
 
 function seconds(s: string): number {
   const m = /^(\d+)(s|m|h)?$/.exec(s)
@@ -28,6 +30,20 @@ function count(s: string, what: string): number {
   const n = Number(s)
   if (!Number.isInteger(n) || n < 1) throw new Error(`${what}: a whole number from 1 (got ${s})`)
   return n
+}
+
+const q = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
+
+// A local file's or folder's content as one sha256 (each file's path, mode and bytes, in order).
+async function digest(p: string): Promise<string> {
+  const h = new Bun.CryptoHasher('sha256')
+  const walk = (d: string, rel: string) => {
+    const st = statSync(d)
+    if (!st.isDirectory()) return void h.update(`${rel}\0${st.mode & 0o111 ? 'x' : '-'}\0`).update(readFileSync(d))
+    for (const e of readdirSync(d).sort()) walk(join(d, e), `${rel}/${e}`)
+  }
+  walk(p, '.')
+  return h.digest('hex')
 }
 
 const loop = {poll: {type: 'string', default: '5s'}, keep: {type: 'string', default: '30m'}} as const
@@ -57,6 +73,10 @@ async function main(argv: string[]): Promise<number> {
     const out = resolve(v.out)
     const repo = await root(process.cwd())
     const jobs = readJobs(resolve(v.jobs))
+    for (const j of jobs) {
+      const img = j.image ? readConfig(repo).images[j.image] : undefined
+      if (img?.setup && !img.snapshot) throw new Error(`${j.name}: image ${j.image} has no snapshot yet: \`supercomputer image build ${j.image}\`, then set its snapshot in supercomputer.toml`)
+    }
     const tree = await pack(repo, readConfig(repo).ignore)
     let batch = readBatch(out)
     if (batch) {
@@ -109,25 +129,59 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === 'image' && rest[0] === 'build') {
     const repo = await root(process.cwd())
     const cfg = readConfig(repo)
-    if (!cfg.setup) throw new Error('supercomputer.toml has no [instabox] setup = "path/to/setup.sh"')
-    const setup = join(repo, cfg.setup)
-    if (!existsSync(setup)) throw new Error(`no ${cfg.setup}`)
-    const script = readFileSync(setup)
-    const hash = new Bun.CryptoHasher('sha256').update(cfg.image.template + '\0').update(script).digest('hex').slice(0, 12)
-    const name = `sc-${(cfg.name ?? 'repo').toLowerCase().replace(/[^a-z0-9-]/g, '-')}-${hash}`
+    const which = rest[1]
+    const img = which ? cfg.images[which] : cfg.image
+    if (!img) throw new Error(`no [instabox.images.${which}] in supercomputer.toml`)
+    if (!img.setup) throw new Error(`supercomputer.toml has no ${which ? `[instabox.images.${which}]` : '[instabox]'} setup = "path/to/setup.sh"`)
+    // (a named image is built on the repo's image: its snapshot, else its template)
+    const base = which ? cfg.image.snapshot ?? `template:${cfg.image.template}` : `template:${img.template}`
+    if (which && !cfg.image.snapshot) log(`image ${which}: the repo has no [instabox] snapshot yet, so it builds on the ${cfg.image.template} template alone`)
+    const setup = join(repo, img.setup)
+    if (!existsSync(setup)) throw new Error(`no ${img.setup}`)
+    const h = new Bun.CryptoHasher('sha256').update(base.replace(/^template:/, '') + '\0').update(readFileSync(setup))
+    for (const [to, from] of Object.entries(img.data).sort()) {
+      if (!existsSync(join(repo, from))) throw new Error(`[instabox.images.${which}] data: no ${from} in ${repo}`)
+      h.update(`\0${to}\0${await digest(join(repo, from))}`)
+    }
+    const hash = h.digest('hex').slice(0, 12)
+    const name = `sc-${(cfg.name ?? 'repo').toLowerCase().replace(/[^a-z0-9-]/g, '-')}${which ? `-${which}` : ''}-${hash}`
     const size = cfg.size ?? sizeOf('large')
-    const box = await ib.create({name: `${name}-build`.slice(0, 63), vcpus: size.vcpus, memMiB: size.memMiB, template: cfg.image.template, meta: {sc: '1', sc_build: name}, autoSuspend: '30m'})
-    log(`image ${name}: building on ${box.name} from ${cfg.image.template}`)
+    const from = base.startsWith('template:') ? {template: base.slice(9)} : {snapshot: base}
+    const box = await ib.create({name: `${name}-build`.slice(0, 63), vcpus: size.vcpus, memMiB: size.memMiB, ...from, meta: {sc: '1', sc_build: name}, autoSuspend: '30m'})
+    log(`image ${name}: building on ${box.name} from ${base.replace(/^template:/, 'the template ')}`)
     try {
+      // (the data first, at its paths, so the setup can use it; each sent as one tarball, since instabox push copies only
+      // what git tracks from a folder in a repo, and data is usually ignored; unpacked under ~/.sc-data, moved there by root)
+      for (const [i, [to, from]] of Object.entries(img.data).sort().entries()) {
+        const src = join(repo, from), tgz = join(tmpdir(), `sc-data-${process.pid}-${i}.tgz`)
+        const dir = statSync(src).isDirectory()
+        // (COPYFILE_DISABLE: macOS's tar would add a ._ file of extended attributes beside each file)
+        const t = Bun.spawnSync(['tar', '-czf', tgz, '-C', dir ? src : dirname(src), dir ? '.' : basename(src)], {stderr: 'pipe', env: {...process.env, COPYFILE_DISABLE: '1'}})
+        if (t.exitCode !== 0) throw new Error(`tar ${from}: ${t.stderr}`)
+        log(`image ${name}: ${from} -> ${to} (${(statSync(tgz).size / 1e6).toFixed(1)} MB)`)
+        const tmp = `/data/home/.sc-data/${i}`
+        try {
+          const r = await ib.exec(box.id, `rm -rf ${q(tmp)} && mkdir -p ${q(tmp)}`)
+          if (r.exitCode !== 0) throw new Error(r.stderr)
+          await ib.push(box.id, tgz, `${tmp}.tgz`)
+        } finally {
+          rmSync(tgz, {force: true})
+        }
+        const what = dir ? q(tmp) : `${q(tmp)}/${q(basename(src))}`
+        const mv = await ib.exec(box.id, `tar -xzf ${q(tmp + '.tgz')} -C ${q(tmp)} && rm ${q(tmp + '.tgz')} && sudo mkdir -p "$(dirname ${q(to)})" && sudo rm -rf ${q(to)} && sudo mv ${what} ${q(to)} && sudo chown -R "$(id -un)" ${q(to)} && find ${q(to)} -type f | wc -l`, {timeout: 600})
+        if (mv.exitCode !== 0) throw new Error(`unpacking ${from} at ${to}: ${mv.stderr}`)
+        log(`image ${name}: ${to}: ${mv.stdout.trim()} files`)
+      }
       const p = Bun.spawn(['instabox', 'ssh', box.id, '--', 'bash', '-s'], {stdin: Bun.file(setup), stdout: 'inherit', stderr: 'inherit'})
-      if ((await p.exited) !== 0) throw new Error(`${cfg.setup} exited ${p.exitCode}`)
+      if ((await p.exited) !== 0) throw new Error(`${img.setup} exited ${p.exitCode}`)
+      await ib.exec(box.id, 'rm -rf /data/home/.sc-data')
       const s = Bun.spawn(['instabox', 'snapshot', 'save', box.id, '--name', name], {stdout: 'inherit', stderr: 'inherit'})
       if ((await s.exited) !== 0) throw new Error('snapshot save failed')
     } finally {
       await ib.remove(box.id).catch(() => undefined)
     }
     console.log(name)
-    log(`image ${name}: saved; set [instabox] snapshot = "${name}" in supercomputer.toml`)
+    log(`image ${name}: saved; set ${which ? `[instabox.images.${which}]` : '[instabox]'} snapshot = "${name}" in supercomputer.toml`)
     return 0
   }
   console.error(USAGE)
