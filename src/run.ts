@@ -167,11 +167,23 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     save()
   }
 
+  // A GPU job's box, as instabox makes it (asked once per type): one the job doesn't fit in is the job's error.
+  const gpus = new Map<string, Promise<ib.GpuBox>>()
+  const gpuBox = async (job: Job): Promise<ib.GpuBox> => {
+    if (!gpus.has(job.gpu!)) gpus.set(job.gpu!, api(() => ib.gpuBox(job.gpu!)))
+    const g = await gpus.get(job.gpu!)!
+    if (job.cpu > g.vcpus || job.memory > g.memMiB - SYSTEM_MIB)
+      throw new Error(`${job.name}: a ${job.gpu} box has ${g.vcpus} vCPUs and ${g.memMiB} MiB, less than the job asks`)
+    return g
+  }
+
   // A box for this job: a paused one of the warm pool of its size and image, else a new one; only in a slot the rule
   // opens for it.
   const acquire = async (i: number): Promise<Live | undefined> => {
     const job = jobs[i]!
-    const size = job.size ?? (timing ? fits(job) : biggest(fits(job), batch.cfg.size))
+    // (a GPU box's size is the GPU type's, not one asked for)
+    const gpu = job.gpu ? await gpuBox(job) : undefined
+    const size = gpu ?? job.size ?? (timing ? fits(job) : biggest(fits(job), batch.cfg.size))
     const slot = batch.nextSlot
     if (!ask({op: 'open', box: slot, cpu: size.vcpus, mem: size.memMiB - SYSTEM_MIB, kind: batch.kinds.indexOf(kindOf(job)) + 1})) return undefined
     batch.nextSlot++
@@ -195,7 +207,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
       } else {
         o.log(`box ${name}: creating ${size.vcpus} vCPU / ${size.memMiB / 1024} GiB${job.gpu ? ` with ${job.gpu}` : ''}`)
         const img = imageOf(job.image)
-        const made = await api(() => ib.create({name, vcpus: size.vcpus, memMiB: size.memMiB, snapshot: job.gpu ? undefined : img.snapshot, template: job.gpu ? 'gpu' : img.template, gpu: job.gpu, meta: meta(job.image)}))
+        const made = await api(() => ib.create({name, vcpus: size.vcpus, memMiB: size.memMiB, snapshot: gpu ? undefined : img.snapshot, template: gpu?.template ?? img.template, gpu: job.gpu, meta: meta(job.image)}))
         b.id = made.id
         recs()
         save()
@@ -332,7 +344,9 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     live.delete(b.slot)
     recs()
     save()
-    if (b.id) await api(() => ib.suspend(b.id)).then(() => o.log(`box ${b.name}: paused into the warm pool`), () => undefined)
+    // (a GPU box is deleted, not paused: no batch resumes one, and paused it would keep its 200 GiB disk until a reap)
+    if (b.id && b.gpu) await api(() => ib.remove(b.id)).then(() => o.log(`box ${b.name}: deleted (a GPU box is not kept)`), () => undefined)
+    else if (b.id) await api(() => ib.suspend(b.id)).then(() => o.log(`box ${b.name}: paused into the warm pool`), () => undefined)
   }
 
   // The boxes this batch held before (a batch picked up): theirs again, resumed if they paused meanwhile.
