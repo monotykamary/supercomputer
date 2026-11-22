@@ -1,146 +1,69 @@
-# supercomputer: run work on boat VMs (agents' guide; `supercomputer --skill` prints it, live values filled in)
+# supercomputer: run a repo's jobs on instabox boxes (agents' guide; `supercomputer --skill` prints it)
 
-**Use it for everything but the extremely light** (tests, checks, Lean, bars, sweeps, timing claims). The laptop runs
-only quick bounded checks. Tool: github.com/monotykamary/supercomputer (README and docs/ for depth; state in ~/.local/share/supercomputer). Now: {live_now}
+**Use it for everything but the extremely light** (tests, checks, Lean, sweeps, timing claims). The machine you are on
+runs only git, edits, few-second commands and watching. Tool: github.com/monotykamary/supercomputer.
 
-**Run a jobs file** from any repo (its git root is the tree; `supercomputer.toml` says what it needs):
-- `supercomputer run --jobs jobs.json --out runs/x [--class C] [--timing] [--data DIR[:DEST]] [--env K=V]`
-- jobs.json: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"?, "timeout"?, "image"?, "backend"?, "gpu"?, "env"?, "vm_type"?, "cpu_model"?, "cpu_model_max_fruitless"?, "distinct_vm_group"?, "distinct_vm_group_scope"?, "distinct_vm_group_generation"?, "required_agent_capabilities"?, "runtime"?}]`;
-  `cmd` runs under bash in `<repo>/<cwd>`; logs in `<out>/<name>.log`, `<out>/summary.tsv` (name, exit, seconds, where).
-  The CLI exits 0 only when every job has a native exit code of 0 and there is no detected mixed toolchain. Failed, missing and mixed results exit 3 after retaining the logs and summary. Exit 1 denotes a collector error. Nonzero alone is not infrastructure failure: intentional negative controls remain data; inspect the native codes.
-- The tree ships without node_modules: start a bun job with `bun install --frozen-lockfile && ...`.
-- `--timing`: each job alone on its VM; `<out>/placement.json` is the label a timing claim needs.
-- `--vm-type T` (or a job's `"vm_type"`): every job placed on type T only (a timing claim's fixed hardware); unnamed, the smallest
-  free VM that fits, any type.
-- A job's `"cpu_model"` pins the exact agent-reported string and requires `"vm_type"`, e.g.
-  `"cpu_model":"AMD Ryzen 9 9950X 16-Core Processor", "vm_type":"xlarge"`. Unknown models never match;
-  no different-model or Modal fallback. `cpu_model_max_fruitless` (default 12) bounds consecutive unsuccessful
-  starts per image/type/model, not spend; a job can override it with `"cpu_model_max_fruitless": 64`.
-  Exhausted items report `unplaceable_by_constraint`, their effective limit and all observed model counts.
-- `"distinct_vm_group":"run/stage/case/rep"`: each member uses a different VM for this batch's lifetime,
-  including after completion, restart or hot handoff. Combines with `cpu_model`; no fallback. Receipts include
-  the group, VM ID and agent boot ID when available. Jobs start as their VMs are ready, with no global barrier.
-- Opt in across batches/clients of one controller with `"distinct_vm_group_scope":"durable"`; the scheduler
-  persists a generation at admission. Optional `"distinct_vm_group_generation":"GEN"` pins that epoch.
-  Requires capabilities `distinct_vm_group_scope:"durable"` and `durable_distinct_vm_group_protocol:1`, checked
-  before tree upload/submission; no Modal fallback. Missing scope keeps batch-only behavior unchanged.
-  `python3 -m supercomputer.boat distinct-groups open|get GROUP` prints the generation/record as JSON;
-  `python3 -m supercomputer.boat distinct-groups close GROUP --generation GEN --ttl-s 3600` starts expiry.
-  Close is idempotent only for the same generation and TTL. Admissions and VM exclusions continue until
-  `expires_at`; afterward new unpinned work/open creates a fresh epoch, but pinned old requests are refused
-  and old queued work never silently rebinds. Open groups do not expire automatically. Coordinate close
-  with every producer. Durable metadata does not park or reserve VMs; ordinary release policy still applies.
+**Run a jobs file** from any repo (its git root is the tree; `supercomputer.toml` says what the boxes need):
 
-**Image retention:** automatic snapshot deletion is disabled. Before publishing a packet or GO, run
-`supercomputer image pin IMAGE... --kind packet|go --reference STABLE_ID` and require its durable
-receipt (`image_pins_protocol:1`). The controller retains these exact images for at least seven days,
-and pins live batches without a TTL before acknowledging admission. `supercomputer image pins` lists
-pins plus locally known resident workers and pending creations. Neither command starts a local controller.
-Unknown history or inventory never authorizes deletion. Old credentialed clients must also be updated
-in the operator-authorized gap; a new controller alone cannot fence their old pruner. See `docs/image-retention.md`.
-
-**Image toolchains (native):** declare tools in `[boat.tools]` in `supercomputer.toml`, e.g. `node = { version = "v24.22.1" }`
-(or `git = {}` to observe only). Updated workers record the actual launch PATH, resolved paths and versions;
-image pins fail before the payload, and mixed fingerprints exit 3 with native job exits unchanged. See
-`<out>/toolchain.json`, `batch fetch` receipts, and `docs/image-toolchains.md`.
-
-**Runtime pins (native):** a job may declare `"runtime":{"bun":{"version":"1.4.3","sha256":"..."},"lean":{"version":"4.34.0","sha256":"..."}}`.
-Use 64-hex digests of the selected executable files, not archives or an Elan proxy; put the actual Lean toolchain
-`bin` on the job PATH. The agent verifies inside the job namespace before payload execution and records the
-observations. Missing/mismatching tools fail closed; no installer or unsupported-provider fallback. Requires
-controller and actual worker `runtime_pins_protocol:1`. See `docs/runtime-pins.md`.
-
-**Classes** (`--class`, else `$SUPERCOMPUTER_CLASS`; a small batch defaults to interactive, a bigger one to submission):
-- `interactive`: quick checks; a slot at once (a filler's or sweep's item is killed and re-queued).
-- `gate`: bars and suites; lower slots at once, then only the VMs that finish it within {gate_horizon} min.
-- `submission`: experiments; up to {sub_vms} VMs at once per client while others could take the slots (else all it can use),
-  free slots before sweeps and filler, a filler's slot after {sub_preempt} s. A job needing several slots (`cpu` over 2) gets them set aside on one VM.
-- `sweep` / `filler`: the treadmill's chains / its soundness fill. Never pick these for your own work.
-
-**Retries, no provider fallback:** boat first for CPU jobs in every class. An item boat fails (a VM lost, a row missing, no VM ready) is retried on another boat VM within its three-failure budget. Exhaustion is terminal `FAILED`/`LOST` with receipts, never Modal. GPU jobs (`"gpu"`) run only on RunPod, with at most two pod attempts and no retry after no-capacity. `--backend modal` and job `"backend":"modal"` are refused at submit: `Modal support removed; use boat or runpod`.
-
-**Single attempt (native):** add `--strict-once --max-attempts 1 --backend boat` for an ordinary jobs batch,
-or use `boat.session(..., strict_once=True, max_attempts=1)`. There is at most one physical attempt per
-persisted item: no requeue/replacement/fallback on loss or preemption. Handoff observes the original attempt.
-A lost attempt returns terminal `status:"LOST"` with VM/boot/launch identity. Reconnects are recorded in
-append-only custody; strict close synchronously reaps, retains journals and reports `cleanup_complete`.
-Never interpret incomplete cleanup as success or retry LOST under a new batch ID. Zero launches are possible
-on admission/preparation failure. Full custody, hash-binding and cleanup contract: `docs/strict-once.md`.
-
-**Shell hygiene:** one background waiter per thing, killed by its exact PID; never `pkill` or `pgrep -f` loops.
-
-**Cleanup:** `supercomputer status` (the pool), `supercomputer reap` (dead clients' leases, orphaned Modal apps and
-pods). Legacy Modal-app cleanup remains until every machine has none, then is removable. No new Modal execution. Never stop or delete VMs another client or project leased.
-
-**Money:** CPU capacity and retries are boat-only; GPU spend is RunPod-only, with no Modal fallback charges. No limits, be smart. No VM-hour or dollar caps: warm slots and lower classes first, then free starts,
-then paid ones (~$0.03-0.07). The pool grows only when queued work beyond held and coming capacity pays for a new VM
-(the larger start-or-hold opportunity cost divided by its VM-hour price), gates for what finishes them within {gate_horizon} min; idle VMs go; chains stop when they stop gaining.
-No VM ceiling ({max_vms}); {bringup} VMs coming up at once is only the scheduler's own load guard.
-`supercomputer starts` and the digest report spend as information. {limits}
-
-**boat's terms:** busy, never parked, with one deliberate exception: a project with no treadmill keeps one warm VM
-(the default floor) for up to 45 min after its last real work (the hold), so its bursts don't churn starts; that VM idles between
-them (`supercomputer policy floor_by_image=<image>=0` drops it for a project finishing up). VMs above the treadmill's
-floor ({floor}) run filler up to {hold} min after their last real work, then go; a released VM stops 60 s later. No metering tricks, one account, no shared keys.
-Leave free starts for the account's other projects (the reserve), and never touch their VMs.
-
-**Data:** volumes live on boat (`supercomputer store push|pull|ls`), named snapshots with sha256 manifests, available
-to RunPod; legacy Modal volume imports are recovery-only, pulls cached by hash.
-
-**Explicit roots:** an explicit nested non-repository root is refused with both the requested and enclosing root
-named; it is never silently widened to the parent checkout. An omitted root keeps the usual current-repository
-selection. Submission logs show the effective root, file count and link count.
-
-**Output files (native boat jobs):** write artifacts to the reserved `$SUPERCOMPUTER_OUTPUT_DIR`, not stdout,
-base64 in JSON, `/tmp`, or the working tree (those directories are cleaned after the job). The directory is private
-to the job. Regular files, including subdirectories, are copied by SHA-256 into immutable spools before cleanup;
-symlinks and special files are not exported. There is no output-file size limit that rejects a job; available disk
-and transport capacity still apply. Example command:
 ```sh
-mkdir -p "$SUPERCOMPUTER_OUTPUT_DIR/proofs"
-cp proof.bin "$SUPERCOMPUTER_OUTPUT_DIR/proofs/proof.bin"
+supercomputer run --jobs jobs.json --out runs/x [--max-boxes 50] [--size large] [--timing] [--strict-once] [--env K=V]
 ```
-Client collection inventories output manifests before copying file bodies and refuses a batch above **1 GiB**
-(1,073,741,824 logical output bytes), with per-item sizes and the largest paths. Remote outputs are not deleted.
-Override deliberately with `run --allow-large`, `batch fetch --allow-large`, or `SUPERCOMPUTER_FETCH_LIMIT=2GiB`
-(nonnegative integer bytes or KiB/MiB/GiB; zero allows only empty files). A refusal is not a reason to rerun jobs:
-recover the retained batch ID with `batch fetch` and an override before its normal history expiry. Row/result JSON
-and logs are separate. Programmatic sessions accept `allow_large=True` or `fetch_limit=bytes`; output-bearing
-callbacks wait for batch inventory. Prefer exporting results only. Obvious whole-tree output declarations/copies
-(.lake, build folders, node_modules) warn once per job at CLI submission.
-`supercomputer run --jobs jobs.json --out runs/x` downloads files to `runs/x/JOB.files/<relative-path>`, verifies
-SHA-256 before accepting each file, and retains a manifest. `collect()` remains bounded stdout/stderr only.
-Programmatic sessions add `output_files_ref`, `output_files_manifest`, and `output_files_dir` to the result row.
-Large Python return values (>32 KiB) and rows (>64 KiB) are complete JSON files, not truncated: rows carry
-`result_ref`/`row_ref` plus downloaded `result_file`/`row_file`. Small returns are unchanged. `Session.call()` returns
-a reference/file envelope for a large return; explicitly parse that file only if your client has enough memory.
-Poll responses are paged (128 rows and about 512 KiB maximum), chunks are at most 256 KiB, and clients download
-before closing the batch. Native controller capability `output_files_protocol:1` / `result_files_protocol:1` is
-required for these features, but controller support alone does not prove worker support. For artifact or large-return
-jobs, declare `"required_agent_capabilities":{"output_files_protocol":1,"result_files_protocol":1}` in each job
-and run with `--backend boat`. Placement and prelaunch checks require actual agent ping inventory; old/unknown
-agents cannot satisfy the declaration. Busy legacy agents are not upgraded; an actual idle upgrade excludes
-new placement. Jobs without the declaration keep legacy behavior. Never infer capabilities from a source hash
-or assume Modal fallback exports artifacts. See `docs/agent-capabilities.md` for the complete recipe and
-`docs/result-files.md` for transport/reference formats.
 
-**Cold results:** closed batches' exported output files may be tiered into a boat snapshot when the controller's
-disk fills (rows, logs and receipts stay); a fetch of one waits (503, retried) while it is restored with every sha256
-checked. `supercomputer batch tier` (dry run), `tier-status`, `hydrate ID`. Near a full disk new filler is refused
-first. See `docs/closed-history.md`.
+- **jobs.json**: `[{"name", "cmd", "cwd"?, "cpu"?, "memory"? (MiB), "timeout"? (s), "env"?, "vm_type"?, "gpu"?, "image"?, "distinct_vm_group"?}]`.
+  `cmd` runs under bash in `<tree>/<cwd>`. What instabox can't honour (`cpu_model`, `backend`, `runtime`) is refused,
+  not ignored.
+- **Results**: `<out>/<name>.log`, `<out>/<name>.files/` (what the job wrote to `$SUPERCOMPUTER_OUTPUT_DIR`, sha256
+  checked), `<out>/summary.tsv` (name, exit or `lost`, seconds, box), `<out>/batch.json` (the batch, its plan).
+- **Exit**: 0 only when every job answered 0; 3 when any failed or was lost; 1 on a client error. A nonzero native exit
+  is data (a failing test), never retried; only a lost attempt (its box gone) is, up to `--max-attempts` (3).
+- The tree ships without `node_modules`: start a bun job with `bun install --frozen-lockfile && ...`.
+- `--timing`: each job alone on a fresh box of its own (one job per box, ever). `--strict-once`: one attempt.
+- `"vm_type"`: `small` 2x4, `default` 4x8, `large` 8x16, `xlarge` 16x32, `2xlarge` 32x64 (vCPU x GiB), or `NxM`.
+  Unnamed, jobs pack onto boxes of `[instabox] size` (or the smallest that fits) by vCPUs and memory.
+- `"gpu": "a100"` (`l4`, `t4`, `h100`, `"a100:2"`): a GPU box from instabox's GPU queue.
+- `"image": "runner"`: a box of `[instabox.images.runner]` (another snapshot, its own PATH and env).
 
-**Recover a finished admission:** `supercomputer batch fetch BATCH_ID --out NEW_DIRECTORY`
-fetches retained rows, logs and exported files by ID with SHA verification, without starting a scheduler,
-submitting, closing or reaping. Requires controller `batch_fetch_protocol:1`; missing/incomplete history
-fails explicitly. The same output directory resumes the same admission generation. See `docs/batch-fetch.md`.
+**Survives this machine going away.** Each job runs detached on its box and keeps its log, exit and outputs there.
+Close the laptop mid-batch and the boxes finish their jobs, then pause themselves. Note the `--out` directory, and
+pick the batch up later from any checkout of the repo with:
 
-**The treadmill:** sweeps of unsolved tasks, soundness fuzz and mutants, and an idea queue:
-`supercomputer queue add jobs.json [--name N] [--meta k=v]`, `queue ls`, `queue results <name>`; `supercomputer
-digest` (VM-hours and dollars by class, starts per 100 items, waits by class, gaps between waves).
+```sh
+supercomputer batch fetch runs/x
+```
 
-**The scheduler** uses the configured `live/controller.json` by default. `SUPERCOMPUTER_LOCAL=1` explicitly
-opts into this machine; an unavailable controller never silently starts a local scheduler. Without a configured
-controller it runs on this machine and owns the pool: one per pool (a lock), started by the first batch, and
-after a laptop sleep it renews its VMs and adopts any left without an owner. `supercomputer status` (the pool, the
-policy generation, code hashes, orphans), `supercomputer policy [k=v ...]` (one policy file, in force within a tick),
-`supercomputer reap`. A new install hands the pool to the new code by itself: nothing lost, no VM let go.
+Finished jobs are fetched (not run again), running ones watched where they are, lost ones tried again within their
+attempts.
+
+**Boxes and money.** instabox bills a running box by the second and a paused one for its disk only. A batch's boxes
+pause into a warm pool when it ends, and the next batch resumes them in seconds before it creates any.
+`supercomputer status` lists the pool; `supercomputer reap --keep 30m` deletes paused boxes past their keep (every
+`run` reaps on its way out).
+
+**The repo's image.** `supercomputer image build` runs `[instabox] setup` on a fresh box and saves a snapshot named
+by the script's hash; put it in `supercomputer.toml`:
+
+```toml
+name = "repo"
+[run]
+pre = "export X=1; "                   # before every job's cmd
+[instabox]
+setup = "supercomputer/setup.sh"
+snapshot = "sc-repo-0123456789ab"
+size = "large"
+path = ["~/.bun/bin"]
+env = { A = "1" }
+ignore = ["runs/**"]
+[[cache]]                              # build outputs kept on each box between jobs and batches
+name = "olean"
+dir = "lean"
+modules = ["A", "B"]
+inputs = "{m}.lean"
+outputs = "{m}.olean"
+salt = "leanprover/lean4:v4.34.0"
+```
+
+**What it decides is proven, and is what runs.** `src/batch.ts` is the batch as a gdp-wired rule (jobs and boxes,
+every act a request); the runner steps its compiled machine and acts only on what it accepts. Its laws (at most
+`--max-boxes` live, no box past its vCPUs or memory, attempts within their budget, a group's members on different
+boxes, an answer never taken back, a box closed only with nothing on it, a pass only with every job answered 0) are
+proven from every state they allow (`bun run laws`).

@@ -1,12 +1,3 @@
-live/
-repos/
-verification/
-runs/hotreload*/
-runs/stopped-holds*/
+node_modules/
+runs/
 .pi/
-__pycache__/
-*.pyc
-.venv/
-dist/
-build/
-ts/node_modules/

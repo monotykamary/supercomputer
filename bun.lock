@@ -1,0 +1,29 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "supercomputer-instabox",
+      "dependencies": {
+        "gdp-wired": "0.57.0",
+      },
+      "devDependencies": {
+        "@types/bun": "1.3.3",
+        "typescript": "5.9.3",
+      },
+    },
+  },
+  "packages": {
+    "@types/bun": ["@types/bun@1.3.3", "", { "dependencies": { "bun-types": "1.3.3" } }, "sha512-ogrKbJ2X5N0kWLLFKeytG0eHDleBYtngtlbu9cyBKFtNL3cnpDZkNdQj8flVf6WTZUX5ulI9AY1oa7ljhSrp+g=="],
+
+    "@types/node": ["@types/node@26.6.6", "", { "dependencies": { "undici-types": "~8.9.0" } }, "sha512-MzQj+8Kx3XI40OmUAE6Qoh58ZMNstNNMwn2nfd3qWsfe7nDNSqJNzes4njhz6AHwrSHOffSLwXU6yb474Q4aog=="],
+
+    "bun-types": ["bun-types@1.3.3", "", { "dependencies": { "@types/node": "*" } }, "sha512-z3Xwlg7j2l9JY27x5Qn3Wlyos8YAp0kKRlrePAOjgjMGS5IG6E7Jnlx736vH9UVI4wUICwwhC9anYL++XeOgTQ=="],
+
+    "gdp-wired": ["gdp-wired@0.57.0", "", { "peerDependencies": { "@gdp-ts/core": ">=0.1.0", "typescript": ">=5.0.0" }, "optionalPeers": ["@gdp-ts/core", "typescript"], "bin": { "gdp-wired": "dist/core/cli.js", "gdp-wired-check": "dist/interchange/cli.js", "gdp-wired-agent-consult": "dist/core/agent-consult/cli.js" } }, "sha512-O550RyQfyToEHZj2+00MjRg1NGVGJrxwjH53IxtqjK1uUo7xBv1ZR3+z69hCbBYr8Pg6uJ+V/byXDbBO+/410w=="],
+
+    "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
+
+    "undici-types": ["undici-types@8.9.0", "", {}, "sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg=="],
+  }
+}
