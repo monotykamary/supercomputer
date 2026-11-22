@@ -126,7 +126,9 @@ class GitHubLedger implements Ledger {
       if (!d.errors?.some((e) => e.type === 'RATE_LIMITED') || attempt >= 10) break
       await Bun.sleep(60_000 + Math.random() * 5000)
     }
-    if (d.errors?.some((e) => e.type === 'STALE_DATA')) return undefined
+    // (the branch moved since the version read: STALE_DATA, or, when the move is very recent, an error without that
+    // type saying where the branch is and what was expected)
+    if (d.errors?.some((e) => e.type === 'STALE_DATA' || /but expected|expected branch to point/i.test(e.message))) return undefined
     const oid = d.data?.createCommitOnBranch?.commit.oid
     if (!oid) throw new Error(`the ledger ${this.where}: ${r.status} ${d.errors?.map((e) => e.message).join('; ') ?? 'no commit'}`)
     return oid
