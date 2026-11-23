@@ -154,3 +154,17 @@ test.skipIf(!linux)("a size-locked snapshot: its boxes are its size; a job it ca
   expect(existsSync(join(r.dir, 'runs', 'big', 'batch.json'))).toBe(false)
   expect(boxes(r.fake)).toHaveLength(1)
 }, 60_000)
+
+test.skipIf(!linux)('execs refused for load (too many at once across the account): strict-once work still runs, nothing lost', async () => {
+  const r = repo({'x': ''})
+  const f = jobs(r, [{name: 'a', cmd: 'echo a > "$SUPERCOMPUTER_OUTPUT_DIR/o"'}, {name: 'b', cmd: 'echo b > "$SUPERCOMPUTER_OUTPUT_DIR/o"'}])
+  writeFileSync(join(r.fake, 'refuse-execs'), '8')
+  const p = Bun.spawn(['bun', join(here, 'src/cli.ts'), 'run', '--jobs', f, '--out', r.out, '--poll', '1s', '--strict-once'], {
+    cwd: r.dir, stdout: 'pipe', stderr: 'pipe',
+    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake, SC_REFUSAL_BACKOFF_MS: '20'},
+  })
+  const {err, code} = await done(p)
+  expect(code, err).toBe(0)
+  expect(summary(r.out).sort()).toEqual([['a', '0'], ['b', '0']])
+  expect(err).not.toContain('lost on') // (no attempt lost; the summary's "0 lost" aside)
+}, 60_000)

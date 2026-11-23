@@ -77,6 +77,14 @@ if (cmd === 'create') {
     console.log(JSON.stringify({error: {code: 'not_running', message: `machine is ${b.state}`}}))
     process.exit(1)
   }
+  // ($FAKE_INSTABOX_DIR/refuse-execs holding N: the next N execs refused for load, as instabox refuses past 256 at once)
+  const rf = join(root, 'refuse-execs')
+  const left = existsSync(rf) ? Number(readFileSync(rf, 'utf8')) : 0
+  if (left > 0) {
+    writeFileSync(rf, String(left - 1))
+    console.log(JSON.stringify({error: {code: 'too_many_execs', message: 'too many concurrent execs (at most 256 per user)'}}))
+    process.exit(5)
+  }
   const script = args.slice(args.indexOf('--') + 1)
   const home = join(at(b.id), 'home')
   const p = Bun.spawnSync(script, {cwd: home, env: {...process.env, HOME: home}, stdin: args.includes('--stdin') ? Bun.stdin : 'ignore'})
