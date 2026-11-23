@@ -16,6 +16,8 @@ supercomputer run --jobs jobs.json --out runs/x [--max-boxes 50] [--size large] 
   checked), `<out>/summary.tsv` (name, exit or `lost`, seconds, box), `<out>/batch.json` (the batch, its plan).
 - **Exit**: 0 only when every job answered 0; 3 when any failed or was lost; 1 on a client error. A nonzero native exit
   is data (a failing test), never retried; only a lost attempt (its box gone) is, up to `--max-attempts` (3).
+  instabox refusing a call for load (too many execs at once across the account, a rate limit) is waited out and
+  made again: it ran nothing, so it never costs an attempt, strict-once included.
 - The tree ships without `node_modules`: start a bun job with `bun install --frozen-lockfile && ...`.
 - `--timing`: each job alone on a fresh box of its own (one job per box, ever). `--strict-once`: one attempt.
 - `"vm_type"`: `small` 2x4, `default` 4x8, `large` 8x16, `xlarge` 16x32, `2xlarge` 32x64 (vCPU x GiB), or `NxM`.

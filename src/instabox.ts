@@ -21,7 +21,7 @@ export class InstaboxError extends Error {
 
 const bin = () => (process.env.INSTABOX_BIN ?? 'instabox').split(' ')
 
-async function call(args: string[], stdin?: Blob | string): Promise<{stdout: string; stderr: string; code: number}> {
+async function once(args: string[], stdin?: Blob | string): Promise<{stdout: string; stderr: string; code: number}> {
   const p = Bun.spawn([...bin(), ...args], {
     stdin: stdin === undefined ? 'ignore' : typeof stdin === 'string' ? new Blob([stdin]) : stdin,
     stdout: 'pipe',
@@ -30,6 +30,22 @@ async function call(args: string[], stdin?: Blob | string): Promise<{stdout: str
   })
   const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
   return {stdout, stderr, code}
+}
+
+// instabox refusing a call for load (too many execs at once across the account, a rate limit): the call ran nothing,
+// so it is made again, a little later each time, for up to about five minutes; never an attempt lost for it.
+export const refusedForLoad = (r: {stdout: string; stderr: string; code: number}) =>
+  (r.code !== 0 || /"error"/.test(r.stdout)) && /too many concurrent|rate.?limit|too many requests|\b429\b|try again (later|in)/i.test(r.stderr + r.stdout)
+
+async function call(args: string[], stdin?: Blob | string): Promise<{stdout: string; stderr: string; code: number}> {
+  const base = Number(process.env.SC_REFUSAL_BACKOFF_MS ?? 2000)
+  for (let attempt = 0, waited = 0; ; attempt++) {
+    const r = await once(args, stdin)
+    if (!refusedForLoad(r) || waited >= 300_000) return r
+    const wait = Math.min(base * 2 ** attempt, 60_000) * (0.75 + Math.random() / 2)
+    await Bun.sleep(wait)
+    waited += wait
+  }
 }
 
 async function ok(args: string[], stdin?: Blob | string): Promise<string> {
