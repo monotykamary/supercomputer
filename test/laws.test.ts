@@ -3,6 +3,7 @@
 import {expect, test} from 'bun:test'
 import {proveDecision, proveSteps} from 'gdp-wired'
 import {decideIdle, idleLaws} from '../src/idle.ts'
+import {boxSizeLaws} from '../src/size.ts'
 import {letGoLaw} from '../src/pool.ts'
 import {batch, type Bug, BUGS, laws, lawsOf, makeBatch, stepLaws, stepLawsOf} from '../src/batch.ts'
 
@@ -95,3 +96,9 @@ test('with peers, the last box with work left is refused its close, and replaced
   lone.step({op: 'open', box: 0, cpu: 2, mem: 100, kind: 2})
   expect(lone.step({op: 'close', box: 0})).toBe(true) // (a client-run batch: the client is there to open another)
 })
+
+for (const law of boxSizeLaws)
+  test(`the size a job's box gets: ${law.name ?? 'a law'}`, () => {
+    const v = proveDecision(law)
+    expect({proven: v.proven, checked: v.checked}).toEqual({proven: true, checked: true})
+  })

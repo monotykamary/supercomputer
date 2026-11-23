@@ -18,14 +18,15 @@ import {homedir, tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {Engine, type Limits, type Req} from './engine.ts'
 import * as ib from './instabox.ts'
-import {type Cache, type Config, fits, type Job} from './jobs.ts'
+import type {Cache, Config, Job} from './jobs.ts'
 import {type BoxRec, type Files, type Ledger, openLedger, type State} from './ledger.ts'
 import {decideIdle} from './idle.ts'
-import {biggest, jobScript, kindOf, newBatch, SYSTEM_MIB} from './run.ts'
+import {jobScript, kindOf, lockedSizes, newBatch, SYSTEM_MIB} from './run.ts'
+import {type Locked, planSize} from './size.ts'
 import type {Tree} from './tree.ts'
 
 // batch.json in the ledger: what never changes.
-export type Shared = {id: string; owner: string; tree: string; caches: (Cache & {key: string})[]; cfg: Config; limits: Limits; jobs: Job[]; groups: string[]; kinds: string[]}
+export type Shared = {id: string; owner: string; tree: string; caches: (Cache & {key: string})[]; cfg: Config; limits: Limits; jobs: Job[]; groups: string[]; kinds: string[]; locked?: Locked}
 
 export type PeerOptions = {log: (line: string) => void; poll: number}
 
@@ -73,7 +74,7 @@ export async function claimBox(ledger: Ledger, head: string, shared: Shared, sta
     if (j.st !== 'queued') continue
     if (sim.boxes().some(([b]) => sim.step({op: 'start', job: i, box: b}))) continue
     const job = shared.jobs[i]!
-    const size = job.size ?? (shared.limits.timing ? fits(job) : biggest(fits(job), shared.cfg.size))
+    const size = planSize(job, shared.cfg, shared.locked ?? {}, shared.limits.timing)
     const slot = Object.keys(state.boxes).length
     const rec: BoxRec = {name: `sc-${shared.owner}-${Math.random().toString(36).slice(2, 10)}`, at: Date.now(), size, image: job.image, by}
     const open: Req = {op: 'open', box: slot, cpu: size.vcpus, mem: size.memMiB - SYSTEM_MIB, kind: shared.kinds.indexOf(kindOf(job)) + 1}
@@ -215,8 +216,9 @@ async function isGone(name: string): Promise<boolean> {
 export async function launch(jobs: Job[], cfg: Config, tree: Tree, limits: Limits, repo: string, log: (s: string) => void): Promise<string> {
   for (const j of jobs) if (j.gpu) throw new Error(`${j.name}: GPU jobs don't run controller-less yet`)
   // (peers: the rule keeps the last box while work is left, and hands its slot on with replace)
-  const b = newBatch(jobs, cfg, tree, {...limits, peers: true})
-  const shared: Shared = {id: b.id, owner: b.owner, tree: b.tree, caches: b.caches, cfg: b.cfg, limits: b.limits, jobs: b.jobs, groups: b.groups, kinds: b.kinds}
+  const locked = await lockedSizes(cfg, jobs)
+  const b = newBatch(jobs, cfg, tree, {...limits, peers: true}, locked)
+  const shared: Shared = {id: b.id, owner: b.owner, tree: b.tree, caches: b.caches, cfg: b.cfg, limits: b.limits, jobs: b.jobs, groups: b.groups, kinds: b.kinds, locked: b.locked}
   const out = join(mkdtempSync(join(tmpdir(), 'sc-js-')), 'sc.js')
   const built = Bun.spawnSync(['bun', 'build', join(import.meta.dir, 'cli.ts'), '--target', 'bun', '--outfile', out], {stdout: 'pipe', stderr: 'pipe'})
   if (built.exitCode !== 0) throw new Error(`bundling the peer: ${built.stderr}`)
@@ -411,7 +413,7 @@ export async function peer(spec: string, me: {slot: number; name: string}, o: Pe
         // runs one job in its life)
         const i = queued[0]!
         const job = shared.jobs[i]!
-        const size = job.size ?? (shared.limits.timing ? fits(job) : biggest(fits(job), shared.cfg.size))
+        const size = planSize(job, shared.cfg, shared.locked ?? {}, shared.limits.timing)
         const rec: BoxRec = {name: `sc-${shared.owner}-${Math.random().toString(36).slice(2, 10)}`, at: Date.now(), size, image: job.image, by: me.name}
         const own = state.boxes[me.slot]!
         const took = await propose(ledger, head, shared, state, [{op: 'replace', box: me.slot, cpu: size.vcpus, mem: size.memMiB - SYSTEM_MIB, kind: shared.kinds.indexOf(kindOf(job)) + 1}], (st) => (st.boxes[me.slot] = rec))

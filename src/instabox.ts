@@ -96,6 +96,14 @@ export async function exec(box: string, script: string, o: {stdin?: Blob | strin
 // the type's vCPUs and memory per GPU times the count (`instabox templates --json`).
 export type GpuBox = {template: string; vcpus: number; memMiB: number}
 type Template = {id: string; gpuTypes?: {type: string; sizes: {vcpus: number; memMiB: number}[]; counts: number[]}[]}
+// A snapshot as `instabox snapshot ls --json` lists it (the parts the runner reads): one saved with sizeLocked makes
+// boxes of its defaultSpec's size only.
+export type Snapshot = {name: string; status?: string; sizeLocked?: boolean; defaultSpec?: {vcpus: number; memMiB: number}}
+
+export async function snapshots(): Promise<Snapshot[]> {
+  return JSON.parse(await ok(['snapshot', 'ls', '--json'])) as Snapshot[]
+}
+
 export async function gpuBox(gpu: string): Promise<GpuBox> {
   const [type, n] = gpu.split(':')
   const count = Number(n ?? 1)

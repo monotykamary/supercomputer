@@ -24,6 +24,10 @@ const GPU_TYPES = [
   {id: 'gpu-metal', gpuTypes: [{type: 'h100', sizes: [{vcpus: 44, memMiB: 229376}], counts: [1]}]},
 ]
 
+// The account's snapshots: $FAKE_INSTABOX_DIR/snapshots.json, as `instabox snapshot ls --json` lists them (none when absent)
+type Snap = {name: string; sizeLocked?: boolean; defaultSpec: {vcpus: number; memMiB: number}}
+const snaps = (): Snap[] => (existsSync(join(root, 'snapshots.json')) ? JSON.parse(readFileSync(join(root, 'snapshots.json'), 'utf8')) : [])
+
 const [cmd, ...args] = process.argv.slice(2)
 log([cmd, ...args.slice(0, 2)].join(' '))
 const flag = (name: string) => {
@@ -43,11 +47,18 @@ if (cmd === 'create') {
   const g = gpu ? GPU_TYPES.flatMap((t) => t.gpuTypes).find((x) => x.type === type) : undefined
   if (gpu && (!g || flag('--template') !== GPU_TYPES.find((t) => t.gpuTypes.includes(g))!.id)) fail(`bad_request: no ${type} GPUs on template ${flag('--template')}`)
   const count = Number(n ?? 1)
+  // (a snapshot saved with sizeLocked makes boxes of its size only, as instabox's create refuses any other)
+  const snap = flag('--snapshot') ? snaps().find((x) => x.name === flag('--snapshot')) : undefined
+  if (flag('--snapshot') && !snap) fail(`not_found: no snapshot ${flag('--snapshot')}`)
+  if (snap?.sizeLocked && (Number(flag('--vcpus')) !== snap.defaultSpec.vcpus || Number(flag('--mem-mib')) !== snap.defaultSpec.memMiB))
+    fail(`spec_not_allowed: snapshot ${snap.name} is size-locked to ${snap.defaultSpec.vcpus} vCPU / ${snap.defaultSpec.memMiB} MiB`, 5)
   const vcpus = g ? g.sizes[0]!.vcpus * count : Number(flag('--vcpus') ?? 4), memMiB = g ? g.sizes[0]!.memMiB * count : Number(flag('--mem-mib') ?? 8192)
   const b: Box = {id, name, state: 'running', vcpus, memMiB, metadata: Object.fromEntries(metas()), updatedAt: new Date().toISOString(), autoSuspendedAt: null}
   write(b)
   log(`created ${name} template=${flag('--template') ?? '-'} gpu=${gpu ?? '-'} ${vcpus}x${memMiB}`)
   console.log(JSON.stringify(b))
+} else if (cmd === 'snapshot' && args[0] === 'ls') {
+  console.log(JSON.stringify(snaps()))
 } else if (cmd === 'templates') {
   console.log(JSON.stringify({templates: [{id: 'universal'}, ...GPU_TYPES]}))
 } else if (cmd === 'ls') {
