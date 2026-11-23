@@ -1,6 +1,6 @@
 {
   "name": "supercomputer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A repo's jobs on instabox boxes, every decision made by a gdp-wired rule proven from every state it allows",
   "type": "module",
   "license": "MIT",

@@ -14,7 +14,7 @@ import {basename, dirname, join, resolve} from 'node:path'
 import {parseArgs} from 'node:util'
 import * as ib from './instabox.ts'
 import {readConfig, readJobs, sizeOf} from './jobs.ts'
-import {newBatch, owner, readBatch, reap, run} from './run.ts'
+import {lockedSizes, newBatch, owner, readBatch, reap, run} from './run.ts'
 import {fetchLedger, launch, peer} from './peer.ts'
 import {pack, root} from './tree.ts'
 
@@ -93,7 +93,7 @@ async function main(argv: string[]): Promise<number> {
         maxAttempts: count(v['max-attempts']!, '--max-attempts'),
         strictOnce: v['strict-once']!,
         timing: v.timing!,
-      })
+      }, await lockedSizes(cfg, jobs))
       log(`batch ${batch.id}: ${jobs.length} jobs, tree ${tree.hash} (${tree.files} files, ${(tree.bytes / 1e6).toFixed(1)} MB); results in ${out}`)
     }
     return run(batch, tree.hash === batch.tree ? tree : undefined, {out, poll: seconds(v.poll!), keep: seconds(v.keep!), log})

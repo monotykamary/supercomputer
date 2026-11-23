@@ -15,8 +15,9 @@ import {hostname, tmpdir, userInfo} from 'node:os'
 import {join} from 'node:path'
 import {Engine, type Limits, type Req} from './engine.ts'
 import * as ib from './instabox.ts'
-import {type Cache, type Config, fits, type Image, type Job, type Size} from './jobs.ts'
+import {type Cache, type Config, type Image, type Job, type Size} from './jobs.ts'
 import {deletes} from './pool.ts'
+import {type Locked, planSize, refuseUnfit, SYSTEM_MIB} from './size.ts'
 import type {Tree} from './tree.ts'
 
 export type {Limits} from './engine.ts'
@@ -50,6 +51,9 @@ export type Batch = {
   // Each job's last attempt: when it started and ended, and the box it ran on (summary.tsv).
   times: Record<string, {started?: number; ended?: number; seconds?: number; where?: string}>
   nextSlot: number
+  // Each image's locked size (an instabox snapshot saved with sizeLocked), by image name ('' the repo's): its boxes
+  // are that size, never another. (Absent in a batch.json from before 1.0.1: none locked.)
+  locked?: Locked
 }
 
 // A box as this client holds it: missed polls, and when it is ready for jobs.
@@ -57,7 +61,7 @@ type Live = BoxRec & {misses: number; ready: Promise<void>}
 
 const q = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
 const sleep = (s: number) => new Promise((r) => setTimeout(r, s * 1000))
-export const SYSTEM_MIB = 512 // a box's memory left to its system
+export {SYSTEM_MIB} from './size.ts'
 
 export const owner = () => new Bun.CryptoHasher('sha256').update(`${userInfo().username}@${hostname()}`).digest('hex').slice(0, 8)
 
@@ -80,13 +84,15 @@ function limiter(n: number) {
   }
 }
 
-export function newBatch(jobs: Job[], cfg: Config, tree: Tree, limits: Limits): Batch {
+export function newBatch(jobs: Job[], cfg: Config, tree: Tree, limits: Limits, locked: Locked = {}): Batch {
   for (const j of jobs) {
     const img = j.image ? cfg.images[j.image] : undefined
     if (j.image && !img) throw new Error(`${j.name}: no image ${j.image} in supercomputer.toml's [instabox.images]`)
     // (an image of its own setup has no snapshot until it is built: its boxes would be the bare template)
     if (img?.setup && !img.snapshot) throw new Error(`${j.name}: image ${j.image} has no snapshot yet: \`supercomputer image build ${j.image}\`, then set its snapshot in supercomputer.toml`)
   }
+  // (a job no box can hold, its image's locked size or any size instabox has: refused now, never lost later)
+  refuseUnfit(jobs, cfg, locked, limits.timing)
   const id = `${new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)}-${Math.random().toString(36).slice(2, 8)}`
   if (limits.strictOnce) limits = {...limits, maxAttempts: 1}
   const groups = [...new Set(jobs.flatMap((j) => (j.group ? [j.group] : [])))]
@@ -97,7 +103,7 @@ export function newBatch(jobs: Job[], cfg: Config, tree: Tree, limits: Limits): 
     if (!engine.step(req)) throw new Error(`${j.name}: the batch rule refused it`)
   }
   const caches = cfg.caches.map((c) => ({...c, key: cacheKey(tree.root, c)}))
-  return {id, owner: owner(), tree: tree.hash, caches, cfg, limits, jobs, groups, kinds, boxes: [], log: engine.log, times: {}, nextSlot: 0}
+  return {id, owner: owner(), tree: tree.hash, caches, cfg, limits, jobs, groups, kinds, boxes: [], log: engine.log, times: {}, nextSlot: 0, locked}
 }
 
 // A cache's key: its salt and every input file's path and content (a missing one as such).
@@ -188,7 +194,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     const job = jobs[i]!
     // (a GPU box's size is the GPU type's, not one asked for)
     const gpu = job.gpu ? await gpuBox(job) : undefined
-    const size = gpu ?? job.size ?? (timing ? fits(job) : biggest(fits(job), batch.cfg.size))
+    const size: Size = gpu ?? planSize(job, batch.cfg, batch.locked ?? {}, timing)
     const slot = batch.nextSlot
     if (!ask({op: 'open', box: slot, cpu: size.vcpus, mem: size.memMiB - SYSTEM_MIB, kind: batch.kinds.indexOf(kindOf(job)) + 1})) return undefined
     batch.nextSlot++
@@ -419,8 +425,20 @@ export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, 
   return {script, launch}
 }
 
-export function biggest(a: Size, b?: Size): Size {
-  return b && b.vcpus > a.vcpus ? b : a
+// Each image the jobs use, its locked size, if its snapshot was saved with sizeLocked: asked of instabox once per
+// batch. A snapshot instabox doesn't have is refused now, not when its first box can't be made.
+export async function lockedSizes(cfg: Config, jobs: Job[]): Promise<Locked> {
+  const used = new Set(jobs.filter((j) => !j.gpu).map((j) => j.image ?? ''))
+  const want = [...used].map((name) => ({name, snap: (name ? cfg.images[name] : cfg.image)?.snapshot})).filter((x): x is {name: string; snap: string} => !!x.snap)
+  if (!want.length) return {}
+  const all = await ib.snapshots()
+  const locked: Locked = {}
+  for (const {name, snap} of want) {
+    const s = all.find((x) => x.name === snap)
+    if (!s) throw new Error(`${name ? `image ${name}` : "the repo's image"}: instabox has no snapshot ${snap} (instabox snapshot ls)`)
+    if (s.sizeLocked && s.defaultSpec) locked[name] = {vcpus: s.defaultSpec.vcpus, memMiB: s.defaultSpec.memMiB}
+  }
+  return locked
 }
 
 function sha(file: string): string {

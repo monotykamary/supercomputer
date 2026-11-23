@@ -20,6 +20,8 @@ supercomputer run --jobs jobs.json --out runs/x [--max-boxes 50] [--size large] 
 - `--timing`: each job alone on a fresh box of its own (one job per box, ever). `--strict-once`: one attempt.
 - `"vm_type"`: `small` 2x4, `default` 4x8, `large` 8x16, `xlarge` 16x32, `2xlarge` 32x64 (vCPU x GiB), or `NxM`.
   Unnamed, jobs pack onto boxes of `[instabox] size` (or the smallest that fits) by vCPUs and memory.
+  A snapshot saved size-locked (`instabox snapshot ls`: sizeLocked) makes boxes of its own size only: every job on it
+  gets that size, and one it can't hold (its memory plus the box's 512 MiB) is refused when the batch starts.
 - `"gpu": "a100"` (`l4`, `t4`, `h100`, `"a100:2"`): a GPU box from instabox's GPU queue.
 - `"image": "runner"`: a box of `[instabox.images.runner]` (another snapshot, its own PATH and env).
   An image with its own `setup` (and `data`) is built on the repo's image by `supercomputer image build NAME`.

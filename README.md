@@ -21,6 +21,9 @@ There is no controller. A batch is this client, its boxes, and `<out>/batch.json
 - **A job** runs detached on its box (`setsid`), with its log, exit code and `$SUPERCOMPUTER_OUTPUT_DIR` under
   `~/sc/run/<batch>/<job>` until they are fetched and their sha256 checked. The client only places jobs and polls.
 - **Packing**: jobs pack onto a box by vCPUs and memory; a box takes the next queued job that fits once a slot frees.
+- **Box sizes**: the size a job's box gets is a proven gdp-wired decision (`src/size.ts`): a size-locked snapshot's
+  own size always, else the job's `vm_type`, else `[instabox] size` when bigger, else the smallest that holds it. A job
+  its box can't hold is refused when the batch starts, never lost when instabox refuses the box.
 - **The warm pool**: a box with nothing on it that no queued job can use pauses (it then costs only its disk). The
   next batch resumes a paused box of the same size and image in seconds before it creates one.
   `supercomputer reap --keep 30m` deletes paused boxes past their keep.
