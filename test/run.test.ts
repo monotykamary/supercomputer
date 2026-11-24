@@ -5,6 +5,7 @@ import {existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFile
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {Engine} from '../src/engine.ts'
+import {owner} from '../src/run.ts'
 
 const here = join(import.meta.dir, '..')
 const linux = process.platform === 'linux'
@@ -22,12 +23,12 @@ function repo(files: Record<string, string>, toml = '') {
   return {dir, fake, out: join(dir, 'runs', 'x')}
 }
 
-function sc(r: {dir: string; fake: string}, args: string[]) {
+function sc(r: {dir: string; fake: string}, args: string[], env: Record<string, string> = {}) {
   return Bun.spawn(['bun', join(here, 'src/cli.ts'), ...args], {
     cwd: r.dir,
     stdout: 'pipe',
     stderr: 'pipe',
-    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake},
+    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake, SC_STATE_DIR: join(r.fake, 'state'), ...env},
   })
 }
 
@@ -161,10 +162,104 @@ test.skipIf(!linux)('execs refused for load (too many at once across the account
   writeFileSync(join(r.fake, 'refuse-execs'), '8')
   const p = Bun.spawn(['bun', join(here, 'src/cli.ts'), 'run', '--jobs', f, '--out', r.out, '--poll', '1s', '--strict-once'], {
     cwd: r.dir, stdout: 'pipe', stderr: 'pipe',
-    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake, SC_REFUSAL_BACKOFF_MS: '20'},
+    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake, SC_STATE_DIR: join(r.fake, 'state'), SC_REFUSAL_BACKOFF_MS: '20'},
   })
   const {err, code} = await done(p)
   expect(code, err).toBe(0)
   expect(summary(r.out).sort()).toEqual([['a', '0'], ['b', '0']])
   expect(err).not.toContain('lost on') // (no attempt lost; the summary's "0 lost" aside)
+}, 60_000)
+
+// Each job counts its runs in the stand-in's folder: a job run twice is seen.
+const counted = (name: string) => `echo run >> "$FAKE_INSTABOX_DIR/ran-${name}"; echo ${name} > "$SUPERCOMPUTER_OUTPUT_DIR/o"`
+const ran = (fake: string, name: string) => (existsSync(join(fake, `ran-${name}`)) ? readFileSync(join(fake, `ran-${name}`), 'utf8') : '')
+const faultsLeft = (fake: string) => Object.values(JSON.parse(readFileSync(join(fake, 'faults.json'), 'utf8')) as Record<string, string[]>).flat()
+const made = (fake: string) => readFileSync(join(fake, 'calls.log'), 'utf8').split('\n').filter((l) => l.startsWith('created')).length
+
+test.skipIf(!linux)('instabox failing in transport on every kind of call: a strict-once batch answers, nothing lost, nothing run twice, no box left behind', async () => {
+  const r = repo({'x': ''}, 'snapshot = "sc-snap"\n')
+  writeFileSync(join(r.fake, 'snapshots.json'), JSON.stringify([{name: 'sc-snap', defaultSpec: {vcpus: 4, memMiB: 8192}}]))
+  writeFileSync(join(r.fake, 'faults.json'), JSON.stringify({
+    snapshot: ['reset', 'timeout'],
+    create: ['timeout-after', 'reset', 'refused', 'timeout-after'],
+    ls: ['502'],
+    'exec:test -s': ['eof'],
+    push: ['stall', 'reset'],
+    'exec:job.sh': ['reset-after', 'timeout', 'reset-after'],
+    'exec:/exit ]': ['reset', 'timeout'],
+    pull: ['reset'],
+    suspend: ['timeout-after'],
+  }))
+  const f = jobs(r, ['a', 'b', 'c'].map((n) => ({name: n, cmd: counted(n), cpu: 3})))
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s', '--strict-once'], {SC_REFUSAL_BACKOFF_MS: '20'}))
+  expect(code, err).toBe(0)
+  expect(summary(r.out).sort()).toEqual([['a', '0'], ['b', '0'], ['c', '0']])
+  for (const n of ['a', 'b', 'c']) expect(ran(r.fake, n)).toBe('run\n')
+  expect(err).not.toContain('lost on')
+  expect(faultsLeft(r.fake)).toEqual([])
+  // (every box made is the batch's, paused into the pool: the timed-out creates made one box each, none leaked)
+  expect(boxes(r.fake)).toHaveLength(made(r.fake))
+  expect(boxes(r.fake).every((b) => b.state === 'suspended')).toBe(true)
+}, 90_000)
+
+test.skipIf(!linux)('a launch that ran but never answered: made again, its job claimed once on the box, so it runs once', async () => {
+  const r = repo({'x': ''})
+  writeFileSync(join(r.fake, 'faults.json'), JSON.stringify({'exec:job.sh': ['reset-after', 'reset-after', 'timeout-after']}))
+  const f = jobs(r, [{name: 'once', cmd: counted('once')}])
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s', '--strict-once'], {SC_REFUSAL_BACKOFF_MS: '20'}))
+  expect(code, err).toBe(0)
+  expect(ran(r.fake, 'once')).toBe('run\n')
+}, 60_000)
+
+test.skipIf(!linux)("an ambiguous launch is not made again blindly: past its retries, the box's claim decides started or lost", async () => {
+  // (the launch ran, its answer lost, no retry left: the job claimed its start, so it is running, not lost)
+  const r = repo({'x': ''})
+  writeFileSync(join(r.fake, 'faults.json'), JSON.stringify({'exec:job.sh': ['reset-after']}))
+  const f = jobs(r, [{name: 'claimed', cmd: `sleep 4; ${counted('claimed')}`}])
+  const a = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s', '--strict-once'], {SC_RETRY_BUDGET_MS: '0'}))
+  expect(a.code, a.err).toBe(0)
+  expect(a.err).toContain('its launch call failed after the job claimed its start')
+  expect(ran(r.fake, 'claimed')).toBe('run\n')
+  // (the launch failed before it ran: no claim on the box, so the attempt is lost, as strict-once says, and never run)
+  const s = repo({'x': ''})
+  writeFileSync(join(s.fake, 'faults.json'), JSON.stringify({'exec:job.sh': ['reset']}))
+  const g = jobs(s, [{name: 'never', cmd: counted('never')}])
+  const b = await done(sc(s, ['run', '--jobs', g, '--out', s.out, '--poll', '1s', '--strict-once'], {SC_RETRY_BUDGET_MS: '0'}))
+  expect(b.code).toBe(3)
+  expect(summary(s.out)).toEqual([['never', 'lost']])
+  expect(ran(s.fake, 'never')).toBe('')
+}, 60_000)
+
+test.skipIf(!linux)("the warm pool reaps itself when a run starts: this owner's paused boxes past their keep, never another's, never one a batch holds", async () => {
+  const r = repo({'x': ''})
+  const me = owner(), long = new Date(Date.now() - 2 * 3600_000).toISOString(), lately = new Date(Date.now() - 60_000).toISOString()
+  const put = (id: string, meta: Record<string, string>, at: string, state = 'suspended') => {
+    mkdirSync(join(r.fake, id, 'home'), {recursive: true})
+    writeFileSync(join(r.fake, id, 'box.json'), JSON.stringify({id, name: `sc-${id}`, state, vcpus: 2, memMiB: 4096, metadata: {sc: '1', ...meta}, updatedAt: at, autoSuspendedAt: at}))
+  }
+  const pool = {sc_owner: me, sc_image: 'other'}
+  put('m_old', pool, long)
+  put('m_fresh', pool, lately)
+  put('m_theirs', {sc_owner: 'someone', sc_image: 'other'}, long)
+  put('m_peer', {...pool, sc_batch: 'B0'}, long)
+  put('m_running', pool, long, 'running')
+  // (paused mid-batch with its client gone: held for that batch while its batch.json can pick it up)
+  put('m_held', pool, long)
+  const other = join(r.dir, 'runs', 'earlier')
+  mkdirSync(other, {recursive: true})
+  writeFileSync(join(other, 'batch.json'), JSON.stringify({id: 'B1'}))
+  mkdirSync(join(r.fake, 'state', 'held'), {recursive: true})
+  writeFileSync(join(r.fake, 'state', 'held', 'm_held'), JSON.stringify({batch: 'B1', out: other}))
+  // (a record whose batch can't be picked up any more holds nothing)
+  put('m_stale', pool, long)
+  writeFileSync(join(r.fake, 'state', 'held', 'm_stale'), JSON.stringify({batch: 'B2', out: join(r.dir, 'runs', 'gone')}))
+  const f = jobs(r, [{name: 'j', cmd: 'echo ok'}])
+  const {err, code} = await done(sc(r, ['run', '--jobs', f, '--out', r.out, '--poll', '1s']))
+  expect(code, err).toBe(0)
+  const ids = new Set(boxes(r.fake).map((b) => b.id))
+  expect(['m_old', 'm_stale'].filter((id) => ids.has(id))).toEqual([])
+  expect(['m_fresh', 'm_theirs', 'm_peer', 'm_running', 'm_held'].filter((id) => !ids.has(id))).toEqual([])
+  // (reaped before the batch made its first box: at the start, not only on the way out)
+  const calls = readFileSync(join(r.fake, 'calls.log'), 'utf8').split('\n')
+  expect(calls.findIndex((l) => l.startsWith('rm --yes m_old'))).toBeLessThan(calls.findIndex((l) => l.startsWith('create')))
 }, 60_000)

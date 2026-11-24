@@ -10,8 +10,8 @@
 // - A box with nothing on it that no queued job can start on (as the rule says) is paused into the warm pool; the next
 //   batch resumes a paused box (seconds) before it creates one.
 
-import {existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync} from 'node:fs'
-import {hostname, tmpdir, userInfo} from 'node:os'
+import {existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync} from 'node:fs'
+import {homedir, hostname, tmpdir, userInfo} from 'node:os'
 import {join} from 'node:path'
 import {Engine, type Limits, type Req} from './engine.ts'
 import * as ib from './instabox.ts'
@@ -64,6 +64,32 @@ const sleep = (s: number) => new Promise((r) => setTimeout(r, s * 1000))
 export {SYSTEM_MIB} from './size.ts'
 
 export const owner = () => new Bun.CryptoHasher('sha256').update(`${userInfo().username}@${hostname()}`).digest('hex').slice(0, 8)
+
+// The boxes this client's batches hold (a job or outputs on them, or about to be): one file per box, naming its
+// batch's --out, from the moment the batch has the box until it pauses it empty (or finds it gone). A reap never
+// deletes one while that batch can still be picked up (its batch.json there, of that batch): a box that paused itself
+// mid-batch, this client gone, keeps what `batch fetch` will take from it.
+const heldDir = () => join(process.env.SC_STATE_DIR ?? join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'supercomputer'), 'held')
+function hold(id: string, batch: string, out: string) {
+  if (!id) return
+  mkdirSync(heldDir(), {recursive: true})
+  writeFileSync(join(heldDir(), id), JSON.stringify({batch, out}))
+}
+const unhold = (id: string) => id && rmSync(join(heldDir(), id), {force: true})
+function held(): Set<string> {
+  const ids = new Set<string>()
+  if (!existsSync(heldDir())) return ids
+  for (const id of readdirSync(heldDir())) {
+    try {
+      const {batch, out} = JSON.parse(readFileSync(join(heldDir(), id), 'utf8')) as {batch: string; out: string}
+      if (readBatch(out)?.id === batch) ids.add(id)
+      else unhold(id) // (its batch can no longer be picked up: nothing would ever take what the box holds)
+    } catch {
+      ids.add(id)
+    }
+  }
+  return ids
+}
 
 // What a box must be for the job: its image, its GPU and, when it names one, its size.
 export const kindOf = (j: Job) => [j.image ?? '', j.gpu ?? '', j.size ? `${j.size.vcpus}x${j.size.memMiB}` : ''].join('|')
@@ -155,7 +181,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
   const sendTree = async (b: Live) => {
     if (b.tree === batch.tree) return
     if (!tree) throw new Error(`box ${b.name} lacks tree ${batch.tree}; pick the batch up from its repo to send it again`)
-    const has = await api(() => ib.exec(b.id, `mkdir -p ~/sc/trees ~/sc/run && test -s ~/sc/trees/${tree.hash}.tgz`))
+    const has = await api(() => ib.exec(b.id, `mkdir -p ~/sc/trees ~/sc/run && test -s ~/sc/trees/${tree.hash}.tgz`, {idempotent: true}))
     if (has.exitCode !== 0) await api(() => ib.push(b.id, tree.tarball, `/data/home/sc/trees/${tree.hash}.tgz`))
     b.tree = tree.hash
     recs()
@@ -174,8 +200,16 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     for (const [i, j] of rule.jobs()) if (j.box === b.slot && (j.st === 'running' || j.st === 'ended')) lose(b, i)
     if (!ask({op: 'close', box: b.slot})) return
     live.delete(b.slot)
+    unhold(b.id)
     recs()
     save()
+  }
+
+  // A box this batch made that never became ready (its create or its tree failed): deleted, so it is never left
+  // running or paused with nothing to show for it. Known by its id, else by its name (a create that did not answer).
+  const discard = async (b: Live) => {
+    const id = b.id || (await api(() => ib.get(b.name)).then((x) => (x.metadata?.sc_owner === batch.owner ? x.id : ''), () => ''))
+    if (id) await api(() => ib.remove(id)).then(() => o.log(`box ${b.name}: deleted (it never became ready)`), () => undefined)
   }
 
   // A GPU job's box, as instabox makes it (asked once per type): one the job doesn't fit in is the job's error.
@@ -211,24 +245,43 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     live.set(slot, b)
     recs()
     save()
+    hold(b.id, batch.id, o.out)
+    let made = false
     ;(async () => {
       if (warm) {
         o.log(`box ${name}: resumed from the warm pool`)
-        await api(() => ib.resume(warm!.id))
-      } else {
-        o.log(`box ${name}: creating ${size.vcpus} vCPU / ${size.memMiB / 1024} GiB${job.gpu ? ` with ${job.gpu}` : ''}`)
+        // (a warm box that won't resume, deleted meanwhile or broken: a new box in its place, the slot kept)
+        const back = await api(() => ib.resume(warm!.id)).then(() => true, (e) => {
+          o.log(`box ${name}: not resumed (${e instanceof Error ? e.message : e}); a new box instead`)
+          return false
+        })
+        if (!back) {
+          unhold(b.id)
+          b.id = ''
+          b.name = `sc-${batch.owner}-${Math.random().toString(36).slice(2, 10)}`
+          recs()
+          save()
+        }
+      }
+      if (!b.id) {
+        o.log(`box ${b.name}: creating ${size.vcpus} vCPU / ${size.memMiB / 1024} GiB${job.gpu ? ` with ${job.gpu}` : ''}`)
         const img = imageOf(job.image)
-        const made = await api(() => ib.create({name, vcpus: size.vcpus, memMiB: size.memMiB, snapshot: gpu ? undefined : img.snapshot, template: gpu?.template ?? img.template, gpu: job.gpu, meta: meta(job.image)}))
-        b.id = made.id
+        made = true
+        const box = await api(() => ib.create({name: b.name, vcpus: size.vcpus, memMiB: size.memMiB, snapshot: gpu ? undefined : img.snapshot, template: gpu?.template ?? img.template, gpu: job.gpu, meta: meta(job.image)}))
+        b.id = box.id
+        hold(b.id, batch.id, o.out)
         recs()
         save()
       }
       await sendTree(b)
     })().then(resolve, (e) => {
-      o.log(`box ${name}: ${e instanceof Error ? e.message : e}`)
+      o.log(`box ${b.name}: ${e instanceof Error ? e.message : e}`)
       reject(e)
     })
-    ready.catch(() => gone(b))
+    ready.catch(async () => {
+      if (made) await discard(b)
+      gone(b)
+    })
     return b
   }
 
@@ -237,13 +290,19 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     if (!ask({op: 'start', job: i, box: b.slot})) return
     batch.times[job.name] = {started: Date.now() / 1000, where: b.name}
     save()
+    const {script, launch, claimed} = jobScript(batch, job)
     try {
       await b.ready
-      const {script, launch} = jobScript(batch, job)
-      const r = await api(() => ib.exec(b.id, launch, {stdin: script}))
+      // (made again through a transport failure: the launch is idempotent, its job claimed once on the box)
+      const r = await api(() => ib.exec(b.id, launch, {stdin: script, idempotent: true}))
       if (r.exitCode !== 0) throw new Error(`launch exited ${r.exitCode}: ${r.stderr.trim()}`)
       o.log(`${job.name}: started on ${b.name}`)
     } catch (e) {
+      // (a launch call that never answered may still have started the job: the box's claim says whether it did)
+      const ran = !!b.id && e instanceof ib.InstaboxError && ib.transportFailure({stdout: '', stderr: e.stderr, code: e.code}) &&
+        (await sleep(2).then(() => api(() => ib.exec(b.id, claimed, {idempotent: true}))).then((x) => x.exitCode === 0, () => false))
+      if (ran) return o.log(`${job.name}: started on ${b.name} (its launch call failed after the job claimed its start)`)
+      if (rule.job(i)?.st !== 'running' || rule.job(i)?.box !== b.slot) return // (answered meanwhile: it had started)
       o.log(`${job.name}: not started on ${b.name}: ${e instanceof Error ? e.message : e}`)
       lose(b, i)
     }
@@ -254,7 +313,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     const J = dir(job.name)
     const local = mkdtempSync(join(tmpdir(), 'sc-out-'))
     try {
-      const pack = await api(() => ib.exec(b.id, `cd ${J} 2>/dev/null || exit 7; tar -czf out.tgz -C out . && sha256sum log out.tgz && find out -type f | wc -l && cat started`))
+      const pack = await api(() => ib.exec(b.id, `cd ${J} 2>/dev/null || exit 7; tar -czf out.tgz -C out . && sha256sum log out.tgz && find out -type f | wc -l && cat started`, {idempotent: true}))
       // (its folder gone from the box: the attempt's answer is gone with it)
       if (pack.exitCode === 7) return lose(b, i)
       if (pack.exitCode !== 0) throw new Error(`packing outputs exited ${pack.exitCode}: ${pack.stderr.trim()}`)
@@ -280,7 +339,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
       // (the answer kept in batch.json before its folder on the box goes)
       if (!ask({op: 'fetch', job: i})) return
       o.log(`${job.name}: exit ${rule.job(i)!.exit} in ${t.seconds} s${count ? `, ${count} output files` : ''}`)
-      await api(() => ib.exec(b.id, `rm -rf ${J}`)).catch(() => undefined)
+      await api(() => ib.exec(b.id, `rm -rf ${J} ${J}.lock`, {idempotent: true})).catch(() => undefined)
     } finally {
       rmSync(local, {recursive: true, force: true})
     }
@@ -294,13 +353,13 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
       const script = running.map((i) => `[ -f ${dir(jobs[i]!.name)}/exit ] && echo ${i} "$(cat ${dir(jobs[i]!.name)}/exit)"`).join('; ') + '; true'
       let r: ib.Exec
       try {
-        r = await api(() => ib.exec(b.id, script, {timeout: 60}))
+        r = await api(() => ib.exec(b.id, script, {timeout: 60, idempotent: true}))
         b.misses = 0
       } catch {
         if (++b.misses < 4) return
         const state = await api(() => ib.get(b.id)).then((x) => x.state, () => 'gone')
         if (state === 'suspended' || state === 'stopped') {
-          await api(async () => { if (state === 'suspended') await ib.resume(b.id); else await ib.exec(b.id, 'true') }).catch(() => undefined)
+          await api(async () => { if (state === 'suspended') await ib.resume(b.id); else await ib.exec(b.id, 'true', {idempotent: true}) }).catch(() => undefined)
           b.misses = 0
           return
         }
@@ -324,6 +383,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
   const pause = async (b: Live) => {
     if (!ask({op: 'close', box: b.slot})) return
     live.delete(b.slot)
+    unhold(b.id)
     recs()
     save()
     // (a GPU box is deleted, not paused: no batch resumes one, and paused it would keep its 200 GiB disk until a reap)
@@ -335,6 +395,9 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
   for (const rec of batch.boxes) {
     const b: Live = {...rec, misses: 0, ready: Promise.resolve()}
     live.set(rec.slot, b)
+    hold(rec.id, batch.id, o.out)
+    // (no id: its create never answered, so no job was launched there; a box it made after all is deleted)
+    if (!rec.id) await discard(b)
     const state = rec.id ? await api(() => ib.get(rec.id)).then((x) => x.state, () => 'gone') : 'gone'
     if (state === 'gone' || state === 'error' || state === 'deleted') {
       o.log(`box ${rec.name}: ${state}`)
@@ -351,6 +414,8 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     if (!live.has(slot)) gone({slot, id: '', name: `slot ${slot}`, size: {vcpus: 0, memMiB: 0}, misses: 0, ready: Promise.resolve()})
   recs()
   save()
+  // (the warm pool reaps itself: this owner's paused boxes past their keep, none this or another batch holds)
+  await reap(o.keep, o.log, new Set(batch.boxes.map((b) => b.id))).catch(() => undefined)
   const out = () => rule.count('queued') + rule.count('running') + rule.count('ended')
   o.log(`batch ${batch.id}: ${jobs.length} jobs, ${rule.count('done')} answered, ${rule.count('queued')} queued, ${rule.count('running') + rule.count('ended')} out; ${imageKey()}`)
 
@@ -391,7 +456,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
 
 // A job's script on its box, and the command that starts it detached (setsid) with the script on its stdin: it unpacks
 // the tree, seeds the caches, runs the command under its timeout, keeps what it built, and writes its exit code last.
-export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, job: Job, attempt?: number): {script: string; launch: string} {
+export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, job: Job, attempt?: number): {script: string; launch: string; claimed: string} {
   const J = `~/sc/run/${batch.id}/${job.name}${attempt ? `.${attempt}` : ''}`
   const img = job.image ? batch.cfg.images[job.image]! : batch.cfg.image
   const path = img.path.map((p) => p.replace(/^~/, '$HOME')).join(':')
@@ -406,9 +471,16 @@ export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, 
       keep: `( cd ${D} 2>/dev/null && [ ! -d ${C} ] && ls ${outs} >/dev/null 2>&1 && T=${C}.$$ && mkdir -p "$T" && cp --parents ${outs} "$T"/ && mv -T "$T" ${C} 2>/dev/null || rm -rf "$T" ) || true`,
     }
   })
+  // The launch's own token: a launch made again with it (its call failed in transport) keeps what the first one
+  // wrote, and the job's claim (an atomic mkdir, its first act) lets one start through, ever; a new launch (another
+  // token, a new attempt) starts the folder over. The lock keeps two launches of the job on the box from interleaving.
+  const T = Math.random().toString(36).slice(2, 12)
+  const D = J.replace(/^~/, '$HOME')
   const script = [
     'set -u',
-    `J=${J.replace(/^~/, '$HOME')}`,
+    `J=${D}`,
+    'mkdir "$J/claim" 2>/dev/null || exit 0',
+    'echo $$ > "$J/pid"',
     `tar -xzf "$HOME/sc/trees/${batch.tree}.tgz" -C "$J/tree" || { echo "the tree did not unpack" > "$J/log"; echo 125 > "$J/exit"; exit; }`,
     `cd "$J/tree"/${q(job.cwd)} || { echo "no ${job.cwd} in the tree" > "$J/log"; echo 126 > "$J/exit"; exit; }`,
     path ? `export PATH="${path}:$PATH"` : '',
@@ -421,8 +493,11 @@ export function jobScript(batch: Pick<Batch, 'id' | 'tree' | 'cfg' | 'caches'>, 
     ...caches.map((c) => c.keep),
     'echo "$code $(date +%s)" > "$J/exit.tmp" && mv "$J/exit.tmp" "$J/exit"',
   ].filter(Boolean).join('\n') + '\n'
-  const launch = `J=${J.replace(/^~/, '$HOME')}; rm -rf "$J" && mkdir -p "$J/tree" "$J/out" && cat > "$J/job.sh" && (setsid nohup bash "$J/job.sh" > "$J/runner.log" 2>&1 < /dev/null & echo $! > "$J/pid")`
-  return {script, launch}
+  const launch = `J=${D}; T=${T}; mkdir -p "$(dirname "$J")" && exec 9>"$J.lock" && { ! command -v flock >/dev/null || flock 9; } &&` +
+    ` { [ "$(cat "$J/launch" 2>/dev/null)" = "$T" ] || { rm -rf "$J" && mkdir -p "$J/tree" "$J/out" && echo "$T" > "$J/launch"; }; } &&` +
+    ` cat > "$J/job.sh.$$" && mv "$J/job.sh.$$" "$J/job.sh" && (setsid nohup bash "$J/job.sh" >> "$J/runner.log" 2>&1 < /dev/null 9>&- &)`
+  const claimed = `J=${D}; test -d "$J/claim" && [ "$(cat "$J/launch" 2>/dev/null)" = ${T} ]`
+  return {script, launch, claimed}
 }
 
 // Each image the jobs use, its locked size, if its snapshot was saved with sizeLocked: asked of instabox once per
@@ -446,11 +521,15 @@ function sha(file: string): string {
 }
 
 // The warm pool's paused boxes the pool's decision lets go (src/pool.ts), deleted.
-export async function reap(keep: number, log: (s: string) => void): Promise<number> {
-  const pool = await ib.list({sc: '1', sc_owner: owner()})
+// Only this owner's paused pool boxes: never another owner's, never a controller-less batch's (sc_batch), never one a
+// batch of this client holds (a job or outputs on it) or that the caller spares (its own batch's).
+export async function reap(keep: number, log: (s: string) => void, spare: Set<string> = new Set()): Promise<number> {
+  const me = owner()
+  const pool = await ib.list({sc: '1', sc_owner: me})
+  const holding = held()
   let n = 0
   for (const b of pool) {
-    if (b.state !== 'suspended') continue
+    if (b.state !== 'suspended' || b.metadata?.sc_owner !== me || b.metadata?.sc_batch || holding.has(b.id) || spare.has(b.id)) continue
     const since = Date.parse(b.autoSuspendedAt ?? b.updatedAt ?? '')
     const pausedFor = Number.isFinite(since) ? Math.max(0, Math.floor((Date.now() - since) / 1000)) : 0
     if (!deletes(pausedFor, keep)) continue

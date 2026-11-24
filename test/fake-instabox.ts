@@ -34,11 +34,80 @@ const flag = (name: string) => {
   const i = args.indexOf(name)
   return i < 0 ? undefined : args[i + 1]
 }
+
+// Transport failures on request: $FAKE_INSTABOX_DIR/faults.json, {"<kind>": [mode, ...]}, the next calls of that
+// kind failing in those modes, one each, in order. A kind is a command (create, exec, push, pull, get, ls, snapshot,
+// suspend, resume, rm) or "exec:<text>", an exec whose script holds the text (checked first). A mode is how the call
+// fails, as instabox's CLI says it: before it does anything (timeout, reset, refused, eof, 502, stall, hang: no
+// answer at all, until the caller's deadline kills it) or after it did what it was asked (timeout-after,
+// reset-after; broken-after: a create whose box then fails; pending-after: one whose box never comes up). Each failing call is logged to calls.log as "fault".
+const MODES: Record<string, string> = {
+  timeout: 'instabox: error cli_error: Get "https://api.instabox.sh/v1/operations/op_fake?wait=25s": context deadline exceeded (Client.Timeout exceeded while awaiting headers)',
+  reset: 'instabox: error cli_error: Get "https://api.instabox.sh/v1/snapshots": read tcp 10.0.0.1:5000->10.0.0.2:443: read: connection reset by peer',
+  refused: 'instabox: error cli_error: Post "https://api.instabox.sh/v1/machines": dial tcp 10.0.0.2:443: connect: connection refused',
+  eof: 'instabox: error cli_error: Post "https://api.instabox.sh/v1/machines/m_x/exec": EOF',
+  '502': 'instabox: error http_502: 502 Bad Gateway',
+  stall: 'instabox: push: the upload stalled: no bytes went out for 2m; nothing was written in the sandbox (a file there is only replaced once every byte has arrived), so it is safe to run the same command again',
+  'reset-after': "the connection to the API closed after 0s, before the command's result came (Post \"https://api.instabox.sh/v1/machines/m_x/exec\": read tcp 10.0.0.1:5000->10.0.0.2:443: read: connection reset by peer); the server stops a command whose request is gone, so it may not have finished",
+}
+MODES['timeout-after'] = MODES.timeout!
+MODES['broken-after'] = MODES.timeout!
+MODES['pending-after'] = MODES.timeout!
+function nextFault(): string | undefined {
+  const f = join(root, 'faults.json'), lock = join(root, 'faults.lock')
+  if (!existsSync(f)) return undefined
+  for (let i = 0; ; i++) {
+    try {
+      mkdirSync(lock)
+      break
+    } catch {
+      if (i > 2000) return undefined
+      Bun.sleepSync(2)
+    }
+  }
+  try {
+    const faults = JSON.parse(readFileSync(f, 'utf8')) as Record<string, string[]>
+    const script = cmd === 'exec' ? args.slice(args.indexOf('--') + 1).join(' ') : ''
+    const kind = Object.keys(faults).find((k) => k.startsWith(`${cmd}:`) && script.includes(k.slice(cmd!.length + 1)) && faults[k]!.length) ??
+      (faults[cmd!]?.length ? cmd : undefined)
+    if (!kind) return undefined
+    const mode = faults[kind]!.shift()!
+    writeFileSync(f, JSON.stringify(faults))
+    log(`fault ${kind} ${mode}`)
+    return mode
+  } finally {
+    rmSync(lock, {recursive: true, force: true})
+  }
+}
+const fault = root ? nextFault() : undefined
+const failWith = (mode: string): never => {
+  if (cmd === 'exec' && mode === 'reset-after') {
+    process.stdout.write(JSON.stringify({error: {code: 'cli_error', message: MODES[mode]}}) + '\n')
+    process.exit(1)
+  }
+  process.stderr.write(`${MODES[mode]}\n`)
+  process.exit(1)
+}
+if (fault === 'hang') Bun.sleepSync(3_600_000)
+else if (fault && !fault.endsWith('-after')) failWith(fault)
+// (a fault after the act: the act done, its answer never reaching the caller)
+const after = fault?.endsWith('-after') ? fault : undefined
+if (after) console.log = () => {}
 const metas = () => args.flatMap((a, i) => (args[i - 1] === '--meta' ? [a.split('=') as [string, string]] : []))
 
 if (cmd === 'create') {
   mkdirSync(root, {recursive: true})
   const name = flag('--name')!
+  // (an idempotency key seen before: the first create's box again, nothing more made; FAKE_FORGET_KEYS: instabox
+  // no longer knows the key, so a create made again finds its name taken)
+  const key = flag('--idempotency-key'), keyFile = key ? join(root, 'keys', key) : ''
+  const first = key && !process.env.FAKE_FORGET_KEYS && existsSync(keyFile) ? read(readFileSync(keyFile, 'utf8')) : undefined
+  if (first) {
+    log(`replayed ${name}`)
+    console.log(JSON.stringify(first))
+    if (after) failWith(after)
+    process.exit(0)
+  }
   if (find(name)) fail(`operation_conflict: a machine named "${name}" already exists`)
   const id = `m_${Math.random().toString(36).slice(2, 12)}`
   mkdirSync(join(at(id), 'home'), {recursive: true})
@@ -53,8 +122,9 @@ if (cmd === 'create') {
   if (snap?.sizeLocked && (Number(flag('--vcpus')) !== snap.defaultSpec.vcpus || Number(flag('--mem-mib')) !== snap.defaultSpec.memMiB))
     fail(`spec_not_allowed: snapshot ${snap.name} is size-locked to ${snap.defaultSpec.vcpus} vCPU / ${snap.defaultSpec.memMiB} MiB`, 5)
   const vcpus = g ? g.sizes[0]!.vcpus * count : Number(flag('--vcpus') ?? 4), memMiB = g ? g.sizes[0]!.memMiB * count : Number(flag('--mem-mib') ?? 8192)
-  const b: Box = {id, name, state: 'running', vcpus, memMiB, metadata: Object.fromEntries(metas()), updatedAt: new Date().toISOString(), autoSuspendedAt: null}
+  const b: Box = {id, name, state: after === 'broken-after' ? 'error' : after === 'pending-after' ? 'starting' : 'running', vcpus, memMiB, metadata: Object.fromEntries(metas()), updatedAt: new Date().toISOString(), autoSuspendedAt: null}
   write(b)
+  if (key) mkdirSync(join(root, 'keys'), {recursive: true}), writeFileSync(keyFile, id)
   log(`created ${name} template=${flag('--template') ?? '-'} gpu=${gpu ?? '-'} ${vcpus}x${memMiB}`)
   console.log(JSON.stringify(b))
 } else if (cmd === 'snapshot' && args[0] === 'ls') {
@@ -104,3 +174,4 @@ if (cmd === 'create') {
 } else {
   fail(`the stand-in has no ${cmd}`, 2)
 }
+if (after) failWith(after)

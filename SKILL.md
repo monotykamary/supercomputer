@@ -16,8 +16,12 @@ supercomputer run --jobs jobs.json --out runs/x [--max-boxes 50] [--size large] 
   checked), `<out>/summary.tsv` (name, exit or `lost`, seconds, box), `<out>/batch.json` (the batch, its plan).
 - **Exit**: 0 only when every job answered 0; 3 when any failed or was lost; 1 on a client error. A nonzero native exit
   is data (a failing test), never retried; only a lost attempt (its box gone) is, up to `--max-attempts` (3).
-  instabox refusing a call for load (too many execs at once across the account, a rate limit) is waited out and
-  made again: it ran nothing, so it never costs an attempt, strict-once included.
+  instabox refusing a call for load (too many execs at once across the account, a rate limit) or failing in transport
+  (a timeout, a connection reset or refused, an EOF, a gateway 5xx, a stalled or hung transfer) is waited out and made
+  again (about 5 minutes) when the call is safe to repeat: reads, the tree's push, a create (under an idempotency key;
+  one that never answered is found by name and used or deleted, never leaked), and the launch (the job claims its
+  start on the box, so it runs once). It never costs an attempt, strict-once included. Past that, a launch whose
+  answer was lost counts as started if the box shows the job's claim, and as lost otherwise.
 - The tree ships without `node_modules`: start a bun job with `bun install --frozen-lockfile && ...`.
 - `--timing`: each job alone on a fresh box of its own (one job per box, ever). `--strict-once`: one attempt.
 - `"vm_type"`: `small` 2x4, `default` 4x8, `large` 8x16, `xlarge` 16x32, `2xlarge` 32x64 (vCPU x GiB), or `NxM`.
@@ -42,7 +46,8 @@ attempts.
 **Boxes and money.** instabox bills a running box by the second and a paused one for its disk only. A batch's boxes
 pause into a warm pool when it ends, and the next batch resumes them in seconds before it creates any.
 `supercomputer status` lists the pool; `supercomputer reap --keep 30m` deletes paused boxes past their keep (every
-`run` reaps on its way out).
+`run` and `launch` reaps on its way in and out, `--keep` to change it): only this client's, never one a batch it can
+still pick up holds, never a controller-less batch's. A box a batch made that never became ready is deleted.
 
 **The repo's image.** `supercomputer image build` runs `[instabox] setup` on a fresh box and saves a snapshot named
 by the script's hash; put it in `supercomputer.toml`:

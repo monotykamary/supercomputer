@@ -26,7 +26,12 @@ There is no controller. A batch is this client, its boxes, and `<out>/batch.json
   its box can't hold is refused when the batch starts, never lost when instabox refuses the box.
 - **The warm pool**: a box with nothing on it that no queued job can use pauses (it then costs only its disk). The
   next batch resumes a paused box of the same size and image in seconds before it creates one.
-  `supercomputer reap --keep 30m` deletes paused boxes past their keep.
+  `supercomputer reap --keep 30m` deletes paused boxes past their keep; every `run` and `launch` reaps when it starts
+  and ends, never a box a batch of this client can still pick up holds.
+- **instabox failing**: a call refused for load or failing in transport (a timeout, a reset, an EOF, a gateway 5xx, a
+  stalled transfer) is made again for about five minutes when it is safe to repeat: reads, pushes, creates (under an
+  idempotency key, reconciled by name) and the launch (idempotent: the job claims its start on the box once). It
+  never costs an attempt, so strict-once holds: a job never runs twice.
 - **Images**: the repo's (`[instabox] setup`, saved by `supercomputer image build`), and named ones a job picks with
   `"image"`. A named image with its own `setup` and `data` is built on the repo's: `image build NAME` copies each local
   file or folder of `data` to its path on the box, runs the setup, and saves the snapshot under a name that hashes them.

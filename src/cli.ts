@@ -106,9 +106,13 @@ async function main(argv: string[]): Promise<number> {
         jobs: {type: 'string'}, ledger: {type: 'string'},
         'max-boxes': {type: 'string', default: '50'}, 'max-attempts': {type: 'string', default: '3'},
         size: {type: 'string'}, timing: {type: 'boolean', default: false}, 'strict-once': {type: 'boolean', default: false},
+        keep: loop.keep,
       },
     })
     if (!v.jobs || !v.ledger) throw new Error('launch needs --jobs FILE and --ledger OWNER/REPO')
+    // (the warm pool reaps itself on the way in and out, as a run does; a controller-less batch's boxes are never its)
+    const keep = seconds(v.keep!)
+    await reap(keep, log).catch(() => undefined)
     const repo = await root(process.cwd())
     const cfg = readConfig(repo)
     if (v.size) cfg.size = sizeOf(v.size)
@@ -118,6 +122,7 @@ async function main(argv: string[]): Promise<number> {
       strictOnce: v['strict-once']!, timing: v.timing!,
     }, v.ledger, log)
     console.log(where)
+    await reap(keep, log).catch(() => undefined)
     log(`launched: the boxes run the batch now, this machine may go; results: supercomputer batch fetch --ledger ${where} --out DIR`)
     return 0
   }
