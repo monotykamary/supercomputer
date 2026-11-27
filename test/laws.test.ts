@@ -1,10 +1,10 @@
 // The batch rule's laws: proven from every state they allow (a batch is picked up from batch.json), checked by the
 // kernel, nothing assumed; each bug they rule out refuted by a run from the start; the builders cross-checked.
 import {expect, test} from 'bun:test'
-import {proveDecision, proveSteps} from 'gdp-wired'
+import {crossCheckDecision, proveDecision, proveSteps} from 'gdp-wired'
 import {decideIdle, idleLaws} from '../src/idle.ts'
 import {boxSizeLaws} from '../src/size.ts'
-import {letGoLaw} from '../src/pool.ts'
+import {decideLetGo, fitsLifetimeLaws, hasEnoughLifetime, LET_GO_BUGS, letGoLaws, letGoLawsOf, makeLetGo} from '../src/pool.ts'
 import {batch, type Bug, BUGS, laws, lawsOf, makeBatch, stepLaws, stepLawsOf} from '../src/batch.ts'
 
 test('every law of the batch is proven from every state the laws allow', () => {
@@ -58,9 +58,45 @@ test("the builders' callbacks agree with the proven expressions on concrete runs
   expect(c.checked).toBeGreaterThan(0)
 }, 600_000)
 
-test("the warm pool's decision: a paused box is deleted only past its keep", () => {
-  const v = proveDecision(letGoLaw)
-  expect({proven: v.proven, checked: v.checked}).toEqual({proven: true, checked: true})
+for (const law of letGoLaws)
+  test(`the warm pool's decision: ${law.name}`, () => {
+    const v = proveDecision(law)
+    expect({proven: v.proven, checked: v.checked}).toEqual({proven: true, checked: true})
+    expect(crossCheckDecision(law).failure).toBeUndefined()
+  })
+
+for (const bug of LET_GO_BUGS)
+  test(`refuted: warm pool decision that ${bug}`, () => {
+    const broken = letGoLawsOf(makeLetGo(bug))
+    const refuted = broken.some((law) => !proveDecision(law).proven)
+    expect(refuted).toBe(true)
+  })
+
+test("the warm pool decision's compiled runner answers as its laws say", () => {
+  const p = {keep: 1800, holdKeep: 21600}
+  expect(decideLetGo({pausedFor: 1799, held: false, live: false, pulled: false}, p)).toBe('keep')
+  expect(decideLetGo({pausedFor: 1800, held: false, live: false, pulled: false}, p)).toBe('delete')
+  expect(decideLetGo({pausedFor: 99999, held: false, live: true, pulled: false}, p)).toBe('keep')
+  expect(decideLetGo({pausedFor: 21599, held: true, live: false, pulled: false}, p)).toBe('keep')
+  expect(decideLetGo({pausedFor: 21600, held: true, live: false, pulled: false}, p)).toBe('pull')
+  expect(decideLetGo({pausedFor: 21600, held: true, live: false, pulled: true}, p)).toBe('delete')
+  expect(decideLetGo({pausedFor: 21600, held: true, live: true, pulled: true}, p)).toBe('keep')
+  expect(decideLetGo({pausedFor: 21600, held: true, live: true, pulled: false}, p)).toBe('keep')
+})
+
+for (const law of fitsLifetimeLaws)
+  test(`the box lifetime decision: ${law.name}`, () => {
+    const v = proveDecision(law)
+    expect({proven: v.proven, checked: v.checked}).toEqual({proven: true, checked: true})
+    expect(crossCheckDecision(law).failure).toBeUndefined()
+  })
+
+test("the box lifetime runner rejects boxes near delete-after and allows fresh or unbounded ones", () => {
+  const now = Date.UTC(2026, 10, 27, 12, 0, 0)
+  expect(hasEnoughLifetime(undefined, 3600, now, 600)).toBe(true)
+  expect(hasEnoughLifetime(new Date(now + 4199_000).toISOString(), 3600, now, 600)).toBe(false)
+  expect(hasEnoughLifetime(new Date(now + 4200_000).toISOString(), 3600, now, 600)).toBe(true)
+  expect(hasEnoughLifetime(new Date(now - 10_000).toISOString(), 60, now, 600)).toBe(false)
 })
 
 

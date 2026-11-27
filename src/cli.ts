@@ -3,7 +3,8 @@
 //   supercomputer run --jobs jobs.json --out runs/x [--max-boxes 50] [--size large] [--timing] [--strict-once]
 //   supercomputer batch fetch runs/x   pick a batch up from runs/x/batch.json: fetch what finished, run the rest
 //   supercomputer status               the warm pool and the boxes running for this client
-//   supercomputer reap [--keep 30m]    delete paused boxes of the warm pool past their keep
+//   supercomputer reap [--keep 30m] [--hold-keep 6h] [--until-empty]
+//                                      delete paused boxes of the warm pool past their keep (and expired holds after pulling outputs)
 //   supercomputer image build [NAME]   the repo's snapshot, from supercomputer.toml's [instabox] setup (NAME: one of
 //                                      [instabox.images], its data and setup on the repo's image)
 //   supercomputer --skill              how to use it, for an agent
@@ -14,12 +15,13 @@ import {basename, dirname, join, resolve} from 'node:path'
 import {parseArgs} from 'node:util'
 import * as ib from './instabox.ts'
 import {readConfig, readJobs, sizeOf} from './jobs.ts'
-import {lockedSizes, newBatch, owner, readBatch, reap, run} from './run.ts'
+import {ensureReaper, reapOnce, reapUntilEmpty} from './reaper.ts'
+import {lockedSizes, newBatch, owner, readBatch, run} from './run.ts'
 import {fetchLedger, launch, peer} from './peer.ts'
 import {pack, root} from './tree.ts'
 
 const log = (s: string) => console.error(`${new Date().toISOString().slice(11, 19)} ${s}`)
-const USAGE = 'usage: supercomputer run --jobs FILE --out DIR | launch --jobs FILE --ledger OWNER/REPO | batch fetch DIR | batch fetch --ledger OWNER/REPO#BATCH --out DIR | status | reap [--keep 30m] | image build [NAME] | --skill'
+const USAGE = 'usage: supercomputer run --jobs FILE --out DIR | launch --jobs FILE --ledger OWNER/REPO | batch fetch DIR | batch fetch --ledger OWNER/REPO#BATCH --out DIR | status | reap [--keep 30m] [--hold-keep 6h] [--until-empty] | image build [NAME] | --skill'
 
 function seconds(s: string): number {
   const m = /^(\d+)(s|m|h)?$/.exec(s)
@@ -47,7 +49,7 @@ async function digest(p: string): Promise<string> {
   return h.digest('hex')
 }
 
-const loop = {poll: {type: 'string', default: '5s'}, keep: {type: 'string', default: '30m'}} as const
+const loop = {poll: {type: 'string', default: '5s'}, keep: {type: 'string', default: '30m'}, 'hold-keep': {type: 'string', default: '6h'}} as const
 
 async function main(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv
@@ -96,7 +98,7 @@ async function main(argv: string[]): Promise<number> {
       }, await lockedSizes(cfg, jobs))
       log(`batch ${batch.id}: ${jobs.length} jobs, tree ${tree.hash} (${tree.files} files, ${(tree.bytes / 1e6).toFixed(1)} MB); results in ${out}`)
     }
-    return run(batch, tree.hash === batch.tree ? tree : undefined, {out, poll: seconds(v.poll!), keep: seconds(v.keep!), log})
+    return run(batch, tree.hash === batch.tree ? tree : undefined, {out, poll: seconds(v.poll!), keep: seconds(v.keep!), holdKeep: seconds(v['hold-keep']!), log})
   }
   // Controller-less (src/peer.ts): the batch in a ledger, its boxes running it with no client.
   if (cmd === 'launch') {
@@ -106,13 +108,13 @@ async function main(argv: string[]): Promise<number> {
         jobs: {type: 'string'}, ledger: {type: 'string'},
         'max-boxes': {type: 'string', default: '50'}, 'max-attempts': {type: 'string', default: '3'},
         size: {type: 'string'}, timing: {type: 'boolean', default: false}, 'strict-once': {type: 'boolean', default: false},
-        keep: loop.keep,
+        keep: loop.keep, 'hold-keep': loop['hold-keep'],
       },
     })
     if (!v.jobs || !v.ledger) throw new Error('launch needs --jobs FILE and --ledger OWNER/REPO')
     // (the warm pool reaps itself on the way in and out, as a run does; a controller-less batch's boxes are never its)
-    const keep = seconds(v.keep!)
-    await reap(keep, log).catch(() => undefined)
+    const keep = seconds(v.keep!), holdKeep = seconds(v['hold-keep']!)
+    await reapOnce(keep, log, new Set(), {holdKeep}).catch(() => undefined)
     const repo = await root(process.cwd())
     const cfg = readConfig(repo)
     if (v.size) cfg.size = sizeOf(v.size)
@@ -122,7 +124,8 @@ async function main(argv: string[]): Promise<number> {
       strictOnce: v['strict-once']!, timing: v.timing!,
     }, v.ledger, log)
     console.log(where)
-    await reap(keep, log).catch(() => undefined)
+    const after = await reapOnce(keep, log, new Set(), {holdKeep}).catch(() => undefined)
+    if (after && (after.remainingPaused > 0 || after.remainingHeld > 0)) ensureReaper(keep, holdKeep, log)
     log(`launched: the boxes run the batch now, this machine may go; results: supercomputer batch fetch --ledger ${where} --out DIR`)
     return 0
   }
@@ -147,7 +150,7 @@ async function main(argv: string[]): Promise<number> {
     const repo = await root(process.cwd()).catch(() => undefined)
     const tree = repo ? await pack(repo, batch.cfg.ignore).catch(() => undefined) : undefined
     log(`batch ${batch.id}: picked up from ${join(out, 'batch.json')}`)
-    return run(batch, tree?.hash === batch.tree ? tree : undefined, {out, poll: seconds(v.poll!), keep: seconds(v.keep!), log})
+    return run(batch, tree?.hash === batch.tree ? tree : undefined, {out, poll: seconds(v.poll!), keep: seconds(v.keep!), holdKeep: seconds(v['hold-keep']!), log})
   }
   if (cmd === 'status') {
     const pool = await ib.list({sc: '1', sc_owner: owner()})
@@ -157,9 +160,15 @@ async function main(argv: string[]): Promise<number> {
     return 0
   }
   if (cmd === 'reap') {
-    const {values: v} = parseArgs({args: rest, options: {keep: loop.keep}})
-    const n = await reap(seconds(v.keep!), log)
-    log(`${n} paused boxes deleted`)
+    const {values: v} = parseArgs({args: rest, options: {keep: loop.keep, 'hold-keep': loop['hold-keep'], 'until-empty': {type: 'boolean', default: false}}})
+    const keep = seconds(v.keep!), holdKeep = seconds(v['hold-keep']!)
+    if (v['until-empty']) {
+      await reapUntilEmpty(keep, holdKeep, log)
+      return 0
+    }
+    const r = await reapOnce(keep, log, new Set(), {holdKeep})
+    log(`${r.deleted} paused boxes deleted`)
+    if (r.remainingPaused > 0 || r.remainingHeld > 0) ensureReaper(keep, holdKeep, log)
     return 0
   }
   if (cmd === 'image' && rest[0] === 'build') {

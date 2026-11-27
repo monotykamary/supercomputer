@@ -8,52 +8,45 @@
 //   and pauses itself (--auto-suspend), and `supercomputer batch fetch <out>` (or `run` again with the same --out)
 //   picks the batch up from <out>/batch.json: the jobs and the log of requests the rule accepted, replayed.
 // - A box with nothing on it that no queued job can start on (as the rule says) is paused into the warm pool; the next
-//   batch resumes a paused box (seconds) before it creates one.
+//   batch resumes a paused box (seconds) before it creates one, provided its server-side delete deadline covers the
+//   job's timeout plus a margin.
 
-import {existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync} from 'node:fs'
-import {homedir, hostname, tmpdir, userInfo} from 'node:os'
+import {existsSync, mkdirSync} from 'node:fs'
 import {join} from 'node:path'
 import {Engine, type Limits, type Req} from './engine.ts'
 import * as ib from './instabox.ts'
 import {type Cache, type Config, type Image, type Job, type Size} from './jobs.ts'
-import {deletes} from './pool.ts'
+import {DEFAULT_HOLD_KEEP_S, hasEnoughLifetime} from './pool.ts'
+import {
+  type Batch,
+  type BoxRec,
+  ensureReaper,
+  heldIds,
+  hold,
+  owner,
+  pullJobOutputs,
+  readBatch,
+  reap,
+  reapOnce,
+  saveBatch,
+  shaFile,
+  unhold,
+  writeSummary,
+} from './reaper.ts'
 import {type Locked, planSize, refuseUnfit, SYSTEM_MIB} from './size.ts'
 import type {Tree} from './tree.ts'
 
 export type {Limits} from './engine.ts'
+export type {Batch} from './reaper.ts'
+export {owner, readBatch, reap} from './reaper.ts'
+export {SYSTEM_MIB} from './size.ts'
 
 export type Options = {
   out: string
   poll: number // seconds
   keep: number // seconds a paused box stays in the warm pool
+  holdKeep?: number // seconds a held box whose batch has ended stays before outputs are pulled and it is deleted
   log: (line: string) => void
-}
-
-// A box of the batch, by its slot: what instabox knows it as.
-type BoxRec = {slot: number; id: string; name: string; size: Size; gpu?: string; image?: string; tree?: string}
-
-// What <out>/batch.json holds: enough to pick the batch up with no jobs file and no memory of this client.
-export type Batch = {
-  id: string
-  owner: string
-  tree: string
-  // Each [[cache]] with its key for this tree: the hash of its salt and its inputs.
-  caches: (Cache & {key: string})[]
-  cfg: Config
-  limits: Limits
-  jobs: Job[]
-  // The rule's numbers for what it compares: a job's group and what a box must be for it (its image, GPU, named size).
-  groups: string[]
-  kinds: string[]
-  boxes: BoxRec[]
-  // The requests the batch rule accepted, in order: replayed, they are the batch's state.
-  log: Req[]
-  // Each job's last attempt: when it started and ended, and the box it ran on (summary.tsv).
-  times: Record<string, {started?: number; ended?: number; seconds?: number; where?: string}>
-  nextSlot: number
-  // Each image's locked size (an instabox snapshot saved with sizeLocked), by image name ('' the repo's): its boxes
-  // are that size, never another. (Absent in a batch.json from before 1.0.1: none locked.)
-  locked?: Locked
 }
 
 // A box as this client holds it: missed polls, and when it is ready for jobs.
@@ -61,35 +54,6 @@ type Live = BoxRec & {misses: number; ready: Promise<void>}
 
 const q = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
 const sleep = (s: number) => new Promise((r) => setTimeout(r, s * 1000))
-export {SYSTEM_MIB} from './size.ts'
-
-export const owner = () => new Bun.CryptoHasher('sha256').update(`${userInfo().username}@${hostname()}`).digest('hex').slice(0, 8)
-
-// The boxes this client's batches hold (a job or outputs on them, or about to be): one file per box, naming its
-// batch's --out, from the moment the batch has the box until it pauses it empty (or finds it gone). A reap never
-// deletes one while that batch can still be picked up (its batch.json there, of that batch): a box that paused itself
-// mid-batch, this client gone, keeps what `batch fetch` will take from it.
-const heldDir = () => join(process.env.SC_STATE_DIR ?? join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'supercomputer'), 'held')
-function hold(id: string, batch: string, out: string) {
-  if (!id) return
-  mkdirSync(heldDir(), {recursive: true})
-  writeFileSync(join(heldDir(), id), JSON.stringify({batch, out}))
-}
-const unhold = (id: string) => id && rmSync(join(heldDir(), id), {force: true})
-function held(): Set<string> {
-  const ids = new Set<string>()
-  if (!existsSync(heldDir())) return ids
-  for (const id of readdirSync(heldDir())) {
-    try {
-      const {batch, out} = JSON.parse(readFileSync(join(heldDir(), id), 'utf8')) as {batch: string; out: string}
-      if (readBatch(out)?.id === batch) ids.add(id)
-      else unhold(id) // (its batch can no longer be picked up: nothing would ever take what the box holds)
-    } catch {
-      ids.add(id)
-    }
-  }
-  return ids
-}
 
 // What a box must be for the job: its image, its GPU and, when it names one, its size.
 export const kindOf = (j: Job) => [j.image ?? '', j.gpu ?? '', j.size ? `${j.size.vcpus}x${j.size.memMiB}` : ''].join('|')
@@ -137,29 +101,23 @@ export function cacheKey(root: string, c: Cache): string {
   const h = new Bun.CryptoHasher('sha256').update(c.salt + '\0')
   for (const f of [...c.inputs].sort()) {
     const file = join(root, c.dir, f)
-    h.update(f + '\0' + (existsSync(file) ? sha(file) : '-') + '\0')
+    h.update(f + '\0' + (existsSync(file) ? shaFile(file) : '-') + '\0')
   }
   return h.digest('hex').slice(0, 16)
-}
-
-export function readBatch(out: string): Batch | undefined {
-  const f = join(out, 'batch.json')
-  return existsSync(f) ? (JSON.parse(readFileSync(f, 'utf8')) as Batch) : undefined
 }
 
 // Run (or pick up) the batch in `out` until the rule gives it a verdict; 0 only when it passed.
 export async function run(batch: Batch, tree: Tree | undefined, o: Options): Promise<number> {
   mkdirSync(o.out, {recursive: true})
-  const file = join(o.out, 'batch.json')
+  const holdKeep = o.holdKeep ?? DEFAULT_HOLD_KEEP_S
   const rule = new Engine(batch.limits, batch.log)
   const timing = batch.limits.timing
   const jobs = batch.jobs
   const live = new Map<number, Live>()
-  const recs = () => (batch.boxes = [...live.values()].map(({slot, id, name, size, gpu, image, tree}) => ({slot, id, name, size, gpu, image, tree})))
+  const recs = () => (batch.boxes = [...live.values()].map(({slot, id, name, size, gpu, image, tree, deleteAt}) => ({slot, id, name, size, gpu, image, tree, deleteAt})))
   const save = () => {
     batch.log = rule.log
-    writeFileSync(`${file}.tmp`, JSON.stringify(batch, null, 1))
-    renameSync(`${file}.tmp`, file)
+    saveBatch(o.out, batch)
   }
   // A request to the rule, kept in batch.json when accepted.
   const ask = (r: Req) => {
@@ -177,6 +135,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
   const meta = (image?: string) => ({sc: '1', sc_owner: batch.owner, sc_image: imageKey(image)})
   const dir = (name: string) => `~/sc/run/${batch.id}/${name}`
   const on = (b: Live, st: string) => rule.jobs().filter(([, j]) => j.box === b.slot && j.st === st).map(([i]) => i)
+  let pausedAny = false
 
   const sendTree = async (b: Live) => {
     if (b.tree === batch.tree) return
@@ -222,8 +181,8 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     return g
   }
 
-  // A box for this job: a paused one of the warm pool of its size and image, else a new one; only in a slot the rule
-  // opens for it.
+  // A box for this job: a paused one of the warm pool of its size, image and sufficient remaining lifetime, else a new
+  // one; only in a slot the rule opens for it.
   const acquire = async (i: number): Promise<Live | undefined> => {
     const job = jobs[i]!
     // (a GPU box's size is the GPU type's, not one asked for)
@@ -236,12 +195,21 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     if (!timing && !job.gpu) {
       const pool = await api(() => ib.list(meta(job.image))).catch(() => [] as ib.Box[])
       const taken = new Set([...live.values()].map((b) => b.id))
-      warm = pool.find((b) => b.state === 'suspended' && b.vcpus === size.vcpus && b.memMiB === size.memMiB && !taken.has(b.id))
+      const holding = heldIds()
+      warm = pool.find(
+        (b) =>
+          b.state === 'suspended' &&
+          b.vcpus === size.vcpus &&
+          b.memMiB === size.memMiB &&
+          !taken.has(b.id) &&
+          !holding.has(b.id) &&
+          hasEnoughLifetime(b.deleteAt, job.timeout),
+      )
     }
     const name = warm?.name ?? `sc-${batch.owner}-${Math.random().toString(36).slice(2, 10)}`
     let resolve!: () => void, reject!: (e: unknown) => void
     const ready = new Promise<void>((a, z) => ((resolve = a), (reject = z)))
-    const b: Live = {slot, id: warm?.id ?? '', name, size, gpu: job.gpu, image: job.image, misses: 0, ready}
+    const b: Live = {slot, id: warm?.id ?? '', name, size, gpu: job.gpu, image: job.image, deleteAt: warm?.deleteAt ?? undefined, misses: 0, ready}
     live.set(slot, b)
     recs()
     save()
@@ -258,6 +226,7 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
         if (!back) {
           unhold(b.id)
           b.id = ''
+          b.deleteAt = undefined
           b.name = `sc-${batch.owner}-${Math.random().toString(36).slice(2, 10)}`
           recs()
           save()
@@ -267,8 +236,20 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
         o.log(`box ${b.name}: creating ${size.vcpus} vCPU / ${size.memMiB / 1024} GiB${job.gpu ? ` with ${job.gpu}` : ''}`)
         const img = imageOf(job.image)
         made = true
-        const box = await api(() => ib.create({name: b.name, vcpus: size.vcpus, memMiB: size.memMiB, snapshot: gpu ? undefined : img.snapshot, template: gpu?.template ?? img.template, gpu: job.gpu, meta: meta(job.image)}))
+        const box = await api(() =>
+          ib.create({
+            name: b.name,
+            vcpus: size.vcpus,
+            memMiB: size.memMiB,
+            snapshot: gpu ? undefined : img.snapshot,
+            template: gpu?.template ?? img.template,
+            gpu: job.gpu,
+            meta: meta(job.image),
+            deleteAfter: ib.DEFAULT_DELETE_AFTER,
+          }),
+        )
         b.id = box.id
+        b.deleteAt = box.deleteAt ?? undefined
         hold(b.id, batch.id, o.out)
         recs()
         save()
@@ -311,38 +292,15 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
   const collect = async (b: Live, i: number) => {
     const job = jobs[i]!
     const J = dir(job.name)
-    const local = mkdtempSync(join(tmpdir(), 'sc-out-'))
-    try {
-      const pack = await api(() => ib.exec(b.id, `cd ${J} 2>/dev/null || exit 7; tar -czf out.tgz -C out . && sha256sum log out.tgz && find out -type f | wc -l && cat started`, {idempotent: true}))
-      // (its folder gone from the box: the attempt's answer is gone with it)
-      if (pack.exitCode === 7) return lose(b, i)
-      if (pack.exitCode !== 0) throw new Error(`packing outputs exited ${pack.exitCode}: ${pack.stderr.trim()}`)
-      const lines = pack.stdout.trim().split('\n')
-      const sums = Object.fromEntries(lines.slice(0, 2).map((l) => l.split(/\s+/).reverse()))
-      const count = Number(lines[2])
-      const started = Number(lines[3])
-      const logFile = join(o.out, `${job.name}.log`)
-      await api(() => ib.pull(b.id, `${J.replace(/^~/, '/data/home')}/log`, logFile))
-      let verified = sha(logFile) === sums.log
-      if (count > 0) {
-        const tgz = join(local, 'out.tgz')
-        await api(() => ib.pull(b.id, `${J.replace(/^~/, '/data/home')}/out.tgz`, tgz))
-        verified &&= sha(tgz) === sums['out.tgz']
-        const files = join(o.out, `${job.name}.files`)
-        rmSync(files, {recursive: true, force: true})
-        mkdirSync(files, {recursive: true})
-        if (verified && Bun.spawnSync(['tar', '-xzf', tgz, '-C', files]).exitCode !== 0) verified = false
-      }
-      if (!verified) throw new Error('fetched outputs did not match their sha256')
-      const t = time(job.name)
-      t.seconds = Math.round((t.ended ?? Date.now() / 1000) - (Number.isFinite(started) ? started : t.started!))
-      // (the answer kept in batch.json before its folder on the box goes)
-      if (!ask({op: 'fetch', job: i})) return
-      o.log(`${job.name}: exit ${rule.job(i)!.exit} in ${t.seconds} s${count ? `, ${count} output files` : ''}`)
-      await api(() => ib.exec(b.id, `rm -rf ${J} ${J}.lock`, {idempotent: true})).catch(() => undefined)
-    } finally {
-      rmSync(local, {recursive: true, force: true})
-    }
+    const pulled = await pullJobOutputs(b.id, batch.id, job.name, o.out, api)
+    // (its folder gone from the box: the attempt's answer is gone with it)
+    if (pulled.status === 'missing') return lose(b, i)
+    const t = time(job.name)
+    t.seconds = Math.round((t.ended ?? Date.now() / 1000) - (Number.isFinite(pulled.started) ? pulled.started : t.started!))
+    // (the answer kept in batch.json before its folder on the box goes)
+    if (!ask({op: 'fetch', job: i})) return
+    o.log(`${job.name}: exit ${rule.job(i)!.exit} in ${t.seconds} s${pulled.count ? `, ${pulled.count} output files` : ''}`)
+    await api(() => ib.exec(b.id, `rm -rf ${J} ${J}.lock`, {idempotent: true})).catch(() => undefined)
   }
 
   // A box's running jobs in one call (the ones that wrote their exit code), then the outputs of every ended one.
@@ -388,7 +346,10 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     save()
     // (a GPU box is deleted, not paused: no batch resumes one, and paused it would keep its 200 GiB disk until a reap)
     if (b.id && b.gpu) await api(() => ib.remove(b.id)).then(() => o.log(`box ${b.name}: deleted (a GPU box is not kept)`), () => undefined)
-    else if (b.id) await api(() => ib.suspend(b.id)).then(() => o.log(`box ${b.name}: paused into the warm pool`), () => undefined)
+    else if (b.id) {
+      pausedAny = true
+      await api(() => ib.suspend(b.id)).then(() => o.log(`box ${b.name}: paused into the warm pool`), () => undefined)
+    }
   }
 
   // The boxes this batch held before (a batch picked up): theirs again, resumed if they paused meanwhile.
@@ -398,7 +359,9 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     hold(rec.id, batch.id, o.out)
     // (no id: its create never answered, so no job was launched there; a box it made after all is deleted)
     if (!rec.id) await discard(b)
-    const state = rec.id ? await api(() => ib.get(rec.id)).then((x) => x.state, () => 'gone') : 'gone'
+    const info = rec.id ? await api(() => ib.get(rec.id)).catch(() => undefined) : undefined
+    const state = info?.state ?? 'gone'
+    if (info?.deleteAt) b.deleteAt = info.deleteAt
     if (state === 'gone' || state === 'error' || state === 'deleted') {
       o.log(`box ${rec.name}: ${state}`)
       gone(b)
@@ -414,44 +377,49 @@ export async function run(batch: Batch, tree: Tree | undefined, o: Options): Pro
     if (!live.has(slot)) gone({slot, id: '', name: `slot ${slot}`, size: {vcpus: 0, memMiB: 0}, misses: 0, ready: Promise.resolve()})
   recs()
   save()
-  // (the warm pool reaps itself: this owner's paused boxes past their keep, none this or another batch holds)
-  await reap(o.keep, o.log, new Set(batch.boxes.map((b) => b.id))).catch(() => undefined)
+  // (the warm pool reaps itself: this owner's paused boxes past their keep, none this or another live batch holds)
+  const before = await reapOnce(o.keep, o.log, new Set(batch.boxes.map((b) => b.id)), {holdKeep}).catch(() => undefined)
+  if (before && (before.remainingPaused > 0 || before.remainingHeld > 0)) ensureReaper(o.keep, holdKeep, o.log)
   const out = () => rule.count('queued') + rule.count('running') + rule.count('ended')
   o.log(`batch ${batch.id}: ${jobs.length} jobs, ${rule.count('done')} answered, ${rule.count('queued')} queued, ${rule.count('running') + rule.count('ended')} out; ${imageKey()}`)
 
-  // Place, poll, until nothing is left to run or fetch.
-  while (out() > 0) {
-    for (const [i, j] of rule.jobs()) {
-      if (j.st !== 'queued') continue
-      const b = [...live.values()].find((b) => rule.would({op: 'start', job: i, box: b.slot})) ?? (await acquire(i))
-      if (!b) break // the rule opens no box: at the cap, the rest wait for a slot
-      void start(b, i)
+  let finished = false
+  try {
+    // Place, poll, until nothing is left to run or fetch.
+    while (out() > 0) {
+      for (const [i, j] of rule.jobs()) {
+        if (j.st !== 'queued') continue
+        const b =
+          [...live.values()].find((b) => hasEnoughLifetime(b.deleteAt, jobs[i]!.timeout) && rule.would({op: 'start', job: i, box: b.slot})) ??
+          (await acquire(i))
+        if (!b) break // the rule opens no box: at the cap, the rest wait for a slot
+        void start(b, i)
+      }
+      // A box with nothing on it that no queued job can start on goes back to the pool.
+      const queued = rule.jobs().filter(([, j]) => j.st === 'queued').map(([i]) => i)
+      for (const b of [...live.values()]) {
+        const pb = rule.box(b.slot)
+        if (!b.id || !pb || pb.running || pb.unfetched) continue
+        if (!queued.some((i) => hasEnoughLifetime(b.deleteAt, jobs[i]!.timeout) && rule.would({op: 'start', job: i, box: b.slot}))) await pause(b)
+      }
+      if (out() === 0) break
+      await sleep(o.poll)
+      await Promise.all([...live.values()].filter((b) => b.id).map((b) => b.ready.then(() => poll(b), () => undefined)))
     }
-    // A box with nothing on it that no queued job can start on goes back to the pool.
-    const queued = rule.jobs().filter(([, j]) => j.st === 'queued').map(([i]) => i)
-    for (const b of [...live.values()]) {
-      const pb = rule.box(b.slot)
-      if (!b.id || !pb || pb.running || pb.unfetched) continue
-      if (!queued.some((i) => rule.would({op: 'start', job: i, box: b.slot}))) await pause(b)
-    }
-    if (out() === 0) break
-    await sleep(o.poll)
-    await Promise.all([...live.values()].filter((b) => b.id).map((b) => b.ready.then(() => poll(b), () => undefined)))
-  }
-  await Promise.all([...live.values()].map((b) => pause(b)))
-  ask({op: 'finish'})
+    await Promise.all([...live.values()].map((b) => pause(b)))
+    ask({op: 'finish'})
 
-  // The summary: name, exit (or lost), seconds, the box it ran on.
-  const rows = jobs.map((j, i) => {
-    const st = rule.job(i)!
-    const t = batch.times[j.name] ?? {}
-    return [j.name, st.st === 'done' ? String(st.exit) : st.st, String(st.st === 'done' ? (t.seconds ?? '') : ''), t.where ?? '']
-  })
-  writeFileSync(join(o.out, 'summary.tsv'), ['name\texit\tseconds\twhere', ...rows.map((r) => r.join('\t'))].join('\n') + '\n')
-  const failed = rule.jobs().filter(([, j]) => j.st === 'done' && j.exit !== 0).length
-  o.log(`batch ${batch.id}: ${rule.verdict}: ${rule.count('done') - failed} passed, ${failed} failed, ${rule.count('lost')} lost; ${join(o.out, 'summary.tsv')}`)
-  await reap(o.keep, o.log).catch(() => undefined)
-  return rule.verdict === 'passed' ? 0 : 3
+    // The summary: name, exit (or lost), seconds, the box it ran on.
+    writeSummary(o.out, batch, rule)
+    const failed = rule.jobs().filter(([, j]) => j.st === 'done' && j.exit !== 0).length
+    o.log(`batch ${batch.id}: ${rule.verdict}: ${rule.count('done') - failed} passed, ${failed} failed, ${rule.count('lost')} lost; ${join(o.out, 'summary.tsv')}`)
+    finished = true
+    const after = await reapOnce(o.keep, o.log, new Set(), {holdKeep}).catch(() => undefined)
+    if ((after && (after.remainingPaused > 0 || after.remainingHeld > 0)) || (!after && pausedAny)) ensureReaper(o.keep, holdKeep, o.log)
+    return rule.verdict === 'passed' ? 0 : 3
+  } finally {
+    if (!finished && (live.size > 0 || pausedAny)) ensureReaper(o.keep, holdKeep, o.log)
+  }
 }
 
 // A job's script on its box, and the command that starts it detached (setsid) with the script on its stdin: it unpacks
@@ -514,28 +482,4 @@ export async function lockedSizes(cfg: Config, jobs: Job[]): Promise<Locked> {
     if (s.sizeLocked && s.defaultSpec) locked[name] = {vcpus: s.defaultSpec.vcpus, memMiB: s.defaultSpec.memMiB}
   }
   return locked
-}
-
-function sha(file: string): string {
-  return new Bun.CryptoHasher('sha256').update(readFileSync(file)).digest('hex')
-}
-
-// The warm pool's paused boxes the pool's decision lets go (src/pool.ts), deleted.
-// Only this owner's paused pool boxes: never another owner's, never a controller-less batch's (sc_batch), never one a
-// batch of this client holds (a job or outputs on it) or that the caller spares (its own batch's).
-export async function reap(keep: number, log: (s: string) => void, spare: Set<string> = new Set()): Promise<number> {
-  const me = owner()
-  const pool = await ib.list({sc: '1', sc_owner: me})
-  const holding = held()
-  let n = 0
-  for (const b of pool) {
-    if (b.state !== 'suspended' || b.metadata?.sc_owner !== me || b.metadata?.sc_batch || holding.has(b.id) || spare.has(b.id)) continue
-    const since = Date.parse(b.autoSuspendedAt ?? b.updatedAt ?? '')
-    const pausedFor = Number.isFinite(since) ? Math.max(0, Math.floor((Date.now() - since) / 1000)) : 0
-    if (!deletes(pausedFor, keep)) continue
-    await ib.remove(b.id)
-    log(`box ${b.name}: deleted (paused ${Math.round(pausedFor / 60)} min)`)
-    n++
-  }
-  return n
 }

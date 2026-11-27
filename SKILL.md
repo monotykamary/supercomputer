@@ -46,8 +46,16 @@ attempts.
 **Boxes and money.** instabox bills a running box by the second and a paused one for its disk only. A batch's boxes
 pause into a warm pool when it ends, and the next batch resumes them in seconds before it creates any.
 `supercomputer status` lists the pool; `supercomputer reap --keep 30m` deletes paused boxes past their keep (every
-`run` and `launch` reaps on its way in and out, `--keep` to change it): only this client's, never one a batch it can
-still pick up holds, never a controller-less batch's. A box a batch made that never became ready is deleted.
+`run` and `launch` reaps on its way in and out, `--keep` to change it): only this client's, never one a live batch can
+still pick up, never a controller-less batch's. A box a batch made that never became ready is deleted.
+
+**Automatic reaping and backstop.** Whenever a `run`, `launch` or `reap` leaves paused or held boxes behind, it starts
+one detached background reaper (`supercomputer reap --until-empty`, locked by `<state>/reaper.pid`, logged to
+`<state>/reaper.log`) that sleeps until the earliest keep expiry, reaps, and exits once none remain. A held box whose
+batch has ended and that stays paused past `--hold-keep` (default `6h`) has its outputs pulled into the batch's recorded
+`--out` directory first (no job re-run; kept if any pull fails), then is unheld and deleted. As a server-side backstop
+that survives this machine going away, every box is created with `--delete-after 24h`, and the pool never resumes or
+places a job on a box whose remaining lifetime is shorter than that job's timeout plus a 10-minute margin.
 
 **The repo's image.** `supercomputer image build` runs `[instabox] setup` on a fresh box and saves a snapshot named
 by the script's hash; put it in `supercomputer.toml`:

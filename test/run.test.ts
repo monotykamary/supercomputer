@@ -28,7 +28,7 @@ function sc(r: {dir: string; fake: string}, args: string[], env: Record<string, 
     cwd: r.dir,
     stdout: 'pipe',
     stderr: 'pipe',
-    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake, SC_STATE_DIR: join(r.fake, 'state'), ...env},
+    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake, SC_STATE_DIR: join(r.fake, 'state'), SC_REAPER_RECORD: join(r.fake, 'reaper-spawns.jsonl'), ...env},
   })
 }
 
@@ -162,7 +162,7 @@ test.skipIf(!linux)('execs refused for load (too many at once across the account
   writeFileSync(join(r.fake, 'refuse-execs'), '8')
   const p = Bun.spawn(['bun', join(here, 'src/cli.ts'), 'run', '--jobs', f, '--out', r.out, '--poll', '1s', '--strict-once'], {
     cwd: r.dir, stdout: 'pipe', stderr: 'pipe',
-    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake, SC_STATE_DIR: join(r.fake, 'state'), SC_REFUSAL_BACKOFF_MS: '20'},
+    env: {...process.env, INSTABOX_BIN: `bun ${join(here, 'test/fake-instabox.ts')}`, FAKE_INSTABOX_DIR: r.fake, SC_STATE_DIR: join(r.fake, 'state'), SC_REAPER_RECORD: join(r.fake, 'reaper-spawns.jsonl'), SC_REFUSAL_BACKOFF_MS: '20'},
   })
   const {err, code} = await done(p)
   expect(code, err).toBe(0)

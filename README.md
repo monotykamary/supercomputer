@@ -24,10 +24,15 @@ There is no controller. A batch is this client, its boxes, and `<out>/batch.json
 - **Box sizes**: the size a job's box gets is a proven gdp-wired decision (`src/size.ts`): a size-locked snapshot's
   own size always, else the job's `vm_type`, else `[instabox] size` when bigger, else the smallest that holds it. A job
   its box can't hold is refused when the batch starts, never lost when instabox refuses the box.
-- **The warm pool**: a box with nothing on it that no queued job can use pauses (it then costs only its disk). The
-  next batch resumes a paused box of the same size and image in seconds before it creates one.
-  `supercomputer reap --keep 30m` deletes paused boxes past their keep; every `run` and `launch` reaps when it starts
-  and ends, never a box a batch of this client can still pick up holds.
+- **The warm pool and automatic reaping**: a box with nothing on it that no queued job can use pauses (it then costs
+  only its disk). The next batch resumes a paused box of the same size and image in seconds before it creates one.
+  `supercomputer reap --keep 30m` deletes paused boxes past their keep; every `run`, `launch` and `reap` that leaves
+  paused or held boxes starts one detached background reaper (`supercomputer reap --until-empty`, locked by PID under
+  the state dir) that wakes at the earliest expiry and exits when empty. Held boxes whose batch has ended expire after
+  `--hold-keep` (default `6h`): outputs are pulled into the batch's recorded `--out` dir first (never re-running a job,
+  and keeping the box if any pull fails), then unheld and deleted; a live batch's boxes are never touched. Every box is
+  created with `--delete-after 24h` as a server-side backstop, and the pool never resumes or places a job on a box whose
+  remaining lifetime is shorter than its timeout plus a 10-minute margin.
 - **instabox failing**: a call refused for load or failing in transport (a timeout, a reset, an EOF, a gateway 5xx, a
   stalled transfer) is made again for about five minutes when it is safe to repeat: reads, pushes, creates (under an
   idempotency key, reconciled by name) and the launch (idempotent: the job claims its start on the box once). It
@@ -65,8 +70,10 @@ assumed), in about 3 seconds:
 `BUGS` in `src/batch.ts` are the bugs these laws rule out, each a variant of the same rule (a box opened past the cap,
 jobs packed by vCPUs alone, an answer retried, strict-once work tried twice, a box closed with outputs on it, a group
 twice on a box, a batch passed with a failure), and every one is refuted by a run from the start. `crossCheck`
-compares the builders' callbacks with the proven expressions on concrete runs. The warm pool's one decision (delete
-a paused box only past its keep) is a gdp-wired decision in `src/pool.ts`, proven the same way.
+compares the builders' callbacks with the proven expressions on concrete runs. The warm pool's decisions (delete an
+unheld paused box only past its keep; pull then delete an expired held box only past hold-keep; never touch a live
+batch's box; never reuse a box near its delete-after deadline) are gdp-wired decisions in `src/pool.ts`, proven the
+same way.
 
 ```sh
 bun install

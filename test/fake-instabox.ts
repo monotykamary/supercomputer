@@ -5,7 +5,11 @@ import {cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeF
 import {dirname, join} from 'node:path'
 
 const root = process.env.FAKE_INSTABOX_DIR!
-type Box = {id: string; name: string; state: string; vcpus: number; memMiB: number; metadata: Record<string, string>; updatedAt: string; autoSuspendedAt: string | null}
+type Box = {id: string; name: string; state: string; vcpus: number; memMiB: number; metadata: Record<string, string>; createdAt?: string; updatedAt: string; autoSuspendedAt: string | null; deleteAt?: string | null}
+const parseDurMs = (s?: string): number | undefined => {
+  const m = s ? /^(\d+)(s|m|h)$/.exec(s) : null
+  return m ? Number(m[1]) * ({s: 1000, m: 60_000, h: 3600_000}[m[2] as 's' | 'm' | 'h']) : undefined
+}
 const at = (id: string) => join(root, id)
 const read = (id: string): Box | undefined => (existsSync(join(at(id), 'box.json')) ? JSON.parse(readFileSync(join(at(id), 'box.json'), 'utf8')) : undefined)
 const write = (b: Box) => writeFileSync(join(at(b.id), 'box.json'), JSON.stringify(b))
@@ -30,6 +34,7 @@ const snaps = (): Snap[] => (existsSync(join(root, 'snapshots.json')) ? JSON.par
 
 const [cmd, ...args] = process.argv.slice(2)
 log([cmd, ...args.slice(0, 2)].join(' '))
+writeFileSync(join(root, 'argv.log'), JSON.stringify([cmd, ...args]) + '\n', {flag: 'a'})
 const flag = (name: string) => {
   const i = args.indexOf(name)
   return i < 0 ? undefined : args[i + 1]
@@ -122,7 +127,17 @@ if (cmd === 'create') {
   if (snap?.sizeLocked && (Number(flag('--vcpus')) !== snap.defaultSpec.vcpus || Number(flag('--mem-mib')) !== snap.defaultSpec.memMiB))
     fail(`spec_not_allowed: snapshot ${snap.name} is size-locked to ${snap.defaultSpec.vcpus} vCPU / ${snap.defaultSpec.memMiB} MiB`, 5)
   const vcpus = g ? g.sizes[0]!.vcpus * count : Number(flag('--vcpus') ?? 4), memMiB = g ? g.sizes[0]!.memMiB * count : Number(flag('--mem-mib') ?? 8192)
-  const b: Box = {id, name, state: after === 'broken-after' ? 'error' : after === 'pending-after' ? 'starting' : 'running', vcpus, memMiB, metadata: Object.fromEntries(metas()), updatedAt: new Date().toISOString(), autoSuspendedAt: null}
+  const now = Date.now(), delMs = parseDurMs(flag('--delete-after'))
+  const b: Box = {
+    id, name,
+    state: after === 'broken-after' ? 'error' : after === 'pending-after' ? 'starting' : 'running',
+    vcpus, memMiB,
+    metadata: Object.fromEntries(metas()),
+    createdAt: new Date(now).toISOString(),
+    updatedAt: new Date(now).toISOString(),
+    autoSuspendedAt: null,
+    deleteAt: delMs ? new Date(now + delMs).toISOString() : null,
+  }
   write(b)
   if (key) mkdirSync(join(root, 'keys'), {recursive: true}), writeFileSync(keyFile, id)
   log(`created ${name} template=${flag('--template') ?? '-'} gpu=${gpu ?? '-'} ${vcpus}x${memMiB}`)

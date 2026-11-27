@@ -6,10 +6,24 @@ export type Box = {
   state: string
   vcpus?: number
   memMiB?: number
+  spec?: {vcpus?: number; memMiB?: number}
   metadata?: Record<string, string>
+  createdAt?: string
   updatedAt?: string
   autoSuspendedAt?: string | null
+  deleteAt?: string | null
 }
+
+// instabox returns vcpus/memMiB under `spec`; normalize onto the top level too so callers see one shape.
+const normBox = (b: Box): Box => ({
+  ...b,
+  vcpus: b.vcpus ?? b.spec?.vcpus,
+  memMiB: b.memMiB ?? b.spec?.memMiB,
+})
+
+// Server-side backstop: every box created by supercomputer is deleted by instabox after 24h at the latest,
+// even if this client machine goes away permanently.
+export const DEFAULT_DELETE_AFTER = '24h'
 
 export type Exec = {stdout: string; stderr: string; exitCode: number}
 
@@ -125,9 +139,9 @@ export async function create(o: CreateOptions): Promise<Box> {
   for (const [k, v] of Object.entries(o.meta)) args.push('--meta', `${k}=${v}`)
   if (o.secrets?.length) args.push('--secrets', o.secrets.join(','))
   if (o.setupFile) args.push('--setup-file', o.setupFile)
-  if (o.deleteAfter) args.push('--delete-after', o.deleteAfter)
+  args.push('--delete-after', o.deleteAfter ?? DEFAULT_DELETE_AFTER)
   const r = await call(args, undefined, {again: 'transport'})
-  if (r.code === 0) return JSON.parse(r.stdout) as Box
+  if (r.code === 0) return normBox(JSON.parse(r.stdout) as Box)
   if (transportFailure(r) || /already exists|operation_conflict/i.test(said(r))) {
     const b = await reconcile(o)
     if (b) return b
@@ -166,11 +180,11 @@ async function reconcile(o: CreateOptions): Promise<Box | undefined> {
 export async function list(meta: Record<string, string>): Promise<Box[]> {
   const args = ['ls', '--json']
   for (const [k, v] of Object.entries(meta)) args.push('--meta', `${k}=${v}`)
-  return JSON.parse(await ok(args)) as Box[]
+  return (JSON.parse(await ok(args)) as Box[]).map(normBox)
 }
 
 export async function get(box: string): Promise<Box> {
-  return JSON.parse(await ok(['get', box, '--json'])) as Box
+  return normBox(JSON.parse(await ok(['get', box, '--json'])) as Box)
 }
 
 // One command in the box (bash -lc as its user), its exit code returned rather than thrown. An exec that fails in
