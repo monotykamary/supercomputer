@@ -15,6 +15,12 @@ const read = (id: string): Box | undefined => (existsSync(join(at(id), 'box.json
 const write = (b: Box) => writeFileSync(join(at(b.id), 'box.json'), JSON.stringify(b))
 const all = () => (existsSync(root) ? readdirSync(root).map(read).filter((b): b is Box => !!b) : [])
 const find = (key: string) => all().find((b) => b.id === key || b.name === key)
+const takeNoCapacity = () => {
+  const f = join(root, 'no-capacity')
+  const n = existsSync(f) ? Number(readFileSync(f, 'utf8')) : 0
+  if (n > 0) writeFileSync(f, String(n - 1))
+  return n > 0
+}
 const local = (b: Box, p: string) => join(at(b.id), 'home', p.replace(/^\/data\/home\/?/, ''))
 const fail = (msg: string, code = 1): never => {
   console.error(`instabox: error ${msg}`)
@@ -138,6 +144,13 @@ if (cmd === 'create') {
     autoSuspendedAt: null,
     deleteAt: delMs ? new Date(now + delMs).toISOString() : null,
   }
+  // ($FAKE_INSTABOX_DIR/no-capacity holding N: the next N creates or starts find no room; a create still makes the box,
+  // stopped, as instabox does)
+  if (takeNoCapacity()) {
+    write({...b, state: 'stopped'})
+    if (key) mkdirSync(join(root, 'keys'), {recursive: true}), writeFileSync(keyFile, id)
+    fail(`no_capacity: no room to start the new sandbox right now; it was created stopped: start it in a minute (instabox start ${name})`, 75)
+  }
   write(b)
   if (key) mkdirSync(join(root, 'keys'), {recursive: true}), writeFileSync(keyFile, id)
   log(`created ${name} template=${flag('--template') ?? '-'} gpu=${gpu ?? '-'} ${vcpus}x${memMiB}`)
@@ -180,6 +193,11 @@ if (cmd === 'create') {
   if (!existsSync(from)) fail(`no ${from}`)
   mkdirSync(dirname(to), {recursive: true})
   cpSync(from, to, {recursive: true})
+} else if (cmd === 'start') {
+  const b = find(args.find((a) => !a.startsWith('--'))!) ?? fail('not_found: no such machine')
+  if (takeNoCapacity()) fail('no_capacity: no room to start the sandbox right now; try again in a minute', 75)
+  write({...b, state: 'running', updatedAt: new Date().toISOString()})
+  console.log(JSON.stringify({...b, state: 'running'}))
 } else if (cmd === 'suspend' || cmd === 'resume') {
   const b = find(args[0]!) ?? fail('not_found: no such machine')
   write({...b, state: cmd === 'suspend' ? 'suspended' : 'running', updatedAt: new Date().toISOString(), autoSuspendedAt: cmd === 'suspend' ? new Date().toISOString() : null})

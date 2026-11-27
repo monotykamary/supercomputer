@@ -74,7 +74,7 @@ const said = (r: Result) => r.stderr + r.stdout
 
 // instabox refusing a call for load (too many execs at once across the account, a rate limit): it ran nothing.
 export const refusedForLoad = (r: Result) =>
-  !answered(r) && /too many concurrent|rate.?limit|too many requests|\b429\b|try again (later|in)/i.test(said(r))
+  !answered(r) && !/no_capacity|no room to start/i.test(said(r)) && /too many concurrent|rate.?limit|too many requests|\b429\b|try again (later|in)/i.test(said(r))
 
 // The call's way to instabox failing (a timeout, a connection reset, refused or closed, an EOF, the gateway's 5xx, a
 // stalled transfer): no answer, so whether the call ran on instabox's side is not known from it.
@@ -142,11 +142,38 @@ export async function create(o: CreateOptions): Promise<Box> {
   args.push('--delete-after', o.deleteAfter ?? DEFAULT_DELETE_AFTER)
   const r = await call(args, undefined, {again: 'transport'})
   if (r.code === 0) return normBox(JSON.parse(r.stdout) as Box)
+  if (noCapacity(r)) return startWhenRoom(o, args, r)
   if (transportFailure(r) || /already exists|operation_conflict/i.test(said(r))) {
     const b = await reconcile(o)
     if (b) return b
   }
   throw new InstaboxError(args, r.code, r.stderr || r.stdout)
+}
+
+// instabox out of room for a box right now: a create still makes it, stopped ("it was created stopped: start it").
+export const noCapacity = (r: Result) => !answered(r) && /no_capacity|no room to start/i.test(said(r))
+
+// A box instabox made stopped for want of room: started again, with the same backoff as a call refused for load, until
+// there is room (up to SC_CAPACITY_BUDGET_MS, 15 minutes by default), then waited for as reconcile waits. No room by
+// then: the stopped box is deleted (never left behind) and the create fails as before.
+async function startWhenRoom(o: CreateOptions, args: string[], first: Result): Promise<Box> {
+  const base = Number(process.env.SC_REFUSAL_BACKOFF_MS ?? 2000)
+  const budget = Number(process.env.SC_CAPACITY_BUDGET_MS ?? 900_000)
+  let last = first
+  for (let attempt = 0, waited = 0; waited < budget; attempt++) {
+    const wait = Math.min(base * 2 ** attempt, 60_000) * (0.75 + Math.random() / 2)
+    await Bun.sleep(wait)
+    waited += wait
+    last = await call(['start', o.name], undefined, {again: 'transport'})
+    if (last.code === 0 || !noCapacity(last)) break
+  }
+  if (last.code === 0) {
+    const b = await reconcile(o)
+    if (b) return b
+  }
+  const b = await get(o.name).catch(() => undefined)
+  if (b && sameMeta(b, o.meta)) await remove(b.id).catch(() => undefined)
+  throw new InstaboxError(args, last.code, last.stderr || last.stdout)
 }
 
 const sameMeta = (b: Box, meta: Record<string, string>) => Object.entries(meta).every(([k, v]) => b.metadata?.[k] === v)
